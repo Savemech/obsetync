@@ -167,12 +167,49 @@
           dontNpmInstall = true;
         };
 
+        # ------------------------------------------------------------------
+        # Docker image built entirely by Nix — no Dockerfile involved.
+        # Reproducible: same flake.lock + same nixpkgs → byte-identical image.
+        # Only Linux systems can produce Linux images directly; on macOS use
+        # `nix build .#dockerImage --system x86_64-linux` with a remote builder.
+        # ------------------------------------------------------------------
+        dockerImage = pkgs.dockerTools.buildLayeredImage {
+          name = "obsetync-server";
+          tag  = "nix";
+
+          # Fixed creation date so the image hash is stable across rebuilds.
+          created = "1970-01-01T00:00:00Z";
+
+          contents = [
+            pkgs.dockerTools.caCertificates  # /etc/ssl/certs for rustls
+            pkgs.dockerTools.fakeNss         # minimal /etc/passwd (for `User: nobody`)
+            sync-server                       # the binary at /bin/sync-server
+          ];
+
+          config = {
+            Entrypoint   = [ "${sync-server}/bin/sync-server" ];
+            Cmd          = [ "run" "--data-dir" "/data" ];
+            ExposedPorts = {
+              "27182/tcp" = {};
+              "27183/tcp" = {};
+            };
+            Volumes    = { "/data" = {}; };
+            User       = "nobody";
+            WorkingDir = "/";
+            Labels     = {
+              "org.opencontainers.image.title"       = "obsetync-server";
+              "org.opencontainers.image.description" = "Self-hosted Obsidian vault sync server";
+            };
+          };
+        };
+
       in {
         packages = {
-          server  = sync-server;
-          wasm    = sync-core-wasm;
-          plugin  = plugin;
-          default = sync-server;
+          server      = sync-server;
+          wasm        = sync-core-wasm;
+          plugin      = plugin;
+          dockerImage = dockerImage;
+          default     = sync-server;
         };
 
         # `nix flake check` runs the test suite across the workspace.

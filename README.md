@@ -95,7 +95,24 @@ nix run .#server -- run --data-dir ./data    # run the server directly
 
 First-time setup: run `nix build .#plugin` once. Nix will fail with the correct `npmDepsHash` — paste it into `flake.nix` where it says `lib.fakeHash`, then rerun. One-time annoyance for a permanent pin.
 
-Docker and Nix are independent routes to the same artifacts. Use whichever fits; the results are functionally interchangeable.
+### Option 4 — Nix-built Docker image (hermetic + ready-to-run)
+
+The best of both: Nix compiles the binary deterministically, then *builds the OCI image itself* (no Dockerfile). Same `flake.lock` → byte-identical image hash, loadable into any Docker or Podman.
+
+```sh
+just build-nix-image         # runs both steps below:
+# nix build .#dockerImage    # -> ./result (OCI tarball)
+# docker load < result       # -> image obsetync-server:nix
+
+docker run --rm -v obsetync-data:/data -p 27182:27182 -p 127.0.0.1:27183:27183 \
+    obsetync-server:nix
+
+# Or swap it into compose by setting image: obsetync-server:nix on the server service.
+```
+
+This is the strongest guarantee: the *image itself* is reproducible. Two people running `nix build .#dockerImage` with the same `flake.lock` will get the same image digest.
+
+Docker, Nix, and Nix-built Docker images are independent routes to the same functional artifacts. Pick the one that fits your environment.
 
 ## Run the server
 

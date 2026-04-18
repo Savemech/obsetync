@@ -39,6 +39,19 @@ build-plugin:
 build-dev:
     docker compose --profile tools build dev
 
+# Option 3: build a fully hermetic Docker image via Nix, load into Docker.
+# Same flake.lock → byte-identical image hash on any machine.
+# Requires Nix with flakes enabled.
+build-nix-image:
+    nix build .#dockerImage
+    docker load < result
+    @echo "Loaded as obsetync-server:nix"
+
+# Build the server binary via Nix (hermetic). Output: ./result/bin/sync-server
+build-nix-binary:
+    nix build .#server
+    @echo "Binary at ./result/bin/sync-server"
+
 # --- run ------------------------------------------------------------------
 
 # First-run: create CA, server cert, directory layout inside the data volume.
