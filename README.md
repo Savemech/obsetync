@@ -1,5 +1,7 @@
 # ObsetyNC
 
+[![CI](https://github.com/Savemech/obsetync/actions/workflows/ci.yml/badge.svg)](https://github.com/Savemech/obsetync/actions/workflows/ci.yml)
+
 Self-hosted, end-to-end sync for [Obsidian](https://obsidian.md) vaults.
 
 Your notes stay on your infrastructure. Desktop and iOS sync through your own server — no third-party cloud, no vendor lock-in.
@@ -70,6 +72,13 @@ just build-image
 ```
 
 Use this when you want to run the server via `docker compose up`. See [Run the server](#run-the-server).
+
+Pre-built images are published on GitHub Container Registry on every tagged release:
+
+```sh
+docker pull ghcr.io/savemech/obsetync:latest         # Docker-built (standard)
+docker pull ghcr.io/savemech/obsetync-nix:latest     # Nix-built (hermetic)
+```
 
 ### Everything at once
 

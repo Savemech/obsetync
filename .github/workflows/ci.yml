@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# Cancel in-flight runs when a new push happens on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Rust workspace: fmt, clippy, test. Uses native Rust (fast via Swatinem cache)
+  # rather than Docker to keep CI under a minute on warm cache.
+  # ---------------------------------------------------------------------------
+  rust:
+    name: Rust (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+          target: wasm32-unknown-unknown
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --locked --all-targets
+
+      - name: cargo test
+        env:
+          CC: clang
+        run: cargo test --workspace --locked
+
+      - name: cargo check wasm
+        run: cargo check -p sync-core --target wasm32-unknown-unknown --features wasm --no-default-features --locked
+
+  # ---------------------------------------------------------------------------
+  # Plugin: type-check the TypeScript source. Does NOT run the bundler — that's
+  # the release workflow's job. CI just validates that the source compiles.
+  # ---------------------------------------------------------------------------
+  plugin:
+    name: Plugin (tsc)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: plugin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: plugin/package-lock.json
+
+      - run: npm ci --no-audit --no-fund
+
+      - run: npx tsc --noEmit
+
+  # ---------------------------------------------------------------------------
+  # Docker: verify the multi-stage Dockerfile still builds end-to-end.
+  # Uses gha cache so warm runs are fast.
+  # ---------------------------------------------------------------------------
+  docker:
+    name: Docker (server image)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: server
+          push: false
+          tags: obsetync/server:ci
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+  # ---------------------------------------------------------------------------
+  # Nix: flake check (runs tests via crane) + build server derivation.
+  # Proves the hermetic path stays green.
+  # ---------------------------------------------------------------------------
+  nix:
+    name: Nix (flake check + build server)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: nix flake check
+        run: nix flake check --print-build-logs
+
+      - name: nix build .#server
+        run: nix build .#server --print-build-logs
