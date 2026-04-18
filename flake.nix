@@ -158,7 +158,7 @@
             runHook preInstall
             mkdir -p $out
             cp main.js manifest.json $out/
-            cp -r wasm $out/
+            cp wasm/sync_core.js wasm/sync_core_bg.wasm $out/
             runHook postInstall
           '';
 

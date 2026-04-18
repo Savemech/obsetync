@@ -6,6 +6,8 @@ plugin/wasm/
 plugin/main.js
 plugin/main.js.map
 plugin/dist/
+plugin/sync_core.js
+plugin/sync_core_bg.wasm
 result
 result-*
 .direnv/

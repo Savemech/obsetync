@@ -164,17 +164,47 @@ The server exposes two ports on the host:
 
 Data is stored in the `obsetync-data` named volume.
 
-## Enroll a device
+## Installing the plugin in Obsidian
 
-1. Open the admin UI (`http://localhost:27183/admin`)
-2. *Add Device* → name it → get an enrollment code
-3. Install the plugin into your Obsidian vault:
-   - Copy `dist/plugin/main.js`, `dist/plugin/manifest.json`, and `dist/plugin/wasm/` into `<your-vault>/.obsidian/plugins/obsetync/`
-4. Enable *ObsetyNC* in Obsidian's Community Plugins settings
-5. Open the plugin's settings tab, fill in the server URL and vault ID, paste the enrollment code
-6. Done — it pulls (or pushes, if first device) automatically
+Three paths, pick whichever suits your platform:
 
-Repeat for each device. iOS works the same way; copy the plugin files into the vault's `.obsidian/plugins/obsetync/` directory via the Files app or iCloud Drive.
+### A. BRAT (recommended — works on desktop and iOS)
+
+[BRAT](https://github.com/TfTHacker/obsidian42-brat) ("Beta Reviewers Auto-update Tester") is a community plugin that installs and auto-updates plugins directly from GitHub releases.
+
+1. In Obsidian, open **Settings → Community plugins** and disable Restricted Mode if it's on.
+2. **Browse**, search for *BRAT*, install it, and enable it.
+3. Open **BRAT** settings → **Add Beta plugin** → paste `Savemech/obsetync` and confirm.
+4. BRAT downloads `main.js`, `manifest.json`, and the two WASM files from our latest GitHub release into your vault.
+5. Back in **Community plugins**, enable *ObsetyNC*.
+
+Subsequent releases auto-update via BRAT — no further action needed.
+
+### B. Manual install (no BRAT, fully offline after first download)
+
+1. Go to the [Releases page](https://github.com/Savemech/obsetync/releases/latest) and download `obsetync-<version>.zip`.
+2. Unzip it — you'll see an `obsetync/` folder containing `main.js`, `manifest.json`, `sync_core.js`, `sync_core_bg.wasm`.
+3. Drop that `obsetync/` folder into `<your-vault>/.obsidian/plugins/`.
+4. In Obsidian, **Settings → Community plugins** → disable Restricted Mode → refresh the list → enable *ObsetyNC*.
+
+On **iOS**, the same flow works via the Files app:
+
+1. Open **Safari** on your iPhone, download `obsetync-<version>.zip` from the Releases page.
+2. Tap the downloaded file to open it in **Files**. iOS unzips it in place, giving you an `obsetync/` folder.
+3. In Files, browse to **iCloud Drive → Obsidian → `<your vault>` → `.obsidian` → `plugins`** (create `plugins` if missing). If your vault is stored on-device instead of iCloud, navigate via **On My iPhone → Obsidian → `<your vault>`**.
+4. Long-press the `obsetync/` folder you unzipped → **Move** → place it under `plugins/`.
+5. Open Obsidian on iPhone, **Settings → Community plugins**, turn on Community plugins, enable *ObsetyNC*.
+
+### After install (any path): enroll the device
+
+1. Open the server admin UI (`http://<server>:27183/admin`), click **Add device**, name it, copy the enrollment code.
+2. In Obsidian → **Settings → ObsetyNC**, fill in:
+   - **Server URL** — e.g. `https://your-server:27182`
+   - **Vault ID** — any name you like; use the same ID on every device that syncs the same vault
+   - **Enrollment code** — paste it from the admin UI
+3. Hit **Enroll**. First device pushes; later devices pull.
+
+Repeat on each desktop + phone + tablet you want in the sync.
 
 ## Authentication
 

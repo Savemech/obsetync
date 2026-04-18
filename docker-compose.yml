@@ -73,10 +73,11 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command: >
       "mkdir -p /out &&
-       cp /build/plugin/main.js       /out/ &&
-       cp /build/plugin/manifest.json /out/ &&
        rm -rf /out/wasm &&
-       cp -r /build/plugin/wasm       /out/ &&
+       cp /build/plugin/main.js                /out/ &&
+       cp /build/plugin/manifest.json          /out/ &&
+       cp /build/plugin/wasm/sync_core.js      /out/ &&
+       cp /build/plugin/wasm/sync_core_bg.wasm /out/ &&
        echo 'Plugin files written to ./dist/plugin'"
 
   # ---------------------------------------------------------------------------

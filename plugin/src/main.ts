@@ -202,12 +202,12 @@ export default class SyncPlugin extends Plugin {
     }
 
     private async loadWasm(): Promise<WasmModule> {
-        // Attempt to load the WASM module from the plugin directory.
-        // The wasm-pack output should be at plugin/wasm/sync_core.js + sync_core_bg.wasm.
+        // WASM files live flat alongside main.js — not under wasm/ — so that
+        // BRAT and manual installs can drop a single folder into .obsidian/plugins/
+        // without needing to preserve subdirectories.
         try {
-            // In Obsidian's Electron environment, we can use dynamic import.
             const wasmPath = this.app.vault.adapter.getResourcePath(
-                ".obsidian/plugins/obsetync/wasm/sync_core.js"
+                ".obsidian/plugins/obsetync/sync_core.js"
             );
             const mod = await import(/* webpackIgnore: true */ wasmPath);
             await mod.default(); // Initialize WASM.

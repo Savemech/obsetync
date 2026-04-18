@@ -172,13 +172,16 @@ CMD ["run", "--data-dir", "/data"]
 # produces:
 #   ./dist/plugin/main.js
 #   ./dist/plugin/manifest.json
-#   ./dist/plugin/wasm/*
+#   ./dist/plugin/sync_core.js
+#   ./dist/plugin/sync_core_bg.wasm
+# All flat — drop the whole folder into a vault's .obsidian/plugins/obsetync/.
 # ------------------------------------------------------------------------------
 FROM scratch AS plugin-dist
 
-COPY --from=plugin-builder /build/plugin/main.js       /main.js
-COPY --from=plugin-builder /build/plugin/manifest.json /manifest.json
-COPY --from=plugin-builder /build/plugin/wasm          /wasm/
+COPY --from=plugin-builder /build/plugin/main.js                  /main.js
+COPY --from=plugin-builder /build/plugin/manifest.json            /manifest.json
+COPY --from=plugin-builder /build/plugin/wasm/sync_core.js        /sync_core.js
+COPY --from=plugin-builder /build/plugin/wasm/sync_core_bg.wasm   /sync_core_bg.wasm
 
 
 # ------------------------------------------------------------------------------

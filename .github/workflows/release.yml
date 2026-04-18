@@ -2,7 +2,11 @@ name: Release
 
 on:
   push:
-    tags: ['v*']
+    tags:
+      # Accept both conventions so the plugin can be tagged either `v1.0.2`
+      # (docker-style) or `1.0.2` (Obsidian community plugins convention).
+      - 'v*'
+      - '[0-9]+.[0-9]+.[0-9]+'
 
 permissions:
   contents: write   # create releases + upload assets
@@ -12,8 +16,8 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Plugin artifacts: build main.js + WASM, attach to the GitHub Release.
-  # Users download these and drop them into their vault's
-  # .obsidian/plugins/obsetync/ directory.
+  # Obsidian's auto-updater (and BRAT) expects individual files at release root.
+  # We also attach a zip with the proper folder structure for manual installs.
   # ---------------------------------------------------------------------------
   plugin:
     name: Build plugin artifacts
@@ -52,21 +56,37 @@ jobs:
           npm ci --no-audit --no-fund
           node esbuild.config.mjs production
 
-      - name: Package release assets
+      - name: Stage flat release assets
         run: |
-          mkdir -p release/obsetync
-          cp plugin/main.js        release/obsetync/
-          cp plugin/manifest.json  release/obsetync/
-          cp -r plugin/wasm        release/obsetync/wasm
-          cd release && zip -r obsetync-${{ github.ref_name }}.zip obsetync
+          mkdir -p release
+          # Files BRAT / Obsidian auto-updater download directly:
+          cp plugin/main.js                   release/main.js
+          cp plugin/manifest.json             release/manifest.json
+          cp plugin/wasm/sync_core.js         release/sync_core.js
+          cp plugin/wasm/sync_core_bg.wasm    release/sync_core_bg.wasm
+          cp versions.json                    release/versions.json
+
+          # ZIP for manual install (drop its contents into .obsidian/plugins/obsetync/).
+          mkdir -p zip-staging/obsetync
+          cp release/main.js                  zip-staging/obsetync/
+          cp release/manifest.json            zip-staging/obsetync/
+          cp release/sync_core.js             zip-staging/obsetync/
+          cp release/sync_core_bg.wasm        zip-staging/obsetync/
+          cd zip-staging && zip -r ../release/obsetync-${{ github.ref_name }}.zip obsetync
+
+          echo "Release assets:"
+          ls -la release/
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
+            release/main.js
+            release/manifest.json
+            release/sync_core.js
+            release/sync_core_bg.wasm
+            release/versions.json
             release/obsetync-*.zip
-            plugin/main.js
-            plugin/manifest.json
           generate_release_notes: true
 
   # ---------------------------------------------------------------------------
@@ -109,7 +129,7 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Nix-built Docker image: hermetic build via the flake, pushed to ghcr with
-  # a `-nix` tag suffix so users can opt into byte-identical image pulls.
+  # a `-nix` suffix so users can opt into byte-identical image pulls.
   # ---------------------------------------------------------------------------
   docker-nix:
     name: Nix Docker image → ghcr.io
@@ -141,7 +161,7 @@ jobs:
           REPO: ghcr.io/${{ github.repository }}-nix
           VERSION: ${{ github.ref_name }}
         run: |
-          # Strip 'v' prefix for docker tag convention.
+          # Strip a leading 'v' for docker tag convention (1.0.2 not v1.0.2).
           VERSION_CLEAN="${VERSION#v}"
           docker tag obsetync-server:nix "${REPO}:${VERSION_CLEAN}"
           docker tag obsetync-server:nix "${REPO}:latest"
@@ -149,8 +169,8 @@ jobs:
           docker push "${REPO}:latest"
 
   # ---------------------------------------------------------------------------
-  # Bare-metal binary: extract the stripped sync-server binary via the Docker
-  # build target, attach to the release for people who deploy without Docker.
+  # Bare-metal server binary: extract the stripped sync-server for people who
+  # deploy without Docker.
   # ---------------------------------------------------------------------------
   binary:
     name: Server binary (x86_64-linux)
