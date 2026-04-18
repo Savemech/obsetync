@@ -1,0 +1,63 @@
+# syntax=docker/dockerfile:1.7
+# ==============================================================================
+# ObsetyNC — development container.
+#
+# Use this image for interactive work: cargo watch, npm run dev, running tests,
+# iterating on code. Source is mounted as a volume at runtime — the image itself
+# only carries the toolchain.
+#
+# Build:
+#   docker build -f Dockerfile.dev -t obsetync/dev:local .
+#
+# Run an interactive shell with the project mounted:
+#   docker run --rm -it -v "$PWD":/build obsetync/dev:local bash
+#
+# Or use `just dev` which wraps this.
+# ==============================================================================
+
+FROM rust:1.95-bookworm
+
+ENV CARGO_TERM_COLOR=always \
+    CARGO_NET_RETRY=5 \
+    RUSTFLAGS="--remap-path-prefix=/build=." \
+    DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        clang \
+        cmake \
+        perl \
+        git \
+        ca-certificates \
+        curl \
+        just \
+        build-essential \
+        pkg-config \
+        less \
+        vim-tiny \
+        && rm -rf /var/lib/apt/lists/*
+
+# Node.js 20 for the plugin build.
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+# Rust extras: wasm target, common dev tools.
+RUN rustup target add wasm32-unknown-unknown && \
+    rustup component add rustfmt clippy rust-src
+
+ENV WASM_PACK_VERSION=0.13.1
+RUN curl -sSfL https://github.com/rustwasm/wasm-pack/releases/download/v${WASM_PACK_VERSION}/wasm-pack-v${WASM_PACK_VERSION}-x86_64-unknown-linux-musl.tar.gz \
+    | tar -xz -C /usr/local/bin --strip-components=1 \
+        wasm-pack-v${WASM_PACK_VERSION}-x86_64-unknown-linux-musl/wasm-pack
+
+# Optional watchers — installed via cargo but cached between dev builds.
+RUN --mount=type=cache,id=dev-cargo-registry,target=/usr/local/cargo/registry \
+    cargo install cargo-watch --locked
+
+WORKDIR /build
+
+# Ports: 27182 sync API, 27183 admin UI.
+EXPOSE 27182 27183
+
+CMD ["bash"]

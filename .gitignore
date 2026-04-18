@@ -1,0 +1,34 @@
+# Build artifacts — never tracked.
+target/
+node_modules/
+dist/
+plugin/wasm/
+plugin/main.js
+plugin/main.js.map
+plugin/dist/
+result
+result-*
+.direnv/
+
+# Local env
+.env
+.env.local
+*.env
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
+
+# Tooling local state
+.claude/
+.aider*
+CLAUDE.md
+
+# Private working notes — never publish
+private/
+notes/
+_private/

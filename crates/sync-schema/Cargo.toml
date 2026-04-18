@@ -1,0 +1,7 @@
+[package]
+name = "sync-schema"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+flatbuffers.workspace = true

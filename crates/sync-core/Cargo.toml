@@ -1,0 +1,52 @@
+[package]
+name = "sync-core"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+wasm = [
+    "wasm-bindgen",
+    "js-sys",
+    "console_error_panic_hook",
+    "serde-wasm-bindgen",
+]
+
+[dependencies]
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+flatbuffers.workspace = true
+
+sync-schema = { path = "../sync-schema" }
+similar = "2"
+fastcdc = "3"
+async-trait = "0.1"
+
+wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }
+console_error_panic_hook = { version = "0.1", optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tempfile = "3"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# wasm-opt flags. Rust 1.95 emits bulk-memory / sign-ext ops by default; the
+# wasm-opt bundled with wasm-pack 0.13.1 needs these features explicitly enabled
+# to validate the input. All listed features are supported by every browser
+# that Obsidian targets, so enabling them is safe.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = [
+    "-O",
+    "--enable-bulk-memory",
+    "--enable-nontrapping-float-to-int",
+    "--enable-sign-ext",
+    "--enable-mutable-globals",
+    "--enable-reference-types",
+]

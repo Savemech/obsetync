@@ -1,0 +1,112 @@
+# ObsetyNC — thin wrapper around `docker compose`.
+# Every recipe below is equivalent to a compose command; use compose directly
+# if you prefer.
+set dotenv-load := true
+
+# --- optional .env overrides for `just ship` (personal rsync deploy) ---
+# Leave these blank to disable `ship`; set them in .env to use it.
+server := env_var_or_default("OBSETYNC_SERVER", "")
+dest   := env_var_or_default("OBSETYNC_DEST",   "/opt/obsetync")
+vault  := env_var_or_default("OBSETYNC_VAULT",  "")
+
+# Default: list recipes.
+default:
+    @just --list
+
+# --- build ----------------------------------------------------------------
+
+# Option 1 + 2 combined: build image AND extract artifacts.
+build: build-image build-artifacts
+
+# Option 2: build the runtime server image (obsetync/server:local).
+#   Use when you'll run the server via `docker compose up`.
+build-image:
+    docker compose build server
+
+# Option 1: extract binary + plugin files to ./dist/.
+#   Use when you want clean artifacts for bare-metal deploy or manual install.
+build-artifacts: build-binary build-plugin
+
+# Extract just the server binary to ./dist/bin/sync-server.
+build-binary:
+    docker compose run --rm binary
+
+# Extract just the plugin files to ./dist/plugin/.
+build-plugin:
+    docker compose run --rm plugin
+
+# Build the dev image (carries Rust + Node + wasm-pack toolchain).
+build-dev:
+    docker compose --profile tools build dev
+
+# --- run ------------------------------------------------------------------
+
+# First-run: create CA, server cert, directory layout inside the data volume.
+init:
+    docker compose run --rm server init --data-dir /data
+
+# Start the server in the background.
+up:
+    docker compose up -d server
+
+# Stop the server.
+down:
+    docker compose down
+
+# Tail server logs.
+logs:
+    docker compose logs -f server
+
+# Restart the server.
+restart:
+    docker compose restart server
+
+# Shell inside the running server container (diagnostics).
+shell:
+    docker compose exec server sh
+
+# --- dev ------------------------------------------------------------------
+
+# Interactive dev shell with source mounted + full toolchain.
+dev:
+    docker compose run --rm dev
+
+# Run the Rust test suite across the workspace.
+test:
+    docker compose run --rm test
+
+# --- personal deploy (optional) -------------------------------------------
+
+# Build artifacts and rsync them to your own server + local Obsidian vault.
+# Requires OBSETYNC_SERVER, OBSETYNC_DEST, OBSETYNC_VAULT in .env.
+# Public users should use `just build` + `just up` instead.
+ship: build-artifacts
+    @test -n "{{server}}" || (echo "OBSETYNC_SERVER not set in .env — skipping" && exit 1)
+    @echo "→ rsync binary to {{server}}:{{dest}}/"
+    ssh {{server}} "mkdir -p {{dest}}"
+    rsync -Phz --chmod=F755 dist/bin/sync-server {{server}}:{{dest}}/sync-server
+    -ssh {{server}} systemctl restart obsetync
+    @test -n "{{vault}}" && (echo "→ copy plugin files to {{vault}}/" && mkdir -p "{{vault}}" && cp -r dist/plugin/. "{{vault}}/") || echo "OBSETYNC_VAULT not set — skipping local plugin copy"
+    @echo "Shipped."
+
+# --- maintenance ----------------------------------------------------------
+
+# Wipe synced vault content on the server. Preserves certs + enrolled devices.
+clean-server:
+    @echo "This will erase all synced vault data on the server. Ctrl-C to abort."
+    @sleep 3
+    docker compose exec server sh -c " \
+        rm -rf /data/vaults /data/index /data/content && \
+        mkdir -p /data/vaults /data/index /data/content/manifests /data/content/chunks"
+    docker compose restart server
+    @echo "Server state wiped."
+
+# Drop Docker BuildKit caches.
+clean-cache:
+    docker builder prune -af
+
+# Nuke everything — images, volumes, caches. Fresh start next `just build`.
+nuke:
+    -docker compose --profile tools down -v
+    -docker rmi obsetync/server:local obsetync/plugin-builder:local obsetync/dev:local obsetync/rust-builder:local 2>/dev/null
+    -docker builder prune -af

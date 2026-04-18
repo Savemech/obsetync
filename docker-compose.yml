@@ -1,0 +1,148 @@
+# ==============================================================================
+# ObsetyNC — everything you need, driven by `docker compose`.
+#
+#   docker compose build                      # build every image
+#   docker compose up -d                      # start the server
+#   docker compose down                       # stop it
+#   docker compose logs -f                    # tail logs
+#   docker compose run --rm server init \
+#         --data-dir /data                    # first-time: init the volume
+#   docker compose run --rm plugin            # extract plugin files to ./dist/plugin
+#   docker compose run --rm dev               # interactive dev shell (source mounted)
+#   docker compose run --rm test              # run the Rust test suite
+#
+# The `justfile` wraps these into shorter aliases (`just up`, `just build-plugin`,
+# etc.) but every recipe is a thin layer over these commands.
+# ==============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # server — production runtime.
+  # Build target: the final `server` stage (debian-slim + stripped binary).
+  # ---------------------------------------------------------------------------
+  server:
+    build:
+      context: .
+      target: server
+    image: obsetync/server:local
+    container_name: obsetync-server
+    restart: unless-stopped
+    ports:
+      # Sync API — exposed publicly (mTLS + bearer token auth).
+      - "27182:27182"
+      # Admin UI — bound to localhost. Put behind a reverse proxy / VPN if you
+      # need remote access.
+      - "127.0.0.1:27183:27183"
+    volumes:
+      - obsetync-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "getent hosts localhost >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # plugin — extracts main.js + manifest.json + wasm/ to ./dist/plugin.
+  # Usage: `docker compose run --rm plugin`
+  # ---------------------------------------------------------------------------
+  plugin:
+    build:
+      context: .
+      target: plugin-builder
+    image: obsetync/plugin-builder:local
+    profiles: ["tools"]
+    volumes:
+      - ./dist/plugin:/out
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "mkdir -p /out &&
+       cp /build/plugin/main.js       /out/ &&
+       cp /build/plugin/manifest.json /out/ &&
+       rm -rf /out/wasm &&
+       cp -r /build/plugin/wasm       /out/ &&
+       echo 'Plugin files written to ./dist/plugin'"
+
+  # ---------------------------------------------------------------------------
+  # binary — extracts the server binary to ./dist/bin for bare-metal deploy.
+  # Usage: `docker compose run --rm binary`
+  # Reuses the `server` runtime image (which already has the stripped binary at
+  # /usr/local/bin/sync-server). Running as root so it can write to the mount.
+  # ---------------------------------------------------------------------------
+  binary:
+    build:
+      context: .
+      target: server
+    image: obsetync/server:local
+    profiles: ["tools"]
+    user: root
+    volumes:
+      - ./dist/bin:/host-out
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "mkdir -p /host-out &&
+       cp /usr/local/bin/sync-server /host-out/sync-server &&
+       chmod 0755 /host-out/sync-server &&
+       echo 'Binary written to ./dist/bin/sync-server'"
+
+  # ---------------------------------------------------------------------------
+  # dev — interactive development shell. Your working tree is mounted at /build.
+  # Usage: `docker compose run --rm dev`
+  # All toolchains (Rust, Node, wasm-pack, cargo-watch, just) are pre-installed.
+  # ---------------------------------------------------------------------------
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    image: obsetync/dev:local
+    profiles: ["tools"]
+    volumes:
+      - .:/build
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - target-cache:/build/target
+    working_dir: /build
+    stdin_open: true
+    tty: true
+    ports:
+      - "27182:27182"
+      - "27183:27183"
+    command: bash
+
+  # ---------------------------------------------------------------------------
+  # test — one-shot cargo test across the workspace.
+  # Usage: `docker compose run --rm test`
+  # ---------------------------------------------------------------------------
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    image: obsetync/dev:local
+    profiles: ["tools"]
+    volumes:
+      - .:/build
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - target-cache:/build/target
+    working_dir: /build
+    environment:
+      CC: clang
+    command: cargo test --workspace --locked
+
+volumes:
+  obsetync-data:
+    driver: local
+  cargo-registry:
+    driver: local
+  cargo-git:
+    driver: local
+  target-cache:
+    driver: local

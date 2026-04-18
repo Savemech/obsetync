@@ -1,0 +1,8 @@
+# Strip build-time paths from debug info and panic messages.
+# Applies to every cargo invocation in this workspace.
+
+[build]
+rustflags = [
+    "--remap-path-prefix=/build=.",
+    "--remap-path-prefix=/usr/local/cargo=/cargo",
+]

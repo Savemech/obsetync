@@ -1,0 +1,43 @@
+# Send nothing to the build context that isn't needed.
+# Smaller context = faster builds + zero leak risk for local artifacts.
+
+# Git / VCS
+.git/
+.gitignore
+.gitattributes
+
+# Local tooling / secrets
+.env
+.env.local
+*.env
+.claude/
+.vscode/
+.idea/
+.aider*
+CLAUDE.md
+
+# Private working notes — never publish
+private/
+notes/
+_private/
+
+# Build artifacts (these are what got us in trouble — never send them in)
+target/
+plugin/node_modules/
+plugin/wasm/
+plugin/main.js
+plugin/main.js.map
+plugin/dist/
+dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker infra itself doesn't need to be in the image
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Docs not needed inside containers
+README.md

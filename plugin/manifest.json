@@ -1,0 +1,9 @@
+{
+    "id": "obsetync",
+    "name": "ObsetyNC",
+    "version": "1.0.1",
+    "minAppVersion": "1.4.0",
+    "description": "Self-hosted Obsidian vault sync with content-addressed chunk store and Merkle tree.",
+    "author": "ObsetyNC",
+    "isDesktopOnly": false
+}

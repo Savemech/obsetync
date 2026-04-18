@@ -1,0 +1,42 @@
+namespace SyncChunk;
+
+table FileEntry {
+    path:        string (required);
+    hash:        [ubyte] (required);   // 32 bytes Blake3
+    mtime_ms:    uint64;
+    size_bytes:  uint64;
+}
+
+table LeafChunk {
+    version:  uint32;
+    entries:  [FileEntry] (required);   // sorted by path
+}
+
+table ChildRef {
+    prefix: string (required);
+    hash:   [ubyte] (required);         // 32 bytes
+}
+
+table InternalNode {
+    version:  uint32;
+    children: [ChildRef] (required);    // sorted by prefix
+}
+
+table RootNode {
+    version:     uint32;
+    vault_id:    string (required);
+    created_ms:  uint64;
+    total_files: uint64;
+    children:    [ChildRef] (required);
+    root_hash:   [ubyte];               // 32 bytes, for quick comparison
+    parent_hash: [ubyte];               // 32 bytes, previous root (COW chain)
+    device_id:   string;                // which device produced this root
+}
+
+union NodeType { LeafChunk, InternalNode, RootNode }
+
+table ChunkEnvelope {
+    node: NodeType (required);
+}
+
+root_type ChunkEnvelope;

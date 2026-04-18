@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sync-core",
+    "crates/sync-schema",
+    "crates/sync-server",
+]
+
+[workspace.package]
+version = "1.0.1"
+edition = "2021"
+
+[workspace.dependencies]
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+hex = "0.4"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+flatbuffers = "24.3.25"
+
+# Optimized release binaries — stripped, LTO'd, single codegen unit.
+[profile.release]
+strip       = "symbols"
+debug       = false
+panic       = "abort"
+lto         = true
+codegen-units = 1
+opt-level   = 3
+
+# Debug builds stay fast and keep symbols for local troubleshooting.
+[profile.dev]
+debug       = true
+opt-level   = 0
