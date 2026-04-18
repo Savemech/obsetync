@@ -116,8 +116,10 @@ Docker, Nix, and Nix-built Docker images are independent routes to the same func
 
 ## Run the server
 
+State lives on the host at `./data/server/` — a plain directory you can back up, inspect, or `tar` around. No Docker named volumes anywhere.
+
 ```sh
-# First-time: create CA, server cert, directory layout in the data volume.
+# First-time: create CA, server cert, directory layout in ./data/server.
 docker compose run --rm server init --data-dir /data
 
 # Start / stop / logs / restart.
@@ -131,6 +133,20 @@ docker compose exec server sh
 ```
 
 `just` shortcuts: `just init`, `just up`, `just down`, `just logs`, `just restart`, `just shell`.
+
+### Host directory layout
+
+Everything is under `./data/` (gitignored):
+
+```
+./data/server/            persistent server state: ca/, devices/, vaults/, index/, content/
+./data/cache/cargo-*/     dev shell: cargo dep cache (optional, speeds up rebuilds)
+./data/cache/target/      dev shell: incremental compile cache (optional)
+./dist/bin/sync-server    extracted binary (from `docker compose run --rm binary`)
+./dist/plugin/            extracted plugin files (from `docker compose run --rm plugin`)
+```
+
+Wipe any of these freely. The server's `init` subcommand recreates `./data/server/` from scratch.
 
 The server exposes two ports on the host:
 

@@ -6,20 +6,28 @@
 #   docker compose down                       # stop it
 #   docker compose logs -f                    # tail logs
 #   docker compose run --rm server init \
-#         --data-dir /data                    # first-time: init the volume
-#   docker compose run --rm plugin            # extract plugin files to ./dist/plugin
-#   docker compose run --rm dev               # interactive dev shell (source mounted)
+#         --data-dir /data                    # first-time: init ./data/server
+#   docker compose run --rm plugin            # extract plugin → ./dist/plugin
+#   docker compose run --rm binary            # extract binary → ./dist/bin
+#   docker compose run --rm dev               # interactive dev shell
 #   docker compose run --rm test              # run the Rust test suite
 #
-# The `justfile` wraps these into shorter aliases (`just up`, `just build-plugin`,
-# etc.) but every recipe is a thin layer over these commands.
+# Host directory layout (all relative to the repo root; all created on first use):
+#   ./data/server/            persistent server state (certs, vaults, index, content)
+#   ./data/cache/cargo-registry/   dev shell: downloaded crates
+#   ./data/cache/cargo-git/        dev shell: git-sourced crates
+#   ./data/cache/target/           dev shell: incremental compile cache
+#   ./dist/bin/               extracted binary (from `run --rm binary`)
+#   ./dist/plugin/            extracted plugin files (from `run --rm plugin`)
+#
+# All of these are gitignored. Wipe them freely — `docker compose run --rm server
+# init --data-dir /data` will recreate the server layout.
 # ==============================================================================
 
 services:
 
   # ---------------------------------------------------------------------------
   # server — production runtime.
-  # Build target: the final `server` stage (debian-slim + stripped binary).
   # ---------------------------------------------------------------------------
   server:
     build:
@@ -35,7 +43,8 @@ services:
       # need remote access.
       - "127.0.0.1:27183:27183"
     volumes:
-      - obsetync-data:/data
+      # Host ./data/server → container /data (server's --data-dir).
+      - ./data/server:/data
     read_only: true
     tmpfs:
       - /tmp:size=16m
@@ -51,8 +60,7 @@ services:
       start_period: 10s
 
   # ---------------------------------------------------------------------------
-  # plugin — extracts main.js + manifest.json + wasm/ to ./dist/plugin.
-  # Usage: `docker compose run --rm plugin`
+  # plugin — extract main.js + manifest.json + wasm/ → ./dist/plugin
   # ---------------------------------------------------------------------------
   plugin:
     build:
@@ -72,10 +80,7 @@ services:
        echo 'Plugin files written to ./dist/plugin'"
 
   # ---------------------------------------------------------------------------
-  # binary — extracts the server binary to ./dist/bin for bare-metal deploy.
-  # Usage: `docker compose run --rm binary`
-  # Reuses the `server` runtime image (which already has the stripped binary at
-  # /usr/local/bin/sync-server). Running as root so it can write to the mount.
+  # binary — extract the server binary → ./dist/bin
   # ---------------------------------------------------------------------------
   binary:
     build:
@@ -94,9 +99,8 @@ services:
        echo 'Binary written to ./dist/bin/sync-server'"
 
   # ---------------------------------------------------------------------------
-  # dev — interactive development shell. Your working tree is mounted at /build.
-  # Usage: `docker compose run --rm dev`
-  # All toolchains (Rust, Node, wasm-pack, cargo-watch, just) are pre-installed.
+  # dev — interactive dev shell. Source is bind-mounted, caches persist under
+  # ./data/cache so subsequent cargo/npm runs are fast.
   # ---------------------------------------------------------------------------
   dev:
     build:
@@ -106,9 +110,9 @@ services:
     profiles: ["tools"]
     volumes:
       - .:/build
-      - cargo-registry:/usr/local/cargo/registry
-      - cargo-git:/usr/local/cargo/git
-      - target-cache:/build/target
+      - ./data/cache/cargo-registry:/usr/local/cargo/registry
+      - ./data/cache/cargo-git:/usr/local/cargo/git
+      - ./data/cache/target:/build/target
     working_dir: /build
     stdin_open: true
     tty: true
@@ -118,8 +122,7 @@ services:
     command: bash
 
   # ---------------------------------------------------------------------------
-  # test — one-shot cargo test across the workspace.
-  # Usage: `docker compose run --rm test`
+  # test — one-shot `cargo test` over the workspace.
   # ---------------------------------------------------------------------------
   test:
     build:
@@ -129,20 +132,10 @@ services:
     profiles: ["tools"]
     volumes:
       - .:/build
-      - cargo-registry:/usr/local/cargo/registry
-      - cargo-git:/usr/local/cargo/git
-      - target-cache:/build/target
+      - ./data/cache/cargo-registry:/usr/local/cargo/registry
+      - ./data/cache/cargo-git:/usr/local/cargo/git
+      - ./data/cache/target:/build/target
     working_dir: /build
     environment:
       CC: clang
     command: cargo test --workspace --locked
-
-volumes:
-  obsetync-data:
-    driver: local
-  cargo-registry:
-    driver: local
-  cargo-git:
-    driver: local
-  target-cache:
-    driver: local

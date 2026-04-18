@@ -10,6 +10,9 @@ result
 result-*
 .direnv/
 
+# Runtime state + dev caches (bind-mounted by docker-compose).
+data/
+
 # Local env
 .env
 .env.local

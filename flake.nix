@@ -71,7 +71,7 @@
         sync-server = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
           pname = "sync-server";
-          cargoExtraArgs = "--locked -p sync-server --release";
+          cargoExtraArgs = "--locked -p sync-server";
           doCheck = false;  # test runs under `nix flake check` instead
         });
 
@@ -82,7 +82,7 @@
         sync-core-wasm-raw = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
           pname = "sync-core-wasm";
-          cargoExtraArgs = "--locked -p sync-core --release --target wasm32-unknown-unknown --features wasm --no-default-features";
+          cargoExtraArgs = "--locked -p sync-core --target wasm32-unknown-unknown --features wasm --no-default-features";
           doCheck = false;
 
           # cargo won't put the .wasm anywhere pretty — grab it by hand.

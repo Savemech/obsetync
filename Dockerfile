@@ -146,17 +146,15 @@ LABEL org.opencontainers.image.title="obsetync-server" \
 # Minimal runtime deps.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
-    rm -rf /var/lib/apt/lists/* && \
-    groupadd --system --gid 10001 obsetync && \
-    useradd  --system --uid 10001 --gid obsetync --home-dir /data --no-create-home obsetync
+    rm -rf /var/lib/apt/lists/*
 
 COPY --from=rust-builder /out/sync-server /usr/local/bin/sync-server
 
-# Data directory — mount a volume here so state persists across container restarts.
-RUN mkdir -p /data && chown obsetync:obsetync /data
-VOLUME /data
-
-USER obsetync
+# Data directory — bind mount from the host via docker-compose. Writable by
+# whatever UID runs the container (no USER directive = root inside). Container
+# isolation comes from cap_drop: ALL + read_only + no-new-privileges in compose,
+# not from Linux user separation, so host-side file ownership matches your user.
+RUN mkdir -p /data
 WORKDIR /data
 
 # 27182 sync API (mTLS + bearer token)
