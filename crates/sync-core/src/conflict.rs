@@ -98,14 +98,10 @@ fn collect_changed_ranges(diff: &TextDiff<str>) -> Vec<ChangeRange> {
         match op {
             similar::DiffOp::Equal { .. } => {}
             similar::DiffOp::Delete {
-                old_index,
-                old_len,
-                ..
+                old_index, old_len, ..
             }
             | similar::DiffOp::Replace {
-                old_index,
-                old_len,
-                ..
+                old_index, old_len, ..
             } => {
                 ranges.push(ChangeRange {
                     start: *old_index,
@@ -228,15 +224,15 @@ struct MergeOp<'a> {
     new_lines: Vec<&'a str>,
 }
 
-fn collect_ops<'a>(diff: &'a TextDiff<'_, '_, 'a, str>) -> std::collections::HashMap<usize, MergeOp<'a>> {
+fn collect_ops<'a>(
+    diff: &'a TextDiff<'_, '_, 'a, str>,
+) -> std::collections::HashMap<usize, MergeOp<'a>> {
     let mut ops = std::collections::HashMap::new();
 
     for op in diff.ops() {
         match op {
             similar::DiffOp::Delete {
-                old_index,
-                old_len,
-                ..
+                old_index, old_len, ..
             } => {
                 ops.insert(
                     *old_index,

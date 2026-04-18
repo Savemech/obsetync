@@ -30,10 +30,16 @@ pub async fn merge_trees<S: ChunkStore>(
     // Collect all prefixes across base, A, and B.
     let base_map: HashMap<&str, &FileHash> =
         base.children.iter().map(|(p, h)| (p.as_str(), h)).collect();
-    let a_map: HashMap<&str, &FileHash> =
-        side_a.children.iter().map(|(p, h)| (p.as_str(), h)).collect();
-    let b_map: HashMap<&str, &FileHash> =
-        side_b.children.iter().map(|(p, h)| (p.as_str(), h)).collect();
+    let a_map: HashMap<&str, &FileHash> = side_a
+        .children
+        .iter()
+        .map(|(p, h)| (p.as_str(), h))
+        .collect();
+    let b_map: HashMap<&str, &FileHash> = side_b
+        .children
+        .iter()
+        .map(|(p, h)| (p.as_str(), h))
+        .collect();
 
     let mut all_prefixes: Vec<&str> = base_map
         .keys()
@@ -164,8 +170,8 @@ pub async fn merge_trees<S: ChunkStore>(
 
     // Build a new tree from merged entries.
     let mut all_entries = merged_entries;
-    all_entries.sort();  // FileEntry implements Ord by path
-    all_entries.dedup_by(|a, b| a.path == b.path);  // remove any duplicates from same prefix appearing twice
+    all_entries.sort(); // FileEntry implements Ord by path
+    all_entries.dedup_by(|a, b| a.path == b.path); // remove any duplicates from same prefix appearing twice
     let new_root = crate::tree::build_tree(store, all_entries, &side_a.vault_id, "server").await?;
 
     // Set parent hash to side_a's hash (the server's current root before merge).
@@ -198,9 +204,8 @@ fn merge_entry_lists(
     // All three slices are sorted by path. Three-pointer merge: O(n+m+k), zero map allocations.
 
     // Collect all unique paths in sorted order using a merge of three sorted iterators.
-    let mut paths: Vec<&str> = Vec::with_capacity(
-        base_entries.len().max(a_entries.len()).max(b_entries.len())
-    );
+    let mut paths: Vec<&str> =
+        Vec::with_capacity(base_entries.len().max(a_entries.len()).max(b_entries.len()));
 
     // Merge three sorted slices into a deduplicated sorted path list.
     {
@@ -214,32 +219,68 @@ fn merge_entry_lists(
 
             let min = match (a_path, b_path, c_path) {
                 (None, None, None) => break,
-                (Some(a), None, None) => { ii += 1; a }
-                (None, Some(b), None) => { ji += 1; b }
-                (None, None, Some(c)) => { ki += 1; c }
-                (Some(a), Some(b), None) => {
-                    match a.cmp(b) {
-                        std::cmp::Ordering::Less | std::cmp::Ordering::Equal => { if a == b { ji += 1; } ii += 1; a }
-                        std::cmp::Ordering::Greater => { ji += 1; b }
-                    }
+                (Some(a), None, None) => {
+                    ii += 1;
+                    a
                 }
-                (Some(a), None, Some(c)) => {
-                    match a.cmp(c) {
-                        std::cmp::Ordering::Less | std::cmp::Ordering::Equal => { if a == c { ki += 1; } ii += 1; a }
-                        std::cmp::Ordering::Greater => { ki += 1; c }
-                    }
+                (None, Some(b), None) => {
+                    ji += 1;
+                    b
                 }
-                (None, Some(b), Some(c)) => {
-                    match b.cmp(c) {
-                        std::cmp::Ordering::Less | std::cmp::Ordering::Equal => { if b == c { ki += 1; } ji += 1; b }
-                        std::cmp::Ordering::Greater => { ki += 1; c }
-                    }
+                (None, None, Some(c)) => {
+                    ki += 1;
+                    c
                 }
+                (Some(a), Some(b), None) => match a.cmp(b) {
+                    std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {
+                        if a == b {
+                            ji += 1;
+                        }
+                        ii += 1;
+                        a
+                    }
+                    std::cmp::Ordering::Greater => {
+                        ji += 1;
+                        b
+                    }
+                },
+                (Some(a), None, Some(c)) => match a.cmp(c) {
+                    std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {
+                        if a == c {
+                            ki += 1;
+                        }
+                        ii += 1;
+                        a
+                    }
+                    std::cmp::Ordering::Greater => {
+                        ki += 1;
+                        c
+                    }
+                },
+                (None, Some(b), Some(c)) => match b.cmp(c) {
+                    std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {
+                        if b == c {
+                            ki += 1;
+                        }
+                        ji += 1;
+                        b
+                    }
+                    std::cmp::Ordering::Greater => {
+                        ki += 1;
+                        c
+                    }
+                },
                 (Some(a), Some(b), Some(c)) => {
                     let min3 = a.min(b).min(c);
-                    if a == min3 { ii += 1; }
-                    if b == min3 { ji += 1; }
-                    if c == min3 { ki += 1; }
+                    if a == min3 {
+                        ii += 1;
+                    }
+                    if b == min3 {
+                        ji += 1;
+                    }
+                    if c == min3 {
+                        ki += 1;
+                    }
                     min3
                 }
             };
@@ -254,10 +295,8 @@ fn merge_entry_lists(
     // Use sorted binary search instead of HashMap.
     let base_map: HashMap<&str, &FileEntry> =
         base_entries.iter().map(|e| (e.path.as_str(), e)).collect();
-    let a_map: HashMap<&str, &FileEntry> =
-        a_entries.iter().map(|e| (e.path.as_str(), e)).collect();
-    let b_map: HashMap<&str, &FileEntry> =
-        b_entries.iter().map(|e| (e.path.as_str(), e)).collect();
+    let a_map: HashMap<&str, &FileEntry> = a_entries.iter().map(|e| (e.path.as_str(), e)).collect();
+    let b_map: HashMap<&str, &FileEntry> = b_entries.iter().map(|e| (e.path.as_str(), e)).collect();
 
     for path in paths {
         let base_entry = base_map.get(path);
@@ -285,8 +324,14 @@ fn merge_entry_lists(
                     side_b_hash: b.hash,
                 });
             }
-            (None, Some(a), None) => { *auto_resolved += 1; merged.push((*a).clone()); }
-            (None, None, Some(b)) => { *auto_resolved += 1; merged.push((*b).clone()); }
+            (None, Some(a), None) => {
+                *auto_resolved += 1;
+                merged.push((*a).clone());
+            }
+            (None, None, Some(b)) => {
+                *auto_resolved += 1;
+                merged.push((*b).clone());
+            }
             (None, Some(a), Some(b)) => {
                 merged.push((*a).clone());
                 if a.hash != b.hash {
@@ -299,9 +344,15 @@ fn merge_entry_lists(
                 }
             }
             (Some(base), None, Some(b)) if b.hash == base.hash => {}
-            (Some(_base), None, Some(b)) => { *auto_resolved += 1; merged.push((*b).clone()); }
+            (Some(_base), None, Some(b)) => {
+                *auto_resolved += 1;
+                merged.push((*b).clone());
+            }
             (Some(base), Some(a), None) if a.hash == base.hash => {}
-            (Some(_base), Some(a), None) => { *auto_resolved += 1; merged.push((*a).clone()); }
+            (Some(_base), Some(a), None) => {
+                *auto_resolved += 1;
+                merged.push((*a).clone());
+            }
             (Some(_), None, None) | (None, None, None) => {}
             _ => {}
         }

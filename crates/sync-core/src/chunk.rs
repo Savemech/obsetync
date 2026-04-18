@@ -60,7 +60,9 @@ impl LeafChunk {
 
     /// Serialize to FlatBuffers bytes.
     pub fn serialize(&self) -> Vec<u8> {
-        let mut builder = FlatBufferBuilder::<flatbuffers::DefaultAllocator>::with_capacity(self.entries.len() * 80);
+        let mut builder = FlatBufferBuilder::<flatbuffers::DefaultAllocator>::with_capacity(
+            self.entries.len() * 80,
+        );
 
         let entries: Vec<_> = self
             .entries
@@ -162,7 +164,9 @@ impl InternalNode {
     }
 
     pub fn serialize(&self) -> Vec<u8> {
-        let mut builder = FlatBufferBuilder::<flatbuffers::DefaultAllocator>::with_capacity(self.children.len() * 48);
+        let mut builder = FlatBufferBuilder::<flatbuffers::DefaultAllocator>::with_capacity(
+            self.children.len() * 48,
+        );
 
         let children: Vec<_> = self
             .children
@@ -260,16 +264,15 @@ impl RootNode {
     }
 
     pub fn serialize(&self) -> Vec<u8> {
-        let mut builder = FlatBufferBuilder::<flatbuffers::DefaultAllocator>::with_capacity(self.children.len() * 48 + 128);
+        let mut builder = FlatBufferBuilder::<flatbuffers::DefaultAllocator>::with_capacity(
+            self.children.len() * 48 + 128,
+        );
 
         let vault_id = builder.create_string(&self.vault_id);
         let device_id = builder.create_string(&self.device_id);
         let root_hash_val = self.hash();
         let root_hash = builder.create_vector(&root_hash_val);
-        let parent_hash = self
-            .parent_hash
-            .as_ref()
-            .map(|h| builder.create_vector(h));
+        let parent_hash = self.parent_hash.as_ref().map(|h| builder.create_vector(h));
 
         let children: Vec<_> = self
             .children
@@ -332,10 +335,7 @@ impl RootNode {
 
         let vault_id = root.vault_id().to_string();
 
-        let device_id = root
-            .device_id()
-            .unwrap_or("")
-            .to_string();
+        let device_id = root.device_id().unwrap_or("").to_string();
 
         let parent_hash = root.parent_hash().and_then(|h| {
             if h.len() == 32 {
@@ -414,9 +414,7 @@ mod tests {
 
     #[test]
     fn leaf_chunk_hash_deterministic() {
-        let entries = vec![
-            FileEntry::new("x.md".into(), hash_bytes(b"xxx"), 5000, 500),
-        ];
+        let entries = vec![FileEntry::new("x.md".into(), hash_bytes(b"xxx"), 5000, 500)];
         let c1 = LeafChunk::new(entries.clone());
         let c2 = LeafChunk::new(entries);
         assert_eq!(c1.hash(), c2.hash());

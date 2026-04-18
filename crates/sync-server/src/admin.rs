@@ -1,15 +1,15 @@
+use crate::devices;
+use crate::enrollment;
+use crate::state::SharedState;
 use axum::{
-    Router,
     extract::{Form, Path, State},
     http::{Method, StatusCode},
     response::{Html, IntoResponse, Redirect},
     routing::{get, post},
+    Router,
 };
-use tower_http::cors::CorsLayer;
-use crate::devices;
-use crate::enrollment;
-use crate::state::SharedState;
 use sync_core::hash::hash_to_hex;
+use tower_http::cors::CorsLayer;
 
 pub fn admin_router(state: SharedState) -> Router {
     let cors = CorsLayer::new()
@@ -20,7 +20,10 @@ pub fn admin_router(state: SharedState) -> Router {
         .route("/", get(|| async { Redirect::permanent("/admin") }))
         .route("/admin", get(dashboard))
         .route("/admin/devices", get(device_list))
-        .route("/admin/devices/new", get(new_device_form).post(create_device))
+        .route(
+            "/admin/devices/new",
+            get(new_device_form).post(create_device),
+        )
         .route("/admin/devices/{fingerprint}", get(device_detail))
         .route("/admin/devices/{fingerprint}/revoke", post(revoke_device))
         .route("/admin/vaults", get(vault_list))
@@ -203,7 +206,9 @@ async fn device_detail(
 {revoke_btn}
 <p><a href="/admin/devices">Back to devices</a></p>
 </body></html>"#,
-        device.name, device.name, fingerprint,
+        device.name,
+        device.name,
+        fingerprint,
         format_time(device.enrolled_at),
         format_time(device.last_seen),
     )))
@@ -241,9 +246,7 @@ async fn vault_list(State(state): State<SharedState>) -> Html<String> {
         .iter()
         .map(|(name, has_root)| {
             let status = if *has_root { "Active" } else { "Empty" };
-            format!(
-                "<tr><td><a href='/admin/vaults/{name}'>{name}</a></td><td>{status}</td></tr>"
-            )
+            format!("<tr><td><a href='/admin/vaults/{name}'>{name}</a></td><td>{status}</td></tr>")
         })
         .collect();
 
@@ -268,7 +271,9 @@ async fn vault_detail(
     Path(vault_id): Path<String>,
 ) -> Result<Html<String>, ServerErrorHtml> {
     let current = state.vaults.get_current_root(&vault_id);
-    let current_hex = current.map(|h| hash_to_hex(&h)).unwrap_or_else(|| "none".into());
+    let current_hex = current
+        .map(|h| hash_to_hex(&h))
+        .unwrap_or_else(|| "none".into());
 
     // List all roots in history.
     let roots_dir = state.layout.vault_roots_dir(&vault_id);
@@ -372,13 +377,15 @@ async fn claim_enrollment(
                 StatusCode::OK,
                 [(axum::http::header::CONTENT_TYPE, "application/json")],
                 bundle.to_string(),
-            ).into_response()
+            )
+                .into_response()
         }
         Err(e) => (
             StatusCode::BAD_REQUEST,
             [(axum::http::header::CONTENT_TYPE, "application/json")],
             serde_json::json!({ "error": e }).to_string(),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
 

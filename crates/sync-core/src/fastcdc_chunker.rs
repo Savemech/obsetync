@@ -102,13 +102,14 @@ mod tests {
         // Create a file large enough to produce multiple chunks.
         // At 256KB avg, we need >256KB to get at least 1 chunk.
         // Use 2MB to get ~8 chunks.
-        let data: Vec<u8> = (0..2_000_000u32)
-            .flat_map(|i| i.to_le_bytes())
-            .collect();
+        let data: Vec<u8> = (0..2_000_000u32).flat_map(|i| i.to_le_bytes()).collect();
 
         let chunked = chunk_file(&data);
 
-        assert!(chunked.manifest.chunks.len() > 1, "expected multiple chunks");
+        assert!(
+            chunked.manifest.chunks.len() > 1,
+            "expected multiple chunks"
+        );
         assert_eq!(chunked.manifest.total_size, data.len() as u64);
         assert_eq!(chunked.manifest.file_hash, hash_bytes(&data));
 
@@ -138,9 +139,7 @@ mod tests {
     #[test]
     fn small_edit_changes_few_chunks() {
         // Create a large file.
-        let mut data: Vec<u8> = (0..2_000_000u32)
-            .flat_map(|i| i.to_le_bytes())
-            .collect();
+        let mut data: Vec<u8> = (0..2_000_000u32).flat_map(|i| i.to_le_bytes()).collect();
         let original = chunk_file(&data);
 
         // Modify a small region near the middle.

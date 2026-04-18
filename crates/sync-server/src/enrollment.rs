@@ -51,10 +51,7 @@ pub fn create_enrollment(
 
 /// Claim an enrollment: verify code, register device, return cert bundle.
 /// Deletes the enrollment after claiming.
-pub fn claim_enrollment(
-    layout: &StorageLayout,
-    code: &str,
-) -> Result<EnrollmentInfo, String> {
+pub fn claim_enrollment(layout: &StorageLayout, code: &str) -> Result<EnrollmentInfo, String> {
     let path = layout.enrollment_path(code);
     let data = fs::read_to_string(&path).map_err(|_| "enrollment code not found".to_string())?;
     let info: EnrollmentInfo =

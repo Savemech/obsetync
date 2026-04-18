@@ -21,7 +21,6 @@ fn now_ms() -> u64 {
 /// Target entries per leaf chunk. Tune based on observed chunk churn.
 pub const TARGET_CHUNK_ENTRIES: usize = 1000;
 
-
 /// Extract the top-level directory prefix from a path.
 /// "notes/2024/jan.md" -> "notes/"
 /// "readme.md" -> ""  (root-level file)
@@ -269,12 +268,7 @@ mod tests {
     use crate::store::MemoryChunkStore;
 
     fn make_entry(path: &str) -> FileEntry {
-        FileEntry::new(
-            path.to_string(),
-            hash_bytes(path.as_bytes()),
-            1000,
-            100,
-        )
+        FileEntry::new(path.to_string(), hash_bytes(path.as_bytes()), 1000, 100)
     }
 
     #[tokio::test]
@@ -286,7 +280,9 @@ mod tests {
             make_entry("assets/pic.png"),
         ];
 
-        let root = build_tree(&store, entries, "test-vault", "desktop").await.unwrap();
+        let root = build_tree(&store, entries, "test-vault", "desktop")
+            .await
+            .unwrap();
 
         assert_eq!(root.total_files, 3);
         assert_eq!(root.vault_id, "test-vault");
@@ -297,10 +293,7 @@ mod tests {
     #[tokio::test]
     async fn update_tree_add_file() {
         let store = MemoryChunkStore::new();
-        let entries = vec![
-            make_entry("notes/a.md"),
-            make_entry("notes/b.md"),
-        ];
+        let entries = vec![make_entry("notes/a.md"), make_entry("notes/b.md")];
 
         let root = build_tree(&store, entries, "test", "dev").await.unwrap();
         assert_eq!(root.total_files, 2);
@@ -336,19 +329,11 @@ mod tests {
     #[tokio::test]
     async fn update_tree_modify_file() {
         let store = MemoryChunkStore::new();
-        let entries = vec![
-            make_entry("notes/a.md"),
-            make_entry("notes/b.md"),
-        ];
+        let entries = vec![make_entry("notes/a.md"), make_entry("notes/b.md")];
 
         let root = build_tree(&store, entries, "test", "dev").await.unwrap();
 
-        let modified = FileEntry::new(
-            "notes/a.md".into(),
-            hash_bytes(b"new content"),
-            2000,
-            200,
-        );
+        let modified = FileEntry::new("notes/a.md".into(), hash_bytes(b"new content"), 2000, 200);
         let updated = update_tree(&store, &root, &[modified], &[]).await.unwrap();
 
         assert_eq!(updated.total_files, 2);
@@ -358,10 +343,7 @@ mod tests {
     #[tokio::test]
     async fn build_tree_with_root_level_files() {
         let store = MemoryChunkStore::new();
-        let entries = vec![
-            make_entry("readme.md"),
-            make_entry("notes/a.md"),
-        ];
+        let entries = vec![make_entry("readme.md"), make_entry("notes/a.md")];
 
         let root = build_tree(&store, entries, "test", "dev").await.unwrap();
         assert_eq!(root.total_files, 2);

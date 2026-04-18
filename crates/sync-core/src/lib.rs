@@ -1,13 +1,13 @@
-pub mod hash;
 pub mod chunk;
-pub mod store;
+pub mod conflict;
 pub mod content_store;
+pub mod diff;
 pub mod fastcdc_chunker;
+pub mod hash;
+pub mod merge;
+pub mod store;
 pub mod sync_rules;
 pub mod tree;
-pub mod diff;
-pub mod conflict;
-pub mod merge;
 
 #[cfg(feature = "wasm")]
 pub mod wasm;

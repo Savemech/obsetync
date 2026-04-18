@@ -1,5 +1,5 @@
 use crate::chunk::ChunkError;
-use crate::hash::{FileHash, hash_to_hex};
+use crate::hash::{hash_to_hex, FileHash};
 
 /// Store for actual file content (the bytes of vault files).
 /// Separate from ChunkStore which handles index data.
@@ -70,10 +70,7 @@ impl DiskContentStore {
 
     fn manifest_path(&self, file_hash: &FileHash) -> std::path::PathBuf {
         let hex = hash_to_hex(file_hash);
-        self.base
-            .join("manifests")
-            .join(&hex[..2])
-            .join(&hex[2..])
+        self.base.join("manifests").join(&hex[..2]).join(&hex[2..])
     }
 }
 
@@ -174,7 +171,9 @@ impl ContentStore for MemoryContentStore {
     }
 
     async fn put_manifest(&self, manifest: FileManifest) -> Result<(), ChunkError> {
-        self.manifests.borrow_mut().insert(manifest.file_hash, manifest);
+        self.manifests
+            .borrow_mut()
+            .insert(manifest.file_hash, manifest);
         Ok(())
     }
 }

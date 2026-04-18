@@ -1,10 +1,10 @@
 #![cfg(feature = "wasm")]
 
-use wasm_bindgen::prelude::*;
-use serde::Serialize;
 use crate::chunk::{FileEntry, RootNode};
 use crate::hash::{hash_bytes, hash_to_hex, hex_to_hash};
 use crate::store::MemoryChunkStore;
+use serde::Serialize;
+use wasm_bindgen::prelude::*;
 
 /// Serialize a Rust value to a plain JS object (not a JS Map).
 /// serde-wasm-bindgen 0.4+ serializes maps as JS Map by default, which breaks
@@ -50,8 +50,8 @@ impl WasmTree {
 
     /// Load a root from serialized bytes (received from server or local cache).
     pub fn load_root(&mut self, root_bytes: &[u8]) -> Result<(), JsValue> {
-        let root = RootNode::deserialize(root_bytes)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let root =
+            RootNode::deserialize(root_bytes).map_err(|e| JsValue::from_str(&e.to_string()))?;
 
         // Store the root bytes in the memory store so tree operations can find it.
         let hash = root.hash();
@@ -73,7 +73,10 @@ impl WasmTree {
 
     /// Get total file count in the tree.
     pub fn total_files(&self) -> f64 {
-        self.root.as_ref().map(|r| r.total_files as f64).unwrap_or(0.0)
+        self.root
+            .as_ref()
+            .map(|r| r.total_files as f64)
+            .unwrap_or(0.0)
     }
 
     /// Update a single file entry in the tree.
@@ -89,17 +92,15 @@ impl WasmTree {
 
         let entry = FileEntry::new(path.to_string(), file_hash, mtime_ms as u64, size as u64);
 
-        let root = self
-            .root
-            .as_ref()
-            .ok_or_else(|| JsValue::from_str("no root loaded — call load_root or build_from_entries first"))?;
+        let root = self.root.as_ref().ok_or_else(|| {
+            JsValue::from_str("no root loaded — call load_root or build_from_entries first")
+        })?;
 
         // Run the async update_tree in a blocking context (WASM is single-threaded,
         // async is cooperative, MemoryChunkStore resolves immediately).
-        let new_root = run_local(async {
-            crate::tree::update_tree(&self.store, root, &[entry], &[]).await
-        })
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let new_root =
+            run_local(async { crate::tree::update_tree(&self.store, root, &[entry], &[]).await })
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
         self.root = Some(new_root);
         Ok(())
@@ -134,25 +135,29 @@ impl WasmTree {
         let raw: Vec<RawEntry> = serde_json::from_str(entries_json)
             .map_err(|e| JsValue::from_str(&format!("invalid entries JSON: {}", e)))?;
 
-        if raw.is_empty() { return Ok(()); }
+        if raw.is_empty() {
+            return Ok(());
+        }
 
         let entries: Result<Vec<FileEntry>, JsValue> = raw
             .into_iter()
             .map(|e| {
-                let hash = hex_to_hash(&e.hash)
-                    .map_err(|err| JsValue::from_str(&format!("bad hash for {}: {}", e.path, err)))?;
+                let hash = hex_to_hash(&e.hash).map_err(|err| {
+                    JsValue::from_str(&format!("bad hash for {}: {}", e.path, err))
+                })?;
                 Ok(FileEntry::new(e.path, hash, e.mtime_ms, e.size))
             })
             .collect();
         let entries = entries?;
 
-        let root = self.root.as_ref()
+        let root = self
+            .root
+            .as_ref()
             .ok_or_else(|| JsValue::from_str("no root — call build_from_entries first"))?;
 
-        let new_root = run_local(async {
-            crate::tree::update_tree(&self.store, root, &entries, &[]).await
-        })
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let new_root =
+            run_local(async { crate::tree::update_tree(&self.store, root, &entries, &[]).await })
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
         self.root = Some(new_root);
         Ok(())
@@ -163,18 +168,21 @@ impl WasmTree {
     ///
     /// Input: ["path/a.md", "path/b.md", ...]
     pub fn delete_batch(&mut self, paths_json: &str) -> Result<(), JsValue> {
-        let paths: Vec<String> = serde_json::from_str(paths_json)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let paths: Vec<String> =
+            serde_json::from_str(paths_json).map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-        if paths.is_empty() { return Ok(()); }
+        if paths.is_empty() {
+            return Ok(());
+        }
 
-        let root = self.root.as_ref()
+        let root = self
+            .root
+            .as_ref()
             .ok_or_else(|| JsValue::from_str("no root — call build_from_entries first"))?;
 
-        let new_root = run_local(async {
-            crate::tree::update_tree(&self.store, root, &[], &paths).await
-        })
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let new_root =
+            run_local(async { crate::tree::update_tree(&self.store, root, &[], &paths).await })
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
         self.root = Some(new_root);
         Ok(())
@@ -190,8 +198,9 @@ impl WasmTree {
         let entries: Result<Vec<FileEntry>, JsValue> = raw_entries
             .into_iter()
             .map(|e| -> Result<FileEntry, JsValue> {
-                let hash = hex_to_hash(&e.hash)
-                    .map_err(|err| JsValue::from_str(&format!("bad hash for {}: {}", e.path, err)))?;
+                let hash = hex_to_hash(&e.hash).map_err(|err| {
+                    JsValue::from_str(&format!("bad hash for {}: {}", e.path, err))
+                })?;
                 Ok(FileEntry::new(e.path, hash, e.mtime_ms, e.size))
             })
             .collect();
@@ -220,7 +229,8 @@ pub fn wasm_tree_get_chunk(tree: &WasmTree, hash_hex: &str) -> Option<Vec<u8>> {
 /// The plugin calls this before putRoot to upload any chunks the server is missing.
 #[wasm_bindgen]
 pub fn wasm_tree_chunk_hashes(tree: &WasmTree) -> Vec<String> {
-    tree.store.all_chunk_hashes()
+    tree.store
+        .all_chunk_hashes()
         .into_iter()
         .map(|hash| hash_to_hex(&hash))
         .collect()
@@ -293,7 +303,7 @@ pub fn wasm_hash_batch(data: &[u8], offsets: &[u32], sizes: &[u32]) -> Vec<Strin
         .zip(sizes.iter())
         .map(|(&off, &sz)| {
             let start = off as usize;
-            let end   = start + sz as usize;
+            let end = start + sz as usize;
             let slice = data.get(start..end).unwrap_or(&[]);
             hash_to_hex(&hash_bytes(slice))
         })
@@ -321,7 +331,9 @@ pub struct Hasher {
 impl Hasher {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
-        Self { inner: blake3::Hasher::new() }
+        Self {
+            inner: blake3::Hasher::new(),
+        }
     }
 
     /// Feed the next chunk of file bytes. Call repeatedly until all bytes fed.

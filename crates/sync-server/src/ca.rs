@@ -1,7 +1,5 @@
 use crate::storage::StorageLayout;
-use rcgen::{
-    BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose,
-};
+use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
 use std::fs;
 
 /// Initialize the private CA: generate CA keypair and self-signed cert.
@@ -19,10 +17,7 @@ pub fn init_ca(layout: &StorageLayout) -> Result<(), Box<dyn std::error::Error>>
         .distinguished_name
         .push(DnType::OrganizationName, "ObsetyNC");
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.key_usages = vec![
-        KeyUsagePurpose::KeyCertSign,
-        KeyUsagePurpose::CrlSign,
-    ];
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     params.not_before = rcgen::date_time_ymd(2024, 1, 1);
     params.not_after = rcgen::date_time_ymd(2034, 1, 1);
 
@@ -52,9 +47,7 @@ pub fn init_server_cert(layout: &StorageLayout) -> Result<(), Box<dyn std::error
         .push(DnType::CommonName, "ObsetyNC Server");
     params.not_before = rcgen::date_time_ymd(2024, 1, 1);
     params.not_after = rcgen::date_time_ymd(2034, 1, 1);
-    params.subject_alt_names = vec![
-        rcgen::SanType::DnsName("localhost".try_into()?),
-    ];
+    params.subject_alt_names = vec![rcgen::SanType::DnsName("localhost".try_into()?)];
 
     let server_cert = params.signed_by(&server_key, &ca_cert, &ca_key)?;
 
@@ -126,8 +119,7 @@ pub fn load_ca_cert_der(layout: &StorageLayout) -> Result<Vec<u8>, Box<dyn std::
     }
     // Fallback: parse from PEM.
     let pem_str = fs::read_to_string(layout.base.join("ca/ca.crt"))?;
-    let parsed = pem::parse(pem_str.as_bytes())
-        .map_err(|e| format!("PEM parse error: {}", e))?;
+    let parsed = pem::parse(pem_str.as_bytes()).map_err(|e| format!("PEM parse error: {}", e))?;
     Ok(parsed.contents().to_vec())
 }
 
@@ -138,12 +130,14 @@ pub fn load_server_cert_and_key(
     let cert_pem = fs::read_to_string(layout.base.join("server/server.crt"))?;
     let key_pem = fs::read_to_string(layout.base.join("server/server.key"))?;
 
-    let cert_parsed = pem::parse(cert_pem.as_bytes())
-        .map_err(|e| format!("cert PEM parse: {}", e))?;
-    let key_parsed = pem::parse(key_pem.as_bytes())
-        .map_err(|e| format!("key PEM parse: {}", e))?;
+    let cert_parsed =
+        pem::parse(cert_pem.as_bytes()).map_err(|e| format!("cert PEM parse: {}", e))?;
+    let key_parsed = pem::parse(key_pem.as_bytes()).map_err(|e| format!("key PEM parse: {}", e))?;
 
-    Ok((vec![cert_parsed.contents().to_vec()], key_parsed.contents().to_vec()))
+    Ok((
+        vec![cert_parsed.contents().to_vec()],
+        key_parsed.contents().to_vec(),
+    ))
 }
 
 fn next_serial(layout: &StorageLayout) -> Result<u64, Box<dyn std::error::Error>> {

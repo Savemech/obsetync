@@ -102,7 +102,7 @@ nix develop                  # shell with the exact toolchain
 nix run .#server -- run --data-dir ./data    # run the server directly
 ```
 
-First-time setup: run `nix build .#plugin` once. Nix will fail with the correct `npmDepsHash` — paste it into `flake.nix` where it says `lib.fakeHash`, then rerun. One-time annoyance for a permanent pin.
+The `npmDepsHash` in `flake.nix` is pinned. If you ever bump `plugin/package-lock.json`, Nix will fail with the new correct hash — paste that into the `npmDepsHash = ...` line and rerun.
 
 ### Option 4 — Nix-built Docker image (hermetic + ready-to-run)
 

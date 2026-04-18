@@ -170,7 +170,6 @@ fn detect_renames(deltas: Vec<FileDelta>) -> Vec<FileDelta> {
     deltas
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

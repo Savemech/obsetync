@@ -1,17 +1,17 @@
+use crate::bridge;
+use crate::devices;
+use crate::error::ServerError;
+use crate::state::SharedState;
+use crate::storage::{blob_exists, read_blob, write_blob};
 use axum::{
-    Router,
     extract::{Path, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::Next,
     response::IntoResponse,
     routing::{get, post},
+    Router,
 };
-use sync_core::hash::{hash_bytes, hex_to_hash, hash_to_hex};
-use crate::devices;
-use crate::error::ServerError;
-use crate::state::SharedState;
-use crate::storage::{blob_exists, read_blob, write_blob};
-use crate::bridge;
+use sync_core::hash::{hash_bytes, hash_to_hex, hex_to_hash};
 
 /// Bearer-token auth middleware. Every sync API route (except /health) requires
 /// a valid `Authorization: Bearer <token>` header.
@@ -69,7 +69,10 @@ pub fn sync_router(state: SharedState) -> Router {
             "/api/v1/content/chunks/check",
             post(post_content_chunks_check),
         )
-        .layer(axum::middleware::from_fn_with_state(state.clone(), require_bearer));
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer,
+        ));
 
     Router::new()
         // Health is public — used by ping() before enrollment.
@@ -174,28 +177,25 @@ async fn put_root(
                 // Find the base (common ancestor).
                 // For now, use the parent hash as the base.
                 // TODO: walk parent chain to find true common ancestor.
-                let base_data = state
-                    .vaults
-                    .get_root(&vault_id, &parent_hash)
-                    .ok_or_else(|| {
-                        ServerError::BadRequest(
-                            "parent root not found in history — full rescan needed".into(),
-                        )
-                    })?;
+                let base_data =
+                    state
+                        .vaults
+                        .get_root(&vault_id, &parent_hash)
+                        .ok_or_else(|| {
+                            ServerError::BadRequest(
+                                "parent root not found in history — full rescan needed".into(),
+                            )
+                        })?;
 
                 let base_root = sync_core::chunk::RootNode::deserialize(&base_data)
                     .map_err(|e| ServerError::Internal(format!("corrupt base root: {}", e)))?;
 
                 // Run merge via the bridge (handles !Send).
                 let index_base = state.layout.base.join("index");
-                let merge_result = bridge::run_merge(
-                    index_base,
-                    base_root,
-                    current_root,
-                    incoming_root,
-                )
-                .await
-                .map_err(|e| ServerError::Internal(format!("merge failed: {}", e)))?;
+                let merge_result =
+                    bridge::run_merge(index_base, base_root, current_root, incoming_root)
+                        .await
+                        .map_err(|e| ServerError::Internal(format!("merge failed: {}", e)))?;
 
                 let merged_hash = merge_result.new_root.hash();
                 let merged_bytes = merge_result.new_root.serialize();

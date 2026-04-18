@@ -140,8 +140,7 @@
           version = "1.0.1";
           src     = ./plugin;
 
-          # Replace on first build (Nix will tell you the right hash).
-          npmDepsHash = lib.fakeHash;
+          npmDepsHash = "sha256-qmEElqntkRQ03cdliB/qWnmI0s4jsx9PBnBQ8cWUqzM=";
 
           # Inject the WASM bindings before esbuild runs.
           preBuild = ''

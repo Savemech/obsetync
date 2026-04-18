@@ -1,5 +1,5 @@
 use crate::chunk::ChunkError;
-use crate::hash::{FileHash, hash_to_hex};
+use crate::hash::{hash_to_hex, FileHash};
 
 /// Abstract chunk store for index data (LeafChunk, InternalNode, RootNode).
 /// Desktop uses DiskChunkStore. Server uses its own filesystem impl.
@@ -93,7 +93,11 @@ impl MemoryChunkStore {
     }
 
     pub fn all_chunks(&self) -> Vec<(FileHash, Vec<u8>)> {
-        self.data.borrow().iter().map(|(k, v)| (*k, v.clone())).collect()
+        self.data
+            .borrow()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
     }
 
     pub fn all_chunk_hashes(&self) -> Vec<FileHash> {

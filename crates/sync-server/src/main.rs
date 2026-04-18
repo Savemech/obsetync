@@ -91,10 +91,7 @@ fn cmd_init(data_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     println!("  Server cert:    {}/server/server.crt", data_dir.display());
     println!();
     println!("Run with:");
-    println!(
-        "  obsetync-server run --data-dir {}",
-        data_dir.display()
-    );
+    println!("  obsetync-server run --data-dir {}", data_dir.display());
     println!();
     println!("For development without TLS:");
     println!(

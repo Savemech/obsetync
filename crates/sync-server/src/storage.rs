@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use sync_core::hash::{FileHash, hash_to_hex, hex_to_hash};
+use sync_core::hash::{hash_to_hex, hex_to_hash, FileHash};
 
 /// Manages the filesystem layout for the server's data directory.
 #[derive(Debug, Clone)]
@@ -121,11 +121,7 @@ impl VaultStore {
     }
 
     /// Set the current root hash for a vault (atomic write via rename).
-    pub fn set_current_root(
-        &self,
-        vault_id: &str,
-        hash: &FileHash,
-    ) -> Result<(), std::io::Error> {
+    pub fn set_current_root(&self, vault_id: &str, hash: &FileHash) -> Result<(), std::io::Error> {
         self.layout.ensure_vault(vault_id)?;
         let path = self.layout.vault_current_path(vault_id);
         let tmp = path.with_extension("tmp");

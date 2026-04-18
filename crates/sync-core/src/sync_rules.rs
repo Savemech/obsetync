@@ -115,8 +115,25 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 
 /// Known text file extensions that support three-way merge.
 const TEXT_EXTENSIONS: &[&str] = &[
-    "md", "txt", "css", "json", "js", "ts", "html", "xml", "yaml", "yml", "toml", "csv", "canvas",
-    "excalidraw", "svg", "tex", "bib", "org", "rst",
+    "md",
+    "txt",
+    "css",
+    "json",
+    "js",
+    "ts",
+    "html",
+    "xml",
+    "yaml",
+    "yml",
+    "toml",
+    "csv",
+    "canvas",
+    "excalidraw",
+    "svg",
+    "tex",
+    "bib",
+    "org",
+    "rst",
 ];
 
 /// Check if a file path is a text file (eligible for three-way merge).
@@ -143,10 +160,7 @@ mod tests {
     fn default_rules() {
         let rules = SyncRules::default();
 
-        assert_eq!(
-            rules.strategy_for("photo.png"),
-            &BinaryStrategy::Immutable
-        );
+        assert_eq!(rules.strategy_for("photo.png"), &BinaryStrategy::Immutable);
         assert_eq!(
             rules.strategy_for("data.sqlite"),
             &BinaryStrategy::LocalOnly
