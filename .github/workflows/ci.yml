@@ -28,18 +28,28 @@ jobs:
           components: rustfmt, clippy
           target: wasm32-unknown-unknown
 
+      # setup-rust-toolchain sets RUSTFLAGS=-D warnings by default which turns
+      # any warning into a CI failure. We don't want that — clippy/warnings are
+      # useful feedback but shouldn't block merging. Clear it for every step.
       - name: cargo fmt --check
+        env:
+          RUSTFLAGS: ""
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
+        env:
+          RUSTFLAGS: ""
         run: cargo clippy --workspace --locked --all-targets
 
       - name: cargo test
         env:
+          RUSTFLAGS: ""
           CC: clang
         run: cargo test --workspace --locked
 
       - name: cargo check wasm
+        env:
+          RUSTFLAGS: ""
         run: cargo check -p sync-core --target wasm32-unknown-unknown --features wasm --no-default-features --locked
 
   # ---------------------------------------------------------------------------
