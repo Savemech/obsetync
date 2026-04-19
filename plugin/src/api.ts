@@ -1,4 +1,5 @@
 import { requestUrl, RequestUrlParam } from "obsidian";
+import { SecureChannel, SecureTransportError, UnsupportedPlatformError } from "./secure";
 
 export interface FileDelta {
     action: "added" | "modified" | "deleted" | "renamed";
@@ -26,6 +27,14 @@ export interface FileManifest {
     chunks: Array<{ hash: string; offset: number; size: number }>;
 }
 
+/** Enrollment bundle returned by the admin UI's /admin/enrollment/{code} endpoint. */
+export interface EnrollmentBundle {
+    device_name: string;
+    device_id: string;
+    bearer_token: string;
+    server_box_pub: string;
+}
+
 interface FetchLike {
     status: number;
     ok: boolean;
@@ -34,43 +43,46 @@ interface FetchLike {
 }
 
 /**
- * HTTP client for the ObsetyNC sync server API.
+ * HTTP client for the ObsetyNC sync server.
  *
- * Transport is selected automatically at construction:
- *   Desktop (Electron): Node.js `https` module — supports mTLS client cert.
- *   Mobile (iOS/Android): Obsidian `requestUrl` — standard HTTPS, no client cert.
+ * Transport uses the option-B encrypted envelope defined in `secure.ts`:
+ *   X25519 ECDH + HKDF-SHA256 + AES-256-GCM over plain HTTP. No TLS, no certs,
+ *   no CA trust store involvement — the server's X25519 public key, learned
+ *   at enrollment, is the only pinning.
  *
- * Auth is bearer token on BOTH platforms. Desktop also presents the mTLS client
- * cert as an extra layer, but the bearer token is what the server actually checks.
- * This allows the same server to serve all platforms without separate endpoints.
+ * Identical code path on desktop (Electron) and mobile (iOS WKWebView) via
+ * Obsidian's `requestUrl`. One allowlist, one transport, one bug surface.
  */
 export class SyncApi {
-    private readonly isNode: boolean;
-    private https: any; // Node.js https module — only loaded on desktop
-    private readonly hostname: string;
-    private readonly port: string;
+    private channel: SecureChannel | null = null;
 
     constructor(
         private readonly serverUrl: string,
-        private readonly certPem = "",
-        private readonly keyPem = "",
-        private readonly bearerToken = ""
+        private readonly serverBoxPubBase64: string,
+        private readonly bearerTokenHex: string,
     ) {
         this.serverUrl = serverUrl.replace(/\/$/, "");
-        // Detect Electron: window.require exists in Electron renderer, not in iOS WKWebView.
-        this.isNode = typeof (window as any).require === "function";
-        if (this.isNode) {
-            this.https = (window as any).require("https");
+    }
+
+    /** Lazily establish the SecureChannel. Called before the first encrypted
+     *  request; subsequent requests reuse the same shared secret. */
+    private async getChannel(): Promise<SecureChannel> {
+        if (this.channel) return this.channel;
+        if (!this.serverBoxPubBase64) {
+            throw new Error("SyncApi: server box pubkey missing — re-enroll the device");
         }
-        const u = new URL(this.serverUrl);
-        this.hostname = u.hostname;
-        this.port = u.port || (u.protocol === "https:" ? "443" : "80");
+        if (!this.bearerTokenHex) {
+            throw new Error("SyncApi: bearer token missing — re-enroll the device");
+        }
+        this.channel = await SecureChannel.create(this.serverBoxPubBase64, this.bearerTokenHex);
+        return this.channel;
     }
 
     // --- Root ---
 
     async getRoot(vaultId: string): Promise<Uint8Array | null> {
-        const res = await this.fetch(`/api/v1/root/${vaultId}`);
+        const path = `/api/v1/root/${vaultId}`;
+        const res = await this.sealed("GET", path, new Uint8Array());
         if (res.status === 404) return null;
         if (!res.ok) throw new Error(`getRoot failed: ${res.status}`);
         return new Uint8Array(await res.arrayBuffer());
@@ -79,27 +91,28 @@ export class SyncApi {
     async putRoot(
         vaultId: string,
         rootBytes: Uint8Array,
-        parentHash: string
+        parentHash: string,
     ): Promise<PushResult> {
-        const res = await this.fetch(`/api/v1/root/${vaultId}`, {
-            method: "PUT",
-            headers: { "X-Parent-Root": parentHash },
-            body: rootBytes,
-        });
+        const path = `/api/v1/root/${vaultId}`;
+        // Parent-root used to go as a header. With encryption the header would
+        // be outside the AEAD envelope; prepend it to the body as a 64-char
+        // ASCII hex prefix instead so the server authenticates it too.
+        const header = new TextEncoder().encode(parentHash.padEnd(64, " "));
+        const body = new Uint8Array(header.length + rootBytes.length);
+        body.set(header, 0);
+        body.set(rootBytes, header.length);
+        const res = await this.sealed("PUT", path, body);
         if (!res.ok) throw new Error(`putRoot failed: ${res.status}`);
         return res.json();
     }
 
     // --- Diff ---
 
-    async getDiff(
-        vaultId: string,
-        deviceRootHash: string
-    ): Promise<FileDelta[] | null> {
-        const res = await this.fetch(`/api/v1/diff/${vaultId}`, {
-            method: "POST",
-            headers: { "X-Device-Root": deviceRootHash },
-        });
+    async getDiff(vaultId: string, deviceRootHash: string): Promise<FileDelta[] | null> {
+        const path = `/api/v1/diff/${vaultId}`;
+        // Same trick — device-root prepended to body instead of a header.
+        const body = new TextEncoder().encode(deviceRootHash.padEnd(64, " "));
+        const res = await this.sealed("POST", path, body);
         if (res.status === 304) return null;
         if (!res.ok) throw new Error(`getDiff failed: ${res.status}`);
         return res.json();
@@ -108,25 +121,19 @@ export class SyncApi {
     // --- Index chunks ---
 
     async getChunk(hash: string): Promise<Uint8Array> {
-        const res = await this.fetch(`/api/v1/chunk/${hash}`);
+        const res = await this.sealed("GET", `/api/v1/chunk/${hash}`, new Uint8Array());
         if (!res.ok) throw new Error(`getChunk ${hash}: ${res.status}`);
         return new Uint8Array(await res.arrayBuffer());
     }
 
     async putChunk(hash: string, data: Uint8Array): Promise<void> {
-        const res = await this.fetch(`/api/v1/chunk/${hash}`, {
-            method: "PUT",
-            body: data,
-        });
+        const res = await this.sealed("PUT", `/api/v1/chunk/${hash}`, data);
         if (!res.ok) throw new Error(`putChunk ${hash}: ${res.status}`);
     }
 
     async checkChunks(hashes: string[]): Promise<string[]> {
-        const res = await this.fetch("/api/v1/chunks/check", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(hashes),
-        });
+        const body = new TextEncoder().encode(JSON.stringify(hashes));
+        const res = await this.sealed("POST", "/api/v1/chunks/check", body);
         if (!res.ok) throw new Error(`checkChunks: ${res.status}`);
         return (await res.json()).needed;
     }
@@ -134,25 +141,19 @@ export class SyncApi {
     // --- Content (small files) ---
 
     async getContent(hash: string): Promise<Uint8Array> {
-        const res = await this.fetch(`/api/v1/content/${hash}`);
+        const res = await this.sealed("GET", `/api/v1/content/${hash}`, new Uint8Array());
         if (!res.ok) throw new Error(`getContent ${hash}: ${res.status}`);
         return new Uint8Array(await res.arrayBuffer());
     }
 
     async putContent(hash: string, data: Uint8Array): Promise<void> {
-        const res = await this.fetch(`/api/v1/content/${hash}`, {
-            method: "PUT",
-            body: data,
-        });
+        const res = await this.sealed("PUT", `/api/v1/content/${hash}`, data);
         if (!res.ok) throw new Error(`putContent ${hash}: ${res.status}`);
     }
 
     async checkContent(hashes: string[]): Promise<string[]> {
-        const res = await this.fetch("/api/v1/content/check", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(hashes),
-        });
+        const body = new TextEncoder().encode(JSON.stringify(hashes));
+        const res = await this.sealed("POST", "/api/v1/content/check", body);
         if (!res.ok) throw new Error(`checkContent: ${res.status}`);
         return (await res.json()).needed;
     }
@@ -160,109 +161,65 @@ export class SyncApi {
     // --- Content manifests (large files) ---
 
     async getManifest(hash: string): Promise<FileManifest> {
-        const res = await this.fetch(`/api/v1/content/manifest/${hash}`);
+        const res = await this.sealed("GET", `/api/v1/content/manifest/${hash}`, new Uint8Array());
         if (!res.ok) throw new Error(`getManifest ${hash}: ${res.status}`);
         return res.json();
     }
 
     async putManifest(hash: string, manifest: FileManifest): Promise<void> {
-        const res = await this.fetch(`/api/v1/content/manifest/${hash}`, {
-            method: "PUT",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(manifest),
-        });
+        const body = new TextEncoder().encode(JSON.stringify(manifest));
+        const res = await this.sealed("PUT", `/api/v1/content/manifest/${hash}`, body);
         if (!res.ok) throw new Error(`putManifest ${hash}: ${res.status}`);
     }
 
     // --- Content sub-file chunks ---
 
     async getContentChunk(hash: string): Promise<Uint8Array> {
-        const res = await this.fetch(`/api/v1/content/chunk/${hash}`);
+        const res = await this.sealed("GET", `/api/v1/content/chunk/${hash}`, new Uint8Array());
         if (!res.ok) throw new Error(`getContentChunk ${hash}: ${res.status}`);
         return new Uint8Array(await res.arrayBuffer());
     }
 
     async putContentChunk(hash: string, data: Uint8Array): Promise<void> {
-        const res = await this.fetch(`/api/v1/content/chunk/${hash}`, {
-            method: "PUT",
-            body: data,
-        });
+        const res = await this.sealed("PUT", `/api/v1/content/chunk/${hash}`, data);
         if (!res.ok) throw new Error(`putContentChunk ${hash}: ${res.status}`);
     }
 
     async checkContentChunks(hashes: string[]): Promise<string[]> {
-        const res = await this.fetch("/api/v1/content/chunks/check", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(hashes),
-        });
+        const body = new TextEncoder().encode(JSON.stringify(hashes));
+        const res = await this.sealed("POST", "/api/v1/content/chunks/check", body);
         if (!res.ok) throw new Error(`checkContentChunks: ${res.status}`);
         return (await res.json()).needed;
     }
 
     // --- Health / connectivity ---
 
-    async ping(): Promise<{
-        serverUrl: string;
-        tlsVersion: string;
-        cipher: string;
-        serverFingerprint: string;
-        deviceCert: boolean;
-    }> {
-        if (!this.isNode) {
-            // Mobile: requestUrl doesn't expose TLS socket details.
-            const res = await this.fetch("/health");
-            if (!res.ok) throw new Error("server unreachable");
+    async ping(): Promise<{ serverUrl: string; ok: boolean; transport: string }> {
+        // /health is the only plaintext route. Client calls it pre-enrollment
+        // to verify the URL is reachable without needing serverBoxPub yet.
+        try {
+            const res = await requestUrl({
+                url: `${this.serverUrl}/health`,
+                method: "GET",
+                throw: false,
+            });
             return {
                 serverUrl: this.serverUrl,
-                tlsVersion: "N/A",
-                cipher:     "N/A",
-                serverFingerprint: "N/A",
-                deviceCert: false,
+                ok: res.status >= 200 && res.status < 300,
+                transport: "http/option-B",
             };
+        } catch (e: any) {
+            return { serverUrl: this.serverUrl, ok: false, transport: `error: ${e?.message ?? e}` };
         }
-
-        // Desktop: use raw Node.js https to capture TLS socket info.
-        return new Promise((resolve, reject) => {
-            const options: any = {
-                hostname: this.hostname,
-                port:     this.port,
-                path:     "/health",
-                method:   "GET",
-                rejectUnauthorized: false,
-            };
-            if (this.certPem && this.keyPem) {
-                options.cert = this.certPem;
-                options.key  = this.keyPem;
-            }
-            const req = this.https.request(options, (res: any) => {
-                const sock = res.socket;
-                const cert = sock?.getPeerCertificate?.() ?? {};
-                const info = {
-                    serverUrl:         this.serverUrl,
-                    tlsVersion:        sock?.getProtocol?.() ?? "unknown",
-                    cipher:            sock?.getCipher?.()?.name ?? "unknown",
-                    serverFingerprint: cert.fingerprint256 ?? cert.fingerprint ?? "unknown",
-                    deviceCert:        !!(this.certPem && this.keyPem),
-                };
-                res.resume();
-                res.on("end",   () => resolve(info));
-                res.on("error", reject);
-            });
-            req.on("error", reject);
-            req.end();
-        });
     }
 
     // --- Enrollment ---
 
-    async claimEnrollment(
-        code: string
-    ): Promise<{ cert_pem: string; key_pem: string; fingerprint: string; bearer_token: string }> {
-        // Enrollment goes through the admin port (plain HTTP).
-        // global fetch works on all platforms — no mTLS needed here.
+    async claimEnrollment(code: string): Promise<EnrollmentBundle> {
+        // Admin port is plain HTTP (enrollment UX). User runs it behind
+        // whatever trust boundary they want (localhost, VPN, SSH tunnel).
         const adminUrl = this.serverUrl
-            .replace(/^https/, "http")
+            .replace(/^https:/, "http:")
             .replace(/:\d+$/, ":27183");
         const res = await fetch(`${adminUrl}/admin/enrollment/${code}`);
         const body = await res.json();
@@ -270,116 +227,76 @@ export class SyncApi {
         return body;
     }
 
-    // --- Internal fetch dispatcher ---
-
-    private fetch(
-        path: string,
-        init: {
-            method?:  string;
-            headers?: Record<string, string>;
-            body?:    Uint8Array | string;
-        } = {}
-    ): Promise<FetchLike> {
-        return this.isNode
-            ? this.fetchNode(path, init)
-            : this.fetchWeb(path, init);
-    }
-
-    /** Desktop path: Node.js https with mTLS client cert + bearer token header. */
-    private fetchNode(
-        path: string,
-        init: { method?: string; headers?: Record<string, string>; body?: Uint8Array | string }
-    ): Promise<FetchLike> {
-        return new Promise((resolve, reject) => {
-            const headers: Record<string, string> = { ...(init.headers ?? {}) };
-            if (this.bearerToken) {
-                headers["Authorization"] = `Bearer ${this.bearerToken}`;
-            }
-            if (init.body instanceof Uint8Array) {
-                headers["Content-Length"] = String(init.body.byteLength);
-            } else if (typeof init.body === "string") {
-                headers["Content-Length"] = String(Buffer.byteLength(init.body));
-            }
-
-            const options: any = {
-                hostname: this.hostname,
-                port:     this.port,
-                path,
-                method:   init.method ?? "GET",
-                headers,
-                rejectUnauthorized: false, // self-signed CA
-            };
-            if (this.certPem && this.keyPem) {
-                options.cert = this.certPem;
-                options.key  = this.keyPem;
-            }
-
-            const req = this.https.request(options, (res: any) => {
-                const chunks: Buffer[] = [];
-                res.on("data",  (chunk: Buffer) => chunks.push(chunk));
-                res.on("end",   () => {
-                    const buf    = Buffer.concat(chunks);
-                    const status = res.statusCode ?? 0;
-                    resolve({
-                        status,
-                        ok: status >= 200 && status < 300,
-                        arrayBuffer: async () =>
-                            buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer,
-                        json: async () => JSON.parse(buf.toString("utf8")),
-                    });
-                });
-                res.on("error", reject);
-            });
-            req.on("error", reject);
-
-            if (init.body instanceof Uint8Array) {
-                req.write(Buffer.from(init.body));
-            } else if (typeof init.body === "string") {
-                req.write(init.body);
-            }
-            req.end();
-        });
-    }
+    // --- Internal: encrypted request/response ---
 
     /**
-     * Mobile path: Obsidian requestUrl + bearer token header.
-     * requestUrl uses NSURLSession (iOS) / Electron net (desktop fallback).
-     * Obsidian ships with NSAllowsArbitraryLoads so self-signed server certs work.
-     * No client cert — bearer token is the sole auth mechanism on mobile.
+     * Seal `body` with the SecureChannel, POST it to `path`, unseal the
+     * response. This is the single code path for every sync API call.
+     *
+     * Note: every route maps to POST on the wire even if the semantic method
+     * is GET/PUT/DELETE. The semantic method is preserved in the AAD so the
+     * server still routes correctly, but HTTP-level always POST avoids
+     * issues with iOS's requestUrl not sending a body on GET.
      */
-    private async fetchWeb(
-        path: string,
-        init: { method?: string; headers?: Record<string, string>; body?: Uint8Array | string }
-    ): Promise<FetchLike> {
-        const headers: Record<string, string> = { ...(init.headers ?? {}) };
-        if (this.bearerToken) {
-            headers["Authorization"] = `Bearer ${this.bearerToken}`;
-        }
-
-        let body: ArrayBuffer | string | undefined;
-        if (init.body instanceof Uint8Array) {
-            // Slice correctly — Uint8Array may be a view into a larger buffer.
-            const u = init.body;
-            body = (u.buffer as ArrayBuffer).slice(u.byteOffset, u.byteOffset + u.byteLength);
-            headers["Content-Length"] = String(u.byteLength);
-        } else if (typeof init.body === "string") {
-            body = init.body;
-        }
+    private async sealed(method: string, path: string, body: Uint8Array): Promise<FetchLike> {
+        const channel = await this.getChannel();
+        const wireBody = await channel.encryptRequest(method, path, body);
 
         const params: RequestUrlParam = {
-            url:    `${this.serverUrl}${path}`,
-            method: init.method ?? "GET",
-            headers,
-            throw:  false, // never throw — we inspect status ourselves
+            url: `${this.serverUrl}${path}`,
+            method: "POST",
+            headers: {
+                "Content-Type": "application/octet-stream",
+                "X-Obsetync-Method": method,
+            },
+            body: (wireBody.buffer as ArrayBuffer).slice(
+                wireBody.byteOffset,
+                wireBody.byteOffset + wireBody.byteLength,
+            ),
+            throw: false,
         };
-        if (body !== undefined) params.body = body;
 
         const res = await requestUrl(params);
+
+        // Non-2xx responses from the secure middleware are plaintext error
+        // strings (401 / 403 / 500). Don't try to decrypt those.
+        const isOk = res.status >= 200 && res.status < 300;
+        if (!isOk) {
+            return {
+                status: res.status,
+                ok: false,
+                arrayBuffer: async () => res.arrayBuffer,
+                json: async () => res.json,
+            };
+        }
+
+        const wireResp = new Uint8Array(res.arrayBuffer);
+        let plaintext: Uint8Array;
+        try {
+            plaintext = await channel.decryptResponse(method, path, wireResp);
+        } catch (e) {
+            if (e instanceof SecureTransportError) {
+                throw new Error(`decrypt ${method} ${path}: ${e.message}`);
+            }
+            throw e;
+        }
+
+        const ptBuffer = (plaintext.buffer as ArrayBuffer).slice(
+            plaintext.byteOffset,
+            plaintext.byteOffset + plaintext.byteLength,
+        );
         return {
             status: res.status,
-            ok:     res.status >= 200 && res.status < 300,
-            arrayBuffer: async () => res.arrayBuffer,
-            json:        async () => res.json,
+            ok: true,
+            arrayBuffer: async () => ptBuffer,
+            json: async () => {
+                const text = new TextDecoder().decode(plaintext);
+                return text.length ? JSON.parse(text) : null;
+            },
         };
     }
 }
+
+// Re-export platform error so the enroll flow in main.ts can give the user a
+// clear iOS-17-required message when Web Crypto X25519 isn't available.
+export { UnsupportedPlatformError };

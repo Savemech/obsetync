@@ -91,14 +91,11 @@ export class SyncEngine {
     async start(): Promise<void> {
         console.log("[obsetync] starting sync engine");
 
-        // Step 0: Verify connectivity and log TLS details.
+        // Step 0: Verify connectivity. /health is the only plaintext route.
         try {
             const conn = await this.api.ping();
             console.log(
-                `[obsetync] ✓ connected to ${conn.serverUrl} | ` +
-                `${conn.tlsVersion} | cipher: ${conn.cipher} | ` +
-                `device cert: ${conn.deviceCert ? "yes" : "no"} | ` +
-                `server: ${conn.serverFingerprint}`
+                `[obsetync] ${conn.ok ? "✓ reachable" : "✗ unreachable"} at ${conn.serverUrl} | ${conn.transport}`
             );
         } catch (e) {
             console.warn("[obsetync] ✗ server unreachable:", e);

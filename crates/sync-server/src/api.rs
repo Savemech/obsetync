@@ -7,7 +7,7 @@ use crate::storage::{blob_exists, read_blob, write_blob};
 use axum::{
     body::Body,
     extract::{Path, Request, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -170,30 +170,34 @@ async fn get_root(
 async fn put_root(
     State(state): State<SharedState>,
     Path(vault_id): Path<String>,
-    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
-    // Parse the incoming root to validate it.
-    let incoming_root = sync_core::chunk::RootNode::deserialize(&body)
+    // Option-B transport: parent hash is prepended to the body as a 64-byte
+    // ASCII prefix (hex or empty, space-padded) so it's covered by the AEAD
+    // envelope like the rest of the request.
+    if body.len() < 64 {
+        return Err(ServerError::BadRequest(
+            "body too short for parent_root prefix".into(),
+        ));
+    }
+    let parent_hex = std::str::from_utf8(&body[..64])
+        .map_err(|_| ServerError::BadRequest("parent_root prefix not UTF-8".into()))?
+        .trim()
+        .to_owned();
+    let root_bytes = &body[64..];
+
+    let incoming_root = sync_core::chunk::RootNode::deserialize(root_bytes)
         .map_err(|e| ServerError::BadRequest(format!("invalid root: {}", e)))?;
 
     let incoming_hash = incoming_root.hash();
-    let incoming_bytes = body.to_vec();
+    let incoming_bytes = root_bytes.to_vec();
 
-    // Store the root in history.
     state
         .vaults
         .store_root(&vault_id, &incoming_hash, &incoming_bytes)?;
 
-    // Also store it as an index chunk so merge/diff can find it.
     let idx_path = state.layout.index_path(&incoming_hash);
     write_blob(&idx_path, &incoming_bytes)?;
-
-    // Get parent hash from header.
-    let parent_hex = headers
-        .get("x-parent-root")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
 
     let current_root_hash = state.vaults.get_current_root(&vault_id);
 
@@ -211,7 +215,7 @@ async fn put_root(
             ))
         }
         Some(current_hash) => {
-            let parent_hash = hex_to_hash(parent_hex)
+            let parent_hash = hex_to_hash(&parent_hex)
                 .map_err(|_| ServerError::BadRequest("invalid X-Parent-Root header".into()))?;
 
             if current_hash == parent_hash {
@@ -304,15 +308,21 @@ async fn put_root(
 async fn post_diff(
     State(state): State<SharedState>,
     Path(vault_id): Path<String>,
-    headers: HeaderMap,
+    body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
-    let device_root_hex = headers
-        .get("x-device-root")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| ServerError::BadRequest("missing X-Device-Root header".into()))?;
+    // Option-B: device_root hash rides in the first 64 bytes of the encrypted
+    // body (ASCII hex, space-padded) so it's covered by the AEAD envelope.
+    if body.len() < 64 {
+        return Err(ServerError::BadRequest(
+            "body too short for device_root prefix".into(),
+        ));
+    }
+    let device_root_hex = std::str::from_utf8(&body[..64])
+        .map_err(|_| ServerError::BadRequest("device_root prefix not UTF-8".into()))?
+        .trim();
 
     let device_root_hash = hex_to_hash(device_root_hex)
-        .map_err(|_| ServerError::BadRequest("invalid X-Device-Root hash".into()))?;
+        .map_err(|_| ServerError::BadRequest("invalid device_root hash".into()))?;
 
     let current_hash = state
         .vaults
@@ -389,8 +399,10 @@ async fn put_chunk(
 
 async fn post_chunks_check(
     State(state): State<SharedState>,
-    axum::Json(hashes): axum::Json<Vec<String>>,
+    body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
+    let hashes: Vec<String> = serde_json::from_slice(&body)
+        .map_err(|e| ServerError::BadRequest(format!("expected JSON array of hashes: {}", e)))?;
     let needed: Vec<String> = hashes
         .into_iter()
         .filter(|h| {
@@ -434,8 +446,10 @@ async fn put_content(
 
 async fn post_content_check(
     State(state): State<SharedState>,
-    axum::Json(hashes): axum::Json<Vec<String>>,
+    body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
+    let hashes: Vec<String> = serde_json::from_slice(&body)
+        .map_err(|e| ServerError::BadRequest(format!("expected JSON array of hashes: {}", e)))?;
     let needed: Vec<String> = hashes
         .into_iter()
         .filter(|h| {
@@ -511,8 +525,10 @@ async fn put_content_chunk(
 
 async fn post_content_chunks_check(
     State(state): State<SharedState>,
-    axum::Json(hashes): axum::Json<Vec<String>>,
+    body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
+    let hashes: Vec<String> = serde_json::from_slice(&body)
+        .map_err(|e| ServerError::BadRequest(format!("expected JSON array of hashes: {}", e)))?;
     let needed: Vec<String> = hashes
         .into_iter()
         .filter(|h| {

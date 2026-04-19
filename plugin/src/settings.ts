@@ -20,10 +20,9 @@ export interface SyncSettings {
     syncPriority: SyncPriority;
     syncObsidianConfig: boolean;
     enrolled: boolean;
-    certPem: string;
-    keyPem: string;
-    fingerprint: string;
+    deviceId: string;
     bearerToken: string;
+    serverBoxPub: string;
 }
 
 export const DEFAULT_SETTINGS: SyncSettings = {
@@ -35,10 +34,9 @@ export const DEFAULT_SETTINGS: SyncSettings = {
     syncPriority: "sequential",
     syncObsidianConfig: false,
     enrolled: false,
-    certPem: "",
-    keyPem: "",
-    fingerprint: "",
+    deviceId: "",
     bearerToken: "",
+    serverBoxPub: "",
 };
 
 export class SyncSettingTab extends PluginSettingTab {
@@ -163,10 +161,9 @@ export class SyncSettingTab extends PluginSettingTab {
                         .setWarning()
                         .onClick(async () => {
                             this.plugin.settings.enrolled    = false;
-                            this.plugin.settings.certPem     = "";
-                            this.plugin.settings.keyPem      = "";
-                            this.plugin.settings.fingerprint = "";
-                            this.plugin.settings.bearerToken = "";
+                            this.plugin.settings.deviceId     = "";
+                            this.plugin.settings.bearerToken  = "";
+                            this.plugin.settings.serverBoxPub = "";
                             await this.plugin.saveSettings();
                             new Notice("Enrollment reset. Enter a new code to re-enroll.");
                             this.display(); // Refresh UI — enrollment input reappears.
