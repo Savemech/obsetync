@@ -112,10 +112,10 @@ export class SyncSettingTab extends PluginSettingTab {
             );
 
         // Enrollment.
-        if (!this.plugin.settings.enrolled) {
-            const enrollDiv = containerEl.createDiv();
-            enrollDiv.createEl("h3", { text: "Enrollment" });
+        const enrollDiv = containerEl.createDiv();
+        enrollDiv.createEl("h3", { text: "Enrollment" });
 
+        if (!this.plugin.settings.enrolled) {
             let enrollCode = "";
             new Setting(enrollDiv)
                 .setName("Enrollment Code")
@@ -143,6 +143,29 @@ export class SyncSettingTab extends PluginSettingTab {
                             new Notice(`Enrollment failed: ${e.message}`);
                         }
                     })
+                );
+        } else {
+            new Setting(enrollDiv)
+                .setName("Reset enrollment")
+                .setDesc(
+                    "Clear this device's cert, key, and bearer token so you can enroll " +
+                    "against a new server or re-enroll with a fresh code. Does NOT delete " +
+                    "any notes — only the credentials in plugin settings."
+                )
+                .addButton((btn) =>
+                    btn
+                        .setButtonText("Reset enrollment")
+                        .setWarning()
+                        .onClick(async () => {
+                            this.plugin.settings.enrolled    = false;
+                            this.plugin.settings.certPem     = "";
+                            this.plugin.settings.keyPem      = "";
+                            this.plugin.settings.fingerprint = "";
+                            this.plugin.settings.bearerToken = "";
+                            await this.plugin.saveSettings();
+                            new Notice("Enrollment reset. Enter a new code to re-enroll.");
+                            this.display(); // Refresh UI — enrollment input reappears.
+                        })
                 );
         }
 
