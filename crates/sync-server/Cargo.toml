@@ -25,3 +25,11 @@ rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 tokio-rustls = "0.26"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 pem = "3"
+
+# Option B secure transport: X25519 ECDH + HKDF-SHA256 + AES-256-GCM.
+# Replaces all cert/CA infrastructure in phase 2.
+x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"] }
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
