@@ -1,5 +1,5 @@
 import { requestUrl, RequestUrlParam } from "obsidian";
-import { SecureChannel, SecureTransportError, UnsupportedPlatformError } from "./secure";
+import { SecureChannel, SecureTransportError } from "./secure";
 
 export interface FileDelta {
     action: "added" | "modified" | "deleted" | "renamed";
@@ -61,7 +61,19 @@ export class SyncApi {
         private readonly serverBoxPubBase64: string,
         private readonly bearerTokenHex: string,
     ) {
-        this.serverUrl = serverUrl.replace(/\/$/, "");
+        // Option-B runs on plain HTTP (the AEAD envelope is the trust
+        // boundary). Fold legacy https:// URLs down to http:// transparently
+        // so users migrating from 1.0.x don't trip ERR_SSL_PROTOCOL_ERROR
+        // after the server drops its cert stack.
+        let u = serverUrl.replace(/\/$/, "");
+        if (u.startsWith("https://")) {
+            u = "http://" + u.slice("https://".length);
+            console.warn(
+                "[obsetync] rewrote legacy https:// server URL to http:// " +
+                "(option-B transport is plaintext HTTP + AEAD envelope)"
+            );
+        }
+        this.serverUrl = u;
     }
 
     /** Lazily establish the SecureChannel. Called before the first encrypted
@@ -114,6 +126,10 @@ export class SyncApi {
         const body = new TextEncoder().encode(deviceRootHash.padEnd(64, " "));
         const res = await this.sealed("POST", path, body);
         if (res.status === 304) return null;
+        // 404 = vault has no root on the server yet (fresh server, first
+        // push hasn't landed). Treat as "nothing to pull" and let the push
+        // path seed the vault.
+        if (res.status === 404) return null;
         if (!res.ok) throw new Error(`getDiff failed: ${res.status}`);
         return res.json();
     }
@@ -296,7 +312,3 @@ export class SyncApi {
         };
     }
 }
-
-// Re-export platform error so the enroll flow in main.ts can give the user a
-// clear iOS-17-required message when Web Crypto X25519 isn't available.
-export { UnsupportedPlatformError };

@@ -30,6 +30,11 @@ export async function pull(
     const deltas = await api.getDiff(vaultId, localRootHash);
 
     if (!deltas || deltas.length === 0) {
+        // Successful no-op sync — advance the last-sync timestamp so the UI
+        // reflects the check rather than showing a stale timestamp from the
+        // last round that had actual changes.
+        syncBase.setLastSyncTimestamp(Date.now());
+        await syncBase.save();
         onProgress?.("up to date");
         return { newRootHash: localRootHash, applied: 0 };
     }

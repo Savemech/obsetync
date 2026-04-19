@@ -3,6 +3,7 @@ use crate::config::ServerConfig;
 use crate::secure::KEY_LEN;
 use crate::storage::{StorageLayout, VaultStore};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Shared application state, passed to all axum handlers.
 pub struct AppState {
@@ -15,6 +16,9 @@ pub struct AppState {
     /// worrying about Clone or thread-safety. 32 bytes copy per request is
     /// microseconds.
     pub server_priv_bytes: [u8; KEY_LEN],
+    /// Wall-clock monotonic start time — used by the admin dashboard to show
+    /// uptime. Instant is Copy, so reading from Arc<AppState> needs no lock.
+    pub started_at: Instant,
 }
 
 impl AppState {
@@ -34,6 +38,7 @@ impl AppState {
             layout,
             vaults,
             server_priv_bytes: priv_bytes,
+            started_at: Instant::now(),
         }
     }
 }

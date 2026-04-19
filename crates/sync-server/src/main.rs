@@ -52,7 +52,16 @@ enum Command {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    // Log level via RUST_LOG (standard tracing env). Defaults to `info` for
+    // the server's own spans and `warn` for everything else, so the container
+    // output is readable without being noisy. Examples:
+    //   RUST_LOG=sync_server=debug      → per-request details
+    //   RUST_LOG=sync_server=trace      → includes plaintext body sizes etc.
+    //   RUST_LOG=warn                   → quiet; only problems
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("sync_server=info,warn"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let cli = Cli::parse();
 
@@ -139,6 +148,13 @@ async fn cmd_run(
         sync_addr
     );
     println!("Admin GUI: http://{}", admin_addr);
+
+    tracing::info!(
+        sync = %sync_addr,
+        admin = %admin_addr,
+        data_dir = %data_dir.display(),
+        "server listening (option-B transport: X25519 + AES-256-GCM over HTTP)"
+    );
 
     tokio::select! {
         r = axum::serve(sync_listener, sync_app) => {

@@ -1,10 +1,16 @@
 /**
  * Option-B secure transport — client half.
  *
- * Wraps every sync-API request in an encrypted envelope built from standard
- * Web Crypto primitives: X25519 ECDH + HKDF-SHA256 + AES-256-GCM. No TLS, no
- * certs, no CA trust store involvement. Plain HTTP transport carries an
- * opaque ciphertext blob.
+ * Wraps every sync-API request in an encrypted envelope: X25519 ECDH +
+ * HKDF-SHA256 + AES-256-GCM over plain HTTP. No TLS, no certs, no CA trust
+ * store involvement.
+ *
+ * X25519 is handled by `@noble/curves/ed25519` because Web Crypto's X25519
+ * algorithm only landed in Chromium 133 (Feb 2025), Safari 17, iOS 17. Older
+ * Electron builds (which Obsidian desktop still ships) and pre-17 iOS lack it.
+ * Noble is a pure-JS, audited, zero-dep implementation — same bytes in, same
+ * bytes out as SubtleCrypto. HKDF-SHA256 + AES-256-GCM stay on SubtleCrypto
+ * (ubiquitous since 2014).
  *
  * Wire format (matches `crates/sync-server/src/secure.rs`):
  *
@@ -25,6 +31,8 @@
  * tickets.
  */
 
+import { x25519 } from "@noble/curves/ed25519";
+
 const WIRE_VERSION = 0x01;
 const NONCE_LEN = 12;
 const PUBKEY_LEN = 32;
@@ -37,27 +45,10 @@ const AAD_PREFIX = "obsetync/v1";
 const INFO_C2S = "obsetync/v1/c2s";
 const INFO_S2C = "obsetync/v1/s2c";
 
-export class UnsupportedPlatformError extends Error {
-    constructor(msg: string) {
-        super(msg);
-        this.name = "UnsupportedPlatformError";
-    }
-}
-
 export class SecureTransportError extends Error {
     constructor(msg: string) {
         super(msg);
         this.name = "SecureTransportError";
-    }
-}
-
-/** Feature-detect native X25519 support in Web Crypto. iOS 17+, Safari 17+, recent Electron. */
-async function hasX25519(): Promise<boolean> {
-    try {
-        await crypto.subtle.generateKey({ name: "X25519" }, false, ["deriveBits"]);
-        return true;
-    } catch {
-        return false;
     }
 }
 
@@ -106,40 +97,32 @@ function randomNonce(): Uint8Array {
  * request during the plugin's lifetime.
  */
 export class SecureChannel {
-    private readonly ephPrivKey: CryptoKey;
     private readonly ephPubRaw: Uint8Array;
     private readonly hkdfKey: CryptoKey;
     private readonly bearerBytes: Uint8Array;
 
     private constructor(
-        ephPrivKey: CryptoKey,
         ephPubRaw: Uint8Array,
         hkdfKey: CryptoKey,
         bearerBytes: Uint8Array,
     ) {
-        this.ephPrivKey = ephPrivKey;
         this.ephPubRaw = ephPubRaw;
         this.hkdfKey = hkdfKey;
         this.bearerBytes = bearerBytes;
     }
 
     /**
-     * Establish a new session. Generates a fresh ephemeral X25519 keypair,
-     * performs ECDH with the server's long-term public key, and imports the
-     * shared secret as HKDF key material. All subsequent requests through
-     * this instance reuse the same shared secret (different AES key per
-     * request via HKDF with random nonce as salt).
+     * Establish a new session. Generates a fresh ephemeral X25519 keypair via
+     * @noble/curves (works on every platform Obsidian runs on — no Chromium
+     * 133 dependency), performs ECDH with the server's long-term public key,
+     * and imports the shared secret as HKDF key material. All subsequent
+     * requests through this instance reuse the same shared secret (different
+     * AES key per request via HKDF with random nonce as salt).
      */
     static async create(
         serverBoxPubBase64: string,
         bearerTokenHex: string,
     ): Promise<SecureChannel> {
-        if (!(await hasX25519())) {
-            throw new UnsupportedPlatformError(
-                "WebCrypto X25519 not available — iOS 17+ or Safari 17+ required",
-            );
-        }
-
         if (bearerTokenHex.length !== BEARER_LEN || !/^[0-9a-fA-F]+$/.test(bearerTokenHex)) {
             throw new SecureTransportError("bearer token is not 64 hex chars");
         }
@@ -151,36 +134,23 @@ export class SecureChannel {
             );
         }
 
-        // Ephemeral keypair (private key non-extractable — the browser keeps
-        // it, we only ever hold a handle).
-        const ephKeys = await crypto.subtle.generateKey(
-            { name: "X25519" },
-            false,
-            ["deriveBits"],
-        ) as CryptoKeyPair;
-
-        const ephPubRaw = new Uint8Array(
-            await crypto.subtle.exportKey("raw", ephKeys.publicKey),
-        );
-
-        const serverPubKey = await crypto.subtle.importKey(
-            "raw",
-            bs(serverPubBytes),
-            { name: "X25519" },
-            false,
-            [],
-        );
-
-        const shared = await crypto.subtle.deriveBits(
-            { name: "X25519", public: serverPubKey },
-            ephKeys.privateKey,
-            256,
-        );
+        // Ephemeral X25519 keypair via noble. The private key is a 32-byte
+        // Uint8Array held in memory for the channel's lifetime; there's no
+        // non-extractable CryptoKey handle on platforms lacking Web Crypto
+        // X25519, and pre-existing attacks on our process can read it either
+        // way — TLS session keys have the same property.
+        const ephPrivBytes = new Uint8Array(PUBKEY_LEN);
+        crypto.getRandomValues(ephPrivBytes);
+        const ephPubRaw = x25519.getPublicKey(ephPrivBytes);
+        const shared = x25519.getSharedSecret(ephPrivBytes, serverPubBytes);
+        // Zero the private key — we've already derived the shared secret,
+        // everything from here on uses HKDF-derived per-request AES keys.
+        ephPrivBytes.fill(0);
 
         // Import shared as HKDF key material so we can deriveBits per request.
         const hkdfKey = await crypto.subtle.importKey(
             "raw",
-            shared,
+            bs(shared),
             "HKDF",
             false,
             ["deriveBits"],
@@ -188,7 +158,7 @@ export class SecureChannel {
 
         const bearerBytes = new TextEncoder().encode(bearerTokenHex);
 
-        return new SecureChannel(ephKeys.privateKey, ephPubRaw, hkdfKey, bearerBytes);
+        return new SecureChannel(ephPubRaw, hkdfKey, bearerBytes);
     }
 
     /** Derive an AES-256-GCM key for the given direction + nonce. */

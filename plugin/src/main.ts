@@ -122,9 +122,13 @@ export default class SyncPlugin extends Plugin {
         if (this.syncEngine) {
             push("--- Sync state ---");
             try {
+                const localRoot  = this.syncEngine.getLocalRootHash();
+                const serverRoot = this.syncEngine.getLastObservedServerRoot();
+                const inSync = !!localRoot && localRoot === serverRoot;
                 push(`Engine state:      ${this.syncEngine.getState()}`);
-                push(`Local root hash:   ${trunc(this.syncEngine.getLocalRootHash(), 24)}`);
-                push(`Last server root:  ${trunc(this.syncEngine.getLastObservedServerRoot(), 24)}`);
+                push(`In sync:           ${inSync ? "yes ✓" : "no"}`);
+                push(`Local root hash:   ${trunc(localRoot, 24)}`);
+                push(`Last server root:  ${trunc(serverRoot, 24)}`);
                 push(`sync-base entries: ${this.syncEngine.getSyncBaseCount()}`);
                 push(`Vault file count:  ${this.syncEngine.getVaultFileCount()}`);
                 push(`Last sync (ts):    ${fmt(this.syncEngine.getLastSyncTimestamp())}`);
@@ -193,6 +197,18 @@ export default class SyncPlugin extends Plugin {
             DEFAULT_SETTINGS,
             await this.loadData()
         );
+        // Migration 1.0.x → 1.1.x: server is plain HTTP now (option-B AEAD
+        // envelope is the trust boundary). Persist the rewrite so the
+        // settings UI reflects reality instead of showing a stale https URL.
+        if (this.settings.serverUrl.startsWith("https://")) {
+            this.settings.serverUrl =
+                "http://" + this.settings.serverUrl.slice("https://".length);
+            await this.saveSettings();
+            console.warn(
+                "[obsetync] migrated server URL from https:// to http:// " +
+                "(option-B transport runs over plaintext HTTP)"
+            );
+        }
     }
 
     async saveSettings(): Promise<void> {
@@ -341,12 +357,13 @@ export default class SyncPlugin extends Plugin {
                 adapter.readBinary(`${pluginDir}/sync_core_bg.wasm`),
             ]);
 
-            // wasm-pack --target no-modules declares `wasm_bindgen` implicitly
-            // (via the IIFE). We expose `let wasm_bindgen` in our Function's
-            // scope so the glue's assignment sticks, then return it.
-            const glue = new Function(
-                "let wasm_bindgen;\n" + jsText + "\nreturn wasm_bindgen;"
-            );
+            // wasm-pack --target no-modules emits `let wasm_bindgen = (function(exports) { ... })();`
+            // at the top of sync_core.js, so the Function body's own scope
+            // declares and assigns `wasm_bindgen`. We just reference it on
+            // the way out. Earlier versions prepended another `let wasm_bindgen;`
+            // which caused "Identifier 'wasm_bindgen' has already been declared"
+            // at parse time — the glue silently fell through to the stub.
+            const glue = new Function(jsText + "\nreturn wasm_bindgen;");
             const wasm_bindgen: any = glue();
 
             if (typeof wasm_bindgen !== "function") {
@@ -355,15 +372,18 @@ export default class SyncPlugin extends Plugin {
                 );
             }
 
-            // `wasm_bindgen(input)` initializes the module and resolves to an
-            // object with all the exported functions. Pass the raw bytes so it
-            // doesn't try to fetch a URL.
-            const exports = await wasm_bindgen(new Uint8Array(wasmBuf));
-
-            // The exports object has all the `wasm_*` functions + `WasmTree`
-            // constructor + `Hasher` class. Structural compatibility with
-            // WasmModule, so an `as` cast is safe here.
-            return exports as unknown as WasmModule;
+            // `wasm_bindgen({ module_or_path: bytes })` initializes the
+            // module. In --target no-modules, the init function itself is
+            // augmented with all the exported classes (WasmTree, Hasher, …)
+            // and free functions via `Object.assign(__wbg_init, initSync, exports)`
+            // at the end of the glue — so the callable `wasm_bindgen` IS the
+            // WasmModule after init completes. The init's return value is the
+            // raw wasm.exports table, which does NOT carry the JS-side classes,
+            // which is why earlier versions tripped `WasmTree is not a
+            // constructor`. Pass the object form to silence the deprecation
+            // warning about positional args.
+            await wasm_bindgen({ module_or_path: new Uint8Array(wasmBuf) });
+            return wasm_bindgen as unknown as WasmModule;
         } catch (e) {
             console.warn(
                 "[obsetync] WASM load failed, using stub. " +

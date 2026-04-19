@@ -90,17 +90,38 @@ test:
 
 # --- personal deploy (optional) -------------------------------------------
 
-# Build artifacts and rsync them to your own server + local Obsidian vault.
-# Requires OBSETYNC_SERVER, OBSETYNC_DEST, OBSETYNC_VAULT in .env.
-# Public users should use `just build` + `just up` instead.
-ship: build-artifacts
-    @test -n "{{server}}" || (echo "OBSETYNC_SERVER not set in .env — skipping" && exit 1)
-    @echo "→ rsync binary to {{server}}:{{dest}}/"
-    ssh {{server}} "mkdir -p {{dest}}"
-    rsync -Phz --chmod=F755 dist/bin/sync-server {{server}}:{{dest}}/sync-server
-    -ssh {{server}} systemctl restart obsetync
-    @test -n "{{vault}}" && (echo "→ copy plugin files to {{vault}}/" && mkdir -p "{{vault}}" && cp -r dist/plugin/. "{{vault}}/") || echo "OBSETYNC_VAULT not set — skipping local plugin copy"
+# Build fresh plugin + Nix Docker image, ship to both the remote server (via
+# docker save/load) and the local Obsidian vault. Replaces the old binary +
+# systemd flow — post-1.1.0 the server runs exclusively via docker compose.
+#
+# Requires OBSETYNC_SERVER and OBSETYNC_VAULT in .env (OBSETYNC_DEST defaults
+# to /opt/obsetync).
+ship: ship-plugin ship-server
     @echo "Shipped."
+
+# Build plugin files and copy them into the local Obsidian vault.
+ship-plugin: build-plugin
+    @test -n "{{vault}}" || (echo "OBSETYNC_VAULT not set in .env — skipping plugin copy" && exit 0)
+    @echo "→ copying plugin files to {{vault}}/"
+    mkdir -p "{{vault}}"
+    cp dist/plugin/main.js                 "{{vault}}/"
+    cp dist/plugin/manifest.json           "{{vault}}/"
+    cp dist/plugin/sync_core.js            "{{vault}}/"
+    cp dist/plugin/sync_core_bg.wasm       "{{vault}}/"
+
+# Build the Nix docker image, transfer it to the remote host, load + restart.
+# Does NOT re-run `init` — the server's existing data dir + box keypair stay
+# intact across deploys. Only the compose restarts to pick up the new image.
+ship-server: build-nix-image
+    @test -n "{{server}}" || (echo "OBSETYNC_SERVER not set in .env — skipping server ship" && exit 0)
+    @echo "→ shipping Nix image to {{server}}"
+    scp -q result {{server}}:/tmp/obsetync-nix.tar.gz
+    @echo "→ shipping docker-compose.yml to {{server}}:{{dest}}"
+    scp -q docker-compose.yml {{server}}:{{dest}}/docker-compose.yml
+    ssh {{server}} "docker load < /tmp/obsetync-nix.tar.gz && docker tag obsetync-server:nix obsetync/server:local && docker tag obsetync-server:nix ghcr.io/savemech/obsetync-nix:1.1.9 && rm /tmp/obsetync-nix.tar.gz && cd {{dest}} && docker compose up -d"
+    @echo "→ verifying /health"
+    ssh {{server}} "curl -fsS http://127.0.0.1:27182/health"
+    @echo
 
 # --- maintenance ----------------------------------------------------------
 
