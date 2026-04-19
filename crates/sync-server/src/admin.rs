@@ -24,8 +24,8 @@ pub fn admin_router(state: SharedState) -> Router {
             "/admin/devices/new",
             get(new_device_form).post(create_device),
         )
-        .route("/admin/devices/{fingerprint}", get(device_detail))
-        .route("/admin/devices/{fingerprint}/revoke", post(revoke_device))
+        .route("/admin/devices/{device_id}", get(device_detail))
+        .route("/admin/devices/{device_id}/revoke", post(revoke_device))
         .route("/admin/vaults", get(vault_list))
         .route("/admin/vaults/{vault_id}", get(vault_detail))
         .route("/admin/vaults/{vault_id}/rollback", post(rollback_vault))
@@ -49,7 +49,7 @@ async fn dashboard(State(state): State<SharedState>) -> Html<String> {
             let dot = if is_recent(d.last_seen) { "🟢" } else { "⚪" };
             format!(
                 "<tr><td>{} {}</td><td>{}</td><td>{}</td><td><a href='/admin/devices/{}'>details</a></td></tr>",
-                dot, d.name, status, format_time(d.last_seen), d.fingerprint
+                dot, d.name, status, format_time(d.last_seen), d.device_id
             )
         })
         .collect();
@@ -82,7 +82,7 @@ async fn device_list(State(state): State<SharedState>) -> Html<String> {
     let rows: String = devices
         .iter()
         .map(|d| {
-            let revoked = devices::is_revoked(&state.layout, &d.fingerprint);
+            let revoked = devices::is_revoked(&state.layout, &d.device_id);
             let status = if revoked {
                 "Revoked"
             } else if is_recent(d.last_seen) {
@@ -92,7 +92,7 @@ async fn device_list(State(state): State<SharedState>) -> Html<String> {
             };
             format!(
                 "<tr><td>{}</td><td>{}</td><td>{}</td><td><a href='/admin/devices/{}'>details</a></td></tr>",
-                d.name, status, format_time(d.last_seen), d.fingerprint
+                d.name, status, format_time(d.last_seen), d.device_id
             )
         })
         .collect();
@@ -149,7 +149,7 @@ async fn create_device(
     <p>Certificate generated for <strong>{}</strong></p>
     <p>Enrollment code: <code class="code">{}</code></p>
     <p>Expires in 10 minutes.</p>
-    <p>Fingerprint: <code>{}</code></p>
+    <p>Device ID: <code>{}</code></p>
 </div>
 <h3>To enroll:</h3>
 <ol>
@@ -159,7 +159,7 @@ async fn create_device(
 </ol>
 <p><a href="/admin/devices">Back to devices</a></p>
 </body></html>"#,
-        info.device_name, info.code, info.fingerprint, info.code
+        info.device_name, info.code, info.device_id, info.code
     )))
 }
 
@@ -167,12 +167,12 @@ async fn create_device(
 
 async fn device_detail(
     State(state): State<SharedState>,
-    Path(fingerprint): Path<String>,
+    Path(device_id): Path<String>,
 ) -> Result<Html<String>, ServerErrorHtml> {
-    let device = devices::get_device(&state.layout, &fingerprint)
+    let device = devices::get_device(&state.layout, &device_id)
         .ok_or_else(|| ServerErrorHtml("device not found".into()))?;
 
-    let revoked = devices::is_revoked(&state.layout, &fingerprint);
+    let revoked = devices::is_revoked(&state.layout, &device_id);
     let status = if revoked {
         "Revoked"
     } else if is_recent(device.last_seen) {
@@ -188,7 +188,7 @@ async fn device_detail(
             r#"<form method="POST" action="/admin/devices/{}/revoke" onsubmit="return confirm('Revoke this device?')">
             <button type="submit" class="btn btn-danger">Revoke Device</button>
             </form>"#,
-            fingerprint
+            device_id
         )
     };
 
@@ -199,7 +199,7 @@ async fn device_detail(
 <h1><a href="/admin">ObsetyNC</a> / <a href="/admin/devices">Devices</a> / {}</h1>
 <table>
 <tr><td>Status</td><td>{status}</td></tr>
-<tr><td>Fingerprint</td><td><code>{}</code></td></tr>
+<tr><td>Device ID</td><td><code>{}</code></td></tr>
 <tr><td>Enrolled</td><td>{}</td></tr>
 <tr><td>Last Seen</td><td>{}</td></tr>
 </table>
@@ -208,7 +208,7 @@ async fn device_detail(
 </body></html>"#,
         device.name,
         device.name,
-        fingerprint,
+        device_id,
         format_time(device.enrolled_at),
         format_time(device.last_seen),
     )))
@@ -218,11 +218,11 @@ async fn device_detail(
 
 async fn revoke_device(
     State(state): State<SharedState>,
-    Path(fingerprint): Path<String>,
+    Path(device_id): Path<String>,
 ) -> Result<Redirect, ServerErrorHtml> {
-    devices::revoke_device(&state.layout, &fingerprint)
+    devices::revoke_device(&state.layout, &device_id)
         .map_err(|e| ServerErrorHtml(format!("revoke failed: {}", e)))?;
-    Ok(Redirect::to(&format!("/admin/devices/{}", fingerprint)))
+    Ok(Redirect::to(&format!("/admin/devices/{}", device_id)))
 }
 
 // --- Vault List ---
@@ -364,14 +364,29 @@ async fn claim_enrollment(
     State(state): State<SharedState>,
     Path(code): Path<String>,
 ) -> impl IntoResponse {
+    // Include the server's X25519 public key so the client can pin it for
+    // all subsequent encrypted requests. Fetched fresh on every claim so
+    // a key rotation propagates to newly enrolled devices.
+    let box_pub = match crate::box_key::load_box_pub_base64(&state.layout) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({ "error": format!("server box key unavailable: {}", e) })
+                    .to_string(),
+            )
+                .into_response();
+        }
+    };
+
     match enrollment::claim_enrollment(&state.layout, &code) {
         Ok(info) => {
             let bundle = serde_json::json!({
-                "device_name": info.device_name,
-                "fingerprint": info.fingerprint,
-                "cert_pem": info.cert_pem,
-                "key_pem": info.key_pem,
-                "bearer_token": info.bearer_token,
+                "device_name":     info.device_name,
+                "device_id":       info.device_id,
+                "bearer_token":    info.bearer_token,
+                "server_box_pub":  box_pub,
             });
             (
                 StatusCode::OK,

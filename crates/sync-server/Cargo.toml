@@ -20,16 +20,14 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 sha2 = "0.10"
 rand = "0.9"
-rustls = "0.23"
-rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
-tokio-rustls = "0.26"
-axum-server = { version = "0.8", features = ["tls-rustls"] }
-pem = "3"
+thiserror = { workspace = true }
 
 # Option B secure transport: X25519 ECDH + HKDF-SHA256 + AES-256-GCM.
-# Replaces all cert/CA infrastructure in phase 2.
+# Replaces all cert/CA infrastructure.
 x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"] }
 base64 = "0.22"
+hkdf = "0.12"
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 
 [dev-dependencies]
 tempfile = "3"
