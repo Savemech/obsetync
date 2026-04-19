@@ -1,59 +1,52 @@
 use crate::storage::StorageLayout;
 use std::fs;
 
-/// Information about an enrolled device.
+/// Enrolled device metadata. Under option-B transport we no longer store a
+/// client certificate — device identity is the random `device_id` from
+/// enrollment, and the bearer token is the thing that actually authenticates.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DeviceInfo {
     pub name: String,
-    pub fingerprint: String,
+    /// Random 128-bit identifier assigned at enrollment (32 hex chars).
+    pub device_id: String,
     pub enrolled_at: u64,
     pub last_seen: u64,
-    pub vaults: Vec<String>,
-    /// Bearer token for mobile clients (iOS) that cannot present mTLS certs.
-    /// Desktop clients also receive this token and send it on every request.
     #[serde(default)]
-    pub bearer_token: Option<String>,
+    pub vaults: Vec<String>,
+    pub bearer_token: String,
 }
 
-/// Register a new device after enrollment.
+/// Persist a newly-enrolled device + index its bearer token for O(1) lookup.
 pub fn register_device(
     layout: &StorageLayout,
-    fingerprint: &str,
+    device_id: &str,
     name: &str,
-    cert_pem: &str,
-    bearer_token: Option<&str>,
+    bearer_token: &str,
 ) -> Result<(), std::io::Error> {
-    let dir = layout.device_dir(fingerprint);
+    let dir = layout.device_dir(device_id);
     fs::create_dir_all(&dir)?;
-    // Ensure token index dir exists even on existing installs.
     fs::create_dir_all(layout.token_path("").parent().unwrap())?;
 
     let now = now_ms();
     let info = DeviceInfo {
         name: name.to_string(),
-        fingerprint: fingerprint.to_string(),
+        device_id: device_id.to_string(),
         enrolled_at: now,
         last_seen: now,
         vaults: vec![],
-        bearer_token: bearer_token.map(str::to_owned),
+        bearer_token: bearer_token.to_string(),
     };
 
     let json = serde_json::to_string_pretty(&info)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     fs::write(dir.join("device.json"), json)?;
-    fs::write(dir.join("client.crt"), cert_pem)?;
-
-    // Write token → fingerprint index for O(1) lookup.
-    if let Some(token) = bearer_token {
-        fs::write(layout.token_path(token), fingerprint)?;
-    }
+    fs::write(layout.token_path(bearer_token), device_id)?;
 
     Ok(())
 }
 
-/// Look up which device owns a bearer token. Returns the fingerprint, or None.
+/// Look up the device_id that owns a bearer token.
 pub fn lookup_token(layout: &StorageLayout, token: &str) -> Option<String> {
-    // Basic sanity: tokens are 64 lowercase hex chars.
     if token.len() != 64 || !token.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
@@ -62,22 +55,19 @@ pub fn lookup_token(layout: &StorageLayout, token: &str) -> Option<String> {
         .map(|s| s.trim().to_owned())
 }
 
-/// Throttle: only rewrite device.json if last_seen is older than this.
-/// 30s keeps the admin UI accurate (5-minute "Online" window) without
-/// doing a file write on every single API request during a busy push.
 const TOUCH_THROTTLE_MS: u64 = 30_000;
 
-/// Update the last_seen timestamp for a device, throttled to avoid excess writes.
-/// Called by the bearer-token auth middleware on every authenticated request.
-pub fn touch_last_seen(layout: &StorageLayout, fingerprint: &str) -> Result<(), std::io::Error> {
-    let path = layout.device_dir(fingerprint).join("device.json");
+/// Update last_seen for a device. Throttled to ~once per 30s per device so
+/// big pushes don't rewrite device.json hundreds of times.
+pub fn touch_last_seen(layout: &StorageLayout, device_id: &str) -> Result<(), std::io::Error> {
+    let path = layout.device_dir(device_id).join("device.json");
     let data = fs::read_to_string(&path)?;
     let mut info: DeviceInfo = serde_json::from_str(&data)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     let now = now_ms();
     if now.saturating_sub(info.last_seen) < TOUCH_THROTTLE_MS {
-        return Ok(()); // recent enough, skip the write
+        return Ok(());
     }
 
     info.last_seen = now;
@@ -87,19 +77,17 @@ pub fn touch_last_seen(layout: &StorageLayout, fingerprint: &str) -> Result<(), 
     Ok(())
 }
 
-/// Revoke a device — writes a marker file.
-pub fn revoke_device(layout: &StorageLayout, fingerprint: &str) -> Result<(), std::io::Error> {
-    let dir = layout.device_dir(fingerprint);
+/// Mark a device revoked — subsequent requests with its bearer token are rejected.
+pub fn revoke_device(layout: &StorageLayout, device_id: &str) -> Result<(), std::io::Error> {
+    let dir = layout.device_dir(device_id);
     fs::write(dir.join("revoked"), "")?;
     Ok(())
 }
 
-/// Check if a device is revoked.
-pub fn is_revoked(layout: &StorageLayout, fingerprint: &str) -> bool {
-    layout.device_dir(fingerprint).join("revoked").exists()
+pub fn is_revoked(layout: &StorageLayout, device_id: &str) -> bool {
+    layout.device_dir(device_id).join("revoked").exists()
 }
 
-/// List all enrolled devices.
 pub fn list_devices(layout: &StorageLayout) -> Result<Vec<DeviceInfo>, std::io::Error> {
     let devices_dir = layout.base.join("devices");
     let mut devices = Vec::new();
@@ -113,7 +101,6 @@ pub fn list_devices(layout: &StorageLayout) -> Result<Vec<DeviceInfo>, std::io::
         if !entry.file_type()?.is_dir() {
             continue;
         }
-        // Skip the tokens index directory.
         if entry.file_name() == "tokens" {
             continue;
         }
@@ -129,9 +116,8 @@ pub fn list_devices(layout: &StorageLayout) -> Result<Vec<DeviceInfo>, std::io::
     Ok(devices)
 }
 
-/// Get a single device by fingerprint.
-pub fn get_device(layout: &StorageLayout, fingerprint: &str) -> Option<DeviceInfo> {
-    let path = layout.device_dir(fingerprint).join("device.json");
+pub fn get_device(layout: &StorageLayout, device_id: &str) -> Option<DeviceInfo> {
+    let path = layout.device_dir(device_id).join("device.json");
     let data = fs::read_to_string(&path).ok()?;
     serde_json::from_str(&data).ok()
 }
