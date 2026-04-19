@@ -28,6 +28,20 @@ enum Command {
         /// Path to the data directory.
         #[arg(long)]
         data_dir: PathBuf,
+        /// Hostname(s) / IP(s) clients will use to reach this server.
+        /// Repeat once per name. Include every DNS name and IP — iOS strictly
+        /// validates the TLS cert's SAN against the URL. localhost, 127.0.0.1,
+        /// and ::1 are always added regardless.
+        #[arg(long = "hostname", value_name = "HOST")]
+        hostnames: Vec<String>,
+    },
+    /// Regenerate the server TLS cert (leaving the CA + enrolled devices alone).
+    /// Use when adding a new hostname to an existing install.
+    RegenServerCert {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long = "hostname", value_name = "HOST")]
+        hostnames: Vec<String>,
     },
     /// Run the sync server.
     Run {
@@ -53,9 +67,15 @@ async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Init { data_dir } => {
-            if let Err(e) = cmd_init(&data_dir) {
+        Command::Init { data_dir, hostnames } => {
+            if let Err(e) = cmd_init(&data_dir, &hostnames) {
                 tracing::error!("init failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Command::RegenServerCert { data_dir, hostnames } => {
+            if let Err(e) = cmd_regen_server_cert(&data_dir, &hostnames) {
+                tracing::error!("regen-server-cert failed: {}", e);
                 std::process::exit(1);
             }
         }
@@ -73,13 +93,13 @@ async fn main() {
     }
 }
 
-fn cmd_init(data_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_init(data_dir: &PathBuf, hostnames: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let layout = storage::StorageLayout::new(data_dir);
     layout.init_directories()?;
 
     // Generate CA and server cert.
     ca::init_ca(&layout)?;
-    ca::init_server_cert(&layout)?;
+    ca::init_server_cert(&layout, hostnames)?;
 
     // Save config.
     let config = config::ServerConfig::new(data_dir.clone());
@@ -89,15 +109,35 @@ fn cmd_init(data_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("  CA certificate: {}/ca/ca.crt", data_dir.display());
     println!("  Server cert:    {}/server/server.crt", data_dir.display());
+    if !hostnames.is_empty() {
+        println!("  Cert SAN:       localhost + {}", hostnames.join(", "));
+    } else {
+        println!("  Cert SAN:       localhost only");
+        println!();
+        println!("WARNING: no --hostname was given. Clients connecting via DNS names other");
+        println!("than localhost (iOS especially) will reject the cert. Re-run with:");
+        println!("  obsetync-server regen-server-cert --data-dir {} \\", data_dir.display());
+        println!("    --hostname <your-host>");
+    }
     println!();
     println!("Run with:");
     println!("  obsetync-server run --data-dir {}", data_dir.display());
+    Ok(())
+}
+
+fn cmd_regen_server_cert(
+    data_dir: &PathBuf,
+    hostnames: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let layout = storage::StorageLayout::new(data_dir);
+    ca::init_server_cert(&layout, hostnames)?;
+    println!("Server cert regenerated.");
+    if !hostnames.is_empty() {
+        println!("  SAN: localhost + {}", hostnames.join(", "));
+    }
     println!();
-    println!("For development without TLS:");
-    println!(
-        "  obsetync-server run --data-dir {} --no-tls",
-        data_dir.display()
-    );
+    println!("Restart the server (docker compose restart / systemctl restart) to pick up");
+    println!("the new cert. Enrolled devices keep their credentials.");
     Ok(())
 }
 

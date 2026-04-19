@@ -34,7 +34,14 @@ pub fn init_ca(layout: &StorageLayout) -> Result<(), Box<dyn std::error::Error>>
 }
 
 /// Generate and sign the server certificate using the CA.
-pub fn init_server_cert(layout: &StorageLayout) -> Result<(), Box<dyn std::error::Error>> {
+///
+/// `hostnames` can contain DNS names (e.g. `pve-obsetync-01`, `sync.example.com`)
+/// and/or literal IP addresses. `localhost`, `127.0.0.1`, and `::1` are always
+/// added so local admin UI access keeps working regardless of what else is set.
+pub fn init_server_cert(
+    layout: &StorageLayout,
+    hostnames: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
     let server_dir = layout.base.join("server");
     fs::create_dir_all(&server_dir)?;
 
@@ -47,14 +54,28 @@ pub fn init_server_cert(layout: &StorageLayout) -> Result<(), Box<dyn std::error
         .push(DnType::CommonName, "ObsetyNC Server");
     params.not_before = rcgen::date_time_ymd(2024, 1, 1);
     params.not_after = rcgen::date_time_ymd(2034, 1, 1);
-    params.subject_alt_names = vec![rcgen::SanType::DnsName("localhost".try_into()?)];
+
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let mut sans: Vec<rcgen::SanType> = vec![
+        rcgen::SanType::DnsName("localhost".try_into()?),
+        rcgen::SanType::IpAddress(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+        rcgen::SanType::IpAddress(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+    ];
+    for host in hostnames {
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            sans.push(rcgen::SanType::IpAddress(ip));
+        } else {
+            sans.push(rcgen::SanType::DnsName(host.as_str().try_into()?));
+        }
+    }
+    params.subject_alt_names = sans;
 
     let server_cert = params.signed_by(&server_key, &ca_cert, &ca_key)?;
 
     fs::write(server_dir.join("server.crt"), server_cert.pem())?;
     fs::write(server_dir.join("server.key"), server_key.serialize_pem())?;
 
-    tracing::info!("server certificate generated");
+    tracing::info!("server certificate generated for hostnames: {:?}", hostnames);
     Ok(())
 }
 
