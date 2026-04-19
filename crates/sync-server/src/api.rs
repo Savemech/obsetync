@@ -1,61 +1,118 @@
 use crate::bridge;
 use crate::devices;
 use crate::error::ServerError;
+use crate::secure;
 use crate::state::SharedState;
 use crate::storage::{blob_exists, read_blob, write_blob};
 use axum::{
+    body::Body,
     extract::{Path, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::Next,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
 use sync_core::hash::{hash_bytes, hash_to_hex, hex_to_hash};
+use x25519_dalek::StaticSecret;
 
-/// Bearer-token auth middleware. Every sync API route (except /health) requires
-/// a valid `Authorization: Bearer <token>` header.
-/// Desktop clients send their token alongside the mTLS cert (double auth).
-/// Mobile clients (iOS) send the token only — no client cert from JS.
-async fn require_bearer(
+/// Max body size we'll consume in one shot. Generous to accommodate the
+/// occasional large-file blob upload (FastCDC caps chunks at ~1 MB each,
+/// but the full-file manifest path can push a megabyte or two).
+const MAX_BODY_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB
+
+/// Option-B secure-envelope middleware. Every protected route body is a
+/// sealed blob: `[ver | nonce | client_eph_pub | ciphertext+tag]`. We decrypt
+/// the request using the server's long-term X25519 private key, validate the
+/// bearer token found inside the plaintext, run the inner handler, then
+/// encrypt its response back to the same client using the shared secret from
+/// the request's ECDH.
+async fn secure_envelope(
     State(state): State<SharedState>,
     request: Request,
     next: Next,
-) -> impl IntoResponse {
-    let token = request
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
+) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
 
-    match token.and_then(|t| devices::lookup_token(&state.layout, t)) {
-        Some(fingerprint) => {
-            // Best-effort: keep the admin UI's "Online" badge honest.
-            // Throttled to ~once per 30s per device so it doesn't hammer disk.
-            let _ = devices::touch_last_seen(&state.layout, &fingerprint);
-            next.run(request).await.into_response()
-        }
-        None => StatusCode::UNAUTHORIZED.into_response(),
+    let (parts, body) = request.into_parts();
+    let body_bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::BAD_REQUEST, "request body read failed").into_response(),
+    };
+
+    let server_priv = StaticSecret::from(state.server_priv_bytes);
+    let decrypted =
+        match secure::decrypt_request(&body_bytes, &server_priv, method.as_str(), &path) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::debug!("decrypt failed on {} {}: {}", method, path, e);
+                return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+            }
+        };
+
+    let device_id = match devices::lookup_token(&state.layout, &decrypted.bearer_token) {
+        Some(id) => id,
+        None => return (StatusCode::UNAUTHORIZED, "unknown bearer token").into_response(),
+    };
+    if devices::is_revoked(&state.layout, &device_id) {
+        return (StatusCode::FORBIDDEN, "device revoked").into_response();
     }
+    let _ = devices::touch_last_seen(&state.layout, &device_id);
+
+    // Reassemble request with the decrypted inner body for the real handler.
+    let mut inner_request = Request::from_parts(parts, Body::from(decrypted.inner_body));
+    inner_request
+        .headers_mut()
+        .remove(axum::http::header::CONTENT_LENGTH);
+
+    let inner_response = next.run(inner_request).await;
+
+    // Capture inner response, encrypt it.
+    let (resp_parts, resp_body) = inner_response.into_parts();
+    let resp_bytes = match axum::body::to_bytes(resp_body, MAX_BODY_BYTES).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "response body read failed")
+                .into_response()
+        }
+    };
+
+    let encrypted =
+        match secure::encrypt_response(&resp_bytes, &decrypted.shared_secret, method.as_str(), &path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!("encrypt response failed: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "response encryption failed",
+                )
+                    .into_response();
+            }
+        };
+
+    let mut out = Response::from_parts(resp_parts, Body::from(encrypted));
+    out.headers_mut().remove(axum::http::header::CONTENT_LENGTH);
+    out.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/octet-stream"),
+    );
+    out
 }
 
 pub fn sync_router(state: SharedState) -> Router {
-    // All API routes require bearer token auth.
     let protected = Router::new()
         // Root management
         .route("/api/v1/root/{vault_id}", get(get_root).put(put_root))
         // Diff
         .route("/api/v1/diff/{vault_id}", post(post_diff))
         // Index chunks
-        .route(
-            "/api/v1/chunk/{hash}",
-            get(get_chunk).put(put_chunk).head(head_chunk),
-        )
+        .route("/api/v1/chunk/{hash}", get(get_chunk).put(put_chunk))
         .route("/api/v1/chunks/check", post(post_chunks_check))
         // Content (small files)
         .route(
             "/api/v1/content/{hash}",
-            get(get_content).put(put_content).head(head_content),
+            get(get_content).put(put_content),
         )
         .route("/api/v1/content/check", post(post_content_check))
         // Content manifests (large files)
@@ -74,11 +131,12 @@ pub fn sync_router(state: SharedState) -> Router {
         )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
-            require_bearer,
+            secure_envelope,
         ));
 
     Router::new()
-        // Health is public — used by ping() before enrollment.
+        // Health is public (plaintext) — clients ping it before enrollment to
+        // check connectivity without needing the server's box pubkey.
         .route("/health", get(health))
         .merge(protected)
         .with_state(state)
@@ -329,19 +387,6 @@ async fn put_chunk(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn head_chunk(
-    State(state): State<SharedState>,
-    Path(hash_hex): Path<String>,
-) -> Result<impl IntoResponse, ServerError> {
-    let hash =
-        hex_to_hash(&hash_hex).map_err(|_| ServerError::BadRequest("invalid hash".into()))?;
-    if blob_exists(&state.layout.index_path(&hash)) {
-        Ok(StatusCode::OK)
-    } else {
-        Ok(StatusCode::NOT_FOUND)
-    }
-}
-
 async fn post_chunks_check(
     State(state): State<SharedState>,
     axum::Json(hashes): axum::Json<Vec<String>>,
@@ -385,19 +430,6 @@ async fn put_content(
     let path = state.layout.content_blob_path(&expected);
     write_blob(&path, &body)?;
     Ok(StatusCode::NO_CONTENT)
-}
-
-async fn head_content(
-    State(state): State<SharedState>,
-    Path(hash_hex): Path<String>,
-) -> Result<impl IntoResponse, ServerError> {
-    let hash =
-        hex_to_hash(&hash_hex).map_err(|_| ServerError::BadRequest("invalid hash".into()))?;
-    if blob_exists(&state.layout.content_blob_path(&hash)) {
-        Ok(StatusCode::OK)
-    } else {
-        Ok(StatusCode::NOT_FOUND)
-    }
 }
 
 async fn post_content_check(
