@@ -6,6 +6,7 @@ import { Journal } from "./journal";
 import { SyncEngine } from "./sync";
 import { SyncSettings, DEFAULT_SETTINGS, SyncSettingTab } from "./settings";
 import { ConflictModal, findConflicts } from "./conflict-ui";
+import { debugLog } from "./debug-log";
 import type { WasmModule, WasmTree } from "./push";
 
 export default class SyncPlugin extends Plugin {
@@ -20,6 +21,11 @@ export default class SyncPlugin extends Plugin {
     private statusBarEl: HTMLElement | null = null;
 
     async onload(): Promise<void> {
+        // Capture every subsequent `[obsetync] …` console line into a ring
+        // buffer so the "Show debug info" panel can surface them later,
+        // especially on iOS where there's no easy way to see console output.
+        debugLog.install();
+
         await this.loadSettings();
 
         // Platform I/O.
@@ -71,6 +77,109 @@ export default class SyncPlugin extends Plugin {
 
     onunload(): void {
         this.syncEngine?.stop();
+        debugLog.uninstall();
+    }
+
+    /** Gathers a human-readable snapshot of plugin state + live diagnostics. */
+    async getDebugInfo(): Promise<string> {
+        const lines: string[] = [];
+        const push = (s: string) => lines.push(s);
+        const fmt = (ms: number) => (ms ? new Date(ms).toISOString() : "never");
+        const trunc = (s: string | null | undefined, n = 16) =>
+            !s ? "—" : s.length <= n ? s : s.slice(0, n) + "…";
+
+        push(`=== ObsetyNC ${this.manifest.version} debug info ===`);
+        push(`Captured: ${new Date().toISOString()}`);
+        push("");
+
+        push("--- Settings ---");
+        push(`Server URL:        ${this.settings.serverUrl || "(unset)"}`);
+        push(`Vault ID:          ${this.settings.vaultId || "(unset)"}`);
+        push(`Device name:       ${this.settings.deviceName || "(unset)"}`);
+        push(`Enrolled:          ${this.settings.enrolled}`);
+        push(`Fingerprint:       ${trunc(this.settings.fingerprint, 24)}`);
+        push(`Bearer token:      ${this.settings.bearerToken ? "present" : "MISSING"}`);
+        push(`Device cert+key:   ${this.settings.certPem && this.settings.keyPem ? "present" : "missing"}`);
+        push(`Sync interval:     ${this.settings.syncIntervalMs}ms`);
+        push(`Sync priority:     ${this.settings.syncPriority}`);
+        push(`Sync .obsidian/:   ${this.settings.syncObsidianConfig}`);
+        push(`Auto-sync:         ${this.settings.autoSync}`);
+        push("");
+
+        push("--- Platform ---");
+        const isNode = typeof (window as any).require === "function";
+        push(`Transport mode:    ${isNode ? "Node.js https (desktop)" : "requestUrl (mobile)"}`);
+        push(`WASM:              ${this.wasm ? "loaded" : "not loaded"}`);
+        push(`Plugin id:         ${this.manifest.id}`);
+        push(`Plugin version:    ${this.manifest.version}`);
+        push("");
+
+        if (this.syncEngine) {
+            push("--- Sync state ---");
+            try {
+                push(`Engine state:      ${this.syncEngine.getState()}`);
+                push(`Local root hash:   ${trunc(this.syncEngine.getLocalRootHash(), 24)}`);
+                push(`Last server root:  ${trunc(this.syncEngine.getLastObservedServerRoot(), 24)}`);
+                push(`sync-base entries: ${this.syncEngine.getSyncBaseCount()}`);
+                push(`Vault file count:  ${this.syncEngine.getVaultFileCount()}`);
+                push(`Last sync (ts):    ${fmt(this.syncEngine.getLastSyncTimestamp())}`);
+                const err = this.syncEngine.getLastError();
+                if (err) {
+                    push(`Last error:        [${err.origin}] ${err.message}`);
+                    push(`  at:              ${fmt(err.ts)}`);
+                } else {
+                    push(`Last error:        none`);
+                }
+            } catch (e: any) {
+                push(`Sync state read failed: ${e?.message ?? e}`);
+            }
+            push("");
+        } else {
+            push("--- Sync state ---");
+            push("Sync engine not initialized yet (check enrollment).");
+            push("");
+        }
+
+        push("--- Live diagnostics ---");
+        if (!this.api) {
+            push("SyncApi not ready.");
+        } else {
+            try {
+                push("ping() → ...");
+                const p = await this.api.ping();
+                push(`  TLS:              ${p.tlsVersion} / ${p.cipher}`);
+                push(`  Server fp:        ${p.serverFingerprint}`);
+                push(`  Device cert sent: ${p.deviceCert}`);
+            } catch (e: any) {
+                push(`  ping failed:      ${e?.message ?? e}`);
+            }
+            if (this.settings.vaultId) {
+                try {
+                    push(`getRoot("${this.settings.vaultId}") → ...`);
+                    const rootBytes = await this.api.getRoot(this.settings.vaultId);
+                    if (rootBytes === null) {
+                        push(`  Server has no vault with this ID.`);
+                    } else {
+                        const hash = this.wasm?.wasm_root_hash_from_bytes(rootBytes) ?? null;
+                        push(`  Server root hash: ${trunc(hash, 24)}`);
+                        push(`  Root bytes:       ${rootBytes.length} B`);
+                    }
+                } catch (e: any) {
+                    push(`  getRoot failed:   ${e?.message ?? e}`);
+                }
+            }
+        }
+        push("");
+
+        push(`--- Recent log lines (up to ${debugLog.recent().length}) ---`);
+        const logs = debugLog.recent();
+        if (logs.length === 0) {
+            push("(none yet)");
+        } else {
+            for (const line of logs) push(line);
+        }
+
+        return lines.join("\n");
     }
 
     async loadSettings(): Promise<void> {

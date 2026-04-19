@@ -28,6 +28,10 @@ export class SyncEngine {
     private syncing = false;
     private syncTimer: ReturnType<typeof setInterval> | null = null;
     private eventRefs: any[] = [];
+    /** Most recent pull/push failure — surfaced by the debug panel. */
+    private lastError: { ts: number; message: string; origin: string } | null = null;
+    /** Snapshots of observed remote / local roots for the debug panel. */
+    private lastPullServerRoot: string | null = null;
 
     constructor(
         private app: App,
@@ -49,6 +53,38 @@ export class SyncEngine {
 
     getState(): SyncState {
         return this.state;
+    }
+
+    // --- Debug accessors (used by the "Show debug info" panel) ----------------
+
+    /** Hex root hash of the locally computed tree, or null if tree is empty. */
+    getLocalRootHash(): string | null {
+        try { return this.tree.root_hash_hex(); } catch { return null; }
+    }
+
+    /** Count of files currently tracked in sync-base. */
+    getSyncBaseCount(): number {
+        try { return this.syncBase.allPaths().length; } catch { return -1; }
+    }
+
+    /** Count of vault files Obsidian's cache reports right now (excluding .obsidian/). */
+    getVaultFileCount(): number {
+        try { return this.io.statBulk().size; } catch { return -1; }
+    }
+
+    /** Epoch-ms of the last successful push. 0 if never. */
+    getLastSyncTimestamp(): number {
+        try { return this.syncBase.lastSyncTimestamp; } catch { return 0; }
+    }
+
+    /** Most recent network/sync failure observed. */
+    getLastError(): { ts: number; message: string; origin: string } | null {
+        return this.lastError;
+    }
+
+    /** Last remote root hash observed via pullRemote (for hash mismatch diagnosis). */
+    getLastObservedServerRoot(): string | null {
+        return this.lastPullServerRoot;
     }
 
     /** Start the sync engine: run startup sequence, attach listeners, start timer. */
@@ -237,9 +273,11 @@ export class SyncEngine {
             );
             if (result.newRootHash) {
                 this.localRootHash = result.newRootHash;
+                this.lastPullServerRoot = result.newRootHash;
             }
-        } catch (e) {
+        } catch (e: any) {
             console.error("[obsetync] pull error:", e);
+            this.lastError = { ts: Date.now(), origin: "pull", message: String(e?.message ?? e) };
             this.state = "error";
             this.onStatusUpdate("sync ✗");
         } finally {
@@ -288,8 +326,9 @@ export class SyncEngine {
             for (const change of batch) {
                 this.journal.markSynced(change.path);
             }
-        } catch (e) {
+        } catch (e: any) {
             console.error("[obsetync] push error:", e);
+            this.lastError = { ts: Date.now(), origin: "push", message: String(e?.message ?? e) };
             this.pendingChanges.unshift(...batch);
             this.state = "error";
             this.onStatusUpdate("sync ✗");

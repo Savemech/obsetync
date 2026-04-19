@@ -1,5 +1,6 @@
 import { App, PluginSettingTab, Setting, Notice } from "obsidian";
 import type SyncPlugin from "./main";
+import { DebugInfoModal } from "./debug-modal";
 
 export type SyncPriority =
     | "sequential"   // as found (default)
@@ -225,6 +226,26 @@ export class SyncSettingTab extends PluginSettingTab {
                         new Notice("Sync complete.");
                     } catch (e: any) {
                         new Notice(`Sync failed: ${e.message}`);
+                    }
+                })
+            );
+
+        new Setting(containerEl)
+            .setName("Show debug info")
+            .setDesc(
+                "Dump current settings, sync state, live ping/getRoot results, and recent " +
+                "[obsetync] log lines. Share this when asking for help or diagnosing iOS issues."
+            )
+            .addButton((btn) =>
+                btn.setButtonText("Show debug info").onClick(async () => {
+                    const loading = new Notice("Gathering debug info…", 0);
+                    try {
+                        const text = await this.plugin.getDebugInfo();
+                        loading.hide();
+                        new DebugInfoModal(this.app, text).open();
+                    } catch (e: any) {
+                        loading.hide();
+                        new Notice(`Debug info failed: ${e?.message ?? e}`);
                     }
                 })
             );
