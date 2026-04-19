@@ -55,8 +55,13 @@ pub fn claim_enrollment(layout: &StorageLayout, code: &str) -> Result<Enrollment
         return Err("enrollment code expired".into());
     }
 
-    devices::register_device(layout, &info.device_id, &info.device_name, &info.bearer_token)
-        .map_err(|e| format!("device registration failed: {}", e))?;
+    devices::register_device(
+        layout,
+        &info.device_id,
+        &info.device_name,
+        &info.bearer_token,
+    )
+    .map_err(|e| format!("device registration failed: {}", e))?;
 
     let _ = fs::remove_file(&path);
 

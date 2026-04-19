@@ -146,10 +146,7 @@ pub fn decrypt_request(
     let plaintext = cipher
         .decrypt(
             Nonce::from_slice(&nonce_bytes),
-            Payload {
-                msg: ct,
-                aad: &aad,
-            },
+            Payload { msg: ct, aad: &aad },
         )
         .map_err(|_| SecureError::AeadOpen)?;
 
@@ -157,8 +154,9 @@ pub fn decrypt_request(
         return Err(SecureError::MissingBearer);
     }
     let bearer_bytes = &plaintext[..BEARER_LEN];
-    let bearer_token =
-        std::str::from_utf8(bearer_bytes).map_err(|_| SecureError::BadBearer)?.to_owned();
+    let bearer_token = std::str::from_utf8(bearer_bytes)
+        .map_err(|_| SecureError::BadBearer)?
+        .to_owned();
     let inner_body = plaintext[BEARER_LEN..].to_vec();
 
     Ok(DecryptedRequest {
@@ -195,7 +193,10 @@ pub fn encrypt_response(
     let ct = cipher
         .encrypt(
             Nonce::from_slice(&nonce_bytes),
-            Payload { msg: body, aad: &aad },
+            Payload {
+                msg: body,
+                aad: &aad,
+            },
         )
         .map_err(|e| SecureError::AeadSeal(e.to_string()))?;
 
@@ -290,7 +291,8 @@ mod tests {
             body,
         );
 
-        let decrypted = decrypt_request(&wire, &server_priv, "PUT", "/api/v1/root/svx-main").unwrap();
+        let decrypted =
+            decrypt_request(&wire, &server_priv, "PUT", "/api/v1/root/svx-main").unwrap();
         assert_eq!(decrypted.bearer_token, bearer_64());
         assert_eq!(decrypted.inner_body, body);
 

@@ -53,10 +53,7 @@ pub fn init_box_keypair(
     let b64 = BASE64_STANDARD.encode(pub_key.as_bytes());
     fs::write(&pub_path, format!("{}\n", b64))?;
 
-    tracing::info!(
-        "X25519 keypair generated (pub = {})",
-        &b64
-    );
+    tracing::info!("X25519 keypair generated (pub = {})", &b64);
     Ok((priv_key, pub_key))
 }
 
@@ -66,15 +63,10 @@ pub fn load_box_keypair(
     layout: &StorageLayout,
 ) -> Result<(StaticSecret, PublicKey), Box<dyn std::error::Error>> {
     let priv_path = layout.base.join("server").join(PRIV_FILE);
-    let bytes = fs::read(&priv_path)
-        .map_err(|e| format!("reading {}: {}", priv_path.display(), e))?;
+    let bytes =
+        fs::read(&priv_path).map_err(|e| format!("reading {}: {}", priv_path.display(), e))?;
     if bytes.len() != KEY_LEN {
-        return Err(format!(
-            "box.key is {} bytes, expected {}",
-            bytes.len(),
-            KEY_LEN
-        )
-        .into());
+        return Err(format!("box.key is {} bytes, expected {}", bytes.len(), KEY_LEN).into());
     }
     let mut arr = [0u8; KEY_LEN];
     arr.copy_from_slice(&bytes);

@@ -97,7 +97,10 @@ fn cmd_init(data_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     println!("Server initialized at {}", data_dir.display());
     println!();
     println!("  Box public key: {}", pub_b64);
-    println!("  (stored at {}/server/box.pub — copy into clients at enrollment)", data_dir.display());
+    println!(
+        "  (stored at {}/server/box.pub — copy into clients at enrollment)",
+        data_dir.display()
+    );
     println!();
     println!("Run with:");
     println!("  obsetync-server run --data-dir {}", data_dir.display());
@@ -131,7 +134,10 @@ async fn cmd_run(
     let sync_addr = format!("0.0.0.0:{}", sync_port);
     let sync_listener = tokio::net::TcpListener::bind(&sync_addr).await?;
 
-    println!("Sync API:  http://{} (option-B encrypted payloads)", sync_addr);
+    println!(
+        "Sync API:  http://{} (option-B encrypted payloads)",
+        sync_addr
+    );
     println!("Admin GUI: http://{}", admin_addr);
 
     tokio::select! {
