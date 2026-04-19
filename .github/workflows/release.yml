@@ -72,7 +72,7 @@ jobs:
           cp release/manifest.json            zip-staging/obsetync/
           cp release/sync_core.js             zip-staging/obsetync/
           cp release/sync_core_bg.wasm        zip-staging/obsetync/
-          cd zip-staging && zip -r ../release/obsetync-${{ github.ref_name }}.zip obsetync
+          (cd zip-staging && zip -r ../release/obsetync-${{ github.ref_name }}.zip obsetync)
 
           echo "Release assets:"
           ls -la release/
@@ -158,9 +158,11 @@ jobs:
 
       - name: Tag + push
         env:
-          REPO: ghcr.io/${{ github.repository }}-nix
           VERSION: ${{ github.ref_name }}
         run: |
+          # Docker repo names must be lowercase; github.repository uses the
+          # owner's casing. Lowercase here so "Savemech/obsetync" → "savemech/obsetync".
+          REPO="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')-nix"
           # Strip a leading 'v' for docker tag convention (1.0.2 not v1.0.2).
           VERSION_CLEAN="${VERSION#v}"
           docker tag obsetync-server:nix "${REPO}:${VERSION_CLEAN}"
