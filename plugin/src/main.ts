@@ -80,6 +80,12 @@ export default class SyncPlugin extends Plugin {
         debugLog.uninstall();
     }
 
+    /** Expose the sync engine for the settings tab's status box. Returns null
+     *  if not yet initialized (e.g., before enrollment). */
+    syncEngineOrNull(): SyncEngine | null {
+        return this.syncEngine ?? null;
+    }
+
     /** Gathers a human-readable snapshot of plugin state + live diagnostics. */
     async getDebugInfo(): Promise<string> {
         const lines: string[] = [];

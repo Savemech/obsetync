@@ -69,6 +69,11 @@ export class SyncSettingTab extends PluginSettingTab {
             });
         }
 
+        // Always-visible sync status — shows non-sensitive snapshot of what
+        // the engine knows: state, last sync time, truncated root hashes,
+        // file counts, last error. No fingerprints, tokens, or cert bytes.
+        this.renderStatusBox(containerEl);
+
         // Server URL.
         new Setting(containerEl)
             .setName("Server URL")
@@ -244,11 +249,19 @@ export class SyncSettingTab extends PluginSettingTab {
             .setDesc("Force an immediate sync cycle.")
             .addButton((btn) =>
                 btn.setButtonText("Sync Now").onClick(async () => {
+                    const startedAt = Date.now();
                     try {
                         await this.plugin.syncNow();
-                        new Notice("Sync complete.");
+                        const err = this.plugin.syncEngineOrNull()?.getLastError();
+                        if (err && err.ts >= startedAt) {
+                            new Notice(`Sync had errors: [${err.origin}] ${err.message.slice(0, 80)}${err.message.length > 80 ? "…" : ""}`);
+                        } else {
+                            new Notice("Sync complete.");
+                        }
                     } catch (e: any) {
                         new Notice(`Sync failed: ${e.message}`);
+                    } finally {
+                        this.display(); // refresh status box
                     }
                 })
             );
@@ -280,13 +293,79 @@ export class SyncSettingTab extends PluginSettingTab {
             )
             .addButton((btn) =>
                 btn.setButtonText("Full Rescan").onClick(async () => {
+                    const startedAt = Date.now();
                     try {
                         await this.plugin.fullScan();
-                        new Notice("Rescan complete.");
+                        const err = this.plugin.syncEngineOrNull()?.getLastError();
+                        if (err && err.ts >= startedAt) {
+                            new Notice(`Rescan had errors: [${err.origin}] ${err.message.slice(0, 80)}${err.message.length > 80 ? "…" : ""}`);
+                        } else {
+                            new Notice("Rescan complete.");
+                        }
                     } catch (e: any) {
                         new Notice(`Rescan failed: ${e.message}`);
+                    } finally {
+                        this.display();
                     }
                 })
             );
+    }
+
+    /** Non-sensitive status snapshot rendered inline in the settings tab. */
+    private renderStatusBox(containerEl: HTMLElement): void {
+        const box = containerEl.createDiv();
+        box.setAttribute(
+            "style",
+            "margin: 12px 0 20px 0; padding: 10px 14px; " +
+                "border: 1px solid var(--background-modifier-border); " +
+                "border-radius: 6px; background: var(--background-primary-alt); " +
+                "font-size: 12px; font-family: var(--font-monospace); line-height: 1.6;"
+        );
+
+        const engine = this.plugin.syncEngineOrNull();
+        const t = (s: string | null | undefined, n = 16) =>
+            !s ? "—" : s.length <= n ? s : s.slice(0, n) + "…";
+        const relTime = (ms: number) => {
+            if (!ms) return "never";
+            const ago = Date.now() - ms;
+            if (ago < 60_000) return "just now";
+            if (ago < 3_600_000) return `${Math.floor(ago / 60_000)} min ago`;
+            if (ago < 86_400_000) return `${Math.floor(ago / 3_600_000)} h ago`;
+            return `${Math.floor(ago / 86_400_000)} d ago`;
+        };
+
+        const row = (label: string, value: string) => {
+            const line = box.createDiv();
+            const l = line.createSpan({ text: `${label.padEnd(14, " ")} ` });
+            l.setAttribute("style", "color: var(--text-muted);");
+            line.createSpan({ text: value });
+        };
+
+        row("Engine state", engine?.getState() ?? "not-initialized");
+        row("Last sync",    relTime(engine?.getLastSyncTimestamp() ?? 0));
+        row("Local root",   t(engine?.getLocalRootHash()));
+        row("Server root",  t(engine?.getLastObservedServerRoot()));
+        row("sync-base",    `${engine?.getSyncBaseCount() ?? 0} entries`);
+        row("Vault files",  `${engine?.getVaultFileCount() ?? 0}`);
+        row("Enrolled",     this.plugin.settings.enrolled ? "yes" : "no");
+        row("Bearer token", this.plugin.settings.bearerToken ? "present" : "missing");
+
+        const err = engine?.getLastError();
+        if (err) {
+            const errLine = box.createDiv();
+            errLine.setAttribute("style", "color: var(--text-error); margin-top: 4px;");
+            errLine.setText(
+                `Last error:   [${err.origin}] ${err.message.slice(0, 120)}${
+                    err.message.length > 120 ? "…" : ""
+                } (${relTime(err.ts)})`
+            );
+        }
+
+        const refresh = box.createEl("button", { text: "↻ Refresh" });
+        refresh.setAttribute(
+            "style",
+            "margin-top: 8px; padding: 4px 10px; font-size: 11px; cursor: pointer;"
+        );
+        refresh.onclick = () => this.display();
     }
 }
