@@ -311,19 +311,80 @@ export default class SyncPlugin extends Plugin {
     }
 
     private async loadWasm(): Promise<WasmModule> {
-        // WASM files live flat alongside main.js — not under wasm/ — so that
-        // BRAT and manual installs can drop a single folder into .obsidian/plugins/
-        // without needing to preserve subdirectories.
+        // Load strategy that works on BOTH Electron (desktop) and WKWebView (iOS).
+        //
+        // On desktop, dynamic import of `getResourcePath()` works because the URL
+        // ends up as file:// or app:// and Electron allows both. On iOS the URL
+        // uses the `capacitor://` scheme which WKWebView refuses to dynamic-import,
+        // so we rebuild the module via blob: URL instead:
+        //
+        //   1. Read sync_core.js (the wasm-bindgen JS glue) as text.
+        //   2. Read sync_core_bg.wasm as bytes, base64-encode them.
+        //   3. Patch the glue so its default input is the inline ArrayBuffer
+        //      instead of `new URL('sync_core_bg.wasm', import.meta.url)` — that
+        //      URL wouldn't resolve from inside a blob anyway.
+        //   4. Wrap the patched JS in a blob, create an object URL, dynamic-import.
+        //   5. Revoke the URL once the module has loaded.
+        //
+        // This avoids the stub path entirely on iOS; hashing + tree ops run on
+        // real Blake3 / wasm-bindgen code, not the JS stub.
+        const pluginDir = ".obsidian/plugins/obsetync";
+        const adapter = this.app.vault.adapter;
+
         try {
-            const wasmPath = this.app.vault.adapter.getResourcePath(
-                ".obsidian/plugins/obsetync/sync_core.js"
+            const [jsText, wasmBuf] = await Promise.all([
+                adapter.read(`${pluginDir}/sync_core.js`),
+                adapter.readBinary(`${pluginDir}/sync_core_bg.wasm`),
+            ]);
+
+            const wasmBytes = new Uint8Array(wasmBuf);
+            // btoa + String.fromCharCode.apply blows the stack on large arrays —
+            // chunk to 32 KB and concat.
+            const CHUNK = 32_768;
+            let base64 = "";
+            for (let i = 0; i < wasmBytes.length; i += CHUNK) {
+                const end = Math.min(i + CHUNK, wasmBytes.length);
+                base64 += btoa(
+                    String.fromCharCode.apply(
+                        null,
+                        wasmBytes.subarray(i, end) as unknown as number[]
+                    )
+                );
+            }
+
+            // wasm-pack --target web emits literally:
+            //   input = new URL('sync_core_bg.wasm', import.meta.url);
+            // Replace with inline bytes.
+            const inlineInput =
+                "input=(()=>{const b=atob(\"" +
+                base64 +
+                "\");const a=new Uint8Array(b.length);for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return a.buffer;})();";
+
+            const patched = jsText.replace(
+                /input\s*=\s*new\s+URL\s*\(\s*['"`]sync_core_bg\.wasm['"`]\s*,\s*import\.meta\.url\s*\)\s*;/,
+                inlineInput
             );
-            const mod = await import(/* webpackIgnore: true */ wasmPath);
-            await mod.default(); // Initialize WASM.
-            return mod;
+
+            if (patched === jsText) {
+                console.warn(
+                    "[obsetync] wasm-pack URL pattern not found in sync_core.js; " +
+                    "the loader may fail at runtime. Consider regenerating with current wasm-pack."
+                );
+            }
+
+            const blob = new Blob([patched], { type: "application/javascript" });
+            const url = URL.createObjectURL(blob);
+            try {
+                const mod = await import(/* webpackIgnore: true */ url);
+                await mod.default();
+                return mod;
+            } finally {
+                URL.revokeObjectURL(url);
+            }
         } catch (e) {
             console.warn(
-                "[obsetync] WASM not available, using stub. Build WASM with wasm-pack first.",
+                "[obsetync] WASM load failed, using stub. " +
+                "Hash/tree operations will NOT work correctly until this is fixed.",
                 e
             );
             return createWasmStub();
