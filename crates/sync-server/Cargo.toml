@@ -31,3 +31,5 @@ aes-gcm = { version = "0.10", default-features = false, features = ["aes", "allo
 
 [dev-dependencies]
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

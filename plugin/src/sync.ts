@@ -3,6 +3,14 @@ import { App, TAbstractFile, TFile, debounce, Notice } from "obsidian";
 /** Yield control to the JS event loop (audio, render, IPC callbacks). */
 const yieldToUI = () => new Promise<void>(r => setTimeout(r, 0));
 
+/** Bytes → human-readable short form. Used in status/progress messages. */
+function formatBytes(n: number): string {
+    if (n >= 1_073_741_824) return `${(n / 1_073_741_824).toFixed(2)} GB`;
+    if (n >= 1_048_576)     return `${(n / 1_048_576).toFixed(1)} MB`;
+    if (n >= 1024)          return `${(n / 1024).toFixed(0)} KB`;
+    return `${n} B`;
+}
+
 /** Files above this size skip WASM hashing during scan — push.ts hashes them
  *  during upload via FastCDC (wasm_chunk_file returns file_hash). This keeps
  *  WASM linear memory bounded to ~1 MB per file regardless of vault content. */
@@ -57,9 +65,20 @@ export class SyncEngine {
 
     // --- Debug accessors (used by the "Show debug info" panel) ----------------
 
-    /** Hex root hash of the locally computed tree, or null if tree is empty. */
+    /** Hex root hash the client considers current for this vault.
+     *  Prefers the engine's tracked `localRootHash` (seeded from the cached
+     *  root file at startup + updated after every push/pull) over the WASM
+     *  tree's in-memory hash, which is intentionally left empty until the
+     *  first push bootstraps the tree from sync-base (see the comment in
+     *  main.ts about `load_root` not populating child nodes). */
     getLocalRootHash(): string | null {
-        try { return this.tree.root_hash_hex(); } catch { return null; }
+        if (this.localRootHash) return this.localRootHash;
+        try {
+            const h = this.tree.root_hash_hex();
+            return h && h.length > 0 ? h : null;
+        } catch {
+            return null;
+        }
     }
 
     /** Count of files currently tracked in sync-base. */
@@ -139,10 +158,192 @@ export class SyncEngine {
         this.eventRefs = [];
     }
 
-    /** Force a full sync cycle (pull then push pending). */
+    /** Force a full sync cycle (pull → reconcile content → push pending).
+     *
+     * reconcileContent() is the missing piece that used to let the server and
+     * client silently drift apart: sync-base said "everything's uploaded" but
+     * the server had no content. We now verify, on every Sync Now, that the
+     * server actually holds the content sync-base claims, and re-upload
+     * anything missing. Cheap when the server is fully populated (one
+     * checkContent call with N hashes), correct when it isn't. */
     async forceSync(): Promise<void> {
         await this.pullRemote();
+        try {
+            await this.reconcileContent();
+        } catch (e: any) {
+            console.error("[obsetync] reconcile error:", e);
+            this.lastError = {
+                ts: Date.now(),
+                origin: "reconcile",
+                message: String(e?.message ?? e),
+            };
+        }
         await this.pushPending();
+    }
+
+    /**
+     * Verify every file recorded in sync-base is actually present on the
+     * server, upload whatever is missing. This exists because `sync-base` is
+     * just a local cache of "what we believe the server has" — and the cache
+     * can lie (server wiped, user restored from backup, migrated from TLS
+     * server, etc.). Running it costs one `checkContent` for small files +
+     * one `checkContentChunks` per large file the server already knows about,
+     * plus real uploads for anything truly missing. O(1) network when the
+     * server is fully populated; O(missing) otherwise.
+     */
+    async reconcileContent(onProgress?: (msg: string) => void): Promise<{
+        smallUploaded: number;
+        largeUploaded: number;
+        treeChunksUploaded: number;
+        bytes: number;
+    }> {
+        const progress = onProgress ?? ((m: string) => this.onStatusUpdate(m));
+
+        // Populate the WASM tree from sync-base so wasm_tree_chunk_hashes
+        // reflects the actual index-chunk set the server should have. Same
+        // bootstrap push.ts does on first call.
+        if (!this.tree.root_hash_hex()) {
+            const paths = this.syncBase.allPaths();
+            if (paths.length > 0) {
+                const entries = paths.map(p => {
+                    const e = this.syncBase.getEntry(p)!;
+                    return { path: p, hash: e.hash, mtime_ms: e.mtime, size: e.size };
+                });
+                this.tree.build_from_entries(JSON.stringify(entries));
+            }
+        }
+
+        // --- Partition sync-base: small files (whole blobs) vs large (manifests+chunks).
+        const smallHashToPath = new Map<string, string>(); // first path wins
+        const largeHashToPath = new Map<string, string>();
+        for (const path of this.syncBase.allPaths()) {
+            const entry = this.syncBase.getEntry(path)!;
+            if (entry.size >= LARGE_FILE_THRESHOLD) {
+                if (!largeHashToPath.has(entry.hash)) largeHashToPath.set(entry.hash, path);
+            } else {
+                if (!smallHashToPath.has(entry.hash)) smallHashToPath.set(entry.hash, path);
+            }
+        }
+
+        // --- Step 1: which tree chunks (index) is the server missing?
+        const treeHashes = this.wasm.wasm_tree_chunk_hashes(this.tree);
+        const missingTreeChunks = treeHashes.length > 0
+            ? await this.api.checkChunks(treeHashes)
+            : [];
+
+        // --- Step 2: which small-file contents is the server missing?
+        const smallHashes = [...smallHashToPath.keys()];
+        const CHECK_BATCH = 1000;
+        const missingSmall: string[] = [];
+        for (let i = 0; i < smallHashes.length; i += CHECK_BATCH) {
+            const batch = smallHashes.slice(i, i + CHECK_BATCH);
+            const missing = await this.api.checkContent(batch);
+            missingSmall.push(...missing);
+            progress(`reconcile: checked ${Math.min(i + CHECK_BATCH, smallHashes.length)}/${smallHashes.length}`);
+        }
+
+        const totalMissing = missingTreeChunks.length + missingSmall.length + largeHashToPath.size;
+        if (totalMissing === 0) {
+            progress("reconcile: server in parity");
+            return { smallUploaded: 0, largeUploaded: 0, treeChunksUploaded: 0, bytes: 0 };
+        }
+
+        console.log(
+            `[obsetync] reconcile: server missing ${missingSmall.length} small files, ` +
+            `${missingTreeChunks.length} tree chunks; ${largeHashToPath.size} large files to verify`
+        );
+
+        const notice = totalMissing >= 20
+            ? new Notice(`Re-uploading ${missingSmall.length} files to server...`, 0)
+            : null;
+
+        let smallUploaded = 0;
+        let largeUploaded = 0;
+        let treeChunksUploaded = 0;
+        let bytes = 0;
+
+        // --- Step 3: upload missing tree (index) chunks.
+        for (const hash of missingTreeChunks) {
+            const chunkBytes = this.wasm.wasm_tree_get_chunk(this.tree, hash);
+            if (chunkBytes) {
+                await this.api.putChunk(hash, chunkBytes);
+                treeChunksUploaded++;
+                bytes += chunkBytes.length;
+            }
+        }
+
+        // --- Step 4: upload missing small-file content. Concurrent within
+        // bounded batches to keep peak memory sane.
+        const UPLOAD_CONCURRENCY = 4;
+        for (let i = 0; i < missingSmall.length; i += UPLOAD_CONCURRENCY) {
+            const batch = missingSmall.slice(i, i + UPLOAD_CONCURRENCY);
+            await Promise.all(batch.map(async hash => {
+                const path = smallHashToPath.get(hash);
+                if (!path) return;
+                try {
+                    const data = await this.io.readFile(path);
+                    // If content drifted since sync-base recorded it, skip — the next
+                    // scan cycle will detect the change via hash mismatch and push
+                    // the new version. Don't upload bytes under the WRONG hash.
+                    const actual = streamingHash(this.wasm, data);
+                    if (actual !== hash) return;
+                    await this.api.putContent(hash, data);
+                    smallUploaded++;
+                    bytes += data.length;
+                } catch (e) {
+                    console.warn(`[obsetync] reconcile skipped ${path}:`, e);
+                }
+            }));
+            const done = Math.min(i + UPLOAD_CONCURRENCY, missingSmall.length);
+            const msg = `reconcile: ${done}/${missingSmall.length} files · ${formatBytes(bytes)}`;
+            progress(msg);
+            notice?.setMessage(`Re-uploading: ${done}/${missingSmall.length} · ${formatBytes(bytes)}`);
+            await yieldToUI();
+        }
+
+        // --- Step 5: large files — manifest + sub-file chunks.
+        let largeIdx = 0;
+        for (const [hash, path] of largeHashToPath) {
+            largeIdx++;
+            progress(`reconcile: large file ${largeIdx}/${largeHashToPath.size}`);
+            notice?.setMessage(`Re-uploading large file ${largeIdx}/${largeHashToPath.size}`);
+            try {
+                const data = await this.io.readFile(path);
+                const actual = streamingHash(this.wasm, data);
+                if (actual !== hash) continue; // drifted — scan will pick up
+                const info = this.wasm.wasm_chunk_file(data);
+                const chunkHashes = (info.chunks as any[]).map(c => c.hash);
+                const missingChunks = chunkHashes.length > 0
+                    ? await this.api.checkContentChunks(chunkHashes)
+                    : [];
+                const missingSet = new Set(missingChunks);
+                for (const c of info.chunks as any[]) {
+                    if (missingSet.has(c.hash)) {
+                        const chunkData = this.wasm.wasm_get_file_chunk(data, c.offset, c.size);
+                        await this.api.putContentChunk(c.hash, chunkData);
+                        bytes += chunkData.length;
+                    }
+                }
+                await this.api.putManifest(hash, {
+                    file_hash: hash,
+                    total_size: info.total_size,
+                    chunks: info.chunks,
+                });
+                largeUploaded++;
+            } catch (e) {
+                console.warn(`[obsetync] reconcile skipped large ${path}:`, e);
+            }
+            await yieldToUI();
+        }
+
+        notice?.hide();
+        const summary =
+            `reconcile done: ${smallUploaded} small, ${largeUploaded} large, ` +
+            `${treeChunksUploaded} tree chunks, ${formatBytes(bytes)}`;
+        console.log(`[obsetync] ${summary}`);
+        progress(summary);
+
+        return { smallUploaded, largeUploaded, treeChunksUploaded, bytes };
     }
 
     /** Force a full vault scan (Layer 4). */

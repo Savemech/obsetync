@@ -36,15 +36,24 @@ services:
     image: obsetync/server:local
     container_name: obsetync-server
     restart: unless-stopped
+    environment:
+      # Log verbosity. Override via `RUST_LOG=sync_server=debug docker compose up`.
+      # Default: server info + global warnings. Examples:
+      #   sync_server=info                → sync events, enrollment, revocation
+      #   sync_server=debug               → per-request detail + chunk/content uploads
+      #   sync_server=trace               → plus AEAD internals
+      RUST_LOG: "${RUST_LOG:-sync_server=debug,warn}"
     ports:
-      # Sync API — exposed publicly (mTLS + bearer token auth).
+      # Sync API — exposed publicly (option-B AEAD + bearer token inside AEAD).
       - "27182:27182"
-      # Admin UI — bound to localhost. Put behind a reverse proxy / VPN if you
-      # need remote access.
-      - "127.0.0.1:27183:27183"
+      # Admin UI — exposed publicly too. No auth by itself; put behind a
+      # reverse proxy / VPN if the server is reachable from the open internet.
+      - "27183:27183"
     volumes:
-      # Host ./data/server → container /data (server's --data-dir).
-      - ./data/server:/data
+      # Host ./data → container /data (server's --data-dir).
+      # The server initializes sub-dirs (ca/, vaults/, index/, content/,
+      # enrollments/, devices/, server/) inside this path.
+      - ./data:/data
     read_only: true
     tmpfs:
       - /tmp:size=16m

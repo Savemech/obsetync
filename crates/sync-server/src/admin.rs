@@ -38,40 +38,139 @@ pub fn admin_router(state: SharedState) -> Router {
 
 async fn dashboard(State(state): State<SharedState>) -> Html<String> {
     let device_list = devices::list_devices(&state.layout).unwrap_or_default();
-    let vault_count = std::fs::read_dir(state.layout.base.join("vaults"))
-        .map(|d| d.filter_map(|e| e.ok()).count())
-        .unwrap_or(0);
+    let online = device_list
+        .iter()
+        .filter(|d| is_recent(d.last_seen))
+        .count();
+    let revoked = device_list
+        .iter()
+        .filter(|d| devices::is_revoked(&state.layout, &d.device_id))
+        .count();
+
+    // Vault inventory: list each vault + size of its current root (if any).
+    let vaults_dir = state.layout.base.join("vaults");
+    let mut vaults: Vec<(String, Option<u64>, Option<u64>)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&vaults_dir) {
+        for e in entries.filter_map(|e| e.ok()) {
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let name = e.file_name().to_string_lossy().to_string();
+                let (size, mtime) = current_root_stats(&state, &name);
+                vaults.push((name, size, mtime));
+            }
+        }
+    }
+    vaults.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Storage breakdown. content/ contains blobs + manifests/ + chunks/ —
+    // subtract the nested buckets so "small-file blobs" isolates the direct-
+    // content bytes cleanly.
+    let (idx_bytes, idx_files) = dir_stats(&state.layout.base.join("index"));
+    let content_root = state.layout.base.join("content");
+    let (manifest_bytes, manifest_files) = dir_stats(&content_root.join("manifests"));
+    let (chunk_bytes, chunk_files) = dir_stats(&content_root.join("chunks"));
+    let (content_all_bytes, content_all_files) = dir_stats(&content_root);
+    let blob_bytes = content_all_bytes.saturating_sub(manifest_bytes + chunk_bytes);
+    let blob_files = content_all_files.saturating_sub(manifest_files + chunk_files);
+    let total_bytes = idx_bytes + content_all_bytes;
+
+    let uptime = format_duration(state.started_at.elapsed());
 
     let device_rows: String = device_list
         .iter()
         .map(|d| {
-            let status = if is_recent(d.last_seen) { "Online" } else { "Offline" };
-            let dot = if is_recent(d.last_seen) { "🟢" } else { "⚪" };
+            let dot = if devices::is_revoked(&state.layout, &d.device_id) {
+                "⛔"
+            } else if is_recent(d.last_seen) {
+                "🟢"
+            } else {
+                "⚪"
+            };
+            let status = if devices::is_revoked(&state.layout, &d.device_id) {
+                "Revoked"
+            } else if is_recent(d.last_seen) {
+                "Online"
+            } else {
+                "Offline"
+            };
             format!(
-                "<tr><td>{} {}</td><td>{}</td><td>{}</td><td><a href='/admin/devices/{}'>details</a></td></tr>",
-                dot, d.name, status, format_time(d.last_seen), d.device_id
+                "<tr><td>{} {}</td><td>{}</td><td>{}</td><td>{}</td>\
+                 <td><a href='/admin/devices/{}'>details</a></td></tr>",
+                dot,
+                d.name,
+                status,
+                format_time(d.last_seen),
+                format_time(d.enrolled_at),
+                d.device_id
+            )
+        })
+        .collect();
+
+    let vault_rows: String = vaults
+        .iter()
+        .map(|(name, size, mtime)| {
+            format!(
+                "<tr><td><a href='/admin/vaults/{name}'>{name}</a></td>\
+                 <td>{}</td><td>{}</td></tr>",
+                size.map(format_bytes).unwrap_or_else(|| "(empty)".into()),
+                mtime.map(format_time).unwrap_or_else(|| "never".into()),
             )
         })
         .collect();
 
     Html(format!(
         r#"<!DOCTYPE html>
-<html><head><title>ObsetyNC Admin</title>{CSS}</head>
+<html><head>
+<title>ObsetyNC Admin</title>
+<meta http-equiv="refresh" content="30">
+{CSS}
+</head>
 <body>
 <h1>ObsetyNC Server</h1>
-<div class="stats">
-    <span>Vaults: {vault_count}</span>
-    <span>Devices: {}</span>
+
+<div class="kpi-grid">
+  <div class="kpi"><div class="kpi-label">Uptime</div><div class="kpi-val">{uptime}</div></div>
+  <div class="kpi"><div class="kpi-label">Devices</div>
+    <div class="kpi-val">{} <span class="kpi-sub">({} online, {} revoked)</span></div></div>
+  <div class="kpi"><div class="kpi-label">Vaults</div><div class="kpi-val">{}</div></div>
+  <div class="kpi"><div class="kpi-label">Total storage</div><div class="kpi-val">{}</div></div>
 </div>
+
+<h2>Storage breakdown</h2>
+<table>
+<tr><th>Category</th><th>Files</th><th>Bytes</th></tr>
+<tr><td>Index (Merkle tree)</td><td>{}</td><td>{}</td></tr>
+<tr><td>Small-file blobs</td><td>{}</td><td>{}</td></tr>
+<tr><td>Large-file manifests</td><td>{}</td><td>{}</td></tr>
+<tr><td>Large-file sub-chunks</td><td>{}</td><td>{}</td></tr>
+</table>
+
+<h2>Vaults</h2>
+<table>
+<tr><th>Vault</th><th>Current root</th><th>Last push</th></tr>
+{vault_rows}
+</table>
+
 <h2>Devices</h2>
 <table>
-<tr><th>Name</th><th>Status</th><th>Last Seen</th><th></th></tr>
+<tr><th>Name</th><th>Status</th><th>Last Seen</th><th>Enrolled</th><th></th></tr>
 {device_rows}
 </table>
 <p><a href="/admin/devices/new" class="btn">+ Add Device</a></p>
-<p><a href="/admin/vaults">View Vaults</a></p>
+<p class="footer">Dashboard auto-refreshes every 30 s.</p>
 </body></html>"#,
         device_list.len(),
+        online,
+        revoked,
+        vaults.len(),
+        format_bytes(total_bytes),
+        idx_files,
+        format_bytes(idx_bytes),
+        blob_files,
+        format_bytes(blob_bytes),
+        manifest_files,
+        format_bytes(manifest_bytes),
+        chunk_files,
+        format_bytes(chunk_bytes),
     ))
 }
 
@@ -91,8 +190,18 @@ async fn device_list(State(state): State<SharedState>) -> Html<String> {
                 "Offline"
             };
             format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td><a href='/admin/devices/{}'>details</a></td></tr>",
-                d.name, status, format_time(d.last_seen), d.device_id
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
+                 <td><a href='/admin/devices/{}'>details</a></td></tr>",
+                d.name,
+                status,
+                format_time(d.last_seen),
+                format_time(d.enrolled_at),
+                if d.vaults.is_empty() {
+                    "—".into()
+                } else {
+                    d.vaults.join(", ")
+                },
+                d.device_id
             )
         })
         .collect();
@@ -103,7 +212,7 @@ async fn device_list(State(state): State<SharedState>) -> Html<String> {
 <body>
 <h1><a href="/admin">ObsetyNC</a> / Devices</h1>
 <table>
-<tr><th>Name</th><th>Status</th><th>Last Seen</th><th></th></tr>
+<tr><th>Name</th><th>Status</th><th>Last Seen</th><th>Enrolled</th><th>Vaults</th><th></th></tr>
 {rows}
 </table>
 <p><a href="/admin/devices/new" class="btn">+ Add Device</a></p>
@@ -139,6 +248,13 @@ async fn create_device(
 ) -> Result<Html<String>, ServerErrorHtml> {
     let info = enrollment::create_enrollment(&state.layout, &form.device_name)
         .map_err(|e| ServerErrorHtml(format!("enrollment failed: {}", e)))?;
+
+    tracing::info!(
+        device_name = %info.device_name,
+        device = %&info.device_id[..info.device_id.len().min(12)],
+        code = %info.code,
+        "enrollment: code issued"
+    );
 
     Ok(Html(format!(
         r#"<!DOCTYPE html>
@@ -222,6 +338,10 @@ async fn revoke_device(
 ) -> Result<Redirect, ServerErrorHtml> {
     devices::revoke_device(&state.layout, &device_id)
         .map_err(|e| ServerErrorHtml(format!("revoke failed: {}", e)))?;
+    tracing::info!(
+        device = %&device_id[..device_id.len().min(12)],
+        "devices: revoked"
+    );
     Ok(Redirect::to(&format!("/admin/devices/{}", device_id)))
 }
 
@@ -382,6 +502,12 @@ async fn claim_enrollment(
 
     match enrollment::claim_enrollment(&state.layout, &code) {
         Ok(info) => {
+            tracing::info!(
+                device_name = %info.device_name,
+                device = %&info.device_id[..info.device_id.len().min(12)],
+                code = %code,
+                "enrollment: claimed (bundle issued)"
+            );
             let bundle = serde_json::json!({
                 "device_name":     info.device_name,
                 "device_id":       info.device_id,
@@ -395,12 +521,15 @@ async fn claim_enrollment(
             )
                 .into_response()
         }
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            serde_json::json!({ "error": e }).to_string(),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::warn!(code = %code, reason = %e, "enrollment: claim failed");
+            (
+                StatusCode::BAD_REQUEST,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({ "error": e }).to_string(),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -455,8 +584,93 @@ fn format_time(timestamp_ms: u64) -> String {
     }
 }
 
+fn format_bytes(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    if n >= GB {
+        format!("{:.2} GB", n as f64 / GB as f64)
+    } else if n >= MB {
+        format!("{:.1} MB", n as f64 / MB as f64)
+    } else if n >= KB {
+        format!("{} KB", n / KB)
+    } else {
+        format!("{} B", n)
+    }
+}
+
+fn format_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    let days = secs / 86400;
+    let hours = (secs % 86400) / 3600;
+    let mins = (secs % 3600) / 60;
+    let s = secs % 60;
+    if days > 0 {
+        format!("{}d {}h", days, hours)
+    } else if hours > 0 {
+        format!("{}h {}m", hours, mins)
+    } else if mins > 0 {
+        format!("{}m {}s", mins, s)
+    } else {
+        format!("{}s", s)
+    }
+}
+
+/// Walk a directory tree and sum `(total_bytes, file_count)` of all regular
+/// files. Used by the admin dashboard to show storage breakdown without
+/// needing an external tool like `du`.
+fn dir_stats(path: &std::path::Path) -> (u64, u64) {
+    let mut bytes: u64 = 0;
+    let mut count: u64 = 0;
+    let entries = match std::fs::read_dir(path) {
+        Ok(e) => e,
+        Err(_) => return (0, 0),
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        match entry.file_type() {
+            Ok(ft) if ft.is_file() => {
+                if let Ok(m) = entry.metadata() {
+                    bytes += m.len();
+                    count += 1;
+                }
+            }
+            Ok(ft) if ft.is_dir() => {
+                let (b, c) = dir_stats(&entry.path());
+                bytes += b;
+                count += c;
+            }
+            _ => {}
+        }
+    }
+    (bytes, count)
+}
+
+/// Size + last-modified-ms (epoch) of the current root blob for a vault.
+/// Returns (None, None) if the vault has no current root.
+fn current_root_stats(
+    state: &crate::state::SharedState,
+    vault_id: &str,
+) -> (Option<u64>, Option<u64>) {
+    let hash = match state.vaults.get_current_root(vault_id) {
+        Some(h) => h,
+        None => return (None, None),
+    };
+    let path = state.layout.vault_root_path(vault_id, &hash);
+    match std::fs::metadata(&path) {
+        Ok(m) => {
+            let mtime_ms = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64);
+            (Some(m.len()), mtime_ms)
+        }
+        Err(_) => (None, None),
+    }
+}
+
 const CSS: &str = r#"<style>
-body { font-family: -apple-system, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; color: #333; }
+body { font-family: -apple-system, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; color: #333; }
 h1 { border-bottom: 2px solid #eee; padding-bottom: 10px; }
 h1 a { color: #333; text-decoration: none; }
 h1 a:hover { color: #666; }
@@ -473,4 +687,10 @@ code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; font-size: 0.9
 .success { background: #e8f5e9; border: 1px solid #c8e6c9; padding: 16px; border-radius: 4px; }
 .error { color: #d32f2f; }
 .stats { display: flex; gap: 30px; font-size: 1.1em; margin: 20px 0; }
+.kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin: 20px 0; }
+.kpi { border: 1px solid #e0e0e0; border-radius: 6px; padding: 12px 16px; background: #fafafa; }
+.kpi-label { color: #666; font-size: 0.85em; text-transform: uppercase; letter-spacing: 0.5px; }
+.kpi-val   { font-size: 1.3em; font-weight: 600; margin-top: 4px; color: #1a73e8; }
+.kpi-sub   { font-size: 0.75em; color: #888; font-weight: 400; }
+.footer    { color: #888; font-size: 0.85em; margin-top: 30px; }
 </style>"#;

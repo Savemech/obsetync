@@ -249,11 +249,20 @@ export class SyncSettingTab extends PluginSettingTab {
                     const startedAt = Date.now();
                     try {
                         await this.plugin.syncNow();
-                        const err = this.plugin.syncEngineOrNull()?.getLastError();
+                        const engine = this.plugin.syncEngineOrNull();
+                        const err = engine?.getLastError();
                         if (err && err.ts >= startedAt) {
-                            new Notice(`Sync had errors: [${err.origin}] ${err.message.slice(0, 80)}${err.message.length > 80 ? "…" : ""}`);
+                            new Notice(
+                                `Sync had errors: [${err.origin}] ${err.message.slice(0, 80)}${err.message.length > 80 ? "…" : ""}`
+                            );
                         } else {
-                            new Notice("Sync complete.");
+                            // Distinguish "nothing to do" from "applied changes"
+                            // so the user isn't left wondering whether the
+                            // click did anything.
+                            const localRoot  = engine?.getLocalRootHash() ?? null;
+                            const serverRoot = engine?.getLastObservedServerRoot() ?? null;
+                            const inSync = !!localRoot && localRoot === serverRoot;
+                            new Notice(inSync ? "Already up to date." : "Sync complete.");
                         }
                     } catch (e: any) {
                         new Notice(`Sync failed: ${e.message}`);
@@ -306,6 +315,47 @@ export class SyncSettingTab extends PluginSettingTab {
                     }
                 })
             );
+
+        new Setting(containerEl)
+            .setName("Reconcile with server")
+            .setDesc(
+                "Verify the server actually holds every file in sync-base, " +
+                "re-upload anything missing. Use after a server wipe or " +
+                "when you suspect the server drifted from the client cache."
+            )
+            .addButton((btn) =>
+                btn.setButtonText("Reconcile with server").onClick(async () => {
+                    const engine = this.plugin.syncEngineOrNull();
+                    if (!engine) {
+                        new Notice("Sync engine not ready.");
+                        return;
+                    }
+                    const startedAt = Date.now();
+                    try {
+                        const r = await engine.reconcileContent();
+                        const total = r.smallUploaded + r.largeUploaded + r.treeChunksUploaded;
+                        if (total === 0) {
+                            new Notice("Server already has all content.");
+                        } else {
+                            new Notice(
+                                `Uploaded ${r.smallUploaded} files, ` +
+                                `${r.largeUploaded} large files, ` +
+                                `${r.treeChunksUploaded} tree chunks.`
+                            );
+                        }
+                        const err = engine.getLastError();
+                        if (err && err.ts >= startedAt) {
+                            new Notice(
+                                `Reconcile had errors: [${err.origin}] ${err.message.slice(0, 80)}${err.message.length > 80 ? "…" : ""}`
+                            );
+                        }
+                    } catch (e: any) {
+                        new Notice(`Reconcile failed: ${e.message}`);
+                    } finally {
+                        this.display();
+                    }
+                })
+            );
     }
 
     /** Non-sensitive status snapshot rendered inline in the settings tab. */
@@ -338,10 +388,17 @@ export class SyncSettingTab extends PluginSettingTab {
             line.createSpan({ text: value });
         };
 
-        row("Engine state", engine?.getState() ?? "not-initialized");
+        const localRoot  = engine?.getLocalRootHash() ?? null;
+        const serverRoot = engine?.getLastObservedServerRoot() ?? null;
+        const inSync     = !!localRoot && !!serverRoot && localRoot === serverRoot;
+        const syncLabel  = inSync
+            ? "✓ in sync"
+            : engine?.getState() ?? "not-initialized";
+
+        row("Sync",         syncLabel);
         row("Last sync",    relTime(engine?.getLastSyncTimestamp() ?? 0));
-        row("Local root",   t(engine?.getLocalRootHash()));
-        row("Server root",  t(engine?.getLastObservedServerRoot()));
+        row("Local root",   t(localRoot));
+        row("Server root",  t(serverRoot));
         row("sync-base",    `${engine?.getSyncBaseCount() ?? 0} entries`);
         row("Vault files",  `${engine?.getVaultFileCount() ?? 0}`);
         row("Enrolled",     this.plugin.settings.enrolled ? "yes" : "no");
