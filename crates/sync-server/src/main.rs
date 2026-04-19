@@ -1,5 +1,6 @@
 mod admin;
 mod api;
+mod box_key;
 mod bridge;
 mod ca;
 mod config;
