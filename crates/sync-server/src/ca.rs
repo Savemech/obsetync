@@ -75,7 +75,10 @@ pub fn init_server_cert(
     fs::write(server_dir.join("server.crt"), server_cert.pem())?;
     fs::write(server_dir.join("server.key"), server_key.serialize_pem())?;
 
-    tracing::info!("server certificate generated for hostnames: {:?}", hostnames);
+    tracing::info!(
+        "server certificate generated for hostnames: {:?}",
+        hostnames
+    );
     Ok(())
 }
 

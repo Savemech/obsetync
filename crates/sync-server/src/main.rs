@@ -67,13 +67,19 @@ async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Init { data_dir, hostnames } => {
+        Command::Init {
+            data_dir,
+            hostnames,
+        } => {
             if let Err(e) = cmd_init(&data_dir, &hostnames) {
                 tracing::error!("init failed: {}", e);
                 std::process::exit(1);
             }
         }
-        Command::RegenServerCert { data_dir, hostnames } => {
+        Command::RegenServerCert {
+            data_dir,
+            hostnames,
+        } => {
             if let Err(e) = cmd_regen_server_cert(&data_dir, &hostnames) {
                 tracing::error!("regen-server-cert failed: {}", e);
                 std::process::exit(1);
@@ -116,7 +122,10 @@ fn cmd_init(data_dir: &PathBuf, hostnames: &[String]) -> Result<(), Box<dyn std:
         println!();
         println!("WARNING: no --hostname was given. Clients connecting via DNS names other");
         println!("than localhost (iOS especially) will reject the cert. Re-run with:");
-        println!("  obsetync-server regen-server-cert --data-dir {} \\", data_dir.display());
+        println!(
+            "  obsetync-server regen-server-cert --data-dir {} \\",
+            data_dir.display()
+        );
         println!("    --hostname <your-host>");
     }
     println!();
