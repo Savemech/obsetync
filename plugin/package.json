@@ -1,6 +1,6 @@
 {
   "name": "obsetync",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Self-hosted Obsidian vault sync",
   "main": "main.js",
   "scripts": {

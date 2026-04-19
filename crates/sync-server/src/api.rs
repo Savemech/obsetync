@@ -28,11 +28,14 @@ async fn require_bearer(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
 
-    match token {
-        Some(t) if devices::lookup_token(&state.layout, t).is_some() => {
+    match token.and_then(|t| devices::lookup_token(&state.layout, t)) {
+        Some(fingerprint) => {
+            // Best-effort: keep the admin UI's "Online" badge honest.
+            // Throttled to ~once per 30s per device so it doesn't hammer disk.
+            let _ = devices::touch_last_seen(&state.layout, &fingerprint);
             next.run(request).await.into_response()
         }
-        _ => StatusCode::UNAUTHORIZED.into_response(),
+        None => StatusCode::UNAUTHORIZED.into_response(),
     }
 }
 

@@ -62,14 +62,25 @@ pub fn lookup_token(layout: &StorageLayout, token: &str) -> Option<String> {
         .map(|s| s.trim().to_owned())
 }
 
-/// Update the last_seen timestamp for a device.
-#[allow(dead_code)]
-pub fn update_last_seen(layout: &StorageLayout, fingerprint: &str) -> Result<(), std::io::Error> {
+/// Throttle: only rewrite device.json if last_seen is older than this.
+/// 30s keeps the admin UI accurate (5-minute "Online" window) without
+/// doing a file write on every single API request during a busy push.
+const TOUCH_THROTTLE_MS: u64 = 30_000;
+
+/// Update the last_seen timestamp for a device, throttled to avoid excess writes.
+/// Called by the bearer-token auth middleware on every authenticated request.
+pub fn touch_last_seen(layout: &StorageLayout, fingerprint: &str) -> Result<(), std::io::Error> {
     let path = layout.device_dir(fingerprint).join("device.json");
     let data = fs::read_to_string(&path)?;
     let mut info: DeviceInfo = serde_json::from_str(&data)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    info.last_seen = now_ms();
+
+    let now = now_ms();
+    if now.saturating_sub(info.last_seen) < TOUCH_THROTTLE_MS {
+        return Ok(()); // recent enough, skip the write
+    }
+
+    info.last_seen = now;
     let json = serde_json::to_string_pretty(&info)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     fs::write(&path, json)?;
