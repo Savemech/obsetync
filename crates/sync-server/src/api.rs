@@ -42,14 +42,14 @@ async fn secure_envelope(
     };
 
     let server_priv = StaticSecret::from(state.server_priv_bytes);
-    let decrypted =
-        match secure::decrypt_request(&body_bytes, &server_priv, method.as_str(), &path) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::debug!("decrypt failed on {} {}: {}", method, path, e);
-                return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-            }
-        };
+    let decrypted = match secure::decrypt_request(&body_bytes, &server_priv, method.as_str(), &path)
+    {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::debug!("decrypt failed on {} {}: {}", method, path, e);
+            return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        }
+    };
 
     let device_id = match devices::lookup_token(&state.layout, &decrypted.bearer_token) {
         Some(id) => id,
@@ -73,23 +73,30 @@ async fn secure_envelope(
     let resp_bytes = match axum::body::to_bytes(resp_body, MAX_BODY_BYTES).await {
         Ok(b) => b,
         Err(_) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "response body read failed")
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "response body read failed",
+            )
                 .into_response()
         }
     };
 
-    let encrypted =
-        match secure::encrypt_response(&resp_bytes, &decrypted.shared_secret, method.as_str(), &path) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::error!("encrypt response failed: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "response encryption failed",
-                )
-                    .into_response();
-            }
-        };
+    let encrypted = match secure::encrypt_response(
+        &resp_bytes,
+        &decrypted.shared_secret,
+        method.as_str(),
+        &path,
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!("encrypt response failed: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "response encryption failed",
+            )
+                .into_response();
+        }
+    };
 
     let mut out = Response::from_parts(resp_parts, Body::from(encrypted));
     out.headers_mut().remove(axum::http::header::CONTENT_LENGTH);
@@ -110,10 +117,7 @@ pub fn sync_router(state: SharedState) -> Router {
         .route("/api/v1/chunk/{hash}", get(get_chunk).put(put_chunk))
         .route("/api/v1/chunks/check", post(post_chunks_check))
         // Content (small files)
-        .route(
-            "/api/v1/content/{hash}",
-            get(get_content).put(put_content),
-        )
+        .route("/api/v1/content/{hash}", get(get_content).put(put_content))
         .route("/api/v1/content/check", post(post_content_check))
         // Content manifests (large files)
         .route(
