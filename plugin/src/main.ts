@@ -103,9 +103,9 @@ export default class SyncPlugin extends Plugin {
         push(`Vault ID:          ${this.settings.vaultId || "(unset)"}`);
         push(`Device name:       ${this.settings.deviceName || "(unset)"}`);
         push(`Enrolled:          ${this.settings.enrolled}`);
-        push(`Fingerprint:       ${trunc(this.settings.fingerprint, 24)}`);
+        push(`Device ID:         ${trunc(this.settings.deviceId, 24)}`);
         push(`Bearer token:      ${this.settings.bearerToken ? "present" : "MISSING"}`);
-        push(`Device cert+key:   ${this.settings.certPem && this.settings.keyPem ? "present" : "missing"}`);
+        push(`Server box pubkey: ${trunc(this.settings.serverBoxPub, 24)}`);
         push(`Sync interval:     ${this.settings.syncIntervalMs}ms`);
         push(`Sync priority:     ${this.settings.syncPriority}`);
         push(`Sync .obsidian/:   ${this.settings.syncObsidianConfig}`);
@@ -113,8 +113,7 @@ export default class SyncPlugin extends Plugin {
         push("");
 
         push("--- Platform ---");
-        const isNode = typeof (window as any).require === "function";
-        push(`Transport mode:    ${isNode ? "Node.js https (desktop)" : "requestUrl (mobile)"}`);
+        push(`Transport:         option-B (X25519 + AES-256-GCM over HTTP)`);
         push(`WASM:              ${this.wasm ? "loaded" : "not loaded"}`);
         push(`Plugin id:         ${this.manifest.id}`);
         push(`Plugin version:    ${this.manifest.version}`);
@@ -153,9 +152,9 @@ export default class SyncPlugin extends Plugin {
             try {
                 push("ping() → ...");
                 const p = await this.api.ping();
-                push(`  TLS:              ${p.tlsVersion} / ${p.cipher}`);
-                push(`  Server fp:        ${p.serverFingerprint}`);
-                push(`  Device cert sent: ${p.deviceCert}`);
+                push(`  Server URL:       ${p.serverUrl}`);
+                push(`  Reachable:        ${p.ok ? "yes" : "no"}`);
+                push(`  Transport:        ${p.transport}`);
             } catch (e: any) {
                 push(`  ping failed:      ${e?.message ?? e}`);
             }
@@ -202,17 +201,18 @@ export default class SyncPlugin extends Plugin {
 
     /** Enroll this device with the server using an enrollment code. */
     async enroll(code: string): Promise<void> {
-        const tempApi = new SyncApi(this.settings.serverUrl);
+        // Enrollment is over plain HTTP to the admin port. We pass empty
+        // strings for box_pub + bearer_token since claimEnrollment doesn't
+        // need a SecureChannel (admin endpoint is unauthenticated).
+        const tempApi = new SyncApi(this.settings.serverUrl, "", "");
         const result = await tempApi.claimEnrollment(code);
 
-        this.settings.certPem      = result.cert_pem;
-        this.settings.keyPem       = result.key_pem;
-        this.settings.fingerprint  = result.fingerprint;
+        this.settings.deviceId     = result.device_id;
         this.settings.bearerToken  = result.bearer_token;
+        this.settings.serverBoxPub = result.server_box_pub;
         this.settings.enrolled     = true;
         await this.saveSettings();
 
-        // Re-initialize sync with the new credentials.
         await this.initSync();
     }
 
@@ -257,11 +257,10 @@ export default class SyncPlugin extends Plugin {
         // Stop existing engine if re-initializing.
         this.syncEngine?.stop();
 
-        // Create API client with mTLS credentials.
+        // Create API client with option-B credentials.
         this.api = new SyncApi(
             this.settings.serverUrl,
-            this.settings.certPem,
-            this.settings.keyPem,
+            this.settings.serverBoxPub,
             this.settings.bearerToken,
         );
 
