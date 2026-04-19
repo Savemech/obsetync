@@ -45,7 +45,7 @@ jobs:
       - name: Build WASM
         run: |
           wasm-pack build crates/sync-core \
-            --target web \
+            --target no-modules \
             --out-dir ../../plugin/wasm \
             --release \
             -- --features wasm --no-default-features

@@ -311,23 +311,22 @@ export default class SyncPlugin extends Plugin {
     }
 
     private async loadWasm(): Promise<WasmModule> {
-        // Load strategy that works on BOTH Electron (desktop) and WKWebView (iOS).
+        // Load strategy that avoids dynamic `import()` entirely. Obsidian's
+        // plugin sandbox on iOS rejects import() of any URL (capacitor://,
+        // blob:, data:), so we switched wasm-pack to `--target no-modules`.
+        // That output is a plain script — no `export`, no ES module syntax —
+        // which defines `wasm_bindgen` on its surrounding scope.
         //
-        // On desktop, dynamic import of `getResourcePath()` works because the URL
-        // ends up as file:// or app:// and Electron allows both. On iOS the URL
-        // uses the `capacitor://` scheme which WKWebView refuses to dynamic-import,
-        // so we rebuild the module via blob: URL instead:
+        //   1. Read sync_core.js (plain-script glue) as text.
+        //   2. Read sync_core_bg.wasm as bytes.
+        //   3. Wrap the glue in a Function body; its scope declares
+        //      `let wasm_bindgen;` which gets assigned inside the IIFE the
+        //      glue defines. We return `wasm_bindgen` from the Function.
+        //   4. Call `wasm_bindgen(wasmBytes)` to initialize. It returns the
+        //      exports object that fits our `WasmModule` interface.
         //
-        //   1. Read sync_core.js (the wasm-bindgen JS glue) as text.
-        //   2. Read sync_core_bg.wasm as bytes, base64-encode them.
-        //   3. Patch the glue so its default input is the inline ArrayBuffer
-        //      instead of `new URL('sync_core_bg.wasm', import.meta.url)` — that
-        //      URL wouldn't resolve from inside a blob anyway.
-        //   4. Wrap the patched JS in a blob, create an object URL, dynamic-import.
-        //   5. Revoke the URL once the module has loaded.
-        //
-        // This avoids the stub path entirely on iOS; hashing + tree ops run on
-        // real Blake3 / wasm-bindgen code, not the JS stub.
+        // This works on Electron and iOS WKWebView alike because new Function
+        // is universally supported, unlike dynamic import in sandboxed plugins.
         const pluginDir = ".obsidian/plugins/obsetync";
         const adapter = this.app.vault.adapter;
 
@@ -337,50 +336,29 @@ export default class SyncPlugin extends Plugin {
                 adapter.readBinary(`${pluginDir}/sync_core_bg.wasm`),
             ]);
 
-            const wasmBytes = new Uint8Array(wasmBuf);
-            // btoa + String.fromCharCode.apply blows the stack on large arrays —
-            // chunk to 32 KB and concat.
-            const CHUNK = 32_768;
-            let base64 = "";
-            for (let i = 0; i < wasmBytes.length; i += CHUNK) {
-                const end = Math.min(i + CHUNK, wasmBytes.length);
-                base64 += btoa(
-                    String.fromCharCode.apply(
-                        null,
-                        wasmBytes.subarray(i, end) as unknown as number[]
-                    )
-                );
-            }
-
-            // wasm-pack --target web emits literally:
-            //   input = new URL('sync_core_bg.wasm', import.meta.url);
-            // Replace with inline bytes.
-            const inlineInput =
-                "input=(()=>{const b=atob(\"" +
-                base64 +
-                "\");const a=new Uint8Array(b.length);for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return a.buffer;})();";
-
-            const patched = jsText.replace(
-                /input\s*=\s*new\s+URL\s*\(\s*['"`]sync_core_bg\.wasm['"`]\s*,\s*import\.meta\.url\s*\)\s*;/,
-                inlineInput
+            // wasm-pack --target no-modules declares `wasm_bindgen` implicitly
+            // (via the IIFE). We expose `let wasm_bindgen` in our Function's
+            // scope so the glue's assignment sticks, then return it.
+            const glue = new Function(
+                "let wasm_bindgen;\n" + jsText + "\nreturn wasm_bindgen;"
             );
+            const wasm_bindgen: any = glue();
 
-            if (patched === jsText) {
-                console.warn(
-                    "[obsetync] wasm-pack URL pattern not found in sync_core.js; " +
-                    "the loader may fail at runtime. Consider regenerating with current wasm-pack."
+            if (typeof wasm_bindgen !== "function") {
+                throw new Error(
+                    "sync_core.js did not define wasm_bindgen — is it built with `--target no-modules`?"
                 );
             }
 
-            const blob = new Blob([patched], { type: "application/javascript" });
-            const url = URL.createObjectURL(blob);
-            try {
-                const mod = await import(/* webpackIgnore: true */ url);
-                await mod.default();
-                return mod;
-            } finally {
-                URL.revokeObjectURL(url);
-            }
+            // `wasm_bindgen(input)` initializes the module and resolves to an
+            // object with all the exported functions. Pass the raw bytes so it
+            // doesn't try to fetch a URL.
+            const exports = await wasm_bindgen(new Uint8Array(wasmBuf));
+
+            // The exports object has all the `wasm_*` functions + `WasmTree`
+            // constructor + `Hasher` class. Structural compatibility with
+            // WasmModule, so an `as` cast is safe here.
+            return exports as unknown as WasmModule;
         } catch (e) {
             console.warn(
                 "[obsetync] WASM load failed, using stub. " +
