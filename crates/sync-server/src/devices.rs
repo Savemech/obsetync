@@ -1,9 +1,10 @@
 use crate::storage::StorageLayout;
 use std::fs;
 
-/// Enrolled device metadata. Under option-B transport we no longer store a
-/// client certificate — device identity is the random `device_id` from
-/// enrollment, and the bearer token is the thing that actually authenticates.
+/// Enrolled device metadata. No client certificate is stored — device
+/// identity is the random `device_id` from enrollment, and the bearer
+/// token (carried inside the encrypted request body) is what actually
+/// authenticates.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DeviceInfo {
     pub name: String,

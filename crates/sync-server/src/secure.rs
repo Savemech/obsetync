@@ -1,4 +1,6 @@
-//! Option-B secure transport: X25519 ECDH + HKDF-SHA256 + AES-256-GCM.
+//! Secure transport: X25519 ECDH + HKDF-SHA256 + AES-256-GCM.
+//!
+//! Full wire-format + threat model: `../../../docs/transport.md`.
 //!
 //! Replaces the old self-signed CA + mTLS stack. iOS `requestUrl` can reach
 //! the server over plain HTTP; the payload is encrypted end-to-end using the
@@ -111,7 +113,7 @@ fn hkdf_key(shared: &[u8], nonce: &[u8], info: &[u8]) -> [u8; KEY_LEN] {
     out
 }
 
-/// Decrypt an option-B request from a raw HTTP body.
+/// Decrypt a request from a raw HTTP body.
 ///
 /// - `body` is the full request body bytes.
 /// - `our_priv` is the server's long-term X25519 private key.

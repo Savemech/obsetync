@@ -1,5 +1,5 @@
-//! Server X25519 "box" keypair — the long-term identity used by the option-B
-//! encrypted transport.
+//! Server X25519 "box" keypair — the long-term identity for the AEAD
+//! envelope transport. See `../../../docs/transport.md`.
 //!
 //! Clients learn the public key at enrollment time and use it as the remote
 //! static key in per-request ECDH. Compromise of this key does NOT reveal past

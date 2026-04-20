@@ -143,17 +143,14 @@ async fn cmd_run(
     let sync_addr = format!("0.0.0.0:{}", sync_port);
     let sync_listener = tokio::net::TcpListener::bind(&sync_addr).await?;
 
-    println!(
-        "Sync API:  http://{} (option-B encrypted payloads)",
-        sync_addr
-    );
+    println!("Sync API:  http://{} (AEAD-encrypted payloads)", sync_addr);
     println!("Admin GUI: http://{}", admin_addr);
 
     tracing::info!(
         sync = %sync_addr,
         admin = %admin_addr,
         data_dir = %data_dir.display(),
-        "server listening (option-B transport: X25519 + AES-256-GCM over HTTP)"
+        "server listening (AEAD envelope over HTTP: X25519 + HKDF-SHA256 + AES-256-GCM)"
     );
 
     tokio::select! {

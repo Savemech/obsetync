@@ -1,15 +1,20 @@
-# Transport security — option-B
+# Transport security
 
-ObsetyNC does not use TLS. Every sync-API request is wrapped in a
-self-contained **AEAD envelope** built from stock primitives:
+Every sync-API request is wrapped in an **authenticated-encryption
+envelope** that the server's middleware opens before routing and that
+the middleware reseals on the way back out. The wire is plain HTTP;
+everything inside the POST body is ciphertext.
+
+Building blocks:
 
 ```
 X25519 ECDH   +   HKDF-SHA256   +   AES-256-GCM
 ```
 
-…carried in the body of plain HTTP requests. This doc specifies the
-protocol completely: wire format, key schedule, authentication, threat
-model, and the reasoning behind each choice.
+…all from audited, widely-deployed libraries (`x25519-dalek` on the
+server, `@noble/curves` + `SubtleCrypto` in the browser). This document
+specifies the protocol completely: the choice space that led here, the
+wire format, the key schedule, the threat model, and a worked example.
 
 Reference implementations:
 
@@ -19,23 +24,72 @@ Reference implementations:
 
 ---
 
-## 1. Why not TLS
+## 1. How we got here
 
-Before 1.1.0 ObsetyNC ran mTLS with a private CA. Two problems made it
-untenable:
+Self-hosted sync needs a secure channel between the plugin (desktop
+Obsidian + iOS Obsidian) and the server. Three realistic paths:
 
-1. **iOS can't present a client certificate from JavaScript.** WKWebView
-   will not attach client certs to `fetch` or Obsidian's `requestUrl`, so
-   mobile enrollment needed a second auth path (bearer token) in addition
-   to TLS — two systems to reason about.
-2. **CA install ceremony.** Users had to trust a self-signed root on every
-   device. That's a security footgun (the CA can sign anything for any
-   host) and a UX footgun (iOS trust-profile installation is a maze).
+### Path A — standard HTTPS / TLS with client certs
 
-Option-B collapses both. The server runs plain HTTP. Payload security
-comes from an authenticated-encryption envelope whose keys are pinned at
-enrollment, one device at a time. No TLS library on the server, no CA,
-no per-device cert, identical code path desktop and mobile.
+The textbook answer. The server runs TLS, clients present a client
+certificate at enrollment, and mTLS authenticates each direction. This
+is what ObsetyNC used up to 1.0.x.
+
+It broke on two hard edges:
+
+1. **iOS WKWebView will not attach a client certificate** to `fetch` or
+   Obsidian's `requestUrl`. Mobile enrollment needed a *second* auth
+   system (a bearer token) running next to mTLS, effectively doubling
+   the attack surface and the operator's cognitive load.
+2. **Users had to install a private CA certificate** on every device.
+   That's a significant security footgun (a rogue CA cert can sign
+   anything for any host the device reaches) and a significant UX
+   footgun (iOS's trust-profile installation is a maze and can be
+   undone silently by an iOS update that distrusts unknown roots).
+
+### Path B — libsodium's `crypto_box` / sealed boxes
+
+libsodium ships a batteries-included primitive
+([`crypto_box`](https://doc.libsodium.org/public-key_cryptography/authenticated_encryption))
+that bundles X25519 + XSalsa20 + Poly1305 and handles nonce generation,
+key derivation, and AEAD for you. It's correct, fast, and well-reviewed.
+
+It has two costs for this specific product:
+
+1. **No universal browser build.** libsodium.js exists, but it ships
+   ~300 KB of emscripten-compiled WASM whose loading path is the exact
+   thing iOS WKWebView is strictest about (CSP + eval). We already have
+   one WASM module to load (for hashing + Merkle-tree operations);
+   bolting another one on for just ECDH+AEAD doubles the load-time
+   failure surface.
+2. **Wire format is opaque.** `crypto_box` picks a nonce layout, a
+   key-derivation step, and a padding scheme that are baked into the
+   library. If it ever needs to change — say, to add a bearer-token
+   slot inside the ciphertext, or to bind the request method into the
+   authenticated data — you're either forking libsodium or layering
+   another framing on top.
+
+### Path C — a minimal AEAD envelope from well-reviewed primitives
+
+The path this project took. Instead of depending on a single
+batteries-included library, we compose three NIST/IRTF-standardized
+primitives that every cryptographic library and every modern browser
+already ships:
+
+| Primitive        | Purpose                      | Standard   | Where on the client                | Where on the server |
+|------------------|------------------------------|------------|------------------------------------|---------------------|
+| **X25519**       | Ephemeral ECDH key agreement | RFC 7748   | `@noble/curves`                    | `x25519-dalek`      |
+| **HKDF-SHA256**  | Derive per-message AES keys  | RFC 5869   | `SubtleCrypto.deriveBits`          | `hkdf` crate        |
+| **AES-256-GCM**  | Authenticated encryption     | SP 800-38D | `SubtleCrypto.encrypt` / `.decrypt`| `aes-gcm` crate     |
+
+The protocol is **stateless on the wire** — one HTTP request, one
+envelope — so no handshake-message ordering, no replay windows, no
+session-resumption ticket format. A single 45-byte header carries
+everything the server needs to decrypt the body. The client's identity
+is a 64-char bearer token *inside* the encrypted plaintext, so packet
+captures can't even tell which device is talking.
+
+This is what the rest of this document describes in detail.
 
 ---
 
@@ -45,12 +99,15 @@ The envelope is designed against a **network attacker** who can observe,
 modify, replay, inject, or drop any HTTP request between client and
 server. It is explicitly **not** designed against:
 
-- An attacker with the server's `box.key` (can impersonate the server
-  going forward — treat `box.key` like a TLS server key).
-- An attacker with a device's bearer token + server pubkey (they are that
-  device).
-- A malicious server operator (the server sees plaintext of every sync —
-  same as mTLS).
+- An attacker with the server's private key (`data/server/box.key`). They
+  can impersonate the server going forward — treat this file like a TLS
+  server key: mode 0600, backed up encrypted, rotated on compromise.
+- An attacker with a device's bearer token + the server pubkey. They
+  *are* that device, as far as the server can tell. Revoke the device in
+  the admin UI.
+- A malicious server operator. They see plaintext of every sync — same
+  property mTLS would have given. Client-side per-vault encryption is a
+  separable, much more complex feature, not yet implemented.
 - Side channels (timing, CPU, memory).
 
 What the envelope guarantees against a network attacker:
@@ -63,7 +120,7 @@ What the envelope guarantees against a network attacker:
 | Authenticity of device | Bearer token (64 hex chars) buried inside the encrypted plaintext             |
 | Endpoint binding       | AAD includes `"obsetync/v1 <METHOD> <PATH>"` — envelope can't be replayed cross-endpoint |
 | Forward secrecy        | Per-session ephemeral client keypair; past sessions stay private even if the client is compromised |
-| Traffic analysis       | Nothing — sizes, timing, and device identity (to the server) are visible       |
+| Traffic analysis       | Nothing. Sizes, timing, and device identity (to the server) are visible      |
 
 ---
 
@@ -301,11 +358,8 @@ can't be tricked into accepting a response meant for a different verb.
 
 This gives **forward secrecy per session**. An attacker who compromises
 a device and extracts memory today cannot decrypt captured traffic from
-previous plugin sessions — those ephemeral keys are gone.
-
-(Compare to TLS 1.3 with session tickets: same property. Option-B is
-fundamentally a single-cipher-suite stripped-down 1-RTT handshake with
-static server key + ephemeral client key.)
+previous plugin sessions — those ephemeral keys are gone. (Same property
+as TLS 1.3 with session tickets.)
 
 ---
 
@@ -357,7 +411,7 @@ prevents impersonation.
 | Attacker records ciphertext, has nothing else           | Yes                | Yes                  |
 | Attacker obtains the bearer token                       | Yes                | No (can impersonate) |
 | Attacker obtains `server_box_pub`                       | Yes                | Yes                  |
-| Attacker obtains `server_box.key` (server private)      | Yes (ephemerals gone) | No (can impersonate server) |
+| Attacker obtains `server/box.key` (server private)      | Yes (ephemerals gone) | No (can impersonate server) |
 | Attacker obtains a session's ephemeral client private   | That session only: yes. Other sessions: yes | Yes (ephemeral is session-scoped) |
 | Attacker gets full-device memory access on a live client | Current session: no. Past sessions: yes | Until the next plugin reload: no |
 
@@ -375,13 +429,12 @@ token looked up, device marked revoked → returned).
 ## 10. Non-goals
 
 - **Post-quantum security.** X25519 and AES-256-GCM are both classical.
-  Migration path when PQC KEMs mature: treat the envelope as versioned
-  (byte 0 = wire version), ship v2 with X-Wing or ML-KEM + X25519 hybrid,
-  clients negotiate at enrollment.
-- **Metadata privacy.** The server sees method, path, and timing of every
-  request — identical to mTLS with SNI + HTTP path-in-plaintext. Use
-  Tailscale / WireGuard underneath if you need network-level metadata
-  hiding.
+  Migration path when PQC KEMs mature: the wire version byte (0x01)
+  reserves room for a v2 with a hybrid X-Wing or ML-KEM + X25519 KEM.
+- **Metadata privacy.** The server sees method, path, and timing of
+  every request — identical to mTLS with SNI + HTTP path-in-plaintext.
+  Use Tailscale / WireGuard underneath if you need network-level
+  metadata hiding.
 - **Resistance to a compromised server.** A server operator can read
   every file (they hold the blobs). This is sync-tool-standard behavior;
   client-side encryption with per-user keys is a separable, much more
@@ -517,29 +570,13 @@ bytes to `wasm_root_hash_from_bytes(...)` to learn the root hash.
 
 ---
 
-## 13. Rationale for this specific choice
+## 13. Protocol versioning
 
-Several alternatives were considered; here's why option-B won:
+The `0x01` byte at the front of every envelope is the only coordination
+point for future change. A v2 with hybrid post-quantum KEM, or any other
+breaking wire change, bumps that byte. Servers can accept both versions
+during a migration; clients learn the supported version range at
+enrollment time if we need to extend the bundle.
 
-- **Plain mTLS**: needs CA install on every device, doesn't work for
-  iOS JS clients. Rejected (see §1).
-- **OPAQUE + session keys**: great for password-auth, but we already had
-  an out-of-band enrollment step where we could just hand over the bearer
-  token + server pubkey. OPAQUE's password-PAKE machinery is overkill
-  here.
-- **Noise XK / XX**: perfectly reasonable alternative. We chose "HTTP
-  body + AEAD envelope" over Noise because (a) it's trivially
-  stateless-on-the-wire — one request = one envelope, no handshake
-  messages, no replay windows, and (b) no Noise library is universally
-  available in the browser without bundling.
-- **Encrypt-then-MAC with separate HMAC**: AES-GCM is AEAD; we get the
-  MAC for free and avoid an extra primitive.
-- **ChaCha20-Poly1305**: great choice, chosen against only because
-  SubtleCrypto lacks it in Safari (again iOS) and AES-GCM is hardware-
-  accelerated everywhere else.
-
-The full design has been stable since commit
-[`28bc869`](https://github.com/Savemech/obsetync/commit/28bc869) (1.1.0).
-If you're thinking of changing it, note: the wire version byte (`0x01`)
-is the only coordination point — any future v2 just bumps that byte and
-clients/servers can co-exist across versions.
+Until `0x02` ships, this document is the complete specification of
+what's on the wire.

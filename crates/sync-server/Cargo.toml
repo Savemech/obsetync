@@ -22,7 +22,7 @@ sha2 = "0.10"
 rand = "0.9"
 thiserror = { workspace = true }
 
-# Option B secure transport: X25519 ECDH + HKDF-SHA256 + AES-256-GCM.
+# Secure transport primitives: X25519 ECDH + HKDF-SHA256 + AES-256-GCM.
 # Replaces all cert/CA infrastructure.
 x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"] }
 base64 = "0.22"
