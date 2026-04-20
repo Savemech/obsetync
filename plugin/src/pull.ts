@@ -1,13 +1,19 @@
 import { SyncApi, FileDelta, FileManifest } from "./api";
 import { PlatformIO } from "./platform";
 import { SyncBase } from "./sync-base";
+import type { WasmModule } from "./push";
 
 const CHUNK_THRESHOLD = 1_048_576; // 1MB
 const DOWNLOAD_CONCURRENCY = 6;
 
+/** Sentinel device-root that tells the server "I'm fresh, give me every
+ *  file as an addition." Matches the all-zero branch in `post_diff`. */
+const ZERO_ROOT = "0".repeat(64);
+
 /**
  * Pull path: fetch server-computed deltas and apply to the local vault.
- * Pure HTTP — no WASM needed.
+ * Pure HTTP — no WASM needed except for `wasm_root_hash_from_bytes` to
+ * extract the root hash from the server's root blob after a fresh seed.
  */
 export async function pull(
     api: SyncApi,
@@ -15,15 +21,41 @@ export async function pull(
     syncBase: SyncBase,
     vaultId: string,
     localRootHash: string | null,
+    wasm: WasmModule | null,
     onProgress?: (msg: string) => void
-): Promise<{ newRootHash: string | null; applied: number }> {
+): Promise<{ newRootHash: string | null; newRootBytes: Uint8Array | null; applied: number }> {
+    // --- First-time client: bulk-seed from the server ------------------
+    //
+    // The server's `post_diff` treats an all-zeros device_root as "empty
+    // tree" and returns every file as an addition. We apply those, pull
+    // down the current root bytes, derive the hash via WASM, and save it
+    // as our local root. Subsequent syncs hit the normal incremental path.
     if (!localRootHash) {
-        // No local root — first sync. Get the full remote root.
-        const rootBytes = await api.getRoot(vaultId);
-        if (!rootBytes) return { newRootHash: null, applied: 0 };
-        // TODO: apply all files from a fresh diff against empty root
-        // For now, return the root hash so the caller can do a full scan.
-        return { newRootHash: null, applied: 0 };
+        onProgress?.("first sync: downloading all files from server...");
+        const deltas = await api.getDiff(vaultId, ZERO_ROOT);
+        if (!deltas || deltas.length === 0) {
+            return { newRootHash: null, newRootBytes: null, applied: 0 };
+        }
+        await applyDeltas(api, io, syncBase, deltas, onProgress);
+
+        // Establish newRootHash + raw root bytes from the server's current
+        // root. Caller persists the bytes to cached-root.bin so restart
+        // doesn't force another full re-seed.
+        let newRootHash: string | null = null;
+        let newRootBytes: Uint8Array | null = null;
+        try {
+            newRootBytes = await api.getRoot(vaultId);
+            if (newRootBytes && wasm) {
+                newRootHash = wasm.wasm_root_hash_from_bytes(newRootBytes) ?? null;
+            }
+        } catch (e) {
+            console.warn("[obsetync] first-sync root-hash fetch failed:", e);
+        }
+
+        syncBase.setLastSyncTimestamp(Date.now());
+        await syncBase.save();
+        onProgress?.(`first sync: applied ${deltas.length} files`);
+        return { newRootHash, newRootBytes, applied: deltas.length };
     }
 
     onProgress?.("checking for remote changes...");
@@ -36,12 +68,39 @@ export async function pull(
         syncBase.setLastSyncTimestamp(Date.now());
         await syncBase.save();
         onProgress?.("up to date");
-        return { newRootHash: localRootHash, applied: 0 };
+        return { newRootHash: localRootHash, newRootBytes: null, applied: 0 };
     }
 
     onProgress?.(`${deltas.length} changes to apply`);
+    await applyDeltas(api, io, syncBase, deltas, onProgress);
 
-    // Sort deltas: renames first, then deletions, then modifications, then additions.
+    // Extract the new root hash from the server's current root bytes so
+    // subsequent incremental syncs know what to diff against.
+    let newRootHash: string | null = localRootHash;
+    let newRootBytes: Uint8Array | null = null;
+    try {
+        newRootBytes = await api.getRoot(vaultId);
+        if (newRootBytes && wasm) {
+            newRootHash = wasm.wasm_root_hash_from_bytes(newRootBytes) ?? localRootHash;
+        }
+    } catch (e) {
+        console.warn("[obsetync] post-pull root-hash fetch failed:", e);
+    }
+
+    syncBase.setLastSyncTimestamp(Date.now());
+    await syncBase.save();
+
+    return { newRootHash, newRootBytes, applied: deltas.length };
+}
+
+/** Apply a delta stream: renames, deletions, then file content (parallel). */
+async function applyDeltas(
+    api: SyncApi,
+    io: PlatformIO,
+    syncBase: SyncBase,
+    deltas: FileDelta[],
+    onProgress?: (msg: string) => void,
+): Promise<void> {
     const renames: FileDelta[] = [];
     const deletions: FileDelta[] = [];
     const modifications: FileDelta[] = [];
@@ -53,7 +112,6 @@ export async function pull(
         else additions.push(d);
     }
 
-    // Apply renames.
     for (const delta of renames) {
         if (delta.old_path) {
             await io.renameFile(delta.old_path, delta.path);
@@ -70,13 +128,11 @@ export async function pull(
         }
     }
 
-    // Apply deletions.
     for (const delta of deletions) {
         await io.deleteFile(delta.path);
         syncBase.removeEntry(delta.path);
     }
 
-    // Apply modifications and additions (can be parallelized).
     const toDownload = [...modifications, ...additions];
     for (let i = 0; i < toDownload.length; i += DOWNLOAD_CONCURRENCY) {
         const batch = toDownload.slice(i, i + DOWNLOAD_CONCURRENCY);
@@ -87,20 +143,6 @@ export async function pull(
             `${Math.min(i + DOWNLOAD_CONCURRENCY, toDownload.length)}/${toDownload.length} files applied`
         );
     }
-
-    // Fetch new root bytes and extract hash.
-    const newRootBytes = await api.getRoot(vaultId);
-    let newRootHash: string | null = localRootHash;
-    if (newRootBytes) {
-        // The root hash can be derived from the diff response or the server.
-        // For now, we store the root bytes so we have them locally.
-        // TODO: extract hash from WASM or compute from bytes.
-    }
-
-    syncBase.setLastSyncTimestamp(Date.now());
-    await syncBase.save();
-
-    return { newRootHash, applied: deltas.length };
 }
 
 async function applyContentDelta(

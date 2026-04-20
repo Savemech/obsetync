@@ -107,7 +107,7 @@
             runHook preBuild
 
             wasm-bindgen \
-              --target no-modules \
+              --target web \
               --out-dir bindings \
               lib/sync_core.wasm
 
