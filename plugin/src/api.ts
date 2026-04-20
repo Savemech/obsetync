@@ -45,7 +45,7 @@ interface FetchLike {
 /**
  * HTTP client for the ObsetyNC sync server.
  *
- * Transport uses the option-B encrypted envelope defined in `secure.ts`:
+ * Transport uses the AEAD envelope defined in `secure.ts`:
  *   X25519 ECDH + HKDF-SHA256 + AES-256-GCM over plain HTTP. No TLS, no certs,
  *   no CA trust store involvement — the server's X25519 public key, learned
  *   at enrollment, is the only pinning.
@@ -61,8 +61,8 @@ export class SyncApi {
         private readonly serverBoxPubBase64: string,
         private readonly bearerTokenHex: string,
     ) {
-        // Option-B runs on plain HTTP (the AEAD envelope is the trust
-        // boundary). Fold legacy https:// URLs down to http:// transparently
+        // The sync port speaks plain HTTP — the AEAD envelope is the trust
+        // boundary. Fold legacy https:// URLs down to http:// transparently
         // so users migrating from 1.0.x don't trip ERR_SSL_PROTOCOL_ERROR
         // after the server drops its cert stack.
         let u = serverUrl.replace(/\/$/, "");
@@ -70,7 +70,7 @@ export class SyncApi {
             u = "http://" + u.slice("https://".length);
             console.warn(
                 "[obsetync] rewrote legacy https:// server URL to http:// " +
-                "(option-B transport is plaintext HTTP + AEAD envelope)"
+                "(transport is plaintext HTTP + AEAD envelope)"
             );
         }
         this.serverUrl = u;
@@ -222,7 +222,7 @@ export class SyncApi {
             return {
                 serverUrl: this.serverUrl,
                 ok: res.status >= 200 && res.status < 300,
-                transport: "http/option-B",
+                transport: "http + AEAD envelope",
             };
         } catch (e: any) {
             return { serverUrl: this.serverUrl, ok: false, transport: `error: ${e?.message ?? e}` };

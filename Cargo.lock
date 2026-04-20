@@ -1200,7 +1200,7 @@ dependencies = [
 
 [[package]]
 name = "sync-core"
-version = "1.1.12"
+version = "1.1.13"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1222,14 +1222,14 @@ dependencies = [
 
 [[package]]
 name = "sync-schema"
-version = "1.1.12"
+version = "1.1.13"
 dependencies = [
  "flatbuffers",
 ]
 
 [[package]]
 name = "sync-server"
-version = "1.1.12"
+version = "1.1.13"
 dependencies = [
  "aes-gcm",
  "axum",

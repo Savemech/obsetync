@@ -125,7 +125,7 @@ export default class SyncPlugin extends Plugin {
         push("");
 
         push("--- Platform ---");
-        push(`Transport:         option-B (X25519 + AES-256-GCM over HTTP)`);
+        push(`Transport:         AEAD envelope over HTTP (X25519 + HKDF-SHA256 + AES-256-GCM)`);
         push(`WASM:              ${this.wasm ? "loaded" : "not loaded"}`);
         push(`Plugin id:         ${this.manifest.id}`);
         push(`Plugin version:    ${this.manifest.version}`);
@@ -209,7 +209,7 @@ export default class SyncPlugin extends Plugin {
             DEFAULT_SETTINGS,
             await this.loadData()
         );
-        // Migration 1.0.x → 1.1.x: server is plain HTTP now (option-B AEAD
+        // Migration 1.0.x → 1.1.x: server is plain HTTP now (the AEAD
         // envelope is the trust boundary). Persist the rewrite so the
         // settings UI reflects reality instead of showing a stale https URL.
         if (this.settings.serverUrl.startsWith("https://")) {
@@ -218,7 +218,7 @@ export default class SyncPlugin extends Plugin {
             await this.saveSettings();
             console.warn(
                 "[obsetync] migrated server URL from https:// to http:// " +
-                "(option-B transport runs over plaintext HTTP)"
+                "(transport is plaintext HTTP + AEAD envelope)"
             );
         }
     }
@@ -285,7 +285,7 @@ export default class SyncPlugin extends Plugin {
         // Stop existing engine if re-initializing.
         this.syncEngine?.stop();
 
-        // Create API client with option-B credentials.
+        // Create API client with the pinned server pubkey + bearer token.
         this.api = new SyncApi(
             this.settings.serverUrl,
             this.settings.serverBoxPub,

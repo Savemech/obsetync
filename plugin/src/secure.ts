@@ -1,5 +1,5 @@
 /**
- * Option-B secure transport — client half.
+ * Secure transport — client half.
  *
  * Wraps every sync-API request in an encrypted envelope: X25519 ECDH +
  * HKDF-SHA256 + AES-256-GCM over plain HTTP. No TLS, no certs, no CA trust

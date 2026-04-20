@@ -44,7 +44,7 @@ services:
       #   sync_server=trace               → plus AEAD internals
       RUST_LOG: "${RUST_LOG:-sync_server=debug,warn}"
     ports:
-      # Sync API — exposed publicly (option-B AEAD + bearer token inside AEAD).
+      # Sync API — exposed publicly (AEAD envelope + bearer token inside the ciphertext).
       - "27182:27182"
       # Admin UI — exposed publicly too. No auth by itself; put behind a
       # reverse proxy / VPN if the server is reachable from the open internet.

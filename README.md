@@ -13,7 +13,7 @@ Your notes stay on your infrastructure. Desktop and iOS sync through your own se
 - **Content-addressed storage** — blake3-hashed blobs, automatic deduplication
 - **Incremental sync** — FastCDC chunking means a 1-byte edit to a 200 MB PDF uploads ~64 KB, not the whole file
 - **Merkle tree index** — O(log n) diff, constant-time cached roots on reconnect
-- **Option-B encrypted transport** — X25519 ECDH + HKDF-SHA256 + AES-256-GCM over plain HTTP. No TLS, no CA, no cert install ceremony. The server's X25519 public key is pinned at enrollment; every request is sealed end-to-end with a fresh ephemeral client keypair and a bearer token buried inside the AEAD envelope
+- **End-to-end encrypted transport** — X25519 ECDH + HKDF-SHA256 + AES-256-GCM wrap every request body. No TLS, no CA, no cert install ceremony. The server's X25519 public key is pinned at enrollment; every request is sealed end-to-end with a fresh ephemeral client keypair and a bearer token buried inside the AEAD envelope. Full protocol at [`docs/transport.md`](docs/transport.md)
 - **Three-way merge** — server reconciles concurrent edits; conflicts preserved as copies instead of clobbered
 
 ## Architecture
@@ -215,7 +215,7 @@ On **iOS**, the same flow works via the Files app:
 
 1. Open the server admin UI (`http://<server>:27183/admin`), click **Add device**, name it, copy the enrollment code.
 2. In Obsidian → **Settings → ObsetyNC**, fill in:
-   - **Server URL** — `http://your-server:27182` (plain HTTP; option-B transport encrypts the payload itself, so HTTPS is unnecessary and actively wrong)
+   - **Server URL** — `http://your-server:27182` (plain HTTP; the AEAD envelope encrypts the payload itself, so HTTPS is unnecessary and actively wrong)
    - **Vault ID** — any name you like; use the same ID on every device that syncs the same vault
    - **Enrollment code** — paste it from the admin UI
 3. Hit **Enroll**. First device bulk-pushes its vault; every later device does a first-sync pull (downloads the vault from the server) — progress shown in the status bar + notices.
@@ -224,7 +224,7 @@ Repeat on each desktop + phone + tablet you want in the sync.
 
 ## Authentication & transport
 
-All sync traffic is sealed inside an **option-B encrypted envelope** over plain HTTP: X25519 ECDH + HKDF-SHA256 + AES-256-GCM. No TLS, no CA, no client certs. Clients pin the server's long-term X25519 public key at enrollment (`data/server/box.pub`, base64). Each plugin session generates a fresh ephemeral X25519 keypair; each request carries its own 12-byte nonce + AAD-bound HTTP method and path.
+Sync traffic is sealed inside an **AEAD envelope** carried in plain HTTP bodies: X25519 ECDH + HKDF-SHA256 + AES-256-GCM. No TLS, no CA, no client certs. Clients pin the server's long-term X25519 public key at enrollment (`data/server/box.pub`, base64). Each plugin session generates a fresh ephemeral X25519 keypair; each request carries its own 12-byte nonce + AAD-bound HTTP method and path.
 
 The **bearer token** lives inside the encrypted plaintext (first 64 ASCII hex chars), not in a header — so packet captures can't even tell which device is talking. Revoking a device drops its bearer token from the server index; the next request 401s immediately.
 
@@ -284,7 +284,7 @@ just nuke           # remove all ObsetyNC images + volumes (fresh start)
 
 **"In sync" but the server clearly has nothing** — the client's `sync-base.json` cache is lying. Use **Reconcile with server**.
 
-**`ERR_SSL_PROTOCOL_ERROR` from the plugin** — you saved the Server URL as `https://…`. Option-B runs over plaintext HTTP; the plugin auto-migrates stored URLs on load, but if you typed a fresh one manually, use `http://`. The AEAD envelope is the trust boundary — TLS would be double-encryption of the same bytes.
+**`ERR_SSL_PROTOCOL_ERROR` from the plugin** — you saved the Server URL as `https://…`. The sync port is plaintext HTTP; the plugin auto-migrates stored URLs on load, but if you typed a fresh one manually, use `http://`. The AEAD envelope is the trust boundary — TLS would be double-encryption of the same bytes.
 
 **iPhone loops on `GET /api/v1/root/...` forever** — the plugin WASM module failed to load (check *Show debug info* → recent logs for `WASM load failed`). That drops the plugin to a stub that can't hash. Usually caused by an older iOS/WebKit missing a WASM feature; upgrade iOS first.
 

@@ -21,12 +21,14 @@ use x25519_dalek::StaticSecret;
 /// but the full-file manifest path can push a megabyte or two).
 const MAX_BODY_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB
 
-/// Option-B secure-envelope middleware. Every protected route body is a
-/// sealed blob: `[ver | nonce | client_eph_pub | ciphertext+tag]`. We decrypt
-/// the request using the server's long-term X25519 private key, validate the
-/// bearer token found inside the plaintext, run the inner handler, then
-/// encrypt its response back to the same client using the shared secret from
-/// the request's ECDH.
+/// Secure-envelope middleware. Every protected route body is a sealed
+/// blob: `[ver | nonce | client_eph_pub | ciphertext+tag]`. We decrypt
+/// the request using the server's long-term X25519 private key, validate
+/// the bearer token found inside the plaintext, run the inner handler,
+/// then encrypt its response back to the same client using the shared
+/// secret from the request's ECDH.
+///
+/// Protocol specification: ../../../docs/transport.md
 async fn secure_envelope(
     State(state): State<SharedState>,
     request: Request,
@@ -434,9 +436,10 @@ async fn put_root(
     Path(vault_id): Path<String>,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
-    // Option-B transport: parent hash is prepended to the body as a 64-byte
-    // ASCII prefix (hex or empty, space-padded) so it's covered by the AEAD
-    // envelope like the rest of the request.
+    // Parent hash is prepended to the body as a 64-byte ASCII prefix (hex
+    // or empty, space-padded) so it's covered by the AEAD envelope like
+    // the rest of the request — keeping it out of an HTTP header means a
+    // MITM can't swap it without failing the GCM tag.
     if body.len() < 64 {
         return Err(ServerError::BadRequest(
             "body too short for parent_root prefix".into(),
@@ -595,8 +598,9 @@ async fn post_diff(
     Path(vault_id): Path<String>,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
-    // Option-B: device_root hash rides in the first 64 bytes of the encrypted
-    // body (ASCII hex, space-padded) so it's covered by the AEAD envelope.
+    // device_root hash rides in the first 64 bytes of the encrypted body
+    // (ASCII hex, space-padded) so it's covered by the AEAD envelope
+    // rather than being tamperable in an HTTP header.
     if body.len() < 64 {
         return Err(ServerError::BadRequest(
             "body too short for device_root prefix".into(),
