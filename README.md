@@ -224,11 +224,11 @@ Repeat on each desktop + phone + tablet you want in the sync.
 
 ## Authentication & transport
 
-All sync traffic is sealed inside an **option-B encrypted envelope**: X25519 ECDH + HKDF-SHA256 + AES-256-GCM over plain HTTP. No TLS, no CA, no client certs. Clients pin the server's long-term X25519 public key at enrollment (`data/server/box.pub`, base64). Each request carries a fresh ephemeral client X25519 pubkey; the shared secret per session derives a per-request AES key with the random nonce as HKDF salt. The AAD binds each envelope to `"obsetync/v1 <METHOD> <PATH>"`, so captured blobs can't be replayed against a different endpoint.
+All sync traffic is sealed inside an **option-B encrypted envelope** over plain HTTP: X25519 ECDH + HKDF-SHA256 + AES-256-GCM. No TLS, no CA, no client certs. Clients pin the server's long-term X25519 public key at enrollment (`data/server/box.pub`, base64). Each plugin session generates a fresh ephemeral X25519 keypair; each request carries its own 12-byte nonce + AAD-bound HTTP method and path.
 
 The **bearer token** lives inside the encrypted plaintext (first 64 ASCII hex chars), not in a header — so packet captures can't even tell which device is talking. Revoking a device drops its bearer token from the server index; the next request 401s immediately.
 
-X25519 is handled by [`@noble/curves`](https://github.com/paulmillr/noble-curves) on the client because Web Crypto X25519 only shipped in Chromium 133 / Safari 17 / iOS 17. HKDF-SHA256 and AES-256-GCM stay on SubtleCrypto (universally supported).
+**Full protocol specification**: [`docs/transport.md`](docs/transport.md) — byte-level wire format, key schedule, threat model, code map, and a worked example of a request/response round-trip.
 
 ## Reconcile with server
 
