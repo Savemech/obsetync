@@ -360,18 +360,29 @@ export default class SyncPlugin extends Plugin {
         const pluginDir = ".obsidian/plugins/obsetync";
         const adapter = this.app.vault.adapter;
 
+        // Log at each step so the iPhone debug panel shows WHERE it failed —
+        // previously the catch only surfaced a stack frame from Obsidian's
+        // error handler, which told us nothing about the actual cause.
+        let step = "init";
         try {
+            step = "readBinary";
             const wasmBuf = await adapter.readBinary(`${pluginDir}/sync_core_bg.wasm`);
+            const byteLen = wasmBuf.byteLength;
+
+            step = "initWasm";
             // initWasm accepts { module_or_path: BufferSource } on --target web.
             // It initialises the shared WASM instance inside the bundled glue;
             // after this call WasmExports.* is usable.
             await initWasm({ module_or_path: new Uint8Array(wasmBuf) });
+            console.log(`[obsetync] WASM loaded (${byteLen} bytes)`);
             return WasmExports as unknown as WasmModule;
-        } catch (e) {
+        } catch (e: any) {
+            const msg = e?.message ?? String(e);
+            const name = e?.name ?? "Error";
+            const stack = (e?.stack ?? "").split("\n").slice(0, 3).join(" | ");
             console.warn(
-                "[obsetync] WASM load failed, using stub. " +
-                "Hash/tree operations will NOT work correctly until this is fixed.",
-                e
+                `[obsetync] WASM load failed at step '${step}' — using stub. ` +
+                `${name}: ${msg} (stack: ${stack})`
             );
             return createWasmStub();
         }

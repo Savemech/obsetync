@@ -673,8 +673,64 @@ async fn post_diff(
         "post_diff: computed delta"
     );
 
-    let json = serde_json::to_string(&deltas)?;
+    // sync-core's `FileDelta.hash` is `[u8; 32]`, which serde encodes as a
+    // JSON number array (`[172,42,...]`). The plugin expects hex strings
+    // in its DTO. Convert at the wire boundary so the plugin can just
+    // interpolate `delta.hash` into URLs like `/api/v1/content/{hash}`.
+    let wire_deltas: Vec<WireDelta> = deltas.iter().map(WireDelta::from).collect();
+    let json = serde_json::to_string(&wire_deltas)?;
     Ok((StatusCode::OK, json))
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum WireDelta {
+    Added {
+        path: String,
+        hash: String,
+        size: u64,
+    },
+    Modified {
+        path: String,
+        hash: String,
+        size: u64,
+    },
+    Deleted {
+        path: String,
+    },
+    Renamed {
+        path: String,
+        old_path: String,
+        hash: String,
+    },
+}
+
+impl From<&sync_core::diff::FileDelta> for WireDelta {
+    fn from(d: &sync_core::diff::FileDelta) -> Self {
+        use sync_core::diff::FileDelta as F;
+        match d {
+            F::Added { path, hash, size } => WireDelta::Added {
+                path: path.clone(),
+                hash: hash_to_hex(hash),
+                size: *size,
+            },
+            F::Modified { path, hash, size } => WireDelta::Modified {
+                path: path.clone(),
+                hash: hash_to_hex(hash),
+                size: *size,
+            },
+            F::Deleted { path } => WireDelta::Deleted { path: path.clone() },
+            F::Renamed {
+                path,
+                old_path,
+                hash,
+            } => WireDelta::Renamed {
+                path: path.clone(),
+                old_path: old_path.clone(),
+                hash: hash_to_hex(hash),
+            },
+        }
+    }
 }
 
 // --- Index Chunks ---
