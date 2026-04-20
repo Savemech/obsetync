@@ -624,24 +624,40 @@ async fn post_diff(
         return Ok((StatusCode::NOT_MODIFIED, "[]".to_string()));
     }
 
-    // Load both roots.
-    let device_root_data = state
-        .vaults
-        .get_root(&vault_id, &device_root_hash)
-        .ok_or_else(|| {
-            ServerError::BadRequest("device root not found in history — full rescan needed".into())
-        })?;
-
     let current_data = state
         .vaults
         .get_root(&vault_id, &current_hash)
         .ok_or_else(|| ServerError::Internal("current root data missing".into()))?;
 
-    let from_root = sync_core::chunk::RootNode::deserialize(&device_root_data)
-        .map_err(|e| ServerError::Internal(format!("corrupt device root: {}", e)))?;
-
     let to_root = sync_core::chunk::RootNode::deserialize(&current_data)
         .map_err(|e| ServerError::Internal(format!("corrupt current root: {}", e)))?;
+
+    // A device_root of all zeros is the client signalling "fresh sync — I
+    // have nothing locally, give me every file as an addition". This is how
+    // first-time enrolled clients (iPhone via BRAT, new desktop install)
+    // bootstrap without needing to know an existing server root.
+    let from_root = if device_root_hash == [0u8; 32] {
+        sync_core::chunk::RootNode {
+            vault_id: vault_id.clone(),
+            created_ms: 0,
+            version: 1,
+            children: vec![],
+            total_files: 0,
+            parent_hash: None,
+            device_id: "fresh-client".to_string(),
+        }
+    } else {
+        let device_root_data = state
+            .vaults
+            .get_root(&vault_id, &device_root_hash)
+            .ok_or_else(|| {
+                ServerError::BadRequest(
+                    "device root not found in history — full rescan needed".into(),
+                )
+            })?;
+        sync_core::chunk::RootNode::deserialize(&device_root_data)
+            .map_err(|e| ServerError::Internal(format!("corrupt device root: {}", e)))?
+    };
 
     // Compute deltas via bridge.
     let index_base = state.layout.base.join("index");

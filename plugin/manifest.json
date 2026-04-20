@@ -1,11 +1,11 @@
 {
     "id": "obsetync",
     "name": "ObsetyNC",
-    "version": "1.1.9",
+    "version": "1.1.10",
     "minAppVersion": "1.4.0",
     "description": "Self-hosted Obsidian vault sync with content-addressed chunk store and Merkle tree — works on desktop and iOS.",
     "author": "Savemech",
     "authorUrl": "https://github.com/Savemech/obsetync",
     "isDesktopOnly": false,
-    "pluginFiles": ["sync_core.js", "sync_core_bg.wasm"]
+    "pluginFiles": ["sync_core_bg.wasm"]
 }

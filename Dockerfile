@@ -99,7 +99,7 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=wasm-target,target=/build/target,sharing=locked \
     wasm-pack build crates/sync-core \
-        --target no-modules \
+        --target web \
         --out-dir /build/plugin/wasm \
         --release \
         -- --features wasm --no-default-features

@@ -80,7 +80,7 @@ jobs:
       - name: Build WASM
         run: |
           wasm-pack build crates/sync-core \
-            --target no-modules \
+            --target web \
             --out-dir ../../plugin/wasm \
             --release \
             -- --features wasm --no-default-features

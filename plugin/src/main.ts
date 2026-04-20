@@ -9,6 +9,18 @@ import { ConflictModal, findConflicts } from "./conflict-ui";
 import { debugLog } from "./debug-log";
 import type { WasmModule, WasmTree } from "./push";
 
+// Static import of the wasm-bindgen --target web glue. esbuild inlines this
+// ES module into main.js at build time — no runtime `new Function(...)` or
+// dynamic import() is ever executed. That's what unblocks iOS WKWebView,
+// whose strict CSP (no unsafe-eval) rejects the old `new Function(glueText)`
+// approach used by the --target no-modules output.
+//
+// `@ts-ignore` because the generated sync_core.d.ts is also part of the
+// wasm/ artifacts but isn't guaranteed present during every build environment.
+// The runtime shape matches WasmModule structurally.
+// @ts-ignore
+import initWasm, * as WasmExports from "../wasm/sync_core";
+
 export default class SyncPlugin extends Plugin {
     settings: SyncSettings = DEFAULT_SETTINGS;
     private io!: PlatformIO;
@@ -332,58 +344,29 @@ export default class SyncPlugin extends Plugin {
     }
 
     private async loadWasm(): Promise<WasmModule> {
-        // Load strategy that avoids dynamic `import()` entirely. Obsidian's
-        // plugin sandbox on iOS rejects import() of any URL (capacitor://,
-        // blob:, data:), so we switched wasm-pack to `--target no-modules`.
-        // That output is a plain script — no `export`, no ES module syntax —
-        // which defines `wasm_bindgen` on its surrounding scope.
+        // Load strategy: esbuild inlined the wasm-bindgen --target web glue
+        // into main.js at build time. No runtime eval, no `new Function()`,
+        // no dynamic import — all of which are blocked by iOS WKWebView's
+        // strict CSP. At runtime we only need to:
         //
-        //   1. Read sync_core.js (plain-script glue) as text.
-        //   2. Read sync_core_bg.wasm as bytes.
-        //   3. Wrap the glue in a Function body; its scope declares
-        //      `let wasm_bindgen;` which gets assigned inside the IIFE the
-        //      glue defines. We return `wasm_bindgen` from the Function.
-        //   4. Call `wasm_bindgen(wasmBytes)` to initialize. It returns the
-        //      exports object that fits our `WasmModule` interface.
+        //   1. Read sync_core_bg.wasm bytes from the plugin directory.
+        //   2. Pass them to the bundled init function.
+        //   3. Return the bundled module's named exports, structurally
+        //      compatible with the WasmModule interface.
         //
-        // This works on Electron and iOS WKWebView alike because new Function
-        // is universally supported, unlike dynamic import in sandboxed plugins.
+        // The previous --target no-modules strategy worked on desktop but
+        // silently fell through to a stub on iOS, rendering hashes and trees
+        // useless for mobile sync.
         const pluginDir = ".obsidian/plugins/obsetync";
         const adapter = this.app.vault.adapter;
 
         try {
-            const [jsText, wasmBuf] = await Promise.all([
-                adapter.read(`${pluginDir}/sync_core.js`),
-                adapter.readBinary(`${pluginDir}/sync_core_bg.wasm`),
-            ]);
-
-            // wasm-pack --target no-modules emits `let wasm_bindgen = (function(exports) { ... })();`
-            // at the top of sync_core.js, so the Function body's own scope
-            // declares and assigns `wasm_bindgen`. We just reference it on
-            // the way out. Earlier versions prepended another `let wasm_bindgen;`
-            // which caused "Identifier 'wasm_bindgen' has already been declared"
-            // at parse time — the glue silently fell through to the stub.
-            const glue = new Function(jsText + "\nreturn wasm_bindgen;");
-            const wasm_bindgen: any = glue();
-
-            if (typeof wasm_bindgen !== "function") {
-                throw new Error(
-                    "sync_core.js did not define wasm_bindgen — is it built with `--target no-modules`?"
-                );
-            }
-
-            // `wasm_bindgen({ module_or_path: bytes })` initializes the
-            // module. In --target no-modules, the init function itself is
-            // augmented with all the exported classes (WasmTree, Hasher, …)
-            // and free functions via `Object.assign(__wbg_init, initSync, exports)`
-            // at the end of the glue — so the callable `wasm_bindgen` IS the
-            // WasmModule after init completes. The init's return value is the
-            // raw wasm.exports table, which does NOT carry the JS-side classes,
-            // which is why earlier versions tripped `WasmTree is not a
-            // constructor`. Pass the object form to silence the deprecation
-            // warning about positional args.
-            await wasm_bindgen({ module_or_path: new Uint8Array(wasmBuf) });
-            return wasm_bindgen as unknown as WasmModule;
+            const wasmBuf = await adapter.readBinary(`${pluginDir}/sync_core_bg.wasm`);
+            // initWasm accepts { module_or_path: BufferSource } on --target web.
+            // It initialises the shared WASM instance inside the bundled glue;
+            // after this call WasmExports.* is usable.
+            await initWasm({ module_or_path: new Uint8Array(wasmBuf) });
+            return WasmExports as unknown as WasmModule;
         } catch (e) {
             console.warn(
                 "[obsetync] WASM load failed, using stub. " +

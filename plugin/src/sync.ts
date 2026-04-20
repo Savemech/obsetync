@@ -467,11 +467,26 @@ export class SyncEngine {
                 this.io,
                 this.syncBase,
                 this.vaultId,
-                this.localRootHash
+                this.localRootHash,
+                this.wasm,
             );
             if (result.newRootHash) {
                 this.localRootHash = result.newRootHash;
                 this.lastPullServerRoot = result.newRootHash;
+            }
+            // Persist the raw root bytes so cached-root.bin seeds
+            // localRootHash on the next plugin start — otherwise a fresh
+            // iPhone would re-seed every launch.
+            if (result.newRootBytes) {
+                try {
+                    const path = ".obsidian/plugins/obsetync/cached-root.bin";
+                    await this.app.vault.adapter.writeBinary(
+                        path,
+                        result.newRootBytes.buffer as ArrayBuffer,
+                    );
+                } catch (e) {
+                    console.warn("[obsetync] failed to save cached root after pull:", e);
+                }
             }
         } catch (e: any) {
             console.error("[obsetync] pull error:", e);
