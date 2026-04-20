@@ -13,19 +13,19 @@ Your notes stay on your infrastructure. Desktop and iOS sync through your own se
 - **Content-addressed storage** — blake3-hashed blobs, automatic deduplication
 - **Incremental sync** — FastCDC chunking means a 1-byte edit to a 200 MB PDF uploads ~64 KB, not the whole file
 - **Merkle tree index** — O(log n) diff, constant-time cached roots on reconnect
-- **mTLS + bearer-token auth** — TLS client certs on desktop, bearer token on iOS (WKWebView can't present client certs from JavaScript)
+- **Option-B encrypted transport** — X25519 ECDH + HKDF-SHA256 + AES-256-GCM over plain HTTP. No TLS, no CA, no cert install ceremony. The server's X25519 public key is pinned at enrollment; every request is sealed end-to-end with a fresh ephemeral client keypair and a bearer token buried inside the AEAD envelope
 - **Three-way merge** — server reconciles concurrent edits; conflicts preserved as copies instead of clobbered
 
 ## Architecture
 
 | Piece              | Language      | Role                                                            |
 |--------------------|---------------|-----------------------------------------------------------------|
-| `sync-server`      | Rust (axum)   | HTTPS endpoint, content store, Merkle tree merge/diff           |
+| `sync-server`      | Rust (axum)   | HTTP endpoint, content store, Merkle tree merge/diff            |
 | `sync-core`        | Rust + WASM   | Hashing, FastCDC chunker, tree operations, wire (flatbuffers)   |
 | `plugin/`          | TypeScript    | Obsidian plugin — orchestrates scan/hash/push/pull through WASM |
 | `sync-schema`      | flatbuffers   | On-wire format for tree nodes                                   |
 
-The plugin runs WASM in the Obsidian renderer. Blake3 hashing, FastCDC chunking, and tree updates happen in WASM; the TypeScript side handles I/O, HTTP, and the Obsidian API. Peak memory during a 10k-file scan stays bounded because files are streamed in 64 KB slices — the WASM heap never grows past one slice.
+The plugin runs WASM in the Obsidian renderer. Blake3 hashing, FastCDC chunking, and tree operations happen in WASM; the TypeScript side handles I/O, HTTP, the Obsidian API, and X25519 ECDH via [`@noble/curves`](https://github.com/paulmillr/noble-curves) (so iOS and older Chromium, which don't ship X25519 in WebCrypto yet, still work). Peak memory during a 10k-file scan stays bounded because files are streamed in 64 KB slices — the WASM heap never grows past one slice.
 
 ## Prerequisites
 
@@ -113,7 +113,7 @@ just build-nix-image         # runs both steps below:
 # nix build .#dockerImage    # -> ./result (OCI tarball)
 # docker load < result       # -> image obsetync-server:nix
 
-docker run --rm -v obsetync-data:/data -p 27182:27182 -p 127.0.0.1:27183:27183 \
+docker run --rm -v ./data:/data -p 27182:27182 -p 27183:27183 \
     obsetync-server:nix
 
 # Or swap it into compose by setting image: obsetync-server:nix on the server service.
@@ -128,7 +128,7 @@ Docker, Nix, and Nix-built Docker images are independent routes to the same func
 State lives on the host at `./data/server/` — a plain directory you can back up, inspect, or `tar` around. No Docker named volumes anywhere.
 
 ```sh
-# First-time: create CA, server cert, directory layout in ./data/server.
+# First-time: create the X25519 box keypair + directory layout in ./data/.
 docker compose run --rm server init --data-dir /data
 
 # Start / stop / logs / restart.
@@ -143,26 +143,42 @@ docker compose exec server sh
 
 `just` shortcuts: `just init`, `just up`, `just down`, `just logs`, `just restart`, `just shell`.
 
+After `init`, the base64 of the server's public box key is printed to stdout and stored at `data/server/box.pub`. Clients learn it automatically during enrollment — no manual copy needed.
+
+### Logging
+
+Structured tracing via the standard `RUST_LOG` env var. The container default is `sync_server=debug,warn` so you get per-request detail out of the box. Quieter:
+
+```sh
+RUST_LOG=sync_server=info docker compose up -d
+```
+
+Keys in logs: `device`, `vault`, `method`, `path`, `in_body`, `out_body`, `elapsed_ms` for each request; `put_root: first push accepted / fast-forward accepted / merged divergent roots` for tree updates; enrollment / revocation events at info.
+
 ### Host directory layout
 
 Everything is under `./data/` (gitignored):
 
 ```
-./data/server/            persistent server state: ca/, devices/, vaults/, index/, content/
+./data/server/box.key     X25519 private key (mode 0600)
+./data/server/box.pub     X25519 public key (base64, operator-inspectable)
+./data/devices/           enrolled devices + bearer-token index
+./data/enrollments/       pending enrollment codes (10-minute TTL)
+./data/vaults/            per-vault root pointers and root history
+./data/index/             Merkle tree chunks (leaf + internal nodes)
+./data/content/           content-addressed file storage (blobs + manifests + chunks)
 ./data/cache/cargo-*/     dev shell: cargo dep cache (optional, speeds up rebuilds)
 ./data/cache/target/      dev shell: incremental compile cache (optional)
 ./dist/bin/sync-server    extracted binary (from `docker compose run --rm binary`)
 ./dist/plugin/            extracted plugin files (from `docker compose run --rm plugin`)
 ```
 
-Wipe any of these freely. The server's `init` subcommand recreates `./data/server/` from scratch.
+Wipe any of these freely. The server's `init` subcommand recreates the layout from scratch. *But* — see [Reconcile with server](#reconcile-with-server) below before wiping `content/` while devices still hold a local sync-base: it silently causes drift.
 
 The server exposes two ports on the host:
 
-- **27182** — sync API. Accepts mTLS client certs from desktop clients, bearer tokens from mobile. Expose this publicly (or via VPN) so your devices can reach it.
-- **27183** — admin web UI. Bound to `127.0.0.1` only by default. Access it at `http://localhost:27183/admin`, or put it behind a reverse proxy / SSH tunnel / Tailscale for remote access.
-
-Data is stored in the `obsetync-data` named volume.
+- **27182** — sync API. Plain HTTP; the AEAD envelope is the trust boundary. Expose this publicly (or behind a VPN) so devices can reach it.
+- **27183** — admin web UI. Dashboard with uptime, per-device online status, per-vault storage stats, device enrollment. No auth of its own — put it behind localhost / Tailscale / VPN / reverse proxy.
 
 ## Installing the plugin in Obsidian
 
@@ -199,21 +215,24 @@ On **iOS**, the same flow works via the Files app:
 
 1. Open the server admin UI (`http://<server>:27183/admin`), click **Add device**, name it, copy the enrollment code.
 2. In Obsidian → **Settings → ObsetyNC**, fill in:
-   - **Server URL** — e.g. `https://your-server:27182`
+   - **Server URL** — `http://your-server:27182` (plain HTTP; option-B transport encrypts the payload itself, so HTTPS is unnecessary and actively wrong)
    - **Vault ID** — any name you like; use the same ID on every device that syncs the same vault
    - **Enrollment code** — paste it from the admin UI
-3. Hit **Enroll**. First device pushes; later devices pull.
+3. Hit **Enroll**. First device bulk-pushes its vault; every later device does a first-sync pull (downloads the vault from the server) — progress shown in the status bar + notices.
 
 Repeat on each desktop + phone + tablet you want in the sync.
 
-## Authentication
+## Authentication & transport
 
-On enrollment the server issues three credentials:
+All sync traffic is sealed inside an **option-B encrypted envelope**: X25519 ECDH + HKDF-SHA256 + AES-256-GCM over plain HTTP. No TLS, no CA, no client certs. Clients pin the server's long-term X25519 public key at enrollment (`data/server/box.pub`, base64). Each request carries a fresh ephemeral client X25519 pubkey; the shared secret per session derives a per-request AES key with the random nonce as HKDF salt. The AAD binds each envelope to `"obsetync/v1 <METHOD> <PATH>"`, so captured blobs can't be replayed against a different endpoint.
 
-- A client certificate + key (desktop uses these for mTLS at the TLS layer)
-- A 256-bit random bearer token (sent as `Authorization: Bearer <token>` on every request)
+The **bearer token** lives inside the encrypted plaintext (first 64 ASCII hex chars), not in a header — so packet captures can't even tell which device is talking. Revoking a device drops its bearer token from the server index; the next request 401s immediately.
 
-The server authorizes based on the bearer token. Desktop additionally presents its client cert for defense in depth, but the token is the canonical check. On iOS the token is the sole auth because WKWebView can't attach client certs to JavaScript `fetch` or `requestUrl`.
+X25519 is handled by [`@noble/curves`](https://github.com/paulmillr/noble-curves) on the client because Web Crypto X25519 only shipped in Chromium 133 / Safari 17 / iOS 17. HKDF-SHA256 and AES-256-GCM stay on SubtleCrypto (universally supported).
+
+## Reconcile with server
+
+The client maintains a local `sync-base.json` that caches "what hashes the server has". If the server storage is wiped or restored from an older backup, that cache lies — sync would silently say "in sync" while the server is actually missing content. **Settings → ObsetyNC → Reconcile with server** runs a `checkContent` / `checkContentChunks` sweep across every entry in sync-base and re-uploads anything the server is missing. Cheap when the server is in parity (one batched request); corrective when it isn't. This also runs automatically on every **Sync Now**.
 
 ## Optional: sync your `.obsidian/` folder
 
@@ -222,19 +241,20 @@ The plugin settings include a toggle to sync your `.obsidian/` directory alongsi
 ## Server data layout
 
 ```
-<data volume>/
-├── ca/              CA cert + key (trust anchor for client certs)
-├── server/          server cert
-├── devices/         enrolled devices + bearer-token index
-├── enrollments/     pending enrollment codes (10-minute TTL)
-├── vaults/          per-vault root pointers and root history
-├── index/           Merkle tree chunks (leaf + internal nodes)
-└── content/         content-addressed file storage
-    ├── manifests/   per-file chunk manifests (for large files)
-    └── chunks/      FastCDC chunks (for large files)
+<data dir>/
+├── server/
+│   ├── box.key     X25519 private key (mode 0600) — the server's long-term identity
+│   └── box.pub     X25519 public key (base64) — safe to display; clients pin it
+├── devices/        enrolled devices + bearer-token index
+├── enrollments/    pending enrollment codes (10-minute TTL)
+├── vaults/         per-vault root pointers and root history
+├── index/          Merkle tree chunks (leaf + internal nodes)
+└── content/        content-addressed file storage
+    ├── manifests/  per-file chunk manifests (large files ≥ 1 MB)
+    └── chunks/     FastCDC chunks (large files)
 ```
 
-Small files (< 1 MB) go to `content/<hash>` whole. Large files are chunked via FastCDC; the manifest records chunk hashes and offsets. All storage is content-addressed — identical files across multiple paths use one physical blob.
+Small files (< 1 MB) go to `content/<hash>` whole. Large files are chunked via FastCDC; the manifest records chunk hashes and offsets. All storage is content-addressed — identical files across multiple paths use one physical blob. Compromise of `box.key` lets an attacker impersonate the server going forward but does **not** reveal past session content (forward secrecy via per-session ephemeral client keys).
 
 ## Development
 
@@ -253,9 +273,37 @@ The dev container has Rust, Node, wasm-pack, cargo-watch, and `just` pre-install
 ## Maintenance
 
 ```sh
-just clean-server   # wipe synced content (preserves certs + enrolled devices)
+just clean-server   # wipe synced content (preserves server/box.key + enrolled devices)
 just clean-cache    # drop Docker BuildKit caches
 just nuke           # remove all ObsetyNC images + volumes (fresh start)
+```
+
+**After `clean-server` (or any time the server loses data while clients still hold a sync-base)**: every enrolled device should run **Settings → ObsetyNC → Reconcile with server** once. That uploads every file the server is missing. Without it, `Sync Now` will say "Already up to date" while the server silently holds only the Merkle tree, no content.
+
+## Troubleshooting
+
+**"In sync" but the server clearly has nothing** — the client's `sync-base.json` cache is lying. Use **Reconcile with server**.
+
+**`ERR_SSL_PROTOCOL_ERROR` from the plugin** — you saved the Server URL as `https://…`. Option-B runs over plaintext HTTP; the plugin auto-migrates stored URLs on load, but if you typed a fresh one manually, use `http://`. The AEAD envelope is the trust boundary — TLS would be double-encryption of the same bytes.
+
+**iPhone loops on `GET /api/v1/root/...` forever** — the plugin WASM module failed to load (check *Show debug info* → recent logs for `WASM load failed`). That drops the plugin to a stub that can't hash. Usually caused by an older iOS/WebKit missing a WASM feature; upgrade iOS first.
+
+**`getContent ...: 400` on first sync** — was a real bug in ≤1.1.10 (delta hashes serialized as JSON number arrays instead of hex strings). Upgrade to 1.1.11+ on BOTH the server and every plugin.
+
+**Admin dashboard says `(empty)` next to a vault that should have data** — the vault dir exists but no root was ever pushed successfully. Check `docker logs obsetync-server` during the client's next Sync Now for `put_root:` events. If none appear, the push itself is failing (decrypt error, bearer rejected, etc — the log will say).
+
+**`Last error: [pull] getDiff failed: 404`** — the server has no root for this vault yet. This is harmless on a first-sync-to-an-empty-server (the client treats 404 as empty delta). If it persists across syncs, the server lost its `vaults/<id>/current_root` pointer — check file permissions under `data/vaults/`.
+
+**Tailing live traffic with structured fields:**
+
+```sh
+ssh <server> 'docker logs -f obsetync-server' | grep -E 'put_root|post_diff|unauthorized'
+```
+
+**Finding a specific device's activity:**
+
+```sh
+ssh <server> 'docker logs obsetync-server' | grep 'device=<first 12 hex chars>'
 ```
 
 ## Using `just`
@@ -310,20 +358,24 @@ just --choose              # interactive picker (requires fzf)
 
 ### `just ship` — personal deploy helper
 
-If you want to build via Docker and ship the binary to a bare-metal server (no Docker on the target), set the three vars in `.env`:
+Builds a hermetic Nix Docker image locally, transfers it to a remote server via `docker save | ssh | docker load`, copies the current `docker-compose.yml` to the remote, tags the loaded image as `obsetync/server:local`, and runs `docker compose up -d` + `/health` verification. Also copies fresh plugin files to a local Obsidian vault if configured.
+
+Set the three vars in `.env` (gitignored):
 
 ```
 OBSETYNC_SERVER=user@host        # ssh target
-OBSETYNC_DEST=/opt/obsetync      # where the binary goes
+OBSETYNC_DEST=/opt/obsetync      # where docker-compose.yml + data/ live on the remote
 OBSETYNC_VAULT=/path/to/vault/.obsidian/plugins/obsetync   # optional local copy
 ```
 
 Then `just ship` does:
 
-1. Build binary + plugin artifacts via Docker
-2. rsync `dist/bin/sync-server` → `$OBSETYNC_SERVER:$OBSETYNC_DEST/`
-3. `systemctl restart obsetync` on the remote (no-op if the unit isn't installed)
-4. If `OBSETYNC_VAULT` is set, copy plugin files into it locally
+1. `nix build .#dockerImage` — hermetic OCI image
+2. `scp result $OBSETYNC_SERVER:/tmp/obsetync-nix.tar.gz`
+3. `scp docker-compose.yml $OBSETYNC_SERVER:$OBSETYNC_DEST/`
+4. `ssh` — `docker load`, tag as both `obsetync/server:local` and `ghcr.io/savemech/obsetync-nix:<version>`, `docker compose up -d`
+5. `curl /health` to verify the new image is serving
+6. If `OBSETYNC_VAULT` is set: rebuild plugin artifacts and copy `main.js` + `manifest.json` + `sync_core_bg.wasm` into that vault
 
 Public users: ignore `just ship` — `just build` + `just up` is the full flow.
 
