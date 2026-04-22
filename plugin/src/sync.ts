@@ -167,7 +167,18 @@ export class SyncEngine {
      * anything missing. Cheap when the server is fully populated (one
      * checkContent call with N hashes), correct when it isn't. */
     async forceSync(): Promise<void> {
+        const t0 = Date.now();
+        console.log(
+            `[obsetync] forceSync start: pending=${this.pendingChanges.length} ` +
+            `localRoot=${this.localRootHash?.slice(0, 16) ?? "(none)"}`
+        );
         await this.pullRemote();
+        const t1 = Date.now();
+        console.log(
+            `[obsetync] forceSync: pull done in ${t1 - t0}ms, ` +
+            `localRoot=${this.localRootHash?.slice(0, 16) ?? "(none)"}, ` +
+            `pending=${this.pendingChanges.length}`
+        );
         try {
             await this.reconcileContent();
         } catch (e: any) {
@@ -178,7 +189,17 @@ export class SyncEngine {
                 message: String(e?.message ?? e),
             };
         }
+        const t2 = Date.now();
+        console.log(
+            `[obsetync] forceSync: reconcile done in ${t2 - t1}ms, ` +
+            `pending=${this.pendingChanges.length}`
+        );
         await this.pushPending();
+        console.log(
+            `[obsetync] forceSync end in ${Date.now() - t0}ms, ` +
+            `pending=${this.pendingChanges.length}, ` +
+            `localRoot=${this.localRootHash?.slice(0, 16) ?? "(none)"}`
+        );
     }
 
     /**
@@ -199,6 +220,27 @@ export class SyncEngine {
     }> {
         const progress = onProgress ?? ((m: string) => this.onStatusUpdate(m));
 
+        // Guard against a concurrent push racing this — debouncedPush() fires
+        // from live vault events and would otherwise share our WASM tree
+        // handle while we bootstrap + inspect it.
+        if (this.syncing) {
+            console.log("[obsetync] reconcile skipped — another sync in progress");
+            return { smallUploaded: 0, largeUploaded: 0, treeChunksUploaded: 0, bytes: 0 };
+        }
+        this.syncing = true;
+        try {
+            return await this._reconcileInner(progress);
+        } finally {
+            this.syncing = false;
+        }
+    }
+
+    private async _reconcileInner(progress: (msg: string) => void): Promise<{
+        smallUploaded: number;
+        largeUploaded: number;
+        treeChunksUploaded: number;
+        bytes: number;
+    }> {
         // Populate the WASM tree from sync-base so wasm_tree_chunk_hashes
         // reflects the actual index-chunk set the server should have. Same
         // bootstrap push.ts does on first call.
@@ -225,6 +267,8 @@ export class SyncEngine {
             }
         }
 
+        const CHECK_BATCH = 1000;
+
         // --- Step 1: which tree chunks (index) is the server missing?
         const treeHashes = this.wasm.wasm_tree_chunk_hashes(this.tree);
         const missingTreeChunks = treeHashes.length > 0
@@ -233,7 +277,6 @@ export class SyncEngine {
 
         // --- Step 2: which small-file contents is the server missing?
         const smallHashes = [...smallHashToPath.keys()];
-        const CHECK_BATCH = 1000;
         const missingSmall: string[] = [];
         for (let i = 0; i < smallHashes.length; i += CHECK_BATCH) {
             const batch = smallHashes.slice(i, i + CHECK_BATCH);
@@ -242,19 +285,43 @@ export class SyncEngine {
             progress(`reconcile: checked ${Math.min(i + CHECK_BATCH, smallHashes.length)}/${smallHashes.length}`);
         }
 
-        const totalMissing = missingTreeChunks.length + missingSmall.length + largeHashToPath.size;
+        // --- Step 3: which large-file manifests is the server missing?
+        //
+        // Before, we read + re-chunked + re-manifested every large file
+        // unconditionally on every Sync Now. For a vault with big PDFs that
+        // meant minutes of pointless disk reads and CPU — the "continuously
+        // reuploading large files" symptom. The new bulk check lets us skip
+        // straight past large files whose manifest is already on the server.
+        const largeHashes = [...largeHashToPath.keys()];
+        const missingLargeManifests: string[] = [];
+        for (let i = 0; i < largeHashes.length; i += CHECK_BATCH) {
+            const batch = largeHashes.slice(i, i + CHECK_BATCH);
+            const missing = await this.api.checkManifests(batch);
+            missingLargeManifests.push(...missing);
+        }
+
+        const totalMissing =
+            missingTreeChunks.length + missingSmall.length + missingLargeManifests.length;
+
+        console.log(
+            `[obsetync] reconcile plan: ` +
+            `tree-chunks ${treeHashes.length} checked / ${missingTreeChunks.length} missing, ` +
+            `small ${smallHashes.length} checked / ${missingSmall.length} missing, ` +
+            `large ${largeHashes.length} checked / ${missingLargeManifests.length} missing`
+        );
+
         if (totalMissing === 0) {
             progress("reconcile: server in parity");
             return { smallUploaded: 0, largeUploaded: 0, treeChunksUploaded: 0, bytes: 0 };
         }
 
-        console.log(
-            `[obsetync] reconcile: server missing ${missingSmall.length} small files, ` +
-            `${missingTreeChunks.length} tree chunks; ${largeHashToPath.size} large files to verify`
-        );
-
         const notice = totalMissing >= 20
-            ? new Notice(`Re-uploading ${missingSmall.length} files to server...`, 0)
+            ? new Notice(
+                `Reconcile: uploading ${missingSmall.length} small + ` +
+                `${missingLargeManifests.length} large + ` +
+                `${missingTreeChunks.length} tree chunks...`,
+                0,
+            )
             : null;
 
         let smallUploaded = 0;
@@ -301,12 +368,17 @@ export class SyncEngine {
             await yieldToUI();
         }
 
-        // --- Step 5: large files — manifest + sub-file chunks.
+        // --- Step 5: large files — only those whose manifest is actually
+        // missing on the server. Steady-state syncs hit zero of these and
+        // the whole step is a no-op. When the server was wiped, we read +
+        // re-chunk + upload only the missing ones.
         let largeIdx = 0;
-        for (const [hash, path] of largeHashToPath) {
+        for (const hash of missingLargeManifests) {
+            const path = largeHashToPath.get(hash);
+            if (!path) continue;
             largeIdx++;
-            progress(`reconcile: large file ${largeIdx}/${largeHashToPath.size}`);
-            notice?.setMessage(`Re-uploading large file ${largeIdx}/${largeHashToPath.size}`);
+            progress(`reconcile: large file ${largeIdx}/${missingLargeManifests.length}`);
+            notice?.setMessage(`Re-uploading large file ${largeIdx}/${missingLargeManifests.length}`);
             try {
                 const data = await this.io.readFile(path);
                 const actual = streamingHash(this.wasm, data);
@@ -503,11 +575,21 @@ export class SyncEngine {
     }
 
     private async pushPending(): Promise<void> {
-        if (this.syncing || this.pendingChanges.length === 0) return;
+        if (this.syncing || this.pendingChanges.length === 0) {
+            console.log(
+                `[obsetync] pushPending early-return: syncing=${this.syncing}, ` +
+                `pending=${this.pendingChanges.length}`
+            );
+            return;
+        }
         this.syncing = true;
         this.state = "pushing";
 
         const batch = sortByPriority(this.pendingChanges.splice(0), this.syncPriority);
+        console.log(
+            `[obsetync] pushPending: ${batch.length} changes — ` +
+            `first 3 paths: ${batch.slice(0, 3).map(c => `${c.action}:${c.path}`).join(", ")}`
+        );
         this.onStatusUpdate(`↑ 0/${batch.length}`);
 
         // Show a persistent notice for batches large enough to care about.

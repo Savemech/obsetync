@@ -188,6 +188,13 @@ export class SyncApi {
         if (!res.ok) throw new Error(`putManifest ${hash}: ${res.status}`);
     }
 
+    async checkManifests(hashes: string[]): Promise<string[]> {
+        const body = new TextEncoder().encode(JSON.stringify(hashes));
+        const res = await this.sealed("POST", "/api/v1/content/manifests/check", body);
+        if (!res.ok) throw new Error(`checkManifests: ${res.status}`);
+        return (await res.json()).needed;
+    }
+
     // --- Content sub-file chunks ---
 
     async getContentChunk(hash: string): Promise<Uint8Array> {
