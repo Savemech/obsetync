@@ -114,6 +114,12 @@ export async function push(
     const deleted    = changes.filter(c => c.action === "deleted");
     const nonDeleted = changes.filter(c => c.action !== "deleted");
 
+    console.log(
+        `[obsetync] push: ${changes.length} changes (${nonDeleted.length} upsert, ` +
+        `${deleted.length} delete), tree bootstrapped=${!!tree.root_hash_hex()}, ` +
+        `sync-base size=${syncBase.allPaths().length}`
+    );
+
     // ONE delete_batch call for all deletions → O(N+prefix) not O(N×prefix).
     if (deleted.length > 0) {
         tree.delete_batch(JSON.stringify(deleted.map(c => c.path)));
@@ -291,8 +297,26 @@ export async function push(
     // D. Apply ALL tree updates in ONE update_tree call.
     //    O(N + prefix_size) vs O(N × prefix_size) with per-file update_entry.
     // ------------------------------------------------------------------
+    const beforeRoot = tree.root_hash_hex();
+    const beforeFiles = tree.total_files();
     if (allTreeUpdates.length > 0) {
         tree.update_batch(JSON.stringify(allTreeUpdates));
+    }
+    const afterRoot = tree.root_hash_hex();
+    const afterFiles = tree.total_files();
+    // Diagnostic: if batch > 0 but root didn't move, or file count didn't grow
+    // by the expected delta, update_batch silently dropped entries and we want
+    // to know NOW instead of watching devices mysteriously fail to sync.
+    console.log(
+        `[obsetync] tree update: files ${beforeFiles} → ${afterFiles}, ` +
+        `root ${(beforeRoot ?? "(empty)").slice(0, 16)} → ${(afterRoot ?? "(empty)").slice(0, 16)}, ` +
+        `batch=${allTreeUpdates.length} deletes=${deleted.length}`
+    );
+    if (allTreeUpdates.length > 0 && beforeRoot === afterRoot) {
+        console.warn(
+            `[obsetync] update_batch didn't move root despite ${allTreeUpdates.length} entries — ` +
+            `first 3: ${JSON.stringify(allTreeUpdates.slice(0, 3))}`
+        );
     }
 
     // Upload index chunks (LeafChunk, InternalNode) accumulated in MemoryChunkStore.
@@ -314,7 +338,14 @@ export async function push(
     // parentHash = what the server had BEFORE this push (for fast-forward detection).
     const parentHash = serverRootHash ?? "";
     const rootBytes  = tree.root_bytes();
-    if (!rootBytes) return { newRootHash: null, conflicts: [] };
+    if (!rootBytes) {
+        console.warn(`[obsetync] push: tree.root_bytes() returned null — tree uninitialised?`);
+        return { newRootHash: null, conflicts: [] };
+    }
+    console.log(
+        `[obsetync] putRoot → parent=${parentHash ? parentHash.slice(0,16) : "(empty)"} ` +
+        `new=${afterRoot?.slice(0,16)} bytes=${rootBytes.length}`
+    );
 
     onProgress?.("↑ pushing root...");
     const result = await api.putRoot(vaultId, rootBytes, parentHash);

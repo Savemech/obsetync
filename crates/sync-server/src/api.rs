@@ -234,6 +234,10 @@ pub fn sync_router(state: SharedState) -> Router {
                 .post(manifest_dispatcher),
         )
         .route(
+            "/api/v1/content/manifests/check",
+            post(post_manifests_check),
+        )
+        .route(
             "/api/v1/content/chunk/{hash}",
             get(get_content_chunk)
                 .put(put_content_chunk)
@@ -915,6 +919,23 @@ async fn put_content_chunk(
         "put_content_chunk: sub-file chunk stored"
     );
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn post_manifests_check(
+    State(state): State<SharedState>,
+    body: axum::body::Bytes,
+) -> Result<impl IntoResponse, ServerError> {
+    let hashes: Vec<String> = serde_json::from_slice(&body)
+        .map_err(|e| ServerError::BadRequest(format!("expected JSON array of hashes: {}", e)))?;
+    let needed: Vec<String> = hashes
+        .into_iter()
+        .filter(|h| {
+            hex_to_hash(h)
+                .map(|hash| !blob_exists(&state.layout.content_manifest_path(&hash)))
+                .unwrap_or(false)
+        })
+        .collect();
+    Ok(axum::Json(serde_json::json!({ "needed": needed })))
 }
 
 async fn post_content_chunks_check(
