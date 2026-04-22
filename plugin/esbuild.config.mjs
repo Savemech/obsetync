@@ -29,6 +29,16 @@ const context = await esbuild.context({
         "@lezer/highlight",
         "@lezer/lr",
     ],
+    // The "binary" loader reads the .wasm file at build time and emits it as
+    // a base64-encoded Uint8Array constant inside main.js. That means the
+    // plugin ships as a single self-contained file — no separate
+    // sync_core_bg.wasm download. This is what unblocks iOS, where BRAT +
+    // Obsidian's mobile plugin loader inconsistently honor the manifest's
+    // `pluginFiles` field, sometimes leaving the WASM binary missing and
+    // sending the plugin into silent-stub mode.
+    loader: {
+        ".wasm": "binary",
+    },
     format: "cjs",
     target: "es2020",
     logLevel: "info",

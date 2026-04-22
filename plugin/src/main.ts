@@ -21,6 +21,13 @@ import type { WasmModule, WasmTree } from "./push";
 // @ts-ignore
 import initWasm, * as WasmExports from "../wasm/sync_core";
 
+// Static import of the WASM binary — esbuild's "binary" loader (configured
+// in esbuild.config.mjs) turns this into a base64-embedded Uint8Array at
+// build time. The plugin ships as a single self-contained main.js, no
+// separate `sync_core_bg.wasm` file for BRAT/Obsidian to (fail to) deliver.
+// @ts-ignore
+import wasmBytes from "../wasm/sync_core_bg.wasm";
+
 export default class SyncPlugin extends Plugin {
     settings: SyncSettings = DEFAULT_SETTINGS;
     private io!: PlatformIO;
@@ -344,44 +351,24 @@ export default class SyncPlugin extends Plugin {
     }
 
     private async loadWasm(): Promise<WasmModule> {
-        // Load strategy: esbuild inlined the wasm-bindgen --target web glue
-        // into main.js at build time. No runtime eval, no `new Function()`,
-        // no dynamic import — all of which are blocked by iOS WKWebView's
-        // strict CSP. At runtime we only need to:
-        //
-        //   1. Read sync_core_bg.wasm bytes from the plugin directory.
-        //   2. Pass them to the bundled init function.
-        //   3. Return the bundled module's named exports, structurally
-        //      compatible with the WasmModule interface.
-        //
-        // The previous --target no-modules strategy worked on desktop but
-        // silently fell through to a stub on iOS, rendering hashes and trees
-        // useless for mobile sync.
-        const pluginDir = ".obsidian/plugins/obsetync";
-        const adapter = this.app.vault.adapter;
-
-        // Log at each step so the iPhone debug panel shows WHERE it failed —
-        // previously the catch only surfaced a stack frame from Obsidian's
-        // error handler, which told us nothing about the actual cause.
-        let step = "init";
+        // Both the wasm-bindgen --target web glue AND the WASM binary are
+        // bundled into main.js at build time (the glue via esbuild's ES
+        // module inlining, the binary via the "binary" loader emitting a
+        // base64-encoded Uint8Array constant). At runtime we call the
+        // bundled init function with the bundled bytes — no file I/O, no
+        // `new Function()`, no dynamic import. This is what keeps iOS
+        // WKWebView + CSP + BRAT's spotty pluginFiles delivery from
+        // breaking sync.
         try {
-            step = "readBinary";
-            const wasmBuf = await adapter.readBinary(`${pluginDir}/sync_core_bg.wasm`);
-            const byteLen = wasmBuf.byteLength;
-
-            step = "initWasm";
-            // initWasm accepts { module_or_path: BufferSource } on --target web.
-            // It initialises the shared WASM instance inside the bundled glue;
-            // after this call WasmExports.* is usable.
-            await initWasm({ module_or_path: new Uint8Array(wasmBuf) });
-            console.log(`[obsetync] WASM loaded (${byteLen} bytes)`);
+            await initWasm({ module_or_path: wasmBytes });
+            console.log(`[obsetync] WASM loaded (${wasmBytes.byteLength} bytes, inline)`);
             return WasmExports as unknown as WasmModule;
         } catch (e: any) {
             const msg = e?.message ?? String(e);
             const name = e?.name ?? "Error";
             const stack = (e?.stack ?? "").split("\n").slice(0, 3).join(" | ");
             console.warn(
-                `[obsetync] WASM load failed at step '${step}' — using stub. ` +
+                `[obsetync] WASM load failed — using stub. ` +
                 `${name}: ${msg} (stack: ${stack})`
             );
             return createWasmStub();
