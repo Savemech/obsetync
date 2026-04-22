@@ -1,7 +1,7 @@
 import { SyncApi, FileDelta, FileManifest } from "./api";
 import { PlatformIO } from "./platform";
 import { SyncBase } from "./sync-base";
-import type { WasmModule } from "./push";
+import { hashFileStreaming, type WasmModule } from "./push";
 
 const CHUNK_THRESHOLD = 1_048_576; // 1MB
 const DOWNLOAD_CONCURRENCY = 6;
@@ -36,7 +36,7 @@ export async function pull(
         if (!deltas || deltas.length === 0) {
             return { newRootHash: null, newRootBytes: null, applied: 0 };
         }
-        await applyDeltas(api, io, syncBase, deltas, onProgress);
+        await applyDeltas(api, io, syncBase, wasm, deltas, onProgress);
 
         // Establish newRootHash + raw root bytes from the server's current
         // root. Caller persists the bytes to cached-root.bin so restart
@@ -96,7 +96,7 @@ export async function pull(
     }
 
     onProgress?.(`${deltas.length} changes to apply`);
-    await applyDeltas(api, io, syncBase, deltas, onProgress);
+    await applyDeltas(api, io, syncBase, wasm, deltas, onProgress);
 
     // Extract the new root hash from the server's current root bytes so
     // subsequent incremental syncs know what to diff against.
@@ -117,11 +117,31 @@ export async function pull(
     return { newRootHash, newRootBytes, applied: deltas.length };
 }
 
+/** Counters for the three-tier resolution of a content delta. Summed
+ *  across the whole apply loop and logged at the end, so we can tell
+ *  at a glance whether a 3000-file delta was actually 3000 downloads
+ *  or mostly free cache hits. */
+interface ApplyStats {
+    /** sync-base already records `delta.hash` at the target path + disk
+     *  metadata matches; no hash, no network, no disk write. */
+    cacheHit: number;
+    /** sync-base disagreed (or was absent) but hashing the on-disk file
+     *  locally matched `delta.hash`; sync-base repaired, no network. */
+    localHit: number;
+    /** Had to fetch from the server. Actual bandwidth used. */
+    downloaded: number;
+    /** Sum of bytes we avoided sending over the wire. */
+    bytesSkipped: number;
+    /** Sum of bytes we actually pulled from the server. */
+    bytesDownloaded: number;
+}
+
 /** Apply a delta stream: renames, deletions, then file content (parallel). */
 async function applyDeltas(
     api: SyncApi,
     io: PlatformIO,
     syncBase: SyncBase,
+    wasm: WasmModule | null,
     deltas: FileDelta[],
     onProgress?: (msg: string) => void,
 ): Promise<void> {
@@ -157,14 +177,33 @@ async function applyDeltas(
         syncBase.removeEntry(delta.path);
     }
 
+    const stats: ApplyStats = {
+        cacheHit: 0,
+        localHit: 0,
+        downloaded: 0,
+        bytesSkipped: 0,
+        bytesDownloaded: 0,
+    };
+
     const toDownload = [...modifications, ...additions];
     for (let i = 0; i < toDownload.length; i += DOWNLOAD_CONCURRENCY) {
         const batch = toDownload.slice(i, i + DOWNLOAD_CONCURRENCY);
         await Promise.all(
-            batch.map((delta) => applyContentDelta(api, io, syncBase, delta))
+            batch.map((delta) => applyContentDelta(api, io, syncBase, wasm, delta, stats))
         );
         onProgress?.(
             `${Math.min(i + DOWNLOAD_CONCURRENCY, toDownload.length)}/${toDownload.length} files applied`
+        );
+    }
+
+    if (toDownload.length > 0) {
+        const fmt = (n: number) => (n >= 1_048_576)
+            ? `${(n / 1_048_576).toFixed(1)} MB`
+            : n >= 1024 ? `${(n / 1024).toFixed(0)} KB` : `${n} B`;
+        console.log(
+            `[obsetync] applyDeltas: ${stats.cacheHit} cache-hit, ` +
+            `${stats.localHit} local-hash-hit, ${stats.downloaded} downloaded — ` +
+            `${fmt(stats.bytesSkipped)} saved, ${fmt(stats.bytesDownloaded)} transferred`
         );
     }
 }
@@ -173,27 +212,70 @@ async function applyContentDelta(
     api: SyncApi,
     io: PlatformIO,
     syncBase: SyncBase,
-    delta: FileDelta
+    wasm: WasmModule | null,
+    delta: FileDelta,
+    stats: ApplyStats,
 ): Promise<void> {
     if (!delta.hash) return;
 
     const size = delta.size ?? 0;
 
+    // --- Tier 1: sync-base cache hit --------------------------------------
+    // If sync-base already records this path at this exact hash AND the
+    // on-disk (mtime, size) match the sync-base entry, we know the file is
+    // byte-identical to what the server wants. Zero work.
+    const stat = await io.stat(delta.path);
+    if (stat) {
+        const base = syncBase.getEntry(delta.path);
+        if (
+            base &&
+            base.hash === delta.hash &&
+            base.mtime === stat.mtime &&
+            base.size === stat.size
+        ) {
+            stats.cacheHit++;
+            stats.bytesSkipped += size || stat.size;
+            return;
+        }
+
+        // --- Tier 2: local hash matches target --------------------------
+        // sync-base disagrees (or is missing) but the on-disk file hashes
+        // to the exact value the server is offering. Common after a
+        // rollback or stub-WASM recovery — the content is correct, only
+        // our metadata was stale. Repair sync-base and skip the download.
+        if (wasm) {
+            try {
+                const actualHash = await hashFileStreaming(delta.path, io, wasm);
+                if (actualHash === delta.hash) {
+                    syncBase.setEntry(delta.path, delta.hash, stat.mtime, stat.size);
+                    stats.localHit++;
+                    stats.bytesSkipped += size || stat.size;
+                    return;
+                }
+            } catch (e) {
+                // Hash failed (read error, permission issue, etc.) — fall
+                // through to the download path so we still end up correct.
+                console.warn(`[obsetync] local-hash check failed for ${delta.path}:`, e);
+            }
+        }
+    }
+
+    // --- Tier 3: actual download from server -----------------------------
     if (size >= CHUNK_THRESHOLD) {
-        // Large file: fetch manifest, then missing chunks, reassemble.
         await applyLargeFile(api, io, delta.path, delta.hash);
     } else {
-        // Small file: fetch whole blob.
         const data = await api.getContent(delta.hash);
         await io.writeFile(delta.path, data);
     }
+    stats.downloaded++;
+    stats.bytesDownloaded += size;
 
-    const stat = await io.stat(delta.path);
+    const postStat = await io.stat(delta.path);
     syncBase.setEntry(
         delta.path,
         delta.hash,
-        stat?.mtime ?? Date.now(),
-        stat?.size ?? size
+        postStat?.mtime ?? Date.now(),
+        postStat?.size ?? size,
     );
 }
 
