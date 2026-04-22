@@ -62,13 +62,37 @@ export async function pull(
     const deltas = await api.getDiff(vaultId, localRootHash);
 
     if (!deltas || deltas.length === 0) {
-        // Successful no-op sync — advance the last-sync timestamp so the UI
-        // reflects the check rather than showing a stale timestamp from the
-        // last round that had actual changes.
+        // Empty delta list can mean one of two things:
+        //
+        //   (a) Same root on both sides — server sends 304, middleware
+        //       promotes to 200 with empty body. localRootHash stays valid.
+        //   (b) Different roots but identical content (only mtime/size
+        //       differ between server and client trees). Server computed
+        //       deltas and got []. We MUST advance localRootHash here —
+        //       otherwise every future pull will keep returning 0 deltas
+        //       against our stale root and we'll be stuck forever, even
+        //       though the server is semantically ahead.
+        //
+        // We can't distinguish (a) from (b) on the client (middleware ate
+        // the 304 status to keep the AEAD envelope intact). Cheapest
+        // correct fix: always refresh the server root when pull returns
+        // empty deltas. Adds one HTTP round-trip per idle pull — fine.
         syncBase.setLastSyncTimestamp(Date.now());
         await syncBase.save();
+
+        let newRootHash: string | null = localRootHash;
+        let newRootBytes: Uint8Array | null = null;
+        try {
+            newRootBytes = await api.getRoot(vaultId);
+            if (newRootBytes && wasm) {
+                newRootHash = wasm.wasm_root_hash_from_bytes(newRootBytes) ?? localRootHash;
+            }
+        } catch (e) {
+            console.warn("[obsetync] idle-pull root-hash fetch failed:", e);
+        }
+
         onProgress?.("up to date");
-        return { newRootHash: localRootHash, newRootBytes: null, applied: 0 };
+        return { newRootHash, newRootBytes, applied: 0 };
     }
 
     onProgress?.(`${deltas.length} changes to apply`);

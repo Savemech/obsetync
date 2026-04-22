@@ -118,7 +118,7 @@ ship-server: build-nix-image
     scp -q result {{server}}:/tmp/obsetync-nix.tar.gz
     @echo "→ shipping docker-compose.yml to {{server}}:{{dest}}"
     scp -q docker-compose.yml {{server}}:{{dest}}/docker-compose.yml
-    ssh {{server}} "docker load < /tmp/obsetync-nix.tar.gz && docker tag obsetync-server:nix obsetync/server:local && docker tag obsetync-server:nix ghcr.io/savemech/obsetync-nix:1.1.15 && rm /tmp/obsetync-nix.tar.gz && cd {{dest}} && docker compose up -d"
+    ssh {{server}} "docker load < /tmp/obsetync-nix.tar.gz && docker tag obsetync-server:nix obsetync/server:local && docker tag obsetync-server:nix ghcr.io/savemech/obsetync-nix:1.1.16 && rm /tmp/obsetync-nix.tar.gz && cd {{dest}} && docker compose up -d"
     @echo "→ verifying /health"
     ssh {{server}} "curl -fsS http://127.0.0.1:27182/health"
     @echo
