@@ -8,21 +8,17 @@ The Context diagram shows **who uses ObsetyNC and how it fits into the wider env
 C4Context
     title System Context — ObsetyNC
 
-    Person(user, "Obsidian User", "Writes and edits notes on Desktop (Windows / macOS / Linux) or iOS. Manages enrolled devices via the admin dashboard.")
+    Person(user, "Obsidian User", "Writes notes on Desktop or iOS. Manages enrolled devices via admin dashboard.")
 
-    System_Boundary(b_obsetync, "ObsetyNC") {
-        System(obsetync, "ObsetyNC", "Self-hosted, end-to-end encrypted Obsidian vault sync system. Stores encrypted content blobs, indexes file trees with a Merkle structure, and resolves concurrent edits via three-way merge.")
-    }
+    System(obsetync, "ObsetyNC", "Self-hosted E2E-encrypted vault sync. Content-addressed storage, Merkle tree index, AEAD transport.")
 
-    SystemExt(obsidian_app, "Obsidian App", "Cross-platform note-taking application. Runs on each user device and hosts the ObsetyNC plugin as an in-process extension.")
-    SystemExt(github, "GitHub", "Hosts ObsetyNC plugin releases and the BRAT-compatible versions.json manifest. Used for plugin distribution and auto-update checks.")
+    System_Ext(obsidian_app, "Obsidian App", "Note-taking app. Hosts the ObsetyNC plugin on each device as an in-process extension.")
+    System_Ext(github, "GitHub", "Hosts plugin releases and versions.json manifest for BRAT auto-update.")
 
     Rel(user, obsidian_app, "Writes and edits notes")
-    Rel(obsidian_app, obsetync, "Syncs vault deltas", "AEAD-encrypted HTTP POST, port 27182")
-    Rel(user, obsetync, "Manages devices and enrollments", "Plain HTTP, Admin UI port 27183")
-    Rel(github, obsidian_app, "Delivers plugin updates", "HTTPS — BRAT auto-update or manual install")
-
-    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
+    Rel(obsidian_app, obsetync, "Syncs vault deltas", "AEAD/HTTP POST, port 27182")
+    Rel(user, obsetync, "Manages devices and enrollments", "HTTP, Admin UI port 27183")
+    Rel(github, obsidian_app, "Delivers plugin updates", "HTTPS, BRAT or manual install")
 ```
 
 ---
