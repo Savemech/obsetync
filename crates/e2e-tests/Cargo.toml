@@ -1,0 +1,59 @@
+[package]
+name = "e2e-tests"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[features]
+# Tests are gated behind this feature so `cargo test --workspace` (default
+# members exclude this crate anyway) does not try to talk to a docker stack
+# that may not be running.
+default = []
+e2e = []
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+blake3 = { workspace = true }
+sync-core = { path = "../sync-core" }
+
+reqwest = { version = "0.12", default-features = false }
+base64 = "0.22"
+rand = "0.9"
+x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"] }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+hkdf = "0.12"
+sha2 = "0.10"
+anyhow = "1"
+
+[[test]]
+name = "smoke"
+path = "tests/smoke.rs"
+required-features = ["e2e"]
+
+[[test]]
+name = "enrollment"
+path = "tests/enrollment.rs"
+required-features = ["e2e"]
+
+[[test]]
+name = "single_device"
+path = "tests/single_device.rs"
+required-features = ["e2e"]
+
+[[test]]
+name = "two_device_sync"
+path = "tests/two_device_sync.rs"
+required-features = ["e2e"]
+
+[[test]]
+name = "conflicts"
+path = "tests/conflicts.rs"
+required-features = ["e2e"]
+
+[[test]]
+name = "transport_security"
+path = "tests/transport_security.rs"
+required-features = ["e2e"]

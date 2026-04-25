@@ -1,0 +1,64 @@
+# ==============================================================================
+# ObsetyNC — isolated E2E stack.
+#
+# Separate ports + volume from the dev stack so `just up` and `just e2e` can
+# coexist without colliding. The test runner (cargo test -p e2e-tests) talks
+# to this stack over plain HTTP on 127.0.0.1.
+#
+#   just e2e              # build image (if missing) → up → tests → down -v
+#   just e2e-up           # bring stack up only
+#   just e2e-down         # stop and wipe the e2e volume
+#   just e2e-logs         # tail server logs
+#
+# Ports:
+#   27282  →  container 27182  (sync API, AEAD)
+#   27283  →  container 27183  (admin)
+#
+# Volume:
+#   obsetync-e2e-data  — wiped by `just e2e-down -v` for a fresh install per run.
+# ==============================================================================
+
+services:
+
+  # One-shot init container. Generates the X25519 box keypair and the data
+  # directory layout. Idempotent (re-running on an initialized volume is a
+  # no-op). The `e2e-server` service waits for this to exit successfully.
+  e2e-init:
+    image: obsetync/server:local
+    container_name: obsetync-e2e-init
+    volumes:
+      - obsetync-e2e-data:/data
+    restart: "no"
+    command: ["init", "--data-dir", "/data"]
+
+  # The system under test.
+  e2e-server:
+    image: obsetync/server:local
+    container_name: obsetync-e2e-server
+    restart: "no"
+    environment:
+      RUST_LOG: "${RUST_LOG:-sync_server=info,warn}"
+    depends_on:
+      e2e-init:
+        condition: service_completed_successfully
+    ports:
+      # Bind to loopback only — these are test endpoints, not for external traffic.
+      - "127.0.0.1:27282:27182"
+      - "127.0.0.1:27283:27183"
+    volumes:
+      - obsetync-e2e-data:/data
+    command:
+      - "run"
+      - "--data-dir"
+      - "/data"
+      - "--sync-port"
+      - "27182"
+      - "--admin-port"
+      - "27183"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  obsetync-e2e-data:
