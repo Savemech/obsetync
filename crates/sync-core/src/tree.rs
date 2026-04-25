@@ -349,4 +349,119 @@ mod tests {
         assert_eq!(root.total_files, 2);
         // Should have both "" prefix (root-level) and "notes/" prefix.
     }
+
+    #[test]
+    fn top_level_prefix_extracts_first_dir() {
+        assert_eq!(top_level_prefix("notes/2024/jan.md"), "notes/");
+        assert_eq!(top_level_prefix("notes/a.md"), "notes/");
+        assert_eq!(top_level_prefix("readme.md"), "");
+        assert_eq!(top_level_prefix(""), "");
+        assert_eq!(top_level_prefix("/"), "/");
+        assert_eq!(top_level_prefix("a/"), "a/");
+    }
+
+    #[tokio::test]
+    async fn build_tree_empty_input() {
+        let store = MemoryChunkStore::new();
+        let root = build_tree(&store, vec![], "v", "d").await.unwrap();
+        assert_eq!(root.total_files, 0);
+        assert!(root.children.is_empty());
+        assert_eq!(root.vault_id, "v");
+        assert_eq!(root.device_id, "d");
+        assert!(root.parent_hash.is_none());
+    }
+
+    #[tokio::test]
+    async fn load_all_entries_round_trip_through_build_tree() {
+        let store = MemoryChunkStore::new();
+        let entries = vec![
+            make_entry("notes/a.md"),
+            make_entry("notes/b.md"),
+            make_entry("photos/p.png"),
+        ];
+        let root = build_tree(&store, entries.clone(), "v", "d").await.unwrap();
+
+        // Sum entries across every prefix and confirm round-trip.
+        let mut all = Vec::new();
+        for (_, h) in &root.children {
+            let mut sub = load_all_entries(&store, h).await.unwrap();
+            all.append(&mut sub);
+        }
+        all.sort();
+        let mut sorted_in = entries.clone();
+        sorted_in.sort();
+        assert_eq!(all.len(), sorted_in.len());
+        for (a, b) in all.iter().zip(sorted_in.iter()) {
+            assert_eq!(a.path, b.path);
+            assert_eq!(a.hash, b.hash);
+        }
+    }
+
+    #[tokio::test]
+    async fn update_tree_delete_last_file_in_prefix_removes_prefix() {
+        let store = MemoryChunkStore::new();
+        let entries = vec![
+            make_entry("only/a.md"),
+            make_entry("notes/b.md"),
+        ];
+        let root = build_tree(&store, entries, "v", "d").await.unwrap();
+        assert!(root.children.iter().any(|(p, _)| p == "only/"));
+
+        let updated = update_tree(&store, &root, &[], &["only/a.md".to_string()])
+            .await
+            .unwrap();
+        assert!(!updated.children.iter().any(|(p, _)| p == "only/"));
+        assert_eq!(updated.total_files, 1);
+    }
+
+    #[tokio::test]
+    async fn update_tree_no_changes_keeps_total() {
+        let store = MemoryChunkStore::new();
+        let entries = vec![make_entry("a.md"), make_entry("notes/b.md")];
+        let root = build_tree(&store, entries, "v", "d").await.unwrap();
+        let updated = update_tree(&store, &root, &[], &[]).await.unwrap();
+        assert_eq!(updated.total_files, root.total_files);
+        assert_eq!(updated.parent_hash, Some(root.hash()));
+    }
+
+    #[tokio::test]
+    async fn update_tree_add_to_new_prefix() {
+        let store = MemoryChunkStore::new();
+        let root = build_tree(&store, vec![make_entry("notes/a.md")], "v", "d")
+            .await
+            .unwrap();
+        let updated = update_tree(&store, &root, &[make_entry("photos/p.png")], &[])
+            .await
+            .unwrap();
+        assert_eq!(updated.total_files, 2);
+        assert!(updated.children.iter().any(|(p, _)| p == "photos/"));
+    }
+
+    #[tokio::test]
+    async fn build_tree_splits_into_multiple_leaf_chunks() {
+        // Force >1 leaf chunk per prefix by exceeding TARGET_CHUNK_ENTRIES.
+        let store = MemoryChunkStore::new();
+        let n = TARGET_CHUNK_ENTRIES + 5;
+        let entries: Vec<_> = (0..n)
+            .map(|i| make_entry(&format!("notes/{:05}.md", i)))
+            .collect();
+        let root = build_tree(&store, entries, "v", "d").await.unwrap();
+        assert_eq!(root.total_files, n as u64);
+        // Round-trip via load_all_entries through the InternalNode.
+        let notes_hash = root
+            .children
+            .iter()
+            .find(|(p, _)| p == "notes/")
+            .map(|(_, h)| *h)
+            .unwrap();
+        let entries_back = load_all_entries(&store, &notes_hash).await.unwrap();
+        assert_eq!(entries_back.len(), n);
+    }
+
+    #[tokio::test]
+    async fn load_all_entries_errors_on_unknown_hash() {
+        let store = MemoryChunkStore::new();
+        let err = load_all_entries(&store, &hash_bytes(b"unknown")).await;
+        assert!(err.is_err());
+    }
 }

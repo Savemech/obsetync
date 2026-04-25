@@ -183,4 +183,99 @@ mod tests {
         store.delete(&hash).await.unwrap();
         assert!(!store.has(&hash).await);
     }
+
+    #[tokio::test]
+    async fn memory_store_default_is_empty() {
+        let store = MemoryChunkStore::default();
+        assert!(store.is_empty());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn memory_store_len_tracks_entries() {
+        let store = MemoryChunkStore::new();
+        assert!(store.is_empty());
+        store
+            .put(hash_bytes(b"a"), vec![1, 2, 3])
+            .await
+            .unwrap();
+        store
+            .put(hash_bytes(b"b"), vec![4, 5, 6])
+            .await
+            .unwrap();
+        assert!(!store.is_empty());
+        assert_eq!(store.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn memory_store_insert_get_helpers() {
+        let store = MemoryChunkStore::new();
+        let h = hash_bytes(b"helper");
+        store.insert_chunk(h, vec![9, 9, 9]);
+        assert_eq!(store.get_chunk(&h), Some(vec![9, 9, 9]));
+        assert_eq!(store.get_chunk(&hash_bytes(b"missing")), None);
+    }
+
+    #[tokio::test]
+    async fn memory_store_all_chunks_lists_everything() {
+        let store = MemoryChunkStore::new();
+        let h1 = hash_bytes(b"a");
+        let h2 = hash_bytes(b"b");
+        store.insert_chunk(h1, vec![1]);
+        store.insert_chunk(h2, vec![2]);
+
+        let mut hashes = store.all_chunk_hashes();
+        hashes.sort();
+        let mut expected = vec![h1, h2];
+        expected.sort();
+        assert_eq!(hashes, expected);
+
+        let all = store.all_chunks();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn memory_store_put_overwrites() {
+        let store = MemoryChunkStore::new();
+        let h = hash_bytes(b"k");
+        store.put(h, vec![1]).await.unwrap();
+        store.put(h, vec![2, 2]).await.unwrap();
+        assert_eq!(store.get(&h).await.unwrap(), vec![2, 2]);
+        assert_eq!(store.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn memory_store_delete_missing_is_ok() {
+        let store = MemoryChunkStore::new();
+        store.delete(&hash_bytes(b"never")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disk_store_get_missing_returns_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DiskChunkStore::new(dir.path());
+        let err = store.get(&hash_bytes(b"absent")).await.unwrap_err();
+        assert!(matches!(err, ChunkError::NotFound(_)));
+        assert!(!store.has(&hash_bytes(b"absent")).await);
+    }
+
+    #[tokio::test]
+    async fn disk_store_path_layout_uses_first_two_hex() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DiskChunkStore::new(dir.path());
+        let h = hash_bytes(b"layout");
+        store.put(h, b"x".to_vec()).await.unwrap();
+        // The expected on-disk path puts the first two hex chars in a sub-dir.
+        let hex = hash_to_hex(&h);
+        let expected = dir.path().join(&hex[..2]).join(&hex[2..]);
+        assert!(expected.exists(), "expected blob at {:?}", expected);
+    }
+
+    #[tokio::test]
+    async fn disk_store_delete_missing_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DiskChunkStore::new(dir.path());
+        // deleting a hash that was never written must not error.
+        store.delete(&hash_bytes(b"ghost")).await.unwrap();
+    }
 }

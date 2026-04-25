@@ -669,6 +669,108 @@ fn current_root_stats(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tempfile::tempdir;
+
+    #[test]
+    fn format_bytes_units() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1024), "1 KB");
+        assert_eq!(format_bytes(2048), "2 KB");
+        // 1.5 MB
+        assert_eq!(format_bytes(1024 * 1024 + 512 * 1024), "1.5 MB");
+        // 2 GB exact
+        assert_eq!(format_bytes(2u64 * 1024 * 1024 * 1024), "2.00 GB");
+    }
+
+    #[test]
+    fn format_bytes_boundary_kb_lower() {
+        // 1023 B stays in bytes; 1024 B promotes to KB.
+        assert_eq!(format_bytes(1023), "1023 B");
+        assert_eq!(format_bytes(1024), "1 KB");
+    }
+
+    #[test]
+    fn format_duration_buckets() {
+        assert_eq!(format_duration(Duration::from_secs(5)), "5s");
+        assert_eq!(format_duration(Duration::from_secs(75)), "1m 15s");
+        assert_eq!(format_duration(Duration::from_secs(3 * 3600 + 14 * 60)), "3h 14m");
+        assert_eq!(
+            format_duration(Duration::from_secs(2 * 86400 + 5 * 3600)),
+            "2d 5h"
+        );
+    }
+
+    #[test]
+    fn format_time_zero_is_never() {
+        assert_eq!(format_time(0), "never");
+    }
+
+    #[test]
+    fn format_time_recent_is_just_now() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert_eq!(format_time(now_ms), "just now");
+    }
+
+    #[test]
+    fn format_time_minutes_ago() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        // 5 minutes ago.
+        let five_min = now_ms - 5 * 60 * 1000;
+        let s = format_time(five_min);
+        assert!(s.ends_with(" min ago"), "got: {}", s);
+    }
+
+    #[test]
+    fn is_recent_threshold_is_five_minutes() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(is_recent(now_ms));
+        assert!(is_recent(now_ms - 4 * 60 * 1000));
+        // Older than 5 minutes — must be considered offline.
+        assert!(!is_recent(now_ms - 10 * 60 * 1000));
+    }
+
+    #[test]
+    fn dir_stats_returns_zero_for_missing_dir() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("absent");
+        assert_eq!(dir_stats(&missing), (0, 0));
+    }
+
+    #[test]
+    fn dir_stats_recurses_and_sums() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.bin"), b"hello").unwrap(); // 5
+        std::fs::create_dir_all(root.join("sub/sub2")).unwrap();
+        std::fs::write(root.join("sub/b.bin"), b"world!").unwrap(); // 6
+        std::fs::write(root.join("sub/sub2/c.bin"), b"x").unwrap(); // 1
+
+        let (bytes, count) = dir_stats(root);
+        assert_eq!(count, 3);
+        assert_eq!(bytes, 5 + 6 + 1);
+    }
+
+    #[test]
+    fn dir_stats_empty_dir_zero() {
+        let dir = tempdir().unwrap();
+        assert_eq!(dir_stats(dir.path()), (0, 0));
+    }
+}
+
 const CSS: &str = r#"<style>
 body { font-family: -apple-system, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; color: #333; }
 h1 { border-bottom: 2px solid #eee; padding-bottom: 10px; }

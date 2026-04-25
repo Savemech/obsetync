@@ -386,11 +386,98 @@ mod tests {
 
     #[test]
     fn merge_identical_changes() {
-        let base = b"line1\nline2\n";
-        let changed = b"line1\nline2-same\n";
+        let _base = b"line1\nline2\n";
+        let _changed = b"line1\nline2-same\n";
 
         // Both sides made the same change — local == remote, so classify_sync
         // would return NoChange. This function shouldn't be called in that case,
         // but if it is, both sides have the same content so it shouldn't matter.
+    }
+
+    #[test]
+    fn classify_with_zero_hashes() {
+        let zero = [0u8; 32];
+        assert_eq!(classify_sync(&zero, &zero, &zero), SyncAction::NoChange);
+    }
+
+    #[test]
+    fn classify_extracts_hashes_in_conflict() {
+        let base = hash_bytes(b"base");
+        let local = hash_bytes(b"local");
+        let remote = hash_bytes(b"remote");
+        match classify_sync(&base, &local, &remote) {
+            SyncAction::Conflict {
+                base_hash,
+                local_hash,
+                remote_hash,
+            } => {
+                assert_eq!(base_hash, base);
+                assert_eq!(local_hash, local);
+                assert_eq!(remote_hash, remote);
+            }
+            _ => panic!("expected Conflict"),
+        }
+    }
+
+    #[test]
+    fn merge_empty_inputs() {
+        // Empty base, empty sides — must not panic and must produce some merged result.
+        let result = three_way_text_merge(b"", b"", b"");
+        // Either Merged (with empty content) or Overlap is acceptable; just must not panic.
+        match result {
+            TextMergeResult::Merged { content } => assert!(content.is_empty() || content == b"\n"),
+            TextMergeResult::Overlap => {}
+        }
+    }
+
+    #[test]
+    fn merge_local_only_returns_local_lines() {
+        // Local edits a line, remote unchanged. Result must contain the local change.
+        let base = b"a\nb\nc\n";
+        let local = b"a\nB\nc\n";
+        let remote = b"a\nb\nc\n";
+        match three_way_text_merge(base, local, remote) {
+            TextMergeResult::Merged { content } => {
+                let s = String::from_utf8(content).unwrap();
+                assert!(s.contains("B"));
+            }
+            TextMergeResult::Overlap => panic!("expected merge, got overlap"),
+        }
+    }
+
+    #[test]
+    fn file_resolution_serde_roundtrip() {
+        let h1 = hash_bytes(b"win");
+        let h2 = hash_bytes(b"keep");
+        let r = FileResolution::ConflictCopy {
+            winner_hash: h1,
+            preserved_hash: h2,
+            preserved_path: "notes/conflict.md".into(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        // Tag-based serde: must include the discriminant.
+        assert!(json.contains("conflict_copy"));
+        let _back: FileResolution = serde_json::from_str(&json).unwrap();
+    }
+
+    #[test]
+    fn file_resolution_skipped_serde() {
+        let r = FileResolution::Skipped;
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("skipped"));
+        let _back: FileResolution = serde_json::from_str(&json).unwrap();
+    }
+
+    #[test]
+    fn file_conflict_clone_keeps_fields() {
+        let c = FileConflict {
+            path: "x.md".into(),
+            base_hash: hash_bytes(b"b"),
+            side_a_hash: hash_bytes(b"a"),
+            side_b_hash: hash_bytes(b"bb"),
+        };
+        let c2 = c.clone();
+        assert_eq!(c2.path, "x.md");
+        assert_eq!(c2.base_hash, c.base_hash);
     }
 }

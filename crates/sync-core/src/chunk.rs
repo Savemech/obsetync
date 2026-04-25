@@ -478,4 +478,146 @@ mod tests {
         let decoded = RootNode::deserialize(&bytes).unwrap();
         assert_eq!(decoded.parent_hash, None);
     }
+
+    #[test]
+    fn file_entry_ord_by_path() {
+        let h = hash_bytes(b"x");
+        let a = FileEntry::new("a.md".into(), h, 1, 1);
+        let b = FileEntry::new("b.md".into(), h, 99, 99);
+        let mut v = vec![b.clone(), a.clone()];
+        v.sort();
+        assert_eq!(v[0].path, "a.md");
+        assert_eq!(v[1].path, "b.md");
+        assert!(a < b);
+        assert_eq!(a.partial_cmp(&b), Some(std::cmp::Ordering::Less));
+    }
+
+    #[test]
+    fn leaf_chunk_new_sorts_entries() {
+        let h = hash_bytes(b"x");
+        let entries = vec![
+            FileEntry::new("z.md".into(), h, 1, 1),
+            FileEntry::new("a.md".into(), h, 1, 1),
+            FileEntry::new("m.md".into(), h, 1, 1),
+        ];
+        let chunk = LeafChunk::new(entries);
+        assert_eq!(chunk.entries[0].path, "a.md");
+        assert_eq!(chunk.entries[1].path, "m.md");
+        assert_eq!(chunk.entries[2].path, "z.md");
+    }
+
+    #[test]
+    fn leaf_chunk_empty_roundtrip() {
+        let chunk = LeafChunk::new(vec![]);
+        let bytes = chunk.serialize();
+        let decoded = LeafChunk::deserialize(&bytes).unwrap();
+        assert!(decoded.entries.is_empty());
+    }
+
+    #[test]
+    fn leaf_chunk_hash_changes_with_content() {
+        let c1 = LeafChunk::new(vec![FileEntry::new("a".into(), hash_bytes(b"1"), 1, 1)]);
+        let c2 = LeafChunk::new(vec![FileEntry::new("a".into(), hash_bytes(b"2"), 1, 1)]);
+        assert_ne!(c1.hash(), c2.hash());
+    }
+
+    #[test]
+    fn leaf_chunk_deserialize_rejects_internal_node_bytes() {
+        let node = InternalNode::new(vec![("x/".into(), hash_bytes(b"x"))]);
+        let err = LeafChunk::deserialize(&node.serialize()).unwrap_err();
+        assert!(matches!(err, ChunkError::Deserialize(_)));
+    }
+
+    #[test]
+    fn leaf_chunk_deserialize_rejects_garbage() {
+        let err = LeafChunk::deserialize(&[0u8; 4]).unwrap_err();
+        assert!(matches!(err, ChunkError::Deserialize(_)));
+    }
+
+    #[test]
+    fn internal_node_new_sorts_children() {
+        let h = hash_bytes(b"x");
+        let node = InternalNode::new(vec![
+            ("z/".into(), h),
+            ("a/".into(), h),
+            ("m/".into(), h),
+        ]);
+        assert_eq!(node.children[0].0, "a/");
+        assert_eq!(node.children[1].0, "m/");
+        assert_eq!(node.children[2].0, "z/");
+    }
+
+    #[test]
+    fn internal_node_empty_roundtrip() {
+        let node = InternalNode::new(vec![]);
+        let bytes = node.serialize();
+        let decoded = InternalNode::deserialize(&bytes).unwrap();
+        assert!(decoded.children.is_empty());
+    }
+
+    #[test]
+    fn internal_node_deserialize_rejects_leaf_bytes() {
+        let leaf = LeafChunk::new(vec![]);
+        let err = InternalNode::deserialize(&leaf.serialize()).unwrap_err();
+        assert!(matches!(err, ChunkError::Deserialize(_)));
+    }
+
+    #[test]
+    fn root_node_deserialize_rejects_leaf_bytes() {
+        let leaf = LeafChunk::new(vec![]);
+        let err = RootNode::deserialize(&leaf.serialize()).unwrap_err();
+        assert!(matches!(err, ChunkError::Deserialize(_)));
+    }
+
+    #[test]
+    fn root_node_hash_depends_only_on_children() {
+        let kids = vec![("a/".into(), hash_bytes(b"a"))];
+        let r1 = RootNode {
+            vault_id: "v1".into(),
+            created_ms: 1,
+            version: 1,
+            children: kids.clone(),
+            total_files: 1,
+            parent_hash: None,
+            device_id: "d1".into(),
+        };
+        let r2 = RootNode {
+            vault_id: "v2".into(),
+            created_ms: 999,
+            version: 7,
+            children: kids,
+            total_files: 999,
+            parent_hash: Some(hash_bytes(b"unrelated")),
+            device_id: "d2".into(),
+        };
+        // RootNode::hash hashes only the (prefix, child_hash) list — metadata
+        // doesn't affect identity. Document this invariant.
+        assert_eq!(r1.hash(), r2.hash());
+    }
+
+    #[test]
+    fn chunk_error_display_contains_message() {
+        let e = ChunkError::Deserialize("bad".into());
+        assert!(format!("{}", e).contains("bad"));
+        let e = ChunkError::NotFound("abc".into());
+        assert!(format!("{}", e).contains("abc"));
+        let e: ChunkError =
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "nope").into();
+        assert!(format!("{}", e).contains("io"));
+    }
+
+    #[test]
+    fn root_node_with_empty_device_id_roundtrip() {
+        let r = RootNode {
+            vault_id: "v".into(),
+            created_ms: 0,
+            version: 1,
+            children: vec![],
+            total_files: 0,
+            parent_hash: None,
+            device_id: "".into(),
+        };
+        let decoded = RootNode::deserialize(&r.serialize()).unwrap();
+        assert_eq!(decoded.device_id, "");
+    }
 }
