@@ -57,7 +57,10 @@ async fn fast_forward_push_with_correct_parent_is_accepted() {
 
     // Pull confirms server now serves v2.
     let pulled = pull_vault_snapshot(&client, &vault).await.unwrap();
-    assert_eq!(pulled, vec![("a.md".to_string(), b"v2 with edit\n".to_vec())]);
+    assert_eq!(
+        pulled,
+        vec![("a.md".to_string(), b"v2 with edit\n".to_vec())]
+    );
 }
 
 #[tokio::test]
@@ -123,7 +126,11 @@ async fn put_chunk_rejects_hash_mismatch() {
     // Claim hash of "foo" but upload bytes of "bar".
     let claimed = hash_bytes(b"foo");
     let r = client
-        .raw("PUT", &format!("/api/v1/chunk/{}", hash_to_hex(&claimed)), b"bar")
+        .raw(
+            "PUT",
+            &format!("/api/v1/chunk/{}", hash_to_hex(&claimed)),
+            b"bar",
+        )
         .await
         .unwrap();
     assert!(
@@ -146,10 +153,7 @@ async fn chunks_check_filters_to_only_missing() {
     client.put_chunk(&h_uploaded, &bytes).await.unwrap();
 
     let h_missing = hash_bytes(b"never-uploaded");
-    let needed = client
-        .chunks_check(&[h_uploaded, h_missing])
-        .await
-        .unwrap();
+    let needed = client.chunks_check(&[h_uploaded, h_missing]).await.unwrap();
     assert_eq!(needed.len(), 1);
     assert_eq!(needed[0], hash_to_hex(&h_missing));
 }

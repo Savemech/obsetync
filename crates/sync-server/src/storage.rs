@@ -239,11 +239,7 @@ mod tests {
         );
         assert_eq!(
             layout.content_chunk_path(&h),
-            PathBuf::from(format!(
-                "/base/content/chunks/{}/{}",
-                &hex[..2],
-                &hex[2..]
-            ))
+            PathBuf::from(format!("/base/content/chunks/{}/{}", &hex[..2], &hex[2..]))
         );
     }
 
@@ -271,10 +267,7 @@ mod tests {
     #[test]
     fn device_and_token_and_enrollment_paths() {
         let layout = StorageLayout::new("/d");
-        assert_eq!(
-            layout.device_dir("abc"),
-            PathBuf::from("/d/devices/abc")
-        );
+        assert_eq!(layout.device_dir("abc"), PathBuf::from("/d/devices/abc"));
         assert_eq!(
             layout.token_path("tok"),
             PathBuf::from("/d/devices/tokens/tok")

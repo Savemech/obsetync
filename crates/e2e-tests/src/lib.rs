@@ -52,8 +52,7 @@ const AAD_PREFIX: &[u8] = b"obsetync/v1";
 
 /// Hex string for a 32-byte hash of all zeros — the "fresh client / no parent"
 /// sentinel the server recognises when prepended to PUT /root and POST /diff.
-pub const ZERO_HASH_HEX: &str =
-    "0000000000000000000000000000000000000000000000000000000000000000";
+pub const ZERO_HASH_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 // --- env / harness -----------------------------------------------------------
 
@@ -66,10 +65,10 @@ pub struct E2eEnv {
 
 impl E2eEnv {
     pub fn from_env() -> Self {
-        let base_url = std::env::var("OBSETYNC_E2E_BASE")
-            .unwrap_or_else(|_| "http://127.0.0.1:27282".into());
-        let admin_url = std::env::var("OBSETYNC_E2E_ADMIN")
-            .unwrap_or_else(|_| "http://127.0.0.1:27283".into());
+        let base_url =
+            std::env::var("OBSETYNC_E2E_BASE").unwrap_or_else(|_| "http://127.0.0.1:27282".into());
+        let admin_url =
+            std::env::var("OBSETYNC_E2E_ADMIN").unwrap_or_else(|_| "http://127.0.0.1:27283".into());
         Self {
             base_url,
             admin_url,
@@ -84,7 +83,12 @@ impl E2eEnv {
     pub async fn wait_for_health(&self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         loop {
-            if let Ok(resp) = self.http.get(format!("{}/health", self.base_url)).send().await {
+            if let Ok(resp) = self
+                .http
+                .get(format!("{}/health", self.base_url))
+                .send()
+                .await
+            {
                 if resp.status().is_success() {
                     return Ok(());
                 }
@@ -229,12 +233,7 @@ impl WireClient {
 
     /// Send a sealed envelope. `semantic_method` is what the server sees after
     /// envelope decryption (PUT/GET/POST/etc); the wire method is always POST.
-    pub async fn raw(
-        &self,
-        semantic_method: &str,
-        path: &str,
-        body: &[u8],
-    ) -> Result<RawResponse> {
+    pub async fn raw(&self, semantic_method: &str, path: &str, body: &[u8]) -> Result<RawResponse> {
         // Per-request ephemeral keypair. Forward secrecy: an attacker who later
         // compromises the server's box.key cannot decrypt this exchange.
         let mut seed = [0u8; KEY_LEN];
@@ -281,7 +280,10 @@ impl WireClient {
             body
         };
 
-        Ok(RawResponse { status, body: plaintext })
+        Ok(RawResponse {
+            status,
+            body: plaintext,
+        })
     }
 
     pub async fn get_root(&self, vault_id: &str) -> Result<RootNode> {
@@ -289,7 +291,11 @@ impl WireClient {
             .raw("GET", &format!("/api/v1/root/{}", vault_id), &[])
             .await?;
         if !r.status.is_success() {
-            bail!("get_root: {} — {}", r.status, String::from_utf8_lossy(&r.body));
+            bail!(
+                "get_root: {} — {}",
+                r.status,
+                String::from_utf8_lossy(&r.body)
+            );
         }
         Ok(RootNode::deserialize(&r.body)?)
     }
@@ -314,18 +320,18 @@ impl WireClient {
             .raw("PUT", &format!("/api/v1/root/{}", vault_id), &body)
             .await?;
         if !r.status.is_success() {
-            bail!("put_root: {} — {}", r.status, String::from_utf8_lossy(&r.body));
+            bail!(
+                "put_root: {} — {}",
+                r.status,
+                String::from_utf8_lossy(&r.body)
+            );
         }
         let resp: PutRootResponse =
             serde_json::from_slice(&r.body).context("parsing put_root JSON")?;
         Ok(resp)
     }
 
-    pub async fn post_diff(
-        &self,
-        vault_id: &str,
-        device_root_hex: &str,
-    ) -> Result<DiffResponse> {
+    pub async fn post_diff(&self, vault_id: &str, device_root_hex: &str) -> Result<DiffResponse> {
         if device_root_hex.len() != 64 {
             bail!("device_root_hex must be 64 chars");
         }
@@ -339,7 +345,11 @@ impl WireClient {
         // 304 was promoted to 200 by the middleware before encryption (so the
         // AEAD envelope reaches the wire) — but the body stays "[]".
         if !r.status.is_success() {
-            bail!("post_diff: {} — {}", r.status, String::from_utf8_lossy(&r.body));
+            bail!(
+                "post_diff: {} — {}",
+                r.status,
+                String::from_utf8_lossy(&r.body)
+            );
         }
         let text = std::str::from_utf8(&r.body)?;
         if text.trim() == "[]" {
@@ -354,7 +364,11 @@ impl WireClient {
         let path = format!("/api/v1/chunk/{}", hash_to_hex(hash));
         let r = self.raw("PUT", &path, bytes).await?;
         if !r.status.is_success() {
-            bail!("put_chunk: {} — {}", r.status, String::from_utf8_lossy(&r.body));
+            bail!(
+                "put_chunk: {} — {}",
+                r.status,
+                String::from_utf8_lossy(&r.body)
+            );
         }
         Ok(())
     }
@@ -363,7 +377,11 @@ impl WireClient {
         let path = format!("/api/v1/chunk/{}", hash_to_hex(hash));
         let r = self.raw("GET", &path, &[]).await?;
         if !r.status.is_success() {
-            bail!("get_chunk: {} — {}", r.status, String::from_utf8_lossy(&r.body));
+            bail!(
+                "get_chunk: {} — {}",
+                r.status,
+                String::from_utf8_lossy(&r.body)
+            );
         }
         Ok(r.body)
     }
@@ -372,7 +390,11 @@ impl WireClient {
         let path = format!("/api/v1/content/{}", hash_to_hex(hash));
         let r = self.raw("PUT", &path, bytes).await?;
         if !r.status.is_success() {
-            bail!("put_content: {} — {}", r.status, String::from_utf8_lossy(&r.body));
+            bail!(
+                "put_content: {} — {}",
+                r.status,
+                String::from_utf8_lossy(&r.body)
+            );
         }
         Ok(())
     }
@@ -381,7 +403,11 @@ impl WireClient {
         let path = format!("/api/v1/content/{}", hash_to_hex(hash));
         let r = self.raw("GET", &path, &[]).await?;
         if !r.status.is_success() {
-            bail!("get_content: {} — {}", r.status, String::from_utf8_lossy(&r.body));
+            bail!(
+                "get_content: {} — {}",
+                r.status,
+                String::from_utf8_lossy(&r.body)
+            );
         }
         Ok(r.body)
     }
@@ -389,9 +415,7 @@ impl WireClient {
     pub async fn chunks_check(&self, hashes: &[FileHash]) -> Result<Vec<String>> {
         let payload: Vec<String> = hashes.iter().map(hash_to_hex).collect();
         let body = serde_json::to_vec(&payload)?;
-        let r = self
-            .raw("POST", "/api/v1/chunks/check", &body)
-            .await?;
+        let r = self.raw("POST", "/api/v1/chunks/check", &body).await?;
         if !r.status.is_success() {
             bail!("chunks_check: {}", r.status);
         }
@@ -544,10 +568,7 @@ fn decrypt_response(
     let aad = build_aad(method, path);
 
     cipher
-        .decrypt(
-            Nonce::from_slice(&nonce),
-            Payload { msg: ct, aad: &aad },
-        )
+        .decrypt(Nonce::from_slice(&nonce), Payload { msg: ct, aad: &aad })
         .map_err(|_| anyhow!("response AEAD open failed"))
 }
 
@@ -568,12 +589,7 @@ pub fn build_root_for_files(
     let entries: Vec<FileEntry> = files
         .iter()
         .map(|(path, content)| {
-            FileEntry::new(
-                path.clone(),
-                hash_bytes(content),
-                0,
-                content.len() as u64,
-            )
+            FileEntry::new(path.clone(), hash_bytes(content), 0, content.len() as u64)
         })
         .collect();
 
@@ -624,8 +640,7 @@ pub async fn push_vault_snapshot(
     files: &[(String, Vec<u8>)],
     parent_hex: &str,
 ) -> Result<(RootNode, PutRootResponse)> {
-    let (mut root, chunks) =
-        build_root_for_files(vault_id, &client.creds.device_name, files);
+    let (mut root, chunks) = build_root_for_files(vault_id, &client.creds.device_name, files);
     if parent_hex != ZERO_HASH_HEX {
         root.parent_hash = Some(hex_to_hash(parent_hex)?);
     }

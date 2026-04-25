@@ -698,7 +698,10 @@ mod tests {
     fn format_duration_buckets() {
         assert_eq!(format_duration(Duration::from_secs(5)), "5s");
         assert_eq!(format_duration(Duration::from_secs(75)), "1m 15s");
-        assert_eq!(format_duration(Duration::from_secs(3 * 3600 + 14 * 60)), "3h 14m");
+        assert_eq!(
+            format_duration(Duration::from_secs(3 * 3600 + 14 * 60)),
+            "3h 14m"
+        );
         assert_eq!(
             format_duration(Duration::from_secs(2 * 86400 + 5 * 3600)),
             "2d 5h"

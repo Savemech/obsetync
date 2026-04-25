@@ -150,12 +150,6 @@ async fn vaults_are_isolated_between_ids() {
 
     let x_files = pull_vault_snapshot(&client, &vault_x).await.unwrap();
     let y_files = pull_vault_snapshot(&client, &vault_y).await.unwrap();
-    assert_eq!(
-        x_files,
-        vec![("x.md".to_string(), b"in x\n".to_vec())]
-    );
-    assert_eq!(
-        y_files,
-        vec![("y.md".to_string(), b"in y\n".to_vec())]
-    );
+    assert_eq!(x_files, vec![("x.md".to_string(), b"in x\n".to_vec())]);
+    assert_eq!(y_files, vec![("y.md".to_string(), b"in y\n".to_vec())]);
 }

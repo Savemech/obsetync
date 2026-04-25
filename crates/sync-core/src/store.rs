@@ -195,14 +195,8 @@ mod tests {
     async fn memory_store_len_tracks_entries() {
         let store = MemoryChunkStore::new();
         assert!(store.is_empty());
-        store
-            .put(hash_bytes(b"a"), vec![1, 2, 3])
-            .await
-            .unwrap();
-        store
-            .put(hash_bytes(b"b"), vec![4, 5, 6])
-            .await
-            .unwrap();
+        store.put(hash_bytes(b"a"), vec![1, 2, 3]).await.unwrap();
+        store.put(hash_bytes(b"b"), vec![4, 5, 6]).await.unwrap();
         assert!(!store.is_empty());
         assert_eq!(store.len(), 2);
     }

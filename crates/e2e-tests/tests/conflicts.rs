@@ -75,14 +75,24 @@ async fn modify_different_files_auto_resolves_no_conflict() {
     )
     .await;
 
-    assert!(resp.merged, "stale parent must trigger merge, got {:?}", resp);
+    assert!(
+        resp.merged,
+        "stale parent must trigger merge, got {:?}",
+        resp
+    );
     assert!(resp.conflicts.is_empty(), "{:?}", resp.conflicts);
     assert!(resp.auto_resolved >= 2);
 
     let pulled = pull_vault_snapshot(&a, &vault).await.unwrap();
     let map: std::collections::HashMap<_, _> = pulled.into_iter().collect();
-    assert_eq!(map.get("a.md").map(|v| v.as_slice()), Some(&b"A edited\n"[..]));
-    assert_eq!(map.get("b.md").map(|v| v.as_slice()), Some(&b"B edited\n"[..]));
+    assert_eq!(
+        map.get("a.md").map(|v| v.as_slice()),
+        Some(&b"A edited\n"[..])
+    );
+    assert_eq!(
+        map.get("b.md").map(|v| v.as_slice()),
+        Some(&b"B edited\n"[..])
+    );
 }
 
 #[tokio::test]
@@ -182,8 +192,7 @@ async fn add_same_path_different_content_is_a_conflict() {
     assert_eq!(c.path, "collide.md");
     // No common ancestor for an add-add collision — base hash is zero.
     assert_eq!(
-        c.base_hash,
-        ZERO_HASH_HEX,
+        c.base_hash, ZERO_HASH_HEX,
         "add-add base must be zero hash, got {}",
         c.base_hash
     );
@@ -263,13 +272,20 @@ async fn delete_beats_unchanged() {
     )
     .await;
 
-    assert!(resp.merged, "real divergence must trigger merge: {:?}", resp);
+    assert!(
+        resp.merged,
+        "real divergence must trigger merge: {:?}",
+        resp
+    );
     assert!(resp.conflicts.is_empty(), "{:?}", resp.conflicts);
 
     let pulled = pull_vault_snapshot(&a, &vault).await.unwrap();
     let map: std::collections::HashMap<_, _> = pulled.into_iter().collect();
     assert!(!map.contains_key("x.md"), "x.md should be honoured-deleted");
-    assert_eq!(map.get("y.md").map(|v| v.as_slice()), Some(&b"keeper\n"[..]));
+    assert_eq!(
+        map.get("y.md").map(|v| v.as_slice()),
+        Some(&b"keeper\n"[..])
+    );
     // A's edit to z.md must survive the merge.
     assert_eq!(
         map.get("z.md").map(|v| v.as_slice()),
@@ -323,7 +339,10 @@ async fn merged_root_is_retrievable_via_get_root() {
         &vault,
         vec![("a.md".into(), b"v1\n".to_vec())],
         vec![("a.md".into(), b"A v2\n".to_vec())],
-        vec![("a.md".into(), b"v1\n".to_vec()), ("b.md".into(), b"new\n".to_vec())],
+        vec![
+            ("a.md".into(), b"v1\n".to_vec()),
+            ("b.md".into(), b"new\n".to_vec()),
+        ],
     )
     .await;
     assert!(resp.merged);

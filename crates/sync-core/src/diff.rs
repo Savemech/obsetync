@@ -277,14 +277,9 @@ mod tests {
     #[tokio::test]
     async fn diff_modified_carries_new_hash_and_size() {
         let store = MemoryChunkStore::new();
-        let r1 = build_tree(
-            &store,
-            vec![make_entry("a.md", "old")],
-            "v",
-            "d",
-        )
-        .await
-        .unwrap();
+        let r1 = build_tree(&store, vec![make_entry("a.md", "old")], "v", "d")
+            .await
+            .unwrap();
         let r2 = build_tree(
             &store,
             vec![make_entry("a.md", "new-content-bigger")],
@@ -331,7 +326,12 @@ mod tests {
         .unwrap();
 
         let deltas = compute_deltas(&store, &r1, &r2).await.unwrap();
-        assert_eq!(deltas.len(), 3, "expected modify+delete+add, got {:?}", deltas);
+        assert_eq!(
+            deltas.len(),
+            3,
+            "expected modify+delete+add, got {:?}",
+            deltas
+        );
         let actions: std::collections::HashSet<_> = deltas
             .iter()
             .map(|d| match d {

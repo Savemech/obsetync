@@ -49,10 +49,7 @@ async fn claimed_code_cannot_be_reclaimed() {
 
     let resp = env
         .http
-        .get(format!(
-            "{}/admin/enrollment/{}",
-            env.admin_url, creds.code
-        ))
+        .get(format!("{}/admin/enrollment/{}", env.admin_url, creds.code))
         .send()
         .await
         .unwrap();
