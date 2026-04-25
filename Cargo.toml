@@ -4,6 +4,15 @@ members = [
     "crates/sync-core",
     "crates/sync-schema",
     "crates/sync-server",
+    "crates/e2e-tests",
+]
+# `cargo build --workspace` should not pull in reqwest + crypto deps from the
+# e2e-tests crate. Default-members excludes it; e2e tests run via
+# `cargo test -p e2e-tests --features e2e`.
+default-members = [
+    "crates/sync-core",
+    "crates/sync-schema",
+    "crates/sync-server",
 ]
 
 [workspace.package]
