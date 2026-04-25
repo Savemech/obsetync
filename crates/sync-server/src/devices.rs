@@ -239,14 +239,12 @@ mod tests {
         register_device(&layout, "dev", "x", &token_64()).unwrap();
 
         let path = layout.device_dir("dev").join("device.json");
-        let before: DeviceInfo =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let before: DeviceInfo = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
 
         // Right after register, last_seen is `now`. A touch within 30s is throttled
         // and must NOT bump last_seen.
         touch_last_seen(&layout, "dev").unwrap();
-        let after: DeviceInfo =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let after: DeviceInfo = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(before.last_seen, after.last_seen);
     }
 

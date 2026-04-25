@@ -87,7 +87,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn run_diff_on_identical_roots_returns_empty() {
         let dir = tempdir().unwrap();
-        let root = build_tree_on_disk(dir.path().to_path_buf(), vec![make_entry("a.md", "x")]).await;
+        let root =
+            build_tree_on_disk(dir.path().to_path_buf(), vec![make_entry("a.md", "x")]).await;
         let deltas = run_diff(dir.path().to_path_buf(), root.clone(), root)
             .await
             .unwrap();
@@ -114,8 +115,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn run_merge_passes_through_to_sync_core() {
         let dir = tempdir().unwrap();
-        let base = build_tree_on_disk(dir.path().to_path_buf(), vec![make_entry("a.md", "x")]).await;
-        let side_a = build_tree_on_disk(dir.path().to_path_buf(), vec![make_entry("a.md", "y")]).await;
+        let base =
+            build_tree_on_disk(dir.path().to_path_buf(), vec![make_entry("a.md", "x")]).await;
+        let side_a =
+            build_tree_on_disk(dir.path().to_path_buf(), vec![make_entry("a.md", "y")]).await;
         let side_b = base.clone();
         let result = run_merge(dir.path().to_path_buf(), base, side_a, side_b)
             .await
@@ -130,11 +133,9 @@ mod tests {
         let base =
             build_tree_on_disk(dir.path().to_path_buf(), vec![make_entry("a.md", "x")]).await;
         let side_a =
-            build_tree_on_disk(dir.path().to_path_buf(), vec![make_entry("a.md", "side-a")])
-                .await;
+            build_tree_on_disk(dir.path().to_path_buf(), vec![make_entry("a.md", "side-a")]).await;
         let side_b =
-            build_tree_on_disk(dir.path().to_path_buf(), vec![make_entry("a.md", "side-b")])
-                .await;
+            build_tree_on_disk(dir.path().to_path_buf(), vec![make_entry("a.md", "side-b")]).await;
         let result = run_merge(dir.path().to_path_buf(), base, side_a, side_b)
             .await
             .unwrap();

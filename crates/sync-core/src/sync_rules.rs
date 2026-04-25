@@ -242,10 +242,7 @@ mod tests {
     #[test]
     fn strategy_for_root_level_files() {
         let rules = SyncRules::default();
-        assert_eq!(
-            rules.strategy_for("photo.png"),
-            &BinaryStrategy::Immutable
-        );
+        assert_eq!(rules.strategy_for("photo.png"), &BinaryStrategy::Immutable);
         // Unknown extension falls through to "*" wildcard ConflictCopy.
         assert_eq!(
             rules.strategy_for("weird.xyz"),

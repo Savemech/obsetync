@@ -30,7 +30,11 @@ async fn admin_root_redirects_to_dashboard() {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap();
-    let resp = client.get(format!("{}/", env.admin_url)).send().await.unwrap();
+    let resp = client
+        .get(format!("{}/", env.admin_url))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status().as_u16(), 308);
     let loc = resp
         .headers()
@@ -58,8 +62,7 @@ async fn enrollment_bundle_includes_valid_box_pubkey() {
     let env = harness().await;
     let creds = env.enroll_device("smoke-pubkey").await.unwrap();
     // server_box_pub round-trips through base64; PublicKey enforces 32 bytes.
-    let bytes = BASE64_STANDARD
-        .encode(creds.server_box_pub.as_bytes());
+    let bytes = BASE64_STANDARD.encode(creds.server_box_pub.as_bytes());
     assert_eq!(BASE64_STANDARD.decode(bytes).unwrap().len(), 32);
     assert_eq!(creds.bearer.len(), 64);
     assert!(creds.bearer.chars().all(|c| c.is_ascii_hexdigit()));

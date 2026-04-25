@@ -496,7 +496,11 @@ mod tests {
         .unwrap();
         let result = merge_trees(&store, &base, &side_a, &side_b).await.unwrap();
         // Same content added on both sides — must not flag a conflict.
-        assert!(result.file_conflicts.is_empty(), "{:?}", result.file_conflicts);
+        assert!(
+            result.file_conflicts.is_empty(),
+            "{:?}",
+            result.file_conflicts
+        );
         assert_eq!(result.new_root.total_files, 2);
     }
 

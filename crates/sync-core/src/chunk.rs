@@ -537,11 +537,7 @@ mod tests {
     #[test]
     fn internal_node_new_sorts_children() {
         let h = hash_bytes(b"x");
-        let node = InternalNode::new(vec![
-            ("z/".into(), h),
-            ("a/".into(), h),
-            ("m/".into(), h),
-        ]);
+        let node = InternalNode::new(vec![("z/".into(), h), ("a/".into(), h), ("m/".into(), h)]);
         assert_eq!(node.children[0].0, "a/");
         assert_eq!(node.children[1].0, "m/");
         assert_eq!(node.children[2].0, "z/");

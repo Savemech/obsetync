@@ -400,10 +400,7 @@ mod tests {
     #[tokio::test]
     async fn update_tree_delete_last_file_in_prefix_removes_prefix() {
         let store = MemoryChunkStore::new();
-        let entries = vec![
-            make_entry("only/a.md"),
-            make_entry("notes/b.md"),
-        ];
+        let entries = vec![make_entry("only/a.md"), make_entry("notes/b.md")];
         let root = build_tree(&store, entries, "v", "d").await.unwrap();
         assert!(root.children.iter().any(|(p, _)| p == "only/"));
 

@@ -88,14 +88,16 @@ mod tests {
 
     #[tokio::test]
     async fn bad_request_renders_400() {
-        let (s, b) = status_and_body(ServerError::BadRequest("bad json".into()).into_response()).await;
+        let (s, b) =
+            status_and_body(ServerError::BadRequest("bad json".into()).into_response()).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert!(b.contains("bad json"));
     }
 
     #[tokio::test]
     async fn conflict_renders_409() {
-        let (s, b) = status_and_body(ServerError::Conflict("merge needed".into()).into_response()).await;
+        let (s, b) =
+            status_and_body(ServerError::Conflict("merge needed".into()).into_response()).await;
         assert_eq!(s, StatusCode::CONFLICT);
         assert!(b.contains("merge needed"));
     }
@@ -124,15 +126,13 @@ mod tests {
 
     #[tokio::test]
     async fn chunk_not_found_renders_404() {
-        let resp =
-            ServerError::Chunk(ChunkError::NotFound("aa".into())).into_response();
+        let resp = ServerError::Chunk(ChunkError::NotFound("aa".into())).into_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn chunk_other_error_renders_400() {
-        let resp =
-            ServerError::Chunk(ChunkError::Deserialize("nope".into())).into_response();
+        let resp = ServerError::Chunk(ChunkError::Deserialize("nope".into())).into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 

@@ -166,7 +166,9 @@ mod tests {
     fn hash_to_hex_returns_64_lowercase_chars() {
         let hex = hash_to_hex(&hash_bytes(b"x"));
         assert_eq!(hex.len(), 64);
-        assert!(hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(hex
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]
