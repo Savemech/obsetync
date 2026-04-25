@@ -256,4 +256,122 @@ mod tests {
         assert_eq!(deltas.len(), 1);
         assert!(matches!(&deltas[0], FileDelta::Added { path, .. } if path == "photos/pic.png"));
     }
+
+    #[tokio::test]
+    async fn diff_directory_deleted_entirely() {
+        let store = MemoryChunkStore::new();
+        let entries1 = vec![
+            make_entry("notes/a.md", "aaa"),
+            make_entry("photos/p.png", "img"),
+        ];
+        let root1 = build_tree(&store, entries1, "v", "d").await.unwrap();
+
+        let entries2 = vec![make_entry("notes/a.md", "aaa")];
+        let root2 = build_tree(&store, entries2, "v", "d").await.unwrap();
+
+        let deltas = compute_deltas(&store, &root1, &root2).await.unwrap();
+        assert_eq!(deltas.len(), 1);
+        assert!(matches!(&deltas[0], FileDelta::Deleted { path } if path == "photos/p.png"));
+    }
+
+    #[tokio::test]
+    async fn diff_modified_carries_new_hash_and_size() {
+        let store = MemoryChunkStore::new();
+        let r1 = build_tree(
+            &store,
+            vec![make_entry("a.md", "old")],
+            "v",
+            "d",
+        )
+        .await
+        .unwrap();
+        let r2 = build_tree(
+            &store,
+            vec![make_entry("a.md", "new-content-bigger")],
+            "v",
+            "d",
+        )
+        .await
+        .unwrap();
+
+        let deltas = compute_deltas(&store, &r1, &r2).await.unwrap();
+        assert_eq!(deltas.len(), 1);
+        match &deltas[0] {
+            FileDelta::Modified { path, hash, size } => {
+                assert_eq!(path, "a.md");
+                assert_eq!(*hash, sync_core_hash(b"new-content-bigger"));
+                assert_eq!(*size, 100, "make_entry hardcodes 100");
+            }
+            _ => panic!("expected Modified, got {:?}", &deltas[0]),
+        }
+    }
+
+    fn sync_core_hash(b: &[u8]) -> crate::hash::FileHash {
+        crate::hash::hash_bytes(b)
+    }
+
+    #[tokio::test]
+    async fn diff_multiple_changes_in_one_directory() {
+        let store = MemoryChunkStore::new();
+        let r1 = build_tree(
+            &store,
+            vec![make_entry("d/a.md", "a"), make_entry("d/b.md", "b")],
+            "v",
+            "dev",
+        )
+        .await
+        .unwrap();
+        let r2 = build_tree(
+            &store,
+            vec![make_entry("d/a.md", "a-new"), make_entry("d/c.md", "c")],
+            "v",
+            "dev",
+        )
+        .await
+        .unwrap();
+
+        let deltas = compute_deltas(&store, &r1, &r2).await.unwrap();
+        assert_eq!(deltas.len(), 3, "expected modify+delete+add, got {:?}", deltas);
+        let actions: std::collections::HashSet<_> = deltas
+            .iter()
+            .map(|d| match d {
+                FileDelta::Added { .. } => "add",
+                FileDelta::Modified { .. } => "mod",
+                FileDelta::Deleted { .. } => "del",
+                FileDelta::Renamed { .. } => "ren",
+            })
+            .collect();
+        assert!(actions.contains("add"));
+        assert!(actions.contains("mod"));
+        assert!(actions.contains("del"));
+    }
+
+    #[test]
+    fn file_delta_serde_roundtrip() {
+        let h = crate::hash::hash_bytes(b"x");
+        let d = FileDelta::Added {
+            path: "a.md".into(),
+            hash: h,
+            size: 5,
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains("added"));
+        let back: FileDelta = serde_json::from_str(&json).unwrap();
+        match back {
+            FileDelta::Added { path, hash, size } => {
+                assert_eq!(path, "a.md");
+                assert_eq!(hash, h);
+                assert_eq!(size, 5);
+            }
+            _ => panic!("expected Added"),
+        }
+    }
+
+    #[test]
+    fn file_delta_deleted_serde() {
+        let d = FileDelta::Deleted { path: "x".into() };
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains("deleted"));
+        let _back: FileDelta = serde_json::from_str(&json).unwrap();
+    }
 }

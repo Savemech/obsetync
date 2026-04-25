@@ -137,6 +137,78 @@ mod tests {
     }
 
     #[test]
+    fn empty_file_chunks_to_zero_chunks() {
+        let chunked = chunk_file(&[]);
+        assert!(chunked.manifest.chunks.is_empty());
+        assert!(chunked.chunk_data.is_empty());
+        assert_eq!(chunked.manifest.total_size, 0);
+        assert_eq!(chunked.manifest.file_hash, hash_bytes(&[]));
+    }
+
+    #[test]
+    fn empty_file_reassembles_to_empty() {
+        let chunked = chunk_file(&[]);
+        let out = reassemble_file(&chunked.manifest, &chunked.chunk_data);
+        assert_eq!(out, Some(vec![]));
+    }
+
+    #[test]
+    fn reassemble_rejects_chunk_count_mismatch() {
+        let data: Vec<u8> = (0..500_000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let chunked = chunk_file(&data);
+        // Drop one chunk — reassembly must refuse rather than silently truncate.
+        let mut bad = chunked.chunk_data.clone();
+        bad.pop();
+        assert!(reassemble_file(&chunked.manifest, &bad).is_none());
+    }
+
+    #[test]
+    fn reassemble_rejects_wrong_chunk_hash() {
+        let data: Vec<u8> = (0..500_000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let chunked = chunk_file(&data);
+        let mut bad = chunked.chunk_data.clone();
+        // Replace the first chunk's hash with something that doesn't match its bytes.
+        bad[0].0 = hash_bytes(b"definitely not the right hash");
+        assert!(reassemble_file(&chunked.manifest, &bad).is_none());
+    }
+
+    #[test]
+    fn reassemble_rejects_wrong_chunk_size() {
+        let data: Vec<u8> = (0..500_000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let chunked = chunk_file(&data);
+        let mut bad_manifest = chunked.manifest.clone();
+        // Tamper with a recorded size — reassemble cross-checks chunk_data.len().
+        bad_manifest.chunks[0].size += 1;
+        assert!(reassemble_file(&bad_manifest, &chunked.chunk_data).is_none());
+    }
+
+    #[test]
+    fn should_chunk_threshold_constant() {
+        assert_eq!(FILE_CHUNK_THRESHOLD, 1_048_576);
+        assert!(should_chunk(FILE_CHUNK_THRESHOLD));
+        assert!(!should_chunk(FILE_CHUNK_THRESHOLD - 1));
+        assert!(!should_chunk(0));
+    }
+
+    #[test]
+    fn chunk_offsets_are_contiguous() {
+        let data: Vec<u8> = (0..1_500_000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let chunked = chunk_file(&data);
+        let mut expected_offset: u64 = 0;
+        for (chunk, (_, bytes)) in chunked
+            .manifest
+            .chunks
+            .iter()
+            .zip(chunked.chunk_data.iter())
+        {
+            assert_eq!(chunk.offset, expected_offset);
+            assert_eq!(chunk.size as usize, bytes.len());
+            expected_offset += chunk.size as u64;
+        }
+        assert_eq!(expected_offset, chunked.manifest.total_size);
+    }
+
+    #[test]
     fn small_edit_changes_few_chunks() {
         // Create a large file.
         let mut data: Vec<u8> = (0..2_000_000u32).flat_map(|i| i.to_le_bytes()).collect();

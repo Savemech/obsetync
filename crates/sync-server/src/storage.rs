@@ -174,3 +174,221 @@ pub fn write_blob(path: &Path, data: &[u8]) -> Result<(), std::io::Error> {
 pub fn blob_exists(path: &Path) -> bool {
     path.exists()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sync_core::hash::hash_bytes;
+    use tempfile::tempdir;
+
+    #[test]
+    fn init_directories_creates_full_layout() {
+        let dir = tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        layout.init_directories().unwrap();
+        for sub in [
+            "ca",
+            "server",
+            "devices",
+            "devices/tokens",
+            "enrollments",
+            "vaults",
+            "index",
+            "content",
+            "content/manifests",
+            "content/chunks",
+        ] {
+            assert!(
+                dir.path().join(sub).is_dir(),
+                "{} should exist after init_directories",
+                sub
+            );
+        }
+    }
+
+    #[test]
+    fn init_directories_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        layout.init_directories().unwrap();
+        // Calling twice must not error.
+        layout.init_directories().unwrap();
+    }
+
+    #[test]
+    fn paths_use_two_char_sharding() {
+        let layout = StorageLayout::new("/base");
+        let h = hash_bytes(b"x");
+        let hex = sync_core::hash::hash_to_hex(&h);
+
+        assert_eq!(
+            layout.index_path(&h),
+            PathBuf::from(format!("/base/index/{}/{}", &hex[..2], &hex[2..]))
+        );
+        assert_eq!(
+            layout.content_blob_path(&h),
+            PathBuf::from(format!("/base/content/{}/{}", &hex[..2], &hex[2..]))
+        );
+        assert_eq!(
+            layout.content_manifest_path(&h),
+            PathBuf::from(format!(
+                "/base/content/manifests/{}/{}",
+                &hex[..2],
+                &hex[2..]
+            ))
+        );
+        assert_eq!(
+            layout.content_chunk_path(&h),
+            PathBuf::from(format!(
+                "/base/content/chunks/{}/{}",
+                &hex[..2],
+                &hex[2..]
+            ))
+        );
+    }
+
+    #[test]
+    fn vault_paths_namespaced_by_vault_id() {
+        let layout = StorageLayout::new("/d");
+        assert_eq!(layout.vault_dir("v1"), PathBuf::from("/d/vaults/v1"));
+        assert_eq!(
+            layout.vault_current_path("v1"),
+            PathBuf::from("/d/vaults/v1/current")
+        );
+        assert_eq!(
+            layout.vault_roots_dir("v1"),
+            PathBuf::from("/d/vaults/v1/roots")
+        );
+
+        let h = hash_bytes(b"r");
+        let hex = sync_core::hash::hash_to_hex(&h);
+        assert_eq!(
+            layout.vault_root_path("v1", &h),
+            PathBuf::from(format!("/d/vaults/v1/roots/{}.bin", hex))
+        );
+    }
+
+    #[test]
+    fn device_and_token_and_enrollment_paths() {
+        let layout = StorageLayout::new("/d");
+        assert_eq!(
+            layout.device_dir("abc"),
+            PathBuf::from("/d/devices/abc")
+        );
+        assert_eq!(
+            layout.token_path("tok"),
+            PathBuf::from("/d/devices/tokens/tok")
+        );
+        assert_eq!(
+            layout.enrollment_path("AXBR-7742"),
+            PathBuf::from("/d/enrollments/AXBR-7742.json")
+        );
+    }
+
+    #[test]
+    fn ensure_vault_creates_roots_dir() {
+        let dir = tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        layout.ensure_vault("v1").unwrap();
+        assert!(layout.vault_roots_dir("v1").is_dir());
+        // Calling twice is idempotent.
+        layout.ensure_vault("v1").unwrap();
+    }
+
+    #[test]
+    fn vault_store_set_and_get_current_root() {
+        let dir = tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        let store = VaultStore::new(layout.clone());
+
+        let h = hash_bytes(b"root1");
+        store.set_current_root("v1", &h).unwrap();
+        assert_eq!(store.get_current_root("v1"), Some(h));
+    }
+
+    #[test]
+    fn vault_store_get_current_root_missing_returns_none() {
+        let dir = tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        let store = VaultStore::new(layout);
+        assert!(store.get_current_root("never").is_none());
+    }
+
+    #[test]
+    fn vault_store_set_current_root_overwrites_atomically() {
+        let dir = tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        let store = VaultStore::new(layout);
+
+        let h1 = hash_bytes(b"a");
+        let h2 = hash_bytes(b"b");
+        store.set_current_root("v", &h1).unwrap();
+        store.set_current_root("v", &h2).unwrap();
+        assert_eq!(store.get_current_root("v"), Some(h2));
+    }
+
+    #[test]
+    fn vault_store_root_history_roundtrip() {
+        let dir = tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        let store = VaultStore::new(layout);
+        let h = hash_bytes(b"root-bytes");
+        store.store_root("v", &h, b"the bytes").unwrap();
+        assert_eq!(store.get_root("v", &h).unwrap(), b"the bytes".to_vec());
+    }
+
+    #[test]
+    fn vault_store_get_root_missing_returns_none() {
+        let dir = tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        let store = VaultStore::new(layout);
+        assert!(store.get_root("v", &hash_bytes(b"missing")).is_none());
+    }
+
+    #[test]
+    fn vault_store_exists_after_root_stored() {
+        let dir = tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        let store = VaultStore::new(layout);
+        assert!(!store.vault_exists("v"));
+        store.store_root("v", &hash_bytes(b"r"), b"x").unwrap();
+        assert!(store.vault_exists("v"));
+    }
+
+    #[test]
+    fn read_write_blob_helpers_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nested/sub/blob");
+        write_blob(&path, b"hello").unwrap();
+        assert!(blob_exists(&path));
+        assert_eq!(read_blob(&path).unwrap(), b"hello".to_vec());
+    }
+
+    #[test]
+    fn read_blob_missing_returns_none() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nope");
+        assert!(read_blob(&path).is_none());
+        assert!(!blob_exists(&path));
+    }
+
+    #[test]
+    fn write_blob_creates_parent_directories() {
+        let dir = tempdir().unwrap();
+        let deep = dir.path().join("a/b/c/d/e/file");
+        write_blob(&deep, b"x").unwrap();
+        assert!(deep.exists());
+    }
+
+    #[test]
+    fn vault_store_recovers_from_garbled_current_file() {
+        // current file contains garbage hex — get_current_root must return None,
+        // never panic.
+        let dir = tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        layout.ensure_vault("v").unwrap();
+        std::fs::write(layout.vault_current_path("v"), "not-hex-content").unwrap();
+        let store = VaultStore::new(layout);
+        assert!(store.get_current_root("v").is_none());
+    }
+}

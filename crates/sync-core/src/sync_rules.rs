@@ -192,4 +192,99 @@ mod tests {
         assert!(!is_text_file("photo.png"));
         assert!(!is_text_file("data.sqlite"));
     }
+
+    #[test]
+    fn glob_question_mark_matches_single_char() {
+        assert!(glob_match("a?c", "abc"));
+        assert!(glob_match("a?c", "axc"));
+        assert!(!glob_match("a?c", "ac"));
+        assert!(!glob_match("a?c", "abcd"));
+    }
+
+    #[test]
+    fn glob_star_matches_empty() {
+        assert!(glob_match("foo*bar", "foobar"));
+        assert!(glob_match("foo*bar", "fooXYZbar"));
+        assert!(!glob_match("foo*bar", "foo"));
+    }
+
+    #[test]
+    fn glob_trailing_star_consumes_rest() {
+        assert!(glob_match("prefix*", "prefix"));
+        assert!(glob_match("prefix*", "prefix-anything"));
+        assert!(!glob_match("prefix*", "pre"));
+    }
+
+    #[test]
+    fn binary_strategy_serde_roundtrip() {
+        let s = BinaryStrategy::ConflictCopy;
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(json, "\"conflict-copy\"");
+        let back: BinaryStrategy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, BinaryStrategy::ConflictCopy);
+
+        for s in [BinaryStrategy::LocalOnly, BinaryStrategy::Immutable] {
+            let json = serde_json::to_string(&s).unwrap();
+            let back: BinaryStrategy = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, s);
+        }
+    }
+
+    #[test]
+    fn strategy_for_inspects_filename_only() {
+        let rules = SyncRules::default();
+        // Path components like "notes/.DS_Store" should still match the
+        // ".DS_Store" filename rule (filename component only).
+        assert!(rules.is_local_only("notes/.DS_Store"));
+        assert!(rules.is_local_only("a/b/c/cache.sqlite"));
+    }
+
+    #[test]
+    fn strategy_for_root_level_files() {
+        let rules = SyncRules::default();
+        assert_eq!(
+            rules.strategy_for("photo.png"),
+            &BinaryStrategy::Immutable
+        );
+        // Unknown extension falls through to "*" wildcard ConflictCopy.
+        assert_eq!(
+            rules.strategy_for("weird.xyz"),
+            &BinaryStrategy::ConflictCopy
+        );
+    }
+
+    #[test]
+    fn is_text_file_handles_no_extension_and_unknown() {
+        assert!(!is_text_file("Makefile"));
+        assert!(!is_text_file("README"));
+        assert!(!is_text_file("photo.tiff"));
+    }
+
+    #[test]
+    fn is_text_file_case_insensitive() {
+        assert!(is_text_file("notes.MD"));
+        assert!(is_text_file("DRAWING.Canvas"));
+    }
+
+    #[test]
+    fn empty_rules_uses_conflict_copy_fallback() {
+        let rules = SyncRules {
+            binary_rules: vec![],
+        };
+        assert_eq!(
+            rules.strategy_for("anything.bin"),
+            &BinaryStrategy::ConflictCopy
+        );
+    }
+
+    #[test]
+    fn first_rule_wins() {
+        let rules = SyncRules {
+            binary_rules: vec![
+                ("*.png".into(), BinaryStrategy::LocalOnly),
+                ("*.png".into(), BinaryStrategy::Immutable),
+            ],
+        };
+        assert_eq!(rules.strategy_for("a.png"), &BinaryStrategy::LocalOnly);
+    }
 }

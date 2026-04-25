@@ -254,4 +254,88 @@ mod tests {
         let retrieved = store.get_manifest(&manifest.file_hash).await.unwrap();
         assert_eq!(retrieved.total_size, 1000);
     }
+
+    #[tokio::test]
+    async fn memory_content_store_default_is_empty() {
+        let store = MemoryContentStore::default();
+        assert!(!store.has(&hash_bytes(b"x")).await);
+        assert!(!store.has_manifest(&hash_bytes(b"x")).await);
+    }
+
+    #[tokio::test]
+    async fn memory_content_store_get_missing_returns_not_found() {
+        let store = MemoryContentStore::new();
+        let err = store.get(&hash_bytes(b"missing")).await.unwrap_err();
+        assert!(matches!(err, crate::chunk::ChunkError::NotFound(_)));
+
+        let err = store
+            .get_manifest(&hash_bytes(b"missing"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::chunk::ChunkError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn disk_content_store_get_missing_returns_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DiskContentStore::new(dir.path());
+        let err = store.get(&hash_bytes(b"absent")).await.unwrap_err();
+        assert!(matches!(err, crate::chunk::ChunkError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn disk_content_store_get_manifest_missing_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DiskContentStore::new(dir.path());
+        let err = store
+            .get_manifest(&hash_bytes(b"absent"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::chunk::ChunkError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn disk_content_store_get_manifest_corrupt_is_deserialize_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DiskContentStore::new(dir.path());
+        // Write garbage to the manifest path directly so get_manifest hits
+        // the JSON deserialize error branch.
+        let h = hash_bytes(b"corrupt");
+        let path = dir
+            .path()
+            .join("manifests")
+            .join(&hash_to_hex(&h)[..2])
+            .join(&hash_to_hex(&h)[2..]);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not json").unwrap();
+        let err = store.get_manifest(&h).await.unwrap_err();
+        assert!(matches!(err, crate::chunk::ChunkError::Deserialize(_)));
+    }
+
+    #[tokio::test]
+    async fn memory_content_store_put_overwrites_blob() {
+        let store = MemoryContentStore::new();
+        let h = hash_bytes(b"k");
+        store.put(h, b"first".to_vec()).await.unwrap();
+        store.put(h, b"second".to_vec()).await.unwrap();
+        assert_eq!(store.get(&h).await.unwrap(), b"second".to_vec());
+    }
+
+    #[test]
+    fn manifest_serde_roundtrip() {
+        let m = FileManifest {
+            file_hash: hash_bytes(b"f"),
+            total_size: 42,
+            chunks: vec![ChunkRef {
+                hash: hash_bytes(b"c"),
+                offset: 0,
+                size: 42,
+            }],
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let back: FileManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.total_size, 42);
+        assert_eq!(back.chunks.len(), 1);
+        assert_eq!(back.file_hash, m.file_hash);
+    }
 }

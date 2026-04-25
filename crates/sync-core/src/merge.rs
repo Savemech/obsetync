@@ -423,6 +423,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merge_identical_sides_no_changes() {
+        let store = MemoryChunkStore::new();
+        let entries = vec![make_entry("notes/a.md", "aaa")];
+        let root = build_tree(&store, entries, "v", "d").await.unwrap();
+        let result = merge_trees(&store, &root, &root, &root).await.unwrap();
+        assert!(result.file_conflicts.is_empty());
+        assert_eq!(result.auto_resolved_count, 0);
+    }
+
+    #[tokio::test]
+    async fn merge_new_dir_in_a_only() {
+        let store = MemoryChunkStore::new();
+        let base = build_tree(&store, vec![make_entry("a.md", "x")], "v", "d")
+            .await
+            .unwrap();
+        let side_a = build_tree(
+            &store,
+            vec![make_entry("a.md", "x"), make_entry("photos/p.png", "img")],
+            "v",
+            "d",
+        )
+        .await
+        .unwrap();
+        let side_b = base.clone();
+        let result = merge_trees(&store, &base, &side_a, &side_b).await.unwrap();
+        assert!(result.file_conflicts.is_empty());
+        assert_eq!(result.new_root.total_files, 2);
+    }
+
+    #[tokio::test]
+    async fn merge_new_dir_in_b_only() {
+        let store = MemoryChunkStore::new();
+        let base = build_tree(&store, vec![make_entry("a.md", "x")], "v", "d")
+            .await
+            .unwrap();
+        let side_a = base.clone();
+        let side_b = build_tree(
+            &store,
+            vec![make_entry("a.md", "x"), make_entry("photos/p.png", "img")],
+            "v",
+            "d",
+        )
+        .await
+        .unwrap();
+        let result = merge_trees(&store, &base, &side_a, &side_b).await.unwrap();
+        assert!(result.file_conflicts.is_empty());
+        assert_eq!(result.new_root.total_files, 2);
+    }
+
+    #[tokio::test]
+    async fn merge_both_sides_add_same_file_no_conflict() {
+        let store = MemoryChunkStore::new();
+        let base = build_tree(&store, vec![make_entry("a.md", "x")], "v", "d")
+            .await
+            .unwrap();
+        let side_a = build_tree(
+            &store,
+            vec![make_entry("a.md", "x"), make_entry("notes/c.md", "ccc")],
+            "v",
+            "d",
+        )
+        .await
+        .unwrap();
+        let side_b = build_tree(
+            &store,
+            vec![make_entry("a.md", "x"), make_entry("notes/c.md", "ccc")],
+            "v",
+            "d",
+        )
+        .await
+        .unwrap();
+        let result = merge_trees(&store, &base, &side_a, &side_b).await.unwrap();
+        // Same content added on both sides — must not flag a conflict.
+        assert!(result.file_conflicts.is_empty(), "{:?}", result.file_conflicts);
+        assert_eq!(result.new_root.total_files, 2);
+    }
+
+    #[tokio::test]
+    async fn merge_both_sides_add_different_content_flags_conflict() {
+        let store = MemoryChunkStore::new();
+        let base = build_tree(&store, vec![make_entry("a.md", "x")], "v", "d")
+            .await
+            .unwrap();
+        let side_a = build_tree(
+            &store,
+            vec![make_entry("a.md", "x"), make_entry("notes/c.md", "ccc-A")],
+            "v",
+            "d",
+        )
+        .await
+        .unwrap();
+        let side_b = build_tree(
+            &store,
+            vec![make_entry("a.md", "x"), make_entry("notes/c.md", "ccc-B")],
+            "v",
+            "d",
+        )
+        .await
+        .unwrap();
+        let result = merge_trees(&store, &base, &side_a, &side_b).await.unwrap();
+        assert_eq!(result.file_conflicts.len(), 1);
+        assert_eq!(result.file_conflicts[0].path, "notes/c.md");
+        // base_hash for an add-add conflict is ZERO_HASH (no common ancestor file).
+        assert_eq!(result.file_conflicts[0].base_hash, crate::hash::ZERO_HASH);
+    }
+
+    #[tokio::test]
+    async fn merge_result_root_is_persisted() {
+        // merge_trees stores the merged root in the chunk store before returning.
+        let store = MemoryChunkStore::new();
+        let base = build_tree(&store, vec![make_entry("a.md", "x")], "v", "d")
+            .await
+            .unwrap();
+        let side_a = build_tree(&store, vec![make_entry("a.md", "y")], "v", "d")
+            .await
+            .unwrap();
+        let result = merge_trees(&store, &base, &side_a, &base).await.unwrap();
+        let merged_hash = result.new_root.hash();
+        // The merged root bytes must now be retrievable from the store.
+        let bytes = store.get(&merged_hash).await.unwrap();
+        let decoded = crate::chunk::RootNode::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.hash(), merged_hash);
+    }
+
+    #[tokio::test]
     async fn merge_deletion_and_change() {
         let store = MemoryChunkStore::new();
 
