@@ -95,6 +95,73 @@ jobs:
           cache-to:   type=gha,mode=max
 
   # ---------------------------------------------------------------------------
+  # E2E: spin up the isolated docker-compose stack and run the e2e suite
+  # against it. Reuses the gha buildx cache the `docker` job populated, so
+  # warm runs build the image in seconds.
+  #
+  # Coverage: enrollment lifecycle, single-device push/pull, two-device sync,
+  # the full conflict-resolution truth table, and AEAD transport security.
+  # See docs/conflict-resolution.md.
+  # ---------------------------------------------------------------------------
+  e2e:
+    name: E2E (compose stack + conflict suite)
+    runs-on: ubuntu-latest
+    needs: docker  # depend on docker job so the gha cache is warm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.95.0
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Build the server image with the same gha cache the `docker` job uses.
+      # `load: true` puts it into the runner's docker daemon under the
+      # tag the e2e compose file expects (`obsetync/server:local`). Cache
+      # hit from the previous `docker` job → near-instant restore.
+      - name: Build server image (load into docker)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: server
+          load: true
+          tags: obsetync/server:local
+          cache-from: type=gha
+
+      - name: Bring up e2e stack
+        run: docker compose -f docker-compose.e2e.yml up -d
+
+      - name: Wait for /health
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:27282/health >/dev/null 2>&1; then
+              echo "ready"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::server failed to become healthy in 60s"
+          docker compose -f docker-compose.e2e.yml logs --tail=120 e2e-server
+          exit 1
+
+      - name: Run E2E suite
+        env:
+          RUSTFLAGS: ""
+          CC: clang
+          # Tests serialize because they share a single server container's
+          # state. They also use unique vault_ids so accumulating state
+          # between tests doesn't leak.
+        run: cargo test -p e2e-tests --features e2e --locked -- --test-threads=1
+
+      - name: Dump server logs (on failure)
+        if: failure()
+        run: docker compose -f docker-compose.e2e.yml logs --tail=300 e2e-server
+
+      - name: Tear down stack
+        if: always()
+        run: docker compose -f docker-compose.e2e.yml down -v --remove-orphans
+
+  # ---------------------------------------------------------------------------
   # Nix: flake check (runs tests via crane) + build server derivation.
   # Proves the hermetic path stays green.
   # ---------------------------------------------------------------------------
