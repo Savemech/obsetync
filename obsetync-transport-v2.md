@@ -639,6 +639,13 @@ The persist + fsync MUST happen before the request is sent on the wire,
 so a crash between send and persist does not cause sequence reuse on
 restart.
 
+In the plugin, `lastOutgoingSeq` lives in `settings.ts` (the only
+durable home, per §16). `SyncApi.sealed` reads, increments, and
+fsync-persists it via `await saveSettings()` before passing the
+resolved `seq` into `SecureChannel.encryptRequest(..., seq)`. The
+`SecureChannel` instance itself holds no counter state — it's pure
+crypto (see §11).
+
 ### 8.2 Server side
 
 The server stores `last_seen_seq` per device. Storage schema:
@@ -840,18 +847,33 @@ SecureChannel.create(serverBoxPub, bearer, esPub, esPubValidUntil):
   zero(ec_priv)
   fp   = SHA-256(esPub)[0:8]
 
-  store: ec_pub, ikm, fp, bearer, esPubValidUntil, last_outgoing_seq
+  store: ec_pub, ikm, fp, bearer, esPubValidUntil
   ; serverBoxPub is not retained past create — it's only needed to
-  ; derive dh_s, which is folded into ikm. (last_outgoing_seq is
-  ; in the store here because encryptRequest reads/writes it via
-  ; persist_and_increment; P6 moves it to plugin settings and out
-  ; of this instance state.)
+  ; derive dh_s, which is folded into ikm. The sequence counter is
+  ; not stored here either; SyncApi reads it from plugin settings
+  ; and passes the resolved value into encryptRequest (see §8.1).
 
-SecureChannel.encryptRequest(method, path, body):
+; SyncApi reads and persists `lastOutgoingSeq` from plugin settings
+; (single source of truth, §8.1) before every request, then passes
+; the resolved `seq` into SecureChannel. SecureChannel is stateless
+; w.r.t. the counter — the only durable home is settings.
+
+SyncApi.sealed(method, path, body):
+  channel = await openSession()              ; cached across calls
+  seq = settings.lastOutgoingSeq + 1
+  settings.lastOutgoingSeq = seq
+  await saveSettings()                       ; durable before send (§8.1)
+  wire = channel.encryptRequest(method, path, body, seq)
+  resp = await http_post(server_url + path, wire)
+  return channel.decryptResponse(method, path, resp)
+  ; Error handling (SessionStaleError, ReplayError per §8.3,
+  ; transient retry with same seq per §8.2) lives in the SyncApi
+  ; error-recovery layer, not pure crypto.
+
+SecureChannel.encryptRequest(method, path, body, seq):
   if now > esPubValidUntil - margin: throw SessionStaleError
   ; SyncApi catches SessionStaleError, calls openSession() again,
   ; and retries the original request once.
-  seq = persist_and_increment(last_outgoing_seq)
   nonce = random(12)
   key = HKDF(ikm, nonce, "obsetync/v2/c2s")
   pt  = bearer || seq_be64 || body
