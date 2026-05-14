@@ -545,7 +545,6 @@ Response body (after decrypt), JSON:
   "Es_pub_prev":       "<base64 of previous Es_pub or null>",
   "rotation_timestamp": 1735776000,
   "valid_until":        1735862400,
-  "next_rotation_at":   1735862400,
   "rotation_period_seconds": 86400,
   "grace_seconds":          172800
 }
