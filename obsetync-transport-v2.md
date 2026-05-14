@@ -605,7 +605,6 @@ Response body (after decrypt), JSON:
 ```json
 {
   "Es_pub":            "<base64 of current Es_pub>",
-  "Es_pub_prev":       "<base64 of previous Es_pub or null>",
   "rotation_timestamp": 1735776000,
   "valid_until":        1735862400,
   "rotation_period_seconds": 86400,
@@ -613,20 +612,26 @@ Response body (after decrypt), JSON:
 }
 ```
 
-The client caches `Es_pub`, `Es_pub_prev`, and `valid_until`. It
-schedules a refresh at `valid_until - 3600`. If the cache is stale at
-request time, it does a bootstrap fetch synchronously before the next
-sealed request to a regular endpoint.
+The client caches `Es_pub` and `valid_until`. It schedules a refresh
+at `valid_until - 3600`. If the cache is stale at request time, it
+does a bootstrap fetch synchronously before the next sealed request
+to a regular endpoint.
 
-`Es_pub_prev` is included so a client whose own clock is skewed against
-the server can still pick the right fingerprint for in-flight requests
-during the grace window.
+The server's previous-slot `Es_priv_prev` is retained internally
+during the grace window (§7.1) so that in-flight requests still
+encrypted with the prior `Es_pub` continue to decrypt. The client
+itself does not need to know `Es_pub_prev`: it computes one
+fingerprint from its single cached `Es_pub` per request, and the
+server's §5.4 dispatch matches that against whichever slot still
+holds the matching `Es_priv`.
 
 ### 7.5 First-rotation handling
 
 On first server start (`sync-server init`), both `box.key` and
-`box-eph.{key,pub}` are generated. There is no `box-eph-prev` yet. The
-server returns `"Es_pub_prev": null` for the first 24 hours.
+`box-eph.{key,pub}` are generated. There is no `box-eph-prev` yet,
+so the server's prev slot is `None` and the §5.4 dispatch matches
+only against the current slot until the first rotation populates
+prev.
 
 ### 7.6 Rotation crash recovery
 
@@ -1158,8 +1163,8 @@ CHANGED:
 - `settings.ts`:
   - New fields (camelCase, matching the existing convention —
     `serverBoxPub`, `bearerToken`, `syncIntervalMs`, etc.):
-    `wireVersion`, `esPub`, `esPubPrev`, `esPubValidUntil`,
-    `lastOutgoingSeq`. These are local plugin state. The
+    `wireVersion`, `esPub`, `esPubValidUntil`, `lastOutgoingSeq`.
+    These are local plugin state. The
     snake_case field names used elsewhere in this spec
     (`Es_pub_initial`, `Es_pub_valid_until`, `last_seen_seq`, …)
     refer to wire JSON received from / sent to the server — they
@@ -1181,7 +1186,8 @@ Add to `secure.rs` test module:
 - Decrypt failures (each cause from §9.2) all return
   exactly-256-byte zero body with HTTP 400.
 - Wrong fingerprint → decoy.
-- `Es_pub_prev` accepted within grace, rejected after grace expiry.
+- Previous-rotation `Es_pub` (matching the server's `eph_prev`
+  slot) accepted within grace, rejected after grace expiry.
 - Wire version 0x01 → decoy.
 
 Property tests (over arbitrary bytes / paths / methods):
