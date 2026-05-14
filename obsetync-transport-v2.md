@@ -423,6 +423,40 @@ The single-DH bootstrap channel achieves the same property
 (only the `box.key` holder can publish a valid `Es_pub`) using the same
 primitives already in use, with no new key files.
 
+### 5.4 Server-side mode dispatch
+
+The two key-schedules differ only in their HKDF info labels and in
+how `ikm` is constructed (one DH vs two). They share the same wire
+format, AAD shape, and bearer/seq plaintext layout, so the dispatch
+is a small branch in the middleware *before* AEAD decryption:
+
+```
+fn dispatch(wire: &[u8], path: &str, eph_state: &EphState) -> Mode | Decoy {
+    let fp = &wire[45..53];                             ; §3.1 fp slot
+    match (fp, path) {
+        (BOOT_FP, "/api/v1/server-eph") => Mode::Bootstrap,
+        (BOOT_FP, _)                    => Decoy,       ; §9.2 row 4
+        _ if fp == eph_state.curr.fp    => Mode::Default(&eph_state.curr),
+        _ if fp == eph_state.prev?.fp   => Mode::Default(&eph_state.prev?),
+        _                               => Decoy,       ; §9.2 row 3
+    }
+}
+```
+
+where `BOOT_FP = [0x00; 8]`.
+
+`decrypt_request` returns the chosen `Mode` alongside `(bearer, seq,
+inner_body)`. The middleware threads the same `Mode` into
+`encrypt_response`, which picks `obsetync/v2/s2c` for `Default` or
+`obsetync/v2/s2c-boot` for `Bootstrap`. Handlers — including
+`eph_handler` for `/api/v1/server-eph` — never see the mode; they
+emit a plain body and the middleware handles the cryptographic
+labels.
+
+Threading `mode` (an enum) rather than the info-label string keeps
+the labels under crypto's exclusive control. A handler can't
+accidentally mis-label a response by passing the wrong string.
+
 ---
 
 ## 6. AAD and endpoint binding
@@ -1059,26 +1093,37 @@ CHANGED:
   - `WIRE_VERSION = 0x02`
   - `REQUEST_HEADER_LEN = 53` (was 45)
   - `MIN_REQUEST_LEN = 141` (was 125)
-  - `decrypt_request` reads 8-byte fingerprint, looks up `Es_priv`,
-    does double-DH (or single-DH if `fp = 0x00·8` AND path is
-    `/server-eph`), returns `{bearer, seq, inner_body}`.
-  - `encrypt_response` takes a `(status_u16, body)` tuple, prefixes
-    status into plaintext.
+  - `decrypt_request` reads the 8-byte fingerprint, runs the §5.4
+    dispatch to pick `Mode::Default(eph_slot)` or `Mode::Bootstrap`,
+    does the matching DH(s), and returns
+    `{bearer, seq, inner_body, mode}`. A fingerprint that matches
+    no slot — or the sentinel on a non-`/server-eph` path —
+    short-circuits to the decoy without attempting AEAD decrypt.
+  - `encrypt_response` takes `(status_u16, body, mode)`. `mode`
+    selects the HKDF info label (`obsetync/v2/s2c` or
+    `obsetync/v2/s2c-boot`); the wire format is identical
+    either way.
   - New helper `decoy_response()` returns the canonical 256-byte zero
     body with HTTP 400 for all decrypt failures.
 - `api.rs`:
   - `secure_envelope` middleware:
     - Reads `X-Obsetync-Method`, returns decoy if missing.
-    - Calls `decrypt_request`; returns decoy on failure.
+    - Calls `decrypt_request`; returns decoy on failure. The
+      returned `mode` (Default | Bootstrap) is stashed in the
+      request extensions and re-supplied to `encrypt_response`
+      so the response uses the matching s2c info label.
     - Looks up device by bearer; on failure encrypts semantic 401.
     - Checks revocation; encrypts semantic 403 if revoked.
     - Calls `seq_tracker.check_and_advance(device, seq)`; encrypts
       semantic 401 with `{error: replay}` if seq doesn't advance.
-    - Dispatches handler.
-    - Promotes 204/304 → 200.
-    - Encrypts response with semantic status.
-  - New route `POST /api/v1/server-eph` handled by `eph_handler` —
-    expects single-DH bootstrap.
+    - Dispatches handler — handler is mode-agnostic.
+    - Zeros the body for 204/304 (semantic status survives in the
+      encrypted prefix, §10).
+    - Encrypts response with `(semantic_status, body, mode)`.
+  - New route `POST /api/v1/server-eph` handled by `eph_handler`.
+    The bootstrap requirement is enforced by the §5.4 dispatch,
+    not by the handler — `eph_handler` itself just emits the
+    distribution JSON (§7.4).
 - `state.rs`:
   - Adds `eph_curr: Arc<RwLock<EphKeyMaterial>>`,
     `eph_prev: Arc<RwLock<Option<EphKeyMaterial>>>`,
