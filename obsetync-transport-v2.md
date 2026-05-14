@@ -743,19 +743,30 @@ HTTP/1.1 (RFC 9112) forbids a body on responses with status `1xx`,
 drops the body. Our body would be the encrypted envelope — dropping it
 leaves the client with zero bytes where it expects an AEAD-sealed blob.
 
-Therefore the middleware MUST rewrite handler outputs:
+Therefore the middleware drops the inner body for 204 / 304 but keeps
+the original status in the encrypted semantic prefix (§3.2):
 
 ```
+# wire HTTP is unconditionally 200 OK on envelope success (§3.2);
+# only the inner body is shortened for 204 / 304.
 if handler_status in {204, 304}:
-    handler_status = 200
-    handler_body = b""
-encrypt_response(handler_status, handler_body)
+    inner_body = b""
+else:
+    inner_body = handler_body
+encrypt_response(handler_status, inner_body)   # status goes into the
+                                               # 2-byte semantic prefix
+                                               # verbatim — 204 / 304
+                                               # survive the round-trip
 ```
 
-The semantic intent ("success, no content" or "not modified") is lost on
-the wire, but neither distinction has been load-bearing in obsetync.
-Future endpoints that need real 304 semantics should encode that as a
-field in the response body.
+The HTTP/1.1 "no body on 204/304" rule applies only to the **wire**
+status, which v2 already forces to 200 OK on successful decrypt. The
+semantic intent — "success, no content" or "not modified" — is
+preserved in the encrypted 2-byte status prefix, so callers that
+already treat 304 as a sentinel (e.g. the plugin's `getDiff`
+returning `null` on "in sync") keep working unchanged after they
+switch to reading the post-decrypt `status` field instead of the wire
+HTTP status.
 
 ---
 
