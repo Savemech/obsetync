@@ -512,17 +512,34 @@ loop {
     generate Es_priv_new, Es_pub_new
     fp_new = SHA-256(Es_pub_new)[0:8]
   until fp_new != 0x00·8           ; reject bootstrap-sentinel collision
-  atomically:
-    if box-eph-prev.{key,pub} exists:
-      securely_overwrite_and_unlink(box-eph-prev.key)
-      unlink(box-eph-prev.pub)
-    rename(box-eph.key, box-eph-prev.key)
-    rename(box-eph.pub, box-eph-prev.pub)
-    write(box-eph.key, Es_priv_new, mode 0600, fsync)
-    write(box-eph.pub, Es_pub_new, mode 0644, fsync)
-    update_meta(box-eph.meta)
-  in-memory: swap state.eph_curr, state.eph_prev
-  log("rotated to fingerprint=<hex>")
+
+  ; Crash-safe rotation: stage new key files under .tmp names first,
+  ; then rearrange the live slots via atomic renames. Each
+  ; fsync(dir) makes the preceding rename durable. The recoverable
+  ; mid-crash states are enumerated in §7.6.
+
+  write(box-eph.key.tmp, Es_priv_new, mode 0600), fsync_file
+  write(box-eph.pub.tmp, Es_pub_new,  mode 0644), fsync_file
+
+  if box-eph-prev.{key,pub} exists:
+    securely_overwrite_and_unlink(box-eph-prev.key)
+    unlink(box-eph-prev.pub)
+    fsync_dir(data/server/)
+
+  rename(box-eph.key,     box-eph-prev.key)
+  rename(box-eph.pub,     box-eph-prev.pub)
+  fsync_dir(data/server/)
+
+  rename(box-eph.key.tmp, box-eph.key)
+  rename(box-eph.pub.tmp, box-eph.pub)
+  fsync_dir(data/server/)
+
+  write(box-eph.meta.tmp, new_meta_json, mode 0644), fsync_file
+  rename(box-eph.meta.tmp, box-eph.meta)
+  fsync_dir(data/server/)
+
+  under write-lock: swap state.eph_curr, state.eph_prev
+  log("rotated to fingerprint=<hex of fp_new>")
 }
 ```
 
@@ -576,6 +593,24 @@ during the grace window.
 On first server start (`sync-server init`), both `box.key` and
 `box-eph.{key,pub}` are generated. There is no `box-eph-prev` yet. The
 server returns `"Es_pub_prev": null` for the first 24 hours.
+
+### 7.6 Rotation crash recovery
+
+The §7.3 rename sequence has well-defined crash-recoverable
+intermediate states. At startup the server walks `data/server/` and
+takes one of these actions before booting the rotation timer:
+
+| On-disk state                                                              | Action                                                                                                                                                                |
+|----------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `box-eph.{key,pub}` present, no `.tmp` files                               | Normal load. curr = on-disk values; prev = on-disk if `box-eph-prev.*` exists, else `None`.                                                                           |
+| `box-eph.{key,pub}` present AND `box-eph.{key,pub}.tmp` also present       | Tmp staged but never promoted. Delete the `.tmp` files, `fsync(dir)`, continue with curr unchanged.                                                                   |
+| `box-eph.key` missing AND `box-eph.key.tmp` present                        | Crash between the curr→prev rename and the tmp→curr rename. Promote tmp → curr (atomic rename + `fsync(dir)`), then load normally.                                    |
+| `box-eph.key` missing AND no `.tmp` files                                  | Unrecoverable. Log a hard error and **exit non-zero**. Do not silently regenerate — silent regen would invalidate forward-secrecy guarantees for clients with active sessions. Operator must run an explicit re-init command that logs the fact a new `Es_pub` is being issued. |
+
+If `box-eph.meta` is missing or its fingerprints disagree with the
+actual key-file contents, the server rebuilds meta from disk and
+writes it via the same `.tmp` + rename + `fsync(dir)` pattern. Meta is
+informational; the key files are authoritative.
 
 ---
 
