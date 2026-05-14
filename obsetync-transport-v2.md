@@ -814,22 +814,43 @@ A session = lifetime of a `SecureChannel` instance. Created once per
 plugin load.
 
 ```
-SecureChannel.create(server_url, S_pub_pinned, bearer, Es_pub_cached, valid_until):
-  if Es_pub_cached is null OR now > valid_until - margin:
-    → bootstrap-fetch /api/v1/server-eph
-    → cache returned Es_pub, Es_pub_prev, valid_until
+; SyncApi owns HTTP and the Es_pub cache. It bootstraps when the
+; cache is stale, then hands SecureChannel a resolved set of crypto
+; inputs. SecureChannel itself never makes HTTP calls — same
+; separation v1 already has between secure.ts (pure crypto) and
+; api.ts (network).
 
+SyncApi.openSession():
+  if settings.esPub is null OR now > settings.esPubValidUntil - margin:
+    bundle = bootstrap_eph()           ; sealed call to /api/v1/server-eph
+    settings.esPub           = bundle.Es_pub
+    settings.esPubValidUntil = bundle.valid_until
+    await saveSettings()
+  return SecureChannel.create(
+    serverBoxPub    = settings.serverBoxPub,
+    bearer          = settings.bearerToken,
+    esPub           = settings.esPub,
+    esPubValidUntil = settings.esPubValidUntil)
+
+SecureChannel.create(serverBoxPub, bearer, esPub, esPubValidUntil):
   ec_priv, ec_pub = x25519_generate()
-  dh_s = X25519(ec_priv, S_pub_pinned)
-  dh_e = X25519(ec_priv, Es_pub_current)
+  dh_s = X25519(ec_priv, serverBoxPub)
+  dh_e = X25519(ec_priv, esPub)
   ikm  = dh_s || dh_e          (64 bytes, cached for session)
   zero(ec_priv)
-  fp   = SHA-256(Es_pub_current)[0:8]
+  fp   = SHA-256(esPub)[0:8]
 
-  store: ec_pub, ikm, fp, S_pub_pinned, bearer, last_outgoing_seq
+  store: ec_pub, ikm, fp, bearer, esPubValidUntil, last_outgoing_seq
+  ; serverBoxPub is not retained past create — it's only needed to
+  ; derive dh_s, which is folded into ikm. (last_outgoing_seq is
+  ; in the store here because encryptRequest reads/writes it via
+  ; persist_and_increment; P6 moves it to plugin settings and out
+  ; of this instance state.)
 
 SecureChannel.encryptRequest(method, path, body):
-  if now > valid_until - margin: refresh Es_pub, recreate session
+  if now > esPubValidUntil - margin: throw SessionStaleError
+  ; SyncApi catches SessionStaleError, calls openSession() again,
+  ; and retries the original request once.
   seq = persist_and_increment(last_outgoing_seq)
   nonce = random(12)
   key = HKDF(ikm, nonce, "obsetync/v2/c2s")
@@ -1052,8 +1073,11 @@ CHANGED:
 
 - `secure.ts`:
   - `WIRE_VERSION = 0x02`
-  - `SecureChannel.create` now takes `Es_pub` and `valid_until`,
-    handles bootstrap path.
+  - `SecureChannel.create` now takes `serverBoxPub`, `bearer`,
+    `esPub`, `esPubValidUntil`. **No HTTP** — bootstrap lives in
+    `api.ts`; `SyncApi.openSession()` calls `bootstrap_eph()` when
+    the cache is stale and only then constructs the channel
+    (see §11).
   - `encryptRequest` embeds 8-byte fingerprint and 8-byte sequence.
   - `decryptResponse` returns `{status, body}` instead of just `body`.
 - `api.ts`:
