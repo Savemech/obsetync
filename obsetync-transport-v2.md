@@ -334,7 +334,7 @@ per response:                                                     nonce_resp = r
                                                                                   ikm  = ikm,
                                                                                   salt = nonce_resp,
                                                                                   info = "obsetync/v2/s2c")
-                                                                  aad_resp = "obsetync/v2 <METHOD> <PATH>"
+                                                                  aad_resp = "obsetync/v2 <METHOD> <PATH>" || nonce_req
                                                                   pt = status_be16 || handler_body
                                                                   ct = AES-256-GCM_encrypt(
                                                                           key_resp, nonce_resp, pt, aad_resp)
@@ -345,7 +345,10 @@ per response:                                                     nonce_resp = r
               key_resp = HKDF-SHA256(ikm cached,
                                      salt = nonce_resp,
                                      info = "obsetync/v2/s2c")
-              pt = AES-256-GCM_decrypt(...)
+              aad_resp = "obsetync/v2 <METHOD> <PATH>" || nonce_req
+                                                ; client uses the nonce it
+                                                ; SENT for this request
+              pt = AES-256-GCM_decrypt(key_resp, nonce_resp, ct, aad_resp)
               status = pt[0..2]
               body   = pt[2..]
 ```
@@ -462,11 +465,15 @@ accidentally mis-label a response by passing the wrong string.
 ## 6. AAD and endpoint binding
 
 ```
-"obsetync/v2 <METHOD> <PATH>"
+aad_req  = "obsetync/v2 <METHOD> <PATH>"
+aad_resp = "obsetync/v2 <METHOD> <PATH>" || nonce_req   (12 bytes)
 ```
 
 `<METHOD>` is the **semantic** HTTP method (`GET`/`PUT`/`POST`/`DELETE`).
-`<PATH>` is the URI path.
+`<PATH>` is the URI path. `nonce_req` is the 12-byte AEAD nonce from
+the *request* this response is answering — both sides already have
+it at response time (the client generated it; the server received it
+in the request header).
 
 Consequences:
 
@@ -477,6 +484,13 @@ Consequences:
 - A captured request envelope cannot be replayed to the same path
   either, because the embedded sequence number must strictly advance
   (see §8).
+- **A captured response envelope cannot be swapped for the response to
+  a later same-AAD request.** Two `GET /api/v1/root/<vault>` calls in
+  the same session share method, path, `ikm`, and HKDF info, so
+  without `nonce_req` in the response AAD their responses would be
+  interchangeable on the wire and an attacker could pin a stale read
+  result indefinitely. Binding `nonce_req` makes the GCM tag specific
+  to the exact request being answered.
 - Truncation and extension fail (GCM tag covers entire ciphertext).
 
 ### 6.1 X-Obsetync-Method strict requirement
@@ -902,9 +916,10 @@ SyncApi.sealed(method, path, body):
   seq = settings.lastOutgoingSeq + 1
   settings.lastOutgoingSeq = seq
   await saveSettings()                       ; durable before send (§8.1)
-  wire = channel.encryptRequest(method, path, body, seq)
+  { wire, nonceReq } = channel.encryptRequest(method, path, body, seq)
   resp = await http_post(server_url + path, wire)
-  return channel.decryptResponse(method, path, resp)
+  return channel.decryptResponse(method, path, resp, nonceReq)
+  ; nonceReq binds the response AAD to this specific request — see §6.
   ; Error handling (SessionStaleError, ReplayError per §8.3,
   ; transient retry with same seq per §8.2) lives in the SyncApi
   ; error-recovery layer, not pure crypto.
@@ -913,17 +928,20 @@ SecureChannel.encryptRequest(method, path, body, seq):
   if now > esPubValidUntil - margin: throw SessionStaleError
   ; SyncApi catches SessionStaleError, calls openSession() again,
   ; and retries the original request once.
-  nonce = random(12)
-  key = HKDF(ikm, nonce, "obsetync/v2/c2s")
+  nonceReq = random(12)
+  key = HKDF(ikm, nonceReq, "obsetync/v2/c2s")
   pt  = bearer || seq_be64 || body
-  ct  = aes_gcm_encrypt(key, nonce, pt, aad="obsetync/v2 " || method || " " || path)
-  return 0x02 || nonce || ec_pub || fp || ct
+  ct  = aes_gcm_encrypt(key, nonceReq, pt,
+                        aad = "obsetync/v2 " || method || " " || path)
+  wire = 0x02 || nonceReq || ec_pub || fp || ct
+  return { wire, nonceReq }
 
-SecureChannel.decryptResponse(method, path, wire):
-  parse wire: version, nonce, ct
+SecureChannel.decryptResponse(method, path, wire, nonceReq):
+  parse wire: version, nonceResp, ct
   if version != 0x02: throw envelope-error
-  key = HKDF(ikm, nonce, "obsetync/v2/s2c")
-  pt  = aes_gcm_decrypt(key, nonce, ct, aad="obsetync/v2 " || method || " " || path)
+  key = HKDF(ikm, nonceResp, "obsetync/v2/s2c")
+  aad = "obsetync/v2 " || method || " " || path || nonceReq
+  pt  = aes_gcm_decrypt(key, nonceResp, ct, aad)
   status = pt[0..2]
   body   = pt[2..]
   return { status, body }
@@ -1104,10 +1122,11 @@ CHANGED:
     `{bearer, seq, inner_body, mode}`. A fingerprint that matches
     no slot — or the sentinel on a non-`/server-eph` path —
     short-circuits to the decoy without attempting AEAD decrypt.
-  - `encrypt_response` takes `(status_u16, body, mode)`. `mode`
-    selects the HKDF info label (`obsetync/v2/s2c` or
-    `obsetync/v2/s2c-boot`); the wire format is identical
-    either way.
+  - `encrypt_response` takes `(status_u16, body, mode, nonce_req)`.
+    `mode` selects the HKDF info label (`obsetync/v2/s2c` or
+    `obsetync/v2/s2c-boot`); `nonce_req` is appended to the response
+    AAD per §6 so a captured response can't be swapped onto a later
+    same-AAD request. Wire format is unchanged.
   - New helper `decoy_response()` returns the canonical 256-byte zero
     body with HTTP 400 for all decrypt failures.
 - `api.rs`:
@@ -1257,10 +1276,12 @@ Plaintext after decrypt:
 0x02 .. M      (4400 bytes flatbuffers RootNode)
 ```
 
-AAD committed to:
+AAD committed to (per §6 — response AAD binds the request nonce):
 
 ```
 "obsetync/v2 GET /api/v1/root/svx-main"
+                                       ||  8a 2f 1c 77 09 4b 63 d1 5e ff a0 22
+                                           (= nonce_req from the request above)
 ```
 
 ### Decrypt-failure example
