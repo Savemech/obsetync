@@ -239,6 +239,11 @@ Same library choices as v1. The KDF info labels change to
 | **X25519**      | Two ECDH operations per session | RFC 7748   | `@noble/curves`                    | `x25519-dalek`      |
 | **HKDF-SHA256** | Per-message AES key derivation | RFC 5869  | `SubtleCrypto.deriveBits`          | `hkdf` crate        |
 | **AES-256-GCM** | Authenticated encryption     | SP 800-38D | `SubtleCrypto.encrypt` / `.decrypt`| `aes-gcm` crate     |
+| **SHA-256**     | `Es_pub` fingerprint (§3.1)  | FIPS 180-4 | `SubtleCrypto.digest`              | `sha2` crate        |
+
+`sha2` is already a transitive dependency through `hkdf` on the server,
+so adding fingerprint computation pulls in no new crate. The plugin
+already has `SubtleCrypto` available for HKDF and AES-GCM.
 
 HKDF info labels in v2:
 
