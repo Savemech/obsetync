@@ -212,9 +212,21 @@ Body: 256 bytes, all 0x00
 ```
 
 Same shape, same length, same status, regardless of cause. The cause is
-logged on the server but never appears on the wire. Clients treat any
-HTTP 400 response of exactly 256 zero bytes as "envelope error,
-disconnect / re-enroll."
+logged on the server but never appears on the wire. Clients recognise
+the decoy by its exact size (256 zero bytes) and follow this recovery
+sequence:
+
+1. Re-fetch `Es_pub` via the single-DH bootstrap call to
+   `/api/v1/server-eph` (§7.4) and replace the cached value.
+2. Recompute the session keys with the fresh `Es_pub` and retry the
+   original request **once**.
+3. If the retry also lands a decoy, surface "re-enroll" to the user.
+
+The most common cause of an unexpected decoy is a stale `Es_pub` cache
+that outlived the rotation grace window (§7.2); steps 1–2 recover from
+that without operator action. Genuine re-enrollment is only needed for
+bearer revocation, wire-version mismatch, or a server reinstall — and
+those will continue to decoy after step 2 anyway.
 
 ### 3.4 HTTP wrapping
 
