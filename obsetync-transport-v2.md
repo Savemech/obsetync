@@ -759,6 +759,32 @@ server; its first request uses `seq = 1` and never needs recovery.
   observability (gaps may indicate dropped requests).
 - No window-vs-memory tradeoff. Strict, simple.
 
+**Constraint imposed by strict-advance.** With one `last_seen_seq` per
+device and `seq_in <= seq_last → replay`, the server cannot accept
+two in-flight requests from the same device arriving out of order
+on a lossy network. The plugin today serializes every sync call
+(every `SyncApi.sealed` awaits the previous one's response), so
+this is a non-issue. **It does mean parallel uploads from a single
+device are not supported** — both the spec and any future client
+must keep request fan-out per-device serial.
+
+The day someone wants parallel uploads (e.g. fan-out chunk PUTs for
+large files), the cheap upgrade path — gated behind a new `0x03`
+wire version per §18 if anti-replay state needs renegotiating, or
+hot-swappable per device otherwise — is:
+
+  - Replace `last_seen_seq` with `(last_seen_seq, window_bitmap)`
+    where `window_bitmap` is 64 bits covering
+    `(last_seen_seq − 63 .. last_seen_seq]`.
+  - Accept any `seq_in` such that
+    `last_seen_seq − 63 < seq_in <= last_seen_seq + N` whose bit is
+    unset; set the bit; shift the window when `seq_in > last_seen_seq`.
+
+That's the IPsec AH/ESP anti-replay window exactly. Server state
+stays O(1) per device (16 bytes instead of 8); crash safety is
+still one atomic write per request. We don't pay the complexity
+until we need it.
+
 ---
 
 ## 9. Enveloped errors
