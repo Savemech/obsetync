@@ -996,8 +996,15 @@ CHANGED:
   - Sequence counter persisted in plugin settings, fsync-style flush
     (await `saveSettings()`) before each request.
 - `settings.ts`:
-  - New fields: `wire_version`, `Es_pub`, `Es_pub_prev`,
-    `Es_pub_valid_until`, `last_outgoing_seq`.
+  - New fields (camelCase, matching the existing convention —
+    `serverBoxPub`, `bearerToken`, `syncIntervalMs`, etc.):
+    `wireVersion`, `esPub`, `esPubPrev`, `esPubValidUntil`,
+    `lastOutgoingSeq`. These are local plugin state. The
+    snake_case field names used elsewhere in this spec
+    (`Es_pub_initial`, `Es_pub_valid_until`, `last_seen_seq`, …)
+    refer to wire JSON received from / sent to the server — they
+    keep the server-side serde convention and match the existing
+    `EnrollmentBundle` interface in `plugin/src/api.ts`.
 
 ### Tests
 
