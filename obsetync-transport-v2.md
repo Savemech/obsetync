@@ -634,24 +634,27 @@ poison the sequence counter. A retry with the SAME `seq` value is
 permitted, but only until ANY successful request with a higher `seq`
 lands.
 
-### 8.3 Sequence recovery
+### 8.3 Sequence recovery after client crash
 
-If a client crashes hard enough to lose `last_outgoing_seq`, it can
-recover the server's view via:
+If a client crashes hard enough to lose `last_outgoing_seq` from its
+plugin settings, no dedicated recovery endpoint is required — the
+replay error in §8.2 already carries the authoritative
+`last_seen_seq`. Recovery flow:
 
-```
-GET /api/v1/devices/me/seq
-  (sealed v0x02, double-DH, body empty)
-  → response: { "last_seen_seq": <uint64> }
-```
+1. Client picks any `seq` (e.g. `1`) and sends its next sealed
+   request normally (persist-before-send still applies).
+2. If `last_outgoing_seq` happened to still be ahead of the server's
+   `last_seen_seq` (rare — implies the loss was very recent), the
+   request succeeds and the client persists the new value as usual.
+3. Otherwise the server returns the §8.2 replay error containing
+   `last_seen_seq`. The client sets
+   `last_outgoing_seq = last_seen_seq + 1` and retries the original
+   request.
 
-The client sets `last_outgoing_seq = response.last_seen_seq` and
-proceeds. This is itself a sealed request, so it consumes a sequence
-number too — clients must persist BEFORE sending. The server treats it
-as any other sealed endpoint: any `seq > last_seen_seq` is accepted.
-
-A first-time device after enrollment has `last_seen_seq = 0`; its first
-request uses `seq = 1`.
+One extra round-trip in the worst case; no endpoint to maintain or
+secure separately. A first-time device after enrollment has
+`last_outgoing_seq = 0` on the client and `last_seen_seq = 0` on the
+server; its first request uses `seq = 1` and never needs recovery.
 
 ### 8.4 Why monotonic counter, not seen-nonce LRU
 
@@ -998,7 +1001,6 @@ CHANGED:
     - Encrypts response with semantic status.
   - New route `POST /api/v1/server-eph` handled by `eph_handler` —
     expects single-DH bootstrap.
-  - New route `GET /api/v1/devices/me/seq` for sequence recovery.
 - `state.rs`:
   - Adds `eph_curr: Arc<RwLock<EphKeyMaterial>>`,
     `eph_prev: Arc<RwLock<Option<EphKeyMaterial>>>`,
