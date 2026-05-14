@@ -496,7 +496,10 @@ The server runs an async task at startup:
 ```
 loop {
   sleep until next rotation boundary
-  generate Es_priv_new, Es_pub_new
+  repeat:
+    generate Es_priv_new, Es_pub_new
+    fp_new = SHA-256(Es_pub_new)[0:8]
+  until fp_new != 0x00·8           ; reject bootstrap-sentinel collision
   atomically:
     if box-eph-prev.{key,pub} exists:
       securely_overwrite_and_unlink(box-eph-prev.key)
@@ -515,6 +518,13 @@ loop {
 fsyncs, then unlinks. On the same filesystem this is best-effort
 (SSDs may retain old data); operators paranoid about that should
 filesystem-encrypt `data/server/`.
+
+The same sentinel-collision guard applies at first server start
+(`sync-server init` / `init_eph_keys` per §16): regenerate until the
+new `Es_pub`'s fingerprint differs from `0x00·8`. The probability of a
+hit is 2⁻⁶⁴ — operationally never — but unchecked it would silently
+route every regular request to the bootstrap path and trip §9.2's
+"fingerprint sentinel with non-bootstrap path → decoy" rule.
 
 ### 7.4 Distribution endpoint
 
