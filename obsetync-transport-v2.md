@@ -1037,12 +1037,12 @@ Wire byte    Field                Hex (sample)
                                   12 b1 44 25 21 47 bd b7 86 0f 98 5c
                                   e8 81 aa 2e ba a9 7d e6
  45  .. 53   Es_pub fingerprint   91 4c 22 7d 5b a0 8e f3
- 53  .. 149  ciphertext           (96 bytes: 64 bearer + 8 seq + 0 body
+ 53  .. 125  ciphertext           (72 bytes: 64 bearer + 8 seq + 0 body
                                               encrypted with AES-GCM)
-149  .. 165  GCM tag              16 bytes
+125  .. 141  GCM tag              16 bytes
 ```
 
-Total request: 165 bytes.
+Total request: 141 bytes.
 
 Plaintext that decrypts:
 
