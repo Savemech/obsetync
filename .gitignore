@@ -37,6 +37,7 @@ CLAUDE.md
 private/
 notes/
 _private/
+tasks/
 *.crt
 *.pem
 *.key
