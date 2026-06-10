@@ -910,7 +910,7 @@ HTTP status.
 
 ## 11. Session lifecycle (client)
 
-A session = lifetime of a `ObsetyncSecureChannel` instance. Created once per
+A session = lifetime of an `ObsetyncSecureChannel` instance. Created once per
 plugin load.
 
 ```
