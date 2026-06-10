@@ -137,42 +137,66 @@ export function perfSpan(name: string): () => void {
 const CRASH_LOG_PATH = ".obsetync-crash.log";
 const CRASH_FLUSH_MS = 1000;
 const MAX_SESSION_ENTRIES = 500;
-const ROTATE_ABOVE_BYTES = 512_000;
-const ROTATE_KEEP_BYTES = 100_000;
+/** Per-entry size caps — a multi-MB rejection reason must not become a
+ *  multi-MB log line: every flush re-reads the whole file into memory,
+ *  which is exactly what an OOM-stressed renderer can't afford. */
+const MAX_MSG_CHARS = 2000;
+const MAX_STACK_LINES = 6;
+const MAX_STACK_LINE_CHARS = 300;
+/** UTF-16 code units, not bytes — close enough for a log size bound. */
+const ROTATE_ABOVE_CHARS = 512_000;
+const ROTATE_KEEP_CHARS = 100_000;
 
 class ObsetyncCrashLogger {
     private app: App | null = null;
     private written = 0;
     private capped = false;
     private pending: string[] = [];
+    /** Session-start marker — written lazily with the first real entry, so
+     *  healthy sessions never create or touch the file (and never churn
+     *  third-party folder syncers watching the vault). */
+    private header: string | null = null;
     private flushTimer: ReturnType<typeof setTimeout> | null = null;
+    private lastFlushMs = 0;
     /** Serialises read+write cycles so appends never interleave. */
     private writeChain: Promise<void> = Promise.resolve();
     private lastKey = "";
     private repeats = 0;
 
     private readonly onError = (e: ErrorEvent) => {
-        this.record(
-            "error",
-            `${e.message} (${e.filename || "?"}:${e.lineno ?? "?"})`,
-            e.error?.stack,
-        );
+        try {
+            this.record(
+                "error",
+                `${e.message} (${e.filename || "?"}:${e.lineno ?? "?"})`,
+                e.error?.stack,
+            );
+        } catch {
+            // Never throw from a window listener.
+        }
     };
 
     private readonly onRejection = (e: PromiseRejectionEvent) => {
-        const r: any = e.reason;
-        this.record("rejection", String(r?.message ?? r), r?.stack);
+        try {
+            // e.reason is untrusted — its getters can throw.
+            const r: any = e.reason;
+            this.record("rejection", String(r?.message ?? r), r?.stack);
+        } catch {
+            // Never throw from a window listener.
+        }
     };
 
     install(app: App, version: string): void {
         if (this.app) return;
         this.app = app;
+        // Fresh session — reset the cap and dedup state.
+        this.written = 0;
+        this.capped = false;
+        this.lastKey = "";
+        this.repeats = 0;
+        this.header =
+            `--- obsetync ${version} session start ${new Date().toISOString()} ---`;
         window.addEventListener("error", this.onError);
         window.addEventListener("unhandledrejection", this.onRejection);
-        this.pending.push(
-            `--- obsetync ${version} session start ${new Date().toISOString()} ---`,
-        );
-        this.scheduleFlush();
     }
 
     uninstall(): void {
@@ -190,6 +214,10 @@ class ObsetyncCrashLogger {
     private record(kind: string, msg: string, stack?: string): void {
         try {
             if (this.capped) return;
+
+            if (msg.length > MAX_MSG_CHARS) {
+                msg = msg.slice(0, MAX_MSG_CHARS) + "…[truncated]";
+            }
 
             // Collapse consecutive duplicates (error storms repeat one line).
             const key = `[${kind}] ${msg}`;
@@ -213,7 +241,13 @@ class ObsetyncCrashLogger {
 
             let line = `${new Date().toISOString()} ${key}`;
             if (stack) {
-                line += `\n  ${String(stack).split("\n").slice(0, 6).join("\n  ")}`;
+                const frames = String(stack)
+                    .split("\n")
+                    .slice(0, MAX_STACK_LINES)
+                    .map(s => s.length > MAX_STACK_LINE_CHARS
+                        ? s.slice(0, MAX_STACK_LINE_CHARS) + "…"
+                        : s);
+                line += `\n  ${frames.join("\n  ")}`;
             }
             this.pending.push(line);
             this.scheduleFlush();
@@ -233,10 +267,15 @@ class ObsetyncCrashLogger {
 
     private scheduleFlush(): void {
         if (this.flushTimer !== null) return;
+        // Leading edge: the first entry after an idle period writes
+        // immediately — the fatal error right before a renderer kill must
+        // not wait out a debounce timer. Followers batch up for a second.
+        const delay =
+            Date.now() - this.lastFlushMs >= CRASH_FLUSH_MS ? 0 : CRASH_FLUSH_MS;
         this.flushTimer = setTimeout(() => {
             this.flushTimer = null;
             this.flushNow();
-        }, CRASH_FLUSH_MS);
+        }, delay);
     }
 
     private flushNow(): void {
@@ -244,7 +283,12 @@ class ObsetyncCrashLogger {
         if (!app) return;
         this.flushRepeats();
         if (this.pending.length === 0) return;
-        const lines = this.pending.splice(0);
+        if (this.header) {
+            this.pending.unshift(this.header);
+            this.header = null;
+        }
+        const block = this.pending.splice(0).join("\n") + "\n";
+        this.lastFlushMs = Date.now();
         this.writeChain = this.writeChain
             .then(async () => {
                 let current = "";
@@ -253,14 +297,14 @@ class ObsetyncCrashLogger {
                 } catch {
                     // No file yet — start fresh.
                 }
-                if (current.length > ROTATE_ABOVE_BYTES) {
-                    current = "[rotated]\n" + current.slice(-ROTATE_KEEP_BYTES);
+                if (current.length + block.length > ROTATE_ABOVE_CHARS) {
+                    const tail = current.slice(-ROTATE_KEEP_CHARS);
+                    // Cut at a line boundary so the rotated file starts clean.
+                    const nl = tail.indexOf("\n");
+                    current = "[rotated]\n" + (nl >= 0 ? tail.slice(nl + 1) : tail);
                 }
                 const sep = current && !current.endsWith("\n") ? "\n" : "";
-                await app.vault.adapter.write(
-                    CRASH_LOG_PATH,
-                    current + sep + lines.join("\n") + "\n",
-                );
+                await app.vault.adapter.write(CRASH_LOG_PATH, current + sep + block);
             })
             .catch(() => {
                 // Disk full / adapter gone — drop the lines, never throw.
