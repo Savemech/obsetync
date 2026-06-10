@@ -6,7 +6,7 @@ import { ObsetyncJournal } from "./journal";
 import { ObsetyncSyncEngine } from "./sync";
 import { SyncSettings, DEFAULT_SETTINGS, ObsetyncSettingTab } from "./settings";
 import { ObsetyncConflictModal, findConflicts } from "./conflict-ui";
-import { debugLog, perfSpan } from "./debug-log";
+import { debugLog, crashLog, perfSpan } from "./debug-log";
 import type { WasmModule, WasmTree } from "./push";
 
 // Static import of the wasm-bindgen --target web glue. esbuild inlines this
@@ -44,6 +44,11 @@ export default class ObsetyncPlugin extends Plugin {
         // buffer so the "Show debug info" panel can surface them later,
         // especially on iOS where there's no easy way to see console output.
         debugLog.install();
+
+        // Persist window-level errors to .obsetync-crash.log in the vault
+        // root. DevTools die with the renderer — that file is the postmortem
+        // evidence when the window goes down (OOM, error storms).
+        crashLog.install(this.app, this.manifest.version);
 
         await this.loadSettings();
 
@@ -96,6 +101,7 @@ export default class ObsetyncPlugin extends Plugin {
 
     onunload(): void {
         this.syncEngine?.stop();
+        crashLog.uninstall();
         debugLog.uninstall();
     }
 
