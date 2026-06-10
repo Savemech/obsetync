@@ -100,7 +100,13 @@ export default class ObsetyncPlugin extends Plugin {
     }
 
     onunload(): void {
-        this.syncEngine?.stop();
+        // Engine stop first (crash logger still armed while it runs), but
+        // never let it skip the listener teardown below.
+        try {
+            this.syncEngine?.stop();
+        } catch (e) {
+            console.warn("[obsetync] engine stop failed during unload:", e);
+        }
         crashLog.uninstall();
         debugLog.uninstall();
     }
@@ -244,7 +250,7 @@ export default class ObsetyncPlugin extends Plugin {
     async enroll(code: string): Promise<void> {
         // Enrollment is over plain HTTP to the admin port. We pass empty
         // strings for box_pub + bearer_token since claimEnrollment doesn't
-        // need a ObsetyncSecureChannel (admin endpoint is unauthenticated).
+        // need an ObsetyncSecureChannel (admin endpoint is unauthenticated).
         const tempApi = new ObsetyncApi(this.settings.serverUrl, "", "");
         const result = await tempApi.claimEnrollment(code);
 
@@ -296,10 +302,17 @@ export default class ObsetyncPlugin extends Plugin {
 
     private async initSync(): Promise<void> {
         // Spans the whole startup cost: WASM load + engine start (pull,
-        // journal recovery, mtime scan). Closed at the end of this method;
-        // an init failure drops the span — the error path is logged anyway.
+        // journal recovery, mtime scan) — finally, so a failed init still
+        // closes its span and shows how long it ran before dying.
         const endSpan = perfSpan("init");
+        try {
+            await this.initSyncInner();
+        } finally {
+            endSpan();
+        }
+    }
 
+    private async initSyncInner(): Promise<void> {
         // Stop existing engine if re-initializing.
         this.syncEngine?.stop();
 
@@ -359,7 +372,6 @@ export default class ObsetyncPlugin extends Plugin {
         this.updateStatusBar("sync ↓");
         await this.syncEngine.start();
         this.updateStatusBar("sync ✓");
-        endSpan();
     }
 
     private async loadWasm(): Promise<WasmModule> {
