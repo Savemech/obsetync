@@ -25,7 +25,7 @@
  *
  *   "obsetync/v1 <METHOD> <PATH>"
  *
- * A single `SecureChannel` instance caches the ECDH shared secret for its
+ * A single `ObsetyncSecureChannel` instance caches the ECDH shared secret for its
  * lifetime, so per-request work is just HKDF + AES-GCM (microseconds).
  * Forward secrecy is per-session (per plugin load), same as TLS with session
  * tickets.
@@ -45,10 +45,10 @@ const AAD_PREFIX = "obsetync/v1";
 const INFO_C2S = "obsetync/v1/c2s";
 const INFO_S2C = "obsetync/v1/s2c";
 
-export class SecureTransportError extends Error {
+export class ObsetyncSecureTransportError extends Error {
     constructor(msg: string) {
         super(msg);
-        this.name = "SecureTransportError";
+        this.name = "ObsetyncSecureTransportError";
     }
 }
 
@@ -93,10 +93,10 @@ function randomNonce(): Uint8Array {
 /**
  * Per-session encrypted HTTP transport to the obsetync server.
  *
- * Instantiate once via `SecureChannel.create(...)`. Reuse for every API
+ * Instantiate once via `ObsetyncSecureChannel.create(...)`. Reuse for every API
  * request during the plugin's lifetime.
  */
-export class SecureChannel {
+export class ObsetyncSecureChannel {
     private readonly ephPubRaw: Uint8Array;
     private readonly hkdfKey: CryptoKey;
     private readonly bearerBytes: Uint8Array;
@@ -122,14 +122,14 @@ export class SecureChannel {
     static async create(
         serverBoxPubBase64: string,
         bearerTokenHex: string,
-    ): Promise<SecureChannel> {
+    ): Promise<ObsetyncSecureChannel> {
         if (bearerTokenHex.length !== BEARER_LEN || !/^[0-9a-fA-F]+$/.test(bearerTokenHex)) {
-            throw new SecureTransportError("bearer token is not 64 hex chars");
+            throw new ObsetyncSecureTransportError("bearer token is not 64 hex chars");
         }
 
         const serverPubBytes = decodeBase64(serverBoxPubBase64);
         if (serverPubBytes.length !== PUBKEY_LEN) {
-            throw new SecureTransportError(
+            throw new ObsetyncSecureTransportError(
                 `server box pubkey must be ${PUBKEY_LEN} bytes, got ${serverPubBytes.length}`,
             );
         }
@@ -158,7 +158,7 @@ export class SecureChannel {
 
         const bearerBytes = new TextEncoder().encode(bearerTokenHex);
 
-        return new SecureChannel(ephPubRaw, hkdfKey, bearerBytes);
+        return new ObsetyncSecureChannel(ephPubRaw, hkdfKey, bearerBytes);
     }
 
     /** Derive an AES-256-GCM key for the given direction + nonce. */
@@ -218,7 +218,7 @@ export class SecureChannel {
 
     /**
      * Open a response body received for the given request line. Throws
-     * `SecureTransportError` if the body is malformed, tampered, or was
+     * `ObsetyncSecureTransportError` if the body is malformed, tampered, or was
      * encrypted against a different session.
      */
     async decryptResponse(
@@ -227,12 +227,12 @@ export class SecureChannel {
         wireBody: Uint8Array,
     ): Promise<Uint8Array> {
         if (wireBody.length < RESPONSE_HEADER_LEN + TAG_LEN) {
-            throw new SecureTransportError(
+            throw new ObsetyncSecureTransportError(
                 `response too short: ${wireBody.length} bytes, need at least ${RESPONSE_HEADER_LEN + TAG_LEN}`,
             );
         }
         if (wireBody[0] !== WIRE_VERSION) {
-            throw new SecureTransportError(`unsupported response wire version ${wireBody[0]}`);
+            throw new ObsetyncSecureTransportError(`unsupported response wire version ${wireBody[0]}`);
         }
         // slice() returns a fresh ArrayBuffer-backed view — subarray() would
         // return a view sharing wireBody's backing store, which modern TS
@@ -252,7 +252,7 @@ export class SecureChannel {
             );
             return plaintext;
         } catch {
-            throw new SecureTransportError(
+            throw new ObsetyncSecureTransportError(
                 "response decryption failed (tampered, wrong server key, or mismatched AAD)",
             );
         }

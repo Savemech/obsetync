@@ -20,7 +20,7 @@ Reference implementations (post-upgrade):
 - Server ephemeral rotation: [`crates/sync-server/src/eph_rotation.rs`](../crates/sync-server/src/eph_rotation.rs)
 - Server replay tracker: [`crates/sync-server/src/seq_tracker.rs`](../crates/sync-server/src/seq_tracker.rs)
 - Server middleware: [`crates/sync-server/src/api.rs`](../crates/sync-server/src/api.rs) (`secure_envelope`)
-- Client: [`plugin/src/secure.ts`](../plugin/src/secure.ts) (`SecureChannel`)
+- Client: [`plugin/src/secure.ts`](../plugin/src/secure.ts) (`ObsetyncSecureChannel`)
 - Client API funnel: [`plugin/src/api.ts`](../plugin/src/api.ts)
 
 ---
@@ -693,10 +693,10 @@ so a crash between send and persist does not cause sequence reuse on
 restart.
 
 In the plugin, `lastOutgoingSeq` lives in `settings.ts` (the only
-durable home, per §16). `SyncApi.sealed` reads, increments, and
+durable home, per §16). `ObsetyncApi.sealed` reads, increments, and
 fsync-persists it via `await saveSettings()` before passing the
-resolved `seq` into `SecureChannel.encryptRequest(..., seq)`. The
-`SecureChannel` instance itself holds no counter state — it's pure
+resolved `seq` into `ObsetyncSecureChannel.encryptRequest(..., seq)`. The
+`ObsetyncSecureChannel` instance itself holds no counter state — it's pure
 crypto (see §11).
 
 ### 8.2 Server side
@@ -763,7 +763,7 @@ server; its first request uses `seq = 1` and never needs recovery.
 device and `seq_in <= seq_last → replay`, the server cannot accept
 two in-flight requests from the same device arriving out of order
 on a lossy network. The plugin today serializes every sync call
-(every `SyncApi.sealed` awaits the previous one's response), so
+(every `ObsetyncApi.sealed` awaits the previous one's response), so
 this is a non-issue. **It does mean parallel uploads from a single
 device are not supported** — both the spec and any future client
 must keep request fan-out per-device serial.
@@ -910,29 +910,29 @@ HTTP status.
 
 ## 11. Session lifecycle (client)
 
-A session = lifetime of a `SecureChannel` instance. Created once per
+A session = lifetime of a `ObsetyncSecureChannel` instance. Created once per
 plugin load.
 
 ```
-; SyncApi owns HTTP and the Es_pub cache. It bootstraps when the
-; cache is stale, then hands SecureChannel a resolved set of crypto
-; inputs. SecureChannel itself never makes HTTP calls — same
+; ObsetyncApi owns HTTP and the Es_pub cache. It bootstraps when the
+; cache is stale, then hands ObsetyncSecureChannel a resolved set of crypto
+; inputs. ObsetyncSecureChannel itself never makes HTTP calls — same
 ; separation v1 already has between secure.ts (pure crypto) and
 ; api.ts (network).
 
-SyncApi.openSession():
+ObsetyncApi.openSession():
   if settings.esPub is null OR now > settings.esPubValidUntil - margin:
     bundle = bootstrap_eph()           ; sealed call to /api/v1/server-eph
     settings.esPub           = bundle.Es_pub
     settings.esPubValidUntil = bundle.valid_until
     await saveSettings()
-  return SecureChannel.create(
+  return ObsetyncSecureChannel.create(
     serverBoxPub    = settings.serverBoxPub,
     bearer          = settings.bearerToken,
     esPub           = settings.esPub,
     esPubValidUntil = settings.esPubValidUntil)
 
-SecureChannel.create(serverBoxPub, bearer, esPub, esPubValidUntil):
+ObsetyncSecureChannel.create(serverBoxPub, bearer, esPub, esPubValidUntil):
   ec_priv, ec_pub = x25519_generate()
   dh_s = X25519(ec_priv, serverBoxPub)
   dh_e = X25519(ec_priv, esPub)
@@ -943,15 +943,15 @@ SecureChannel.create(serverBoxPub, bearer, esPub, esPubValidUntil):
   store: ec_pub, ikm, fp, bearer, esPubValidUntil
   ; serverBoxPub is not retained past create — it's only needed to
   ; derive dh_s, which is folded into ikm. The sequence counter is
-  ; not stored here either; SyncApi reads it from plugin settings
+  ; not stored here either; ObsetyncApi reads it from plugin settings
   ; and passes the resolved value into encryptRequest (see §8.1).
 
-; SyncApi reads and persists `lastOutgoingSeq` from plugin settings
+; ObsetyncApi reads and persists `lastOutgoingSeq` from plugin settings
 ; (single source of truth, §8.1) before every request, then passes
-; the resolved `seq` into SecureChannel. SecureChannel is stateless
+; the resolved `seq` into ObsetyncSecureChannel. ObsetyncSecureChannel is stateless
 ; w.r.t. the counter — the only durable home is settings.
 
-SyncApi.sealed(method, path, body):
+ObsetyncApi.sealed(method, path, body):
   channel = await openSession()              ; cached across calls
   seq = settings.lastOutgoingSeq + 1
   settings.lastOutgoingSeq = seq
@@ -961,12 +961,12 @@ SyncApi.sealed(method, path, body):
   return channel.decryptResponse(method, path, resp, nonceReq)
   ; nonceReq binds the response AAD to this specific request — see §6.
   ; Error handling (SessionStaleError, ReplayError per §8.3,
-  ; transient retry with same seq per §8.2) lives in the SyncApi
+  ; transient retry with same seq per §8.2) lives in the ObsetyncApi
   ; error-recovery layer, not pure crypto.
 
-SecureChannel.encryptRequest(method, path, body, seq):
+ObsetyncSecureChannel.encryptRequest(method, path, body, seq):
   if now > esPubValidUntil - margin: throw SessionStaleError
-  ; SyncApi catches SessionStaleError, calls openSession() again,
+  ; ObsetyncApi catches SessionStaleError, calls openSession() again,
   ; and retries the original request once.
   nonceReq = random(12)
   key = HKDF(ikm, nonceReq, "obsetync/v2/c2s")
@@ -976,7 +976,7 @@ SecureChannel.encryptRequest(method, path, body, seq):
   wire = 0x02 || nonceReq || ec_pub || fp || ct
   return { wire, nonceReq }
 
-SecureChannel.decryptResponse(method, path, wire, nonceReq):
+ObsetyncSecureChannel.decryptResponse(method, path, wire, nonceReq):
   parse wire: version, nonceResp, ct
   if version != 0x02: throw envelope-error
   key = HKDF(ikm, nonceResp, "obsetync/v2/s2c")
@@ -988,7 +988,7 @@ SecureChannel.decryptResponse(method, path, wire, nonceReq):
 ```
 
 Plugin unload (Obsidian restart, plugin disable) drops the
-`SecureChannel`. The cached `ikm` is zeroed (best-effort given JS GC).
+`ObsetyncSecureChannel`. The cached `ikm` is zeroed (best-effort given JS GC).
 Next load generates a fresh `ec_priv` → a new session, a new `ikm`, a
 new "session" for FS purposes.
 
@@ -1205,15 +1205,15 @@ CHANGED:
 
 - `secure.ts`:
   - `WIRE_VERSION = 0x02`
-  - `SecureChannel.create` now takes `serverBoxPub`, `bearer`,
+  - `ObsetyncSecureChannel.create` now takes `serverBoxPub`, `bearer`,
     `esPub`, `esPubValidUntil`. **No HTTP** — bootstrap lives in
-    `api.ts`; `SyncApi.openSession()` calls `bootstrap_eph()` when
+    `api.ts`; `ObsetyncApi.openSession()` calls `bootstrap_eph()` when
     the cache is stale and only then constructs the channel
     (see §11).
   - `encryptRequest` embeds 8-byte fingerprint and 8-byte sequence.
   - `decryptResponse` returns `{status, body}` instead of just `body`.
 - `api.ts`:
-  - `SyncApi.sealed(method, path, body)` returns `{status, body}` —
+  - `ObsetyncApi.sealed(method, path, body)` returns `{status, body}` —
     callers handle semantic status.
   - New helper `bootstrap_eph()` calls `/api/v1/server-eph` in
     bootstrap mode; called automatically when cache is missing or

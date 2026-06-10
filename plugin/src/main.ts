@@ -1,11 +1,11 @@
 import { Plugin, Notice } from "obsidian";
 import { createPlatformIO, PlatformIO } from "./platform";
-import { SyncApi } from "./api";
-import { SyncBase } from "./sync-base";
-import { Journal } from "./journal";
-import { SyncEngine } from "./sync";
-import { SyncSettings, DEFAULT_SETTINGS, SyncSettingTab } from "./settings";
-import { ConflictModal, findConflicts } from "./conflict-ui";
+import { ObsetyncApi } from "./api";
+import { ObsetyncSyncBase } from "./sync-base";
+import { ObsetyncJournal } from "./journal";
+import { ObsetyncSyncEngine } from "./sync";
+import { SyncSettings, DEFAULT_SETTINGS, ObsetyncSettingTab } from "./settings";
+import { ObsetyncConflictModal, findConflicts } from "./conflict-ui";
 import { debugLog } from "./debug-log";
 import type { WasmModule, WasmTree } from "./push";
 
@@ -28,13 +28,13 @@ import initWasm, * as WasmExports from "../wasm/sync_core";
 // @ts-ignore
 import wasmBytes from "../wasm/sync_core_bg.wasm";
 
-export default class SyncPlugin extends Plugin {
+export default class ObsetyncPlugin extends Plugin {
     settings: SyncSettings = DEFAULT_SETTINGS;
     private io!: PlatformIO;
-    private api!: SyncApi;
-    private syncBase!: SyncBase;
-    private journal!: Journal;
-    private syncEngine!: SyncEngine;
+    private api!: ObsetyncApi;
+    private syncBase!: ObsetyncSyncBase;
+    private journal!: ObsetyncJournal;
+    private syncEngine!: ObsetyncSyncEngine;
     private wasm!: WasmModule;
     private tree!: WasmTree;
     private statusBarEl: HTMLElement | null = null;
@@ -51,13 +51,13 @@ export default class SyncPlugin extends Plugin {
         this.io = createPlatformIO(this.app);
 
         // Persistence layers.
-        this.syncBase = new SyncBase(this.app);
+        this.syncBase = new ObsetyncSyncBase(this.app);
         await this.syncBase.load();
-        this.journal = new Journal(this.app);
+        this.journal = new ObsetyncJournal(this.app);
         await this.journal.load();
 
         // Settings tab.
-        this.addSettingTab(new SyncSettingTab(this.app, this));
+        this.addSettingTab(new ObsetyncSettingTab(this.app, this));
 
         // Commands.
         this.addCommand({
@@ -101,7 +101,7 @@ export default class SyncPlugin extends Plugin {
 
     /** Expose the sync engine for the settings tab's status box. Returns null
      *  if not yet initialized (e.g., before enrollment). */
-    syncEngineOrNull(): SyncEngine | null {
+    syncEngineOrNull(): ObsetyncSyncEngine | null {
         return this.syncEngine ?? null;
     }
 
@@ -170,7 +170,7 @@ export default class SyncPlugin extends Plugin {
 
         push("--- Live diagnostics ---");
         if (!this.api) {
-            push("SyncApi not ready.");
+            push("ObsetyncApi not ready.");
         } else {
             try {
                 push("ping() → ...");
@@ -238,8 +238,8 @@ export default class SyncPlugin extends Plugin {
     async enroll(code: string): Promise<void> {
         // Enrollment is over plain HTTP to the admin port. We pass empty
         // strings for box_pub + bearer_token since claimEnrollment doesn't
-        // need a SecureChannel (admin endpoint is unauthenticated).
-        const tempApi = new SyncApi(this.settings.serverUrl, "", "");
+        // need a ObsetyncSecureChannel (admin endpoint is unauthenticated).
+        const tempApi = new ObsetyncApi(this.settings.serverUrl, "", "");
         const result = await tempApi.claimEnrollment(code);
 
         this.settings.deviceId     = result.device_id;
@@ -283,7 +283,7 @@ export default class SyncPlugin extends Plugin {
             new Notice("No sync conflicts found.");
             return;
         }
-        new ConflictModal(this.app, this.io, conflicts, () => {
+        new ObsetyncConflictModal(this.app, this.io, conflicts, () => {
             new Notice("All conflicts resolved.");
         }).open();
     }
@@ -293,7 +293,7 @@ export default class SyncPlugin extends Plugin {
         this.syncEngine?.stop();
 
         // Create API client with the pinned server pubkey + bearer token.
-        this.api = new SyncApi(
+        this.api = new ObsetyncApi(
             this.settings.serverUrl,
             this.settings.serverBoxPub,
             this.settings.bearerToken,
@@ -328,7 +328,7 @@ export default class SyncPlugin extends Plugin {
         }
 
         // Create sync engine.
-        this.syncEngine = new SyncEngine(
+        this.syncEngine = new ObsetyncSyncEngine(
             this.app,
             this.api,
             this.io,
