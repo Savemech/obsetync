@@ -19,6 +19,7 @@ import { ObsetyncApi } from "./api";
 import { PlatformIO } from "./platform";
 import { ObsetyncSyncBase } from "./sync-base";
 import { ObsetyncJournal, JournalEntry } from "./journal";
+import { perfSpan } from "./debug-log";
 import { pull } from "./pull";
 import { push, hashFileStreaming, streamingHash, FileChange, WasmModule, WasmTree } from "./push";
 import { SyncPriority } from "./settings";
@@ -228,9 +229,11 @@ export class ObsetyncSyncEngine {
             return { smallUploaded: 0, largeUploaded: 0, treeChunksUploaded: 0, bytes: 0 };
         }
         this.syncing = true;
+        const endSpan = perfSpan("sync.reconcile");
         try {
             return await this._reconcileInner(progress);
         } finally {
+            endSpan();
             this.syncing = false;
         }
     }
@@ -424,6 +427,7 @@ export class ObsetyncSyncEngine {
         this.onStatusUpdate("sync ⟳");
         const notice = new Notice("Scanning vault...", 0);
         console.log("[obsetync] full scan started");
+        const endSpan = perfSpan("scan.full");
 
         try {
             // statBulk() reads all file stats from Obsidian's in-memory cache —
@@ -519,6 +523,7 @@ export class ObsetyncSyncEngine {
 
             console.log(`[obsetync] full scan complete: ${totalChanges} changes`);
         } finally {
+            endSpan();
             notice.hide();
             this.state = "idle";
             this.onStatusUpdate("sync ✓");
@@ -532,6 +537,7 @@ export class ObsetyncSyncEngine {
         this.syncing = true;
         this.state = "pulling";
         this.onStatusUpdate("sync ↓");
+        const endSpan = perfSpan("sync.pull");
 
         try {
             const result = await pull(
@@ -566,6 +572,7 @@ export class ObsetyncSyncEngine {
             this.state = "error";
             this.onStatusUpdate("sync ✗");
         } finally {
+            endSpan();
             this.syncing = false;
             if (this.state !== "error") {
                 this.state = "idle";
@@ -584,6 +591,7 @@ export class ObsetyncSyncEngine {
         }
         this.syncing = true;
         this.state = "pushing";
+        const endSpan = perfSpan("sync.push");
 
         const batch = sortByPriority(this.pendingChanges.splice(0), this.syncPriority);
         console.log(
@@ -629,6 +637,7 @@ export class ObsetyncSyncEngine {
             this.onStatusUpdate("sync ✗");
             notice?.setMessage("sync ✗ error");
         } finally {
+            endSpan();
             notice?.hide();
             this.syncing = false;
             if (this.state !== "error") {

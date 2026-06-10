@@ -6,7 +6,7 @@ import { ObsetyncJournal } from "./journal";
 import { ObsetyncSyncEngine } from "./sync";
 import { SyncSettings, DEFAULT_SETTINGS, ObsetyncSettingTab } from "./settings";
 import { ObsetyncConflictModal, findConflicts } from "./conflict-ui";
-import { debugLog } from "./debug-log";
+import { debugLog, perfSpan } from "./debug-log";
 import type { WasmModule, WasmTree } from "./push";
 
 // Static import of the wasm-bindgen --target web glue. esbuild inlines this
@@ -289,6 +289,11 @@ export default class ObsetyncPlugin extends Plugin {
     }
 
     private async initSync(): Promise<void> {
+        // Spans the whole startup cost: WASM load + engine start (pull,
+        // journal recovery, mtime scan). Closed at the end of this method;
+        // an init failure drops the span — the error path is logged anyway.
+        const endSpan = perfSpan("init");
+
         // Stop existing engine if re-initializing.
         this.syncEngine?.stop();
 
@@ -348,6 +353,7 @@ export default class ObsetyncPlugin extends Plugin {
         this.updateStatusBar("sync ↓");
         await this.syncEngine.start();
         this.updateStatusBar("sync ✓");
+        endSpan();
     }
 
     private async loadWasm(): Promise<WasmModule> {
@@ -359,6 +365,7 @@ export default class ObsetyncPlugin extends Plugin {
         // `new Function()`, no dynamic import. This is what keeps iOS
         // WKWebView + CSP + BRAT's spotty pluginFiles delivery from
         // breaking sync.
+        const endSpan = perfSpan("wasm.load");
         try {
             await initWasm({ module_or_path: wasmBytes });
             console.log(`[obsetync] WASM loaded (${wasmBytes.byteLength} bytes, inline)`);
@@ -372,6 +379,8 @@ export default class ObsetyncPlugin extends Plugin {
                 `${name}: ${msg} (stack: ${stack})`
             );
             return createWasmStub();
+        } finally {
+            endSpan();
         }
     }
 
