@@ -53,6 +53,24 @@ export interface FileChange {
     size?: number;
 }
 
+/**
+ * Per-file state held while a push batch is in flight. A named class (vs an
+ * object literal) so DevTools heap snapshots attribute these — and any
+ * `largeData` blobs they retain — to obsetync: filter the Constructor column
+ * by "Obsetync" and read Retained Size.
+ */
+class ObsetyncBatchFile {
+    constructor(
+        public change: FileChange,
+        public size: number,
+        public mtime: number,
+        /** kept only for large files (needed for chunk upload) */
+        public chunkInfo?: any,
+        /** kept only for large files through upload */
+        public largeData?: Uint8Array,
+    ) {}
+}
+
 // Max files held in memory at once. Keeps RSS bounded even for 10k-file vaults.
 const STREAM_BATCH = 50;
 // Concurrent reads within a batch. 4 is the sweet spot: amortises IPC latency for
@@ -150,15 +168,7 @@ export async function push(
         // Small file without known hash: read in parallel, then wasm_hash_batch
         //   for the whole sub-group — ONE WASM boundary crossing regardless of N.
         // ------------------------------------------------------------------
-        type BatchFile = {
-            change: FileChange;
-            size: number;
-            mtime: number;
-            chunkInfo?: any;       // kept only for large files (needed for chunk upload)
-            largeData?: Uint8Array; // kept only for large files through upload
-        };
-
-        const batchFiles: BatchFile[] = [];
+        const batchFiles: ObsetyncBatchFile[] = [];
 
         for (let i = 0; i < batchChanges.length; i += READ_CONCURRENCY) {
             const group = batchChanges.slice(i, i + READ_CONCURRENCY);
@@ -175,7 +185,7 @@ export async function push(
             }
 
             for (const c of skipRead) {
-                batchFiles.push({ change: c, size: c.size!, mtime: c.mtime ?? Date.now() });
+                batchFiles.push(new ObsetyncBatchFile(c, c.size!, c.mtime ?? Date.now()));
             }
 
             if (needRead.length === 0) continue;
@@ -190,13 +200,13 @@ export async function push(
             for (const { change, data } of reads.filter(r => wasm.wasm_should_chunk(r.data.length))) {
                 const chunkInfo = wasm.wasm_chunk_file(data);
                 change.hash = chunkInfo.file_hash;
-                batchFiles.push({
+                batchFiles.push(new ObsetyncBatchFile(
                     change,
-                    size: data.length,
-                    mtime: change.mtime ?? Date.now(),
+                    data.length,
+                    change.mtime ?? Date.now(),
                     chunkInfo,
-                    largeData: data,
-                });
+                    data,
+                ));
             }
 
             // Small files — batch hash unknown-hash ones in ONE wasm_hash_batch call.
@@ -205,7 +215,7 @@ export async function push(
 
             // Known-hash small files that were forced to read (preloaded change.data).
             for (const { change, data } of smallReads.filter(r => r.change.hash)) {
-                batchFiles.push({ change, size: data.length, mtime: change.mtime ?? Date.now() });
+                batchFiles.push(new ObsetyncBatchFile(change, data.length, change.mtime ?? Date.now()));
             }
 
             const unknownSmall = smallReads.filter(r => !r.change.hash);
@@ -228,11 +238,11 @@ export async function push(
 
             for (let j = 0; j < unknownSmall.length; j++) {
                 unknownSmall[j].change.hash = hashes[j];
-                batchFiles.push({
-                    change: unknownSmall[j].change,
-                    size:   unknownSmall[j].data.length,
-                    mtime:  unknownSmall[j].change.mtime ?? Date.now(),
-                });
+                batchFiles.push(new ObsetyncBatchFile(
+                    unknownSmall[j].change,
+                    unknownSmall[j].data.length,
+                    unknownSmall[j].change.mtime ?? Date.now(),
+                ));
             }
         }
 

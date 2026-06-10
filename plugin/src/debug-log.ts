@@ -79,3 +79,40 @@ function stringify(v: any): string {
 }
 
 export const debugLog = new ObsetyncDebugLog();
+
+// ---------------------------------------------------------------------------
+// User Timing spans — paint obsetync phases onto the DevTools Performance
+// timeline ("Timings" track) so sync work is attributable at a glance:
+//
+//   const end = perfSpan("sync.push");
+//   try { ... } finally { end(); }
+//
+// Marks and measures are cleared right after each measure() — DevTools
+// recordings capture User Timing events as they happen, so clearing keeps
+// the performance entry buffer from accumulating over a long session.
+// A span abandoned on an exception path leaks one mark entry; harmless.
+// ---------------------------------------------------------------------------
+
+let perfSeq = 0;
+
+/** Start a named span. Returns the closer — call it when the phase ends. */
+export function perfSpan(name: string): () => void {
+    const label = `obsetync.${name}`;
+    // Unique mark per call so overlapping spans of the same name don't
+    // measure against each other's start marks.
+    const mark = `${label}.start.${perfSeq++}`;
+    try {
+        performance.mark(mark);
+    } catch {
+        return () => {};
+    }
+    return () => {
+        try {
+            performance.measure(label, mark);
+            performance.clearMarks(mark);
+            performance.clearMeasures(label);
+        } catch {
+            // Mark cleared externally — losing one span is fine.
+        }
+    };
+}
