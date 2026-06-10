@@ -288,8 +288,11 @@ export class ObsetyncApi {
 
         const res = await requestUrl(params);
 
-        // Non-2xx responses from the secure middleware are plaintext error
-        // strings (401 / 403 / 500). Don't try to decrypt those.
+        // Non-2xx responses are never decrypted. Middleware-generated errors
+        // (401 / 403 / 400) are plaintext strings; handler-generated errors
+        // (e.g. 404 from get_root) arrive as encrypted envelopes — but no
+        // caller reads a non-2xx body, only the status, so neither needs
+        // opening here.
         const isOk = res.status >= 200 && res.status < 300;
         if (!isOk) {
             return {

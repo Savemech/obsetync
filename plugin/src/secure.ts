@@ -291,7 +291,8 @@ export class ObsetyncSecureChannel {
             return plaintext;
         } catch {
             throw new ObsetyncSecureTransportError(
-                "response decryption failed (tampered, wrong server key, or mismatched AAD)",
+                "response decryption failed (tampered, wrong server key, mismatched AAD, " +
+                "or client/server version mismatch — update server and plugin together)",
             );
         }
     }

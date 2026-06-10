@@ -469,12 +469,12 @@ Follow the bytes through the implementation:
 ```
 wire POST body      ─► axum::body::to_bytes        (middleware)
 ─► secure::decrypt_request(bytes, server_priv, method, path)
-─► DecryptedRequest { bearer, inner_body, shared_secret }
+─► DecryptedRequest { bearer, inner_body, shared_secret, nonce_req }
 ─► devices::lookup_token(bearer)    → device_id
 ─► devices::is_revoked(device_id)?  → 403 if yes
 ─► route handler (sees the decrypted inner_body)
 ─► handler response body            (inner plaintext out)
-─► secure::encrypt_response(bytes, shared_secret, method, path)
+─► secure::encrypt_response(bytes, shared_secret, method, path, nonce_req)
 ─► wire POST response body
 ```
 
@@ -482,10 +482,11 @@ Primitives live in [`crates/sync-server/src/secure.rs`](../crates/sync-server/sr
 
 - `WIRE_VERSION`, `NONCE_LEN`, `PUBKEY_LEN`, `KEY_LEN`, `TAG_LEN`,
   `BEARER_LEN`, `MIN_REQUEST_LEN` — wire-format constants
-- `decrypt_request` — §3.1 → §5 → return bearer + inner
-- `encrypt_response` — §3.2 → §5 with `c2s` swapped for `s2c`
+- `decrypt_request` — §3.1 → §5 → return bearer + inner + request nonce
+- `encrypt_response` — §3.2 → §5 with `c2s` swapped for `s2c`; AAD binds
+  the request nonce (§6)
 - `hkdf_key` — §4.2
-- `build_aad` — §4.3
+- `build_aad` / `build_response_aad` — §4.3
 
 Unit tests in the same file cover:
 
@@ -496,13 +497,17 @@ Unit tests in the same file cover:
 - Version byte mismatch rejected
 - Too-short body rejected
 - Two independent sessions derive independent keys
+- Response bound to its request's nonce (cross-request replay rejected)
 
 **Client encryption boundary.**
 [`plugin/src/secure.ts`](../plugin/src/secure.ts):
 
 - `ObsetyncSecureChannel.create(server_pub_b64, bearer_hex)` → §5 setup
 - `encryptRequest(method, path, body)` → §3.1 wire request bytes
-- `decryptResponse(method, path, wire)` → opens §3.2
+- `decryptResponse(method, path, nonceReq, wire)` → opens §3.2; AAD
+  appends `nonceReq` (§6)
+- `extractRequestNonce(wireRequest)` → bytes 1..13 of a sealed request,
+  kept by the caller to verify the response
 
 [`plugin/src/api.ts`](../plugin/src/api.ts)'s `ObsetyncApi.sealed(method,
 path, body)` is the single funnel every sync call goes through:
@@ -511,6 +516,7 @@ path, body)` is the single funnel every sync call goes through:
 ObsetyncApi.sealed:
   channel = await getChannel()                     ← first call only
   wireBody = channel.encryptRequest(method, path, body)
+  nonceReq = extractRequestNonce(wireBody)         ← response AAD binding
   res = requestUrl({
     url: `${serverUrl}${path}`,
     method: "POST",                                ← always POST on wire
@@ -518,7 +524,7 @@ ObsetyncApi.sealed:
     body: wireBody,
   })
   if 2xx:
-    plaintext = channel.decryptResponse(method, path, res.arrayBuffer)
+    plaintext = channel.decryptResponse(method, path, nonceReq, res.arrayBuffer)
     return plaintext parsed as JSON / raw bytes
   else:
     return status + plaintext body (non-2xx are plaintext errors
@@ -575,8 +581,10 @@ Wire byte      |  Field          | Hex (sample)
 ```
 
 N = `13 + 4400 + 16` = 4429 bytes of HTTP response body. Client verifies
-AAD `"obsetync/v1 GET /api/v1/root/svx-main"`, decrypts, hands the 4400
-bytes to `wasm_root_hash_from_bytes(...)` to learn the root hash.
+AAD `"obsetync/v1 GET /api/v1/root/svx-main" || 8a 2f 1c 77 09 4b 63 d1
+5e ff a0 22` — the ASCII request line with the 12 raw nonce bytes of the
+*request* appended (§6) — decrypts, and hands the 4400 bytes to
+`wasm_root_hash_from_bytes(...)` to learn the root hash.
 
 ---
 
