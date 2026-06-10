@@ -119,6 +119,7 @@ What the envelope guarantees against a network attacker:
 | Authenticity of server | Client pins the server's X25519 pubkey at enrollment                          |
 | Authenticity of device | Bearer token (64 hex chars) buried inside the encrypted plaintext             |
 | Endpoint binding       | AAD includes `"obsetync/v1 <METHOD> <PATH>"` — envelope can't be replayed cross-endpoint |
+| Response binding       | Response AAD additionally binds `nonce_req` — a response can't be replayed against another request, even same method + path |
 | Forward secrecy        | Per-session ephemeral client keypair; past sessions stay private even if the client is compromised |
 | Traffic analysis       | Nothing. Sizes, timing, and device identity (to the server) are visible      |
 
@@ -231,14 +232,18 @@ nonce AND identical shared secret AND identical info label — which is
 just a repeat of the whole request. Not a concern in practice.
 
 The **AAD** (additional authenticated data, integrity-protected but not
-encrypted) for every message is:
+encrypted) is:
 
 ```
-"obsetync/v1 <METHOD> <PATH>"
+request:   "obsetync/v1 <METHOD> <PATH>"
+response:  "obsetync/v1 <METHOD> <PATH>" || nonce_req
 ```
 
 Where `<METHOD>` is the **semantic** HTTP method (GET/PUT/POST/DELETE —
-whatever the handler expects) and `<PATH>` is the URI path. See §5.
+whatever the handler expects), `<PATH>` is the URI path, and `nonce_req`
+is the 12-byte nonce of the request being answered — raw bytes appended
+after the ASCII prefix. Binding the request nonce into the response AAD
+pins each answer to exactly one request. See §5 and §6.
 
 ---
 
@@ -291,7 +296,7 @@ per response:                                                   nonce_resp = ran
                                                                               salt = nonce_resp,
                                                                               info = "obsetync/v1/s2c",
                                                                               len  = 32)
-                                                                aad_resp = "obsetync/v1 <METHOD> <PATH>"
+                                                                aad_resp = "obsetync/v1 <METHOD> <PATH>" || nonce_req
                                                                 ct  = AES-256-GCM_encrypt(
                                                                            key_resp, nonce_resp,
                                                                            response_body, aad_resp)
@@ -331,6 +336,11 @@ Consequences:
   covers the whole ciphertext.
 - **Direction can't be reflected.** A request key (`c2s`) cannot decrypt
   a response (`s2c`) because the HKDF info differs.
+- **Responses can't be swapped within a session.** The response AAD
+  appends the request's `nonce_req`, so a MITM holding two in-flight
+  `GET /api/v1/root/X` exchanges can't answer request B with the
+  (stale) response minted for request A — the client computes the AAD
+  with B's nonce and the GCM tag fails.
 
 **Why the semantic method matters.** The plugin tunnels every HTTP verb
 through wire POST because iOS' `requestUrl` drops bodies on GET. The

@@ -490,7 +490,9 @@ Consequences:
   without `nonce_req` in the response AAD their responses would be
   interchangeable on the wire and an attacker could pin a stale read
   result indefinitely. Binding `nonce_req` makes the GCM tag specific
-  to the exact request being answered.
+  to the exact request being answered. (Back-ported to v1 in release
+  1.2.3 — the v1 response AAD also binds `nonce_req` since then; see
+  `docs/transport.md` §6.)
 - Truncation and extension fail (GCM tag covers entire ciphertext).
 
 ### 6.1 X-Obsetync-Method strict requirement
