@@ -15,10 +15,10 @@ function formatBytes(n: number): string {
  *  during upload via FastCDC (wasm_chunk_file returns file_hash). This keeps
  *  WASM linear memory bounded to ~1 MB per file regardless of vault content. */
 const LARGE_FILE_THRESHOLD = 1_048_576; // 1 MB
-import { SyncApi } from "./api";
+import { ObsetyncApi } from "./api";
 import { PlatformIO } from "./platform";
-import { SyncBase } from "./sync-base";
-import { Journal, JournalEntry } from "./journal";
+import { ObsetyncSyncBase } from "./sync-base";
+import { ObsetyncJournal, JournalEntry } from "./journal";
 import { pull } from "./pull";
 import { push, hashFileStreaming, streamingHash, FileChange, WasmModule, WasmTree } from "./push";
 import { SyncPriority } from "./settings";
@@ -29,7 +29,7 @@ export type SyncState = "idle" | "pulling" | "pushing" | "scanning" | "error";
  * Core sync orchestrator. Coordinates pull, push, journal recovery,
  * mtime scanning, and live vault event tracking (D-005 4-layer system).
  */
-export class SyncEngine {
+export class ObsetyncSyncEngine {
     private state: SyncState = "idle";
     private localRootHash: string | null;
     private pendingChanges: FileChange[] = [];
@@ -43,10 +43,10 @@ export class SyncEngine {
 
     constructor(
         private app: App,
-        private api: SyncApi,
+        private api: ObsetyncApi,
         private io: PlatformIO,
-        private syncBase: SyncBase,
-        private journal: Journal,
+        private syncBase: ObsetyncSyncBase,
+        private journal: ObsetyncJournal,
         private wasm: WasmModule,
         private tree: WasmTree,
         private vaultId: string,

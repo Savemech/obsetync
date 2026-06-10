@@ -12,7 +12,7 @@ interface ConflictInfo {
  * Modal for resolving sync conflicts.
  * Shows a list of conflicted files and lets the user choose which to keep.
  */
-export class ConflictModal extends Modal {
+export class ObsetyncConflictModal extends Modal {
     private conflicts: ConflictInfo[];
     private io: PlatformIO;
     private onResolved: () => void;

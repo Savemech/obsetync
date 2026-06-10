@@ -4,7 +4,7 @@ import { App, Modal, Notice } from "obsidian";
  * Scrollable modal for the "Show debug info" button.
  * Renders preformatted text and offers a one-tap copy button.
  */
-export class DebugInfoModal extends Modal {
+export class ObsetyncDebugModal extends Modal {
     constructor(app: App, private text: string) {
         super(app);
     }

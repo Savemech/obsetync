@@ -1,6 +1,6 @@
 import { App, PluginSettingTab, Setting, Notice } from "obsidian";
-import type SyncPlugin from "./main";
-import { DebugInfoModal } from "./debug-modal";
+import type ObsetyncPlugin from "./main";
+import { ObsetyncDebugModal } from "./debug-modal";
 
 export type SyncPriority =
     | "sequential"   // as found (default)
@@ -39,8 +39,8 @@ export const DEFAULT_SETTINGS: SyncSettings = {
     serverBoxPub: "",
 };
 
-export class SyncSettingTab extends PluginSettingTab {
-    constructor(app: App, private plugin: SyncPlugin) {
+export class ObsetyncSettingTab extends PluginSettingTab {
+    constructor(app: App, private plugin: ObsetyncPlugin) {
         super(app, plugin);
     }
 
@@ -284,7 +284,7 @@ export class SyncSettingTab extends PluginSettingTab {
                     try {
                         const text = await this.plugin.getDebugInfo();
                         loading.hide();
-                        new DebugInfoModal(this.app, text).open();
+                        new ObsetyncDebugModal(this.app, text).open();
                     } catch (e: any) {
                         loading.hide();
                         new Notice(`Debug info failed: ${e?.message ?? e}`);

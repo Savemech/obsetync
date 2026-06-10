@@ -20,7 +20,7 @@ const MAX_ENTRIES = 10000;
  * markSynced is in-memory only — on restart all entries appear unsynced,
  * which is fine since recoverFromJournal is idempotent.
  */
-export class Journal {
+export class ObsetyncJournal {
     private entries: JournalEntry[] = [];
     private dirEnsured = false;
 

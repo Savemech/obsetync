@@ -1,6 +1,6 @@
-import { SyncApi, FileDelta, FileManifest } from "./api";
+import { ObsetyncApi, FileDelta, FileManifest } from "./api";
 import { PlatformIO } from "./platform";
-import { SyncBase } from "./sync-base";
+import { ObsetyncSyncBase } from "./sync-base";
 import { hashFileStreaming, type WasmModule } from "./push";
 
 const CHUNK_THRESHOLD = 1_048_576; // 1MB
@@ -16,9 +16,9 @@ const ZERO_ROOT = "0".repeat(64);
  * extract the root hash from the server's root blob after a fresh seed.
  */
 export async function pull(
-    api: SyncApi,
+    api: ObsetyncApi,
     io: PlatformIO,
-    syncBase: SyncBase,
+    syncBase: ObsetyncSyncBase,
     vaultId: string,
     localRootHash: string | null,
     wasm: WasmModule | null,
@@ -138,9 +138,9 @@ interface ApplyStats {
 
 /** Apply a delta stream: renames, deletions, then file content (parallel). */
 async function applyDeltas(
-    api: SyncApi,
+    api: ObsetyncApi,
     io: PlatformIO,
-    syncBase: SyncBase,
+    syncBase: ObsetyncSyncBase,
     wasm: WasmModule | null,
     deltas: FileDelta[],
     onProgress?: (msg: string) => void,
@@ -209,9 +209,9 @@ async function applyDeltas(
 }
 
 async function applyContentDelta(
-    api: SyncApi,
+    api: ObsetyncApi,
     io: PlatformIO,
-    syncBase: SyncBase,
+    syncBase: ObsetyncSyncBase,
     wasm: WasmModule | null,
     delta: FileDelta,
     stats: ApplyStats,
@@ -280,7 +280,7 @@ async function applyContentDelta(
 }
 
 async function applyLargeFile(
-    api: SyncApi,
+    api: ObsetyncApi,
     io: PlatformIO,
     path: string,
     hash: string

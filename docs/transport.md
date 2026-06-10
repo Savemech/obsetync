@@ -19,7 +19,7 @@ wire format, the key schedule, the threat model, and a worked example.
 Reference implementations:
 
 - Server: [`crates/sync-server/src/secure.rs`](../crates/sync-server/src/secure.rs) (decrypt + encrypt + round-trip tests)
-- Client: [`plugin/src/secure.ts`](../plugin/src/secure.ts) (`SecureChannel`)
+- Client: [`plugin/src/secure.ts`](../plugin/src/secure.ts) (`ObsetyncSecureChannel`)
 - Middleware wiring the envelope to axum routes: [`crates/sync-server/src/api.rs`](../crates/sync-server/src/api.rs) (`secure_envelope`)
 
 ---
@@ -344,7 +344,7 @@ can't be tricked into accepting a response meant for a different verb.
 
 ## 7. Session lifecycle
 
-- **Plugin load** → `SecureChannel.create(server_pub, bearer)` generates
+- **Plugin load** → `ObsetyncSecureChannel.create(server_pub, bearer)` generates
   a fresh ephemeral keypair, performs ECDH, imports `shared` as HKDF key
   material, zeroes the ephemeral private key bytes.
 - **Each request** → random 12-byte nonce; `deriveBits` new AES key;
@@ -352,7 +352,7 @@ can't be tricked into accepting a response meant for a different verb.
 - **Each response** → derive response AES key from cached `shared` + the
   response nonce; decrypt.
 - **Plugin unload** (Obsidian restart, plugin disable) → the whole
-  `SecureChannel` goes out of scope; the shared secret is dropped. Next
+  `ObsetyncSecureChannel` goes out of scope; the shared secret is dropped. Next
   load generates a new ephemeral keypair → a new session, a new shared
   secret.
 
@@ -490,15 +490,15 @@ Unit tests in the same file cover:
 **Client encryption boundary.**
 [`plugin/src/secure.ts`](../plugin/src/secure.ts):
 
-- `SecureChannel.create(server_pub_b64, bearer_hex)` → §5 setup
+- `ObsetyncSecureChannel.create(server_pub_b64, bearer_hex)` → §5 setup
 - `encryptRequest(method, path, body)` → §3.1 wire request bytes
 - `decryptResponse(method, path, wire)` → opens §3.2
 
-[`plugin/src/api.ts`](../plugin/src/api.ts)'s `SyncApi.sealed(method,
+[`plugin/src/api.ts`](../plugin/src/api.ts)'s `ObsetyncApi.sealed(method,
 path, body)` is the single funnel every sync call goes through:
 
 ```
-SyncApi.sealed:
+ObsetyncApi.sealed:
   channel = await getChannel()                     ← first call only
   wireBody = channel.encryptRequest(method, path, body)
   res = requestUrl({

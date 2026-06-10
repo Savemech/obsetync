@@ -25,7 +25,7 @@ export interface PlatformIO {
 }
 
 /** Desktop implementation — uses Obsidian vault adapter (works on Electron). */
-export class DesktopIO implements PlatformIO {
+export class ObsetyncDesktopIO implements PlatformIO {
     constructor(private app: App) {}
 
     async readFile(path: string): Promise<Uint8Array> {
@@ -142,7 +142,7 @@ export class DesktopIO implements PlatformIO {
 }
 
 /** Mobile (iOS) implementation — same adapter, same code. */
-export class MobileIO extends DesktopIO {
+export class ObsetyncMobileIO extends ObsetyncDesktopIO {
     // No Node.js fs on iOS — streaming hash not available.
     getAbsolutePath(_path: string): string | null { return null; }
     // Falls back to adapter path in listObsidianConfig automatically (absRoot is null).
@@ -150,5 +150,5 @@ export class MobileIO extends DesktopIO {
 
 /** Create the appropriate PlatformIO for the current platform. */
 export function createPlatformIO(app: App): PlatformIO {
-    return Platform.isMobile ? new MobileIO(app) : new DesktopIO(app);
+    return Platform.isMobile ? new ObsetyncMobileIO(app) : new ObsetyncDesktopIO(app);
 }

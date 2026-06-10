@@ -17,7 +17,7 @@ const SYNC_BASE_PATH = ".obsidian/plugins/obsetync/sync-base.json";
  * Tracks the last-synced hash for every file — the "common ancestor" for conflict detection.
  * Persisted as a JSON file in the plugin data directory.
  */
-export class SyncBase {
+export class ObsetyncSyncBase {
     private data: SyncBaseData = { lastSyncTimestamp: 0, entries: {} };
     private dirty = false;
 

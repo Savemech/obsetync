@@ -1,6 +1,6 @@
-import { SyncApi } from "./api";
+import { ObsetyncApi } from "./api";
 import { PlatformIO } from "./platform";
-import { SyncBase } from "./sync-base";
+import { ObsetyncSyncBase } from "./sync-base";
 
 /** Streaming Blake3 hasher — feed in 64 KB chunks, call finalize(), then free(). */
 export interface WasmHasher {
@@ -76,9 +76,9 @@ const READ_CONCURRENCY = 4;
  * Root push and sync-base save happen once after all batches.
  */
 export async function push(
-    api: SyncApi,
+    api: ObsetyncApi,
     io: PlatformIO,
-    syncBase: SyncBase,
+    syncBase: ObsetyncSyncBase,
     wasm: WasmModule,
     tree: WasmTree,
     vaultId: string,

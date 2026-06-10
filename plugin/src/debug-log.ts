@@ -12,7 +12,7 @@ interface LogEntry {
     msg: string;
 }
 
-class DebugLogImpl {
+class ObsetyncDebugLog {
     private buf: LogEntry[] = [];
     private readonly MAX = 200;
     private installed = false;
@@ -78,4 +78,4 @@ function stringify(v: any): string {
     try { return JSON.stringify(v); } catch { return String(v); }
 }
 
-export const debugLog = new DebugLogImpl();
+export const debugLog = new ObsetyncDebugLog();

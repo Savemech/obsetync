@@ -68,7 +68,7 @@ C4Container
 
 ## What is out of scope at this level
 
-- The internal modules of the plugin (SyncEngine, PushEngine, PullEngine, etc.) — see [c4-3-plugin.md](c4-3-plugin.md)
+- The internal modules of the plugin (ObsetyncSyncEngine, PushEngine, PullEngine, etc.) — see [c4-3-plugin.md](c4-3-plugin.md)
 - The internal modules of the Sync Server (SecureEnvelope, BlobStorage, MerkleEngine, etc.) — see [c4-3-server.md](c4-3-server.md)
 - The internal modules of sync-core WASM (TreeBuilder, DiffEngine, FastCDC, etc.) — see [c4-3-wasm.md](c4-3-wasm.md)
 - The cryptographic wire format — see [transport.md](transport.md)

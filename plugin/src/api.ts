@@ -1,5 +1,5 @@
 import { requestUrl, RequestUrlParam } from "obsidian";
-import { SecureChannel, SecureTransportError } from "./secure";
+import { ObsetyncSecureChannel, ObsetyncSecureTransportError } from "./secure";
 
 export interface FileDelta {
     action: "added" | "modified" | "deleted" | "renamed";
@@ -53,8 +53,8 @@ interface FetchLike {
  * Identical code path on desktop (Electron) and mobile (iOS WKWebView) via
  * Obsidian's `requestUrl`. One allowlist, one transport, one bug surface.
  */
-export class SyncApi {
-    private channel: SecureChannel | null = null;
+export class ObsetyncApi {
+    private channel: ObsetyncSecureChannel | null = null;
 
     constructor(
         private readonly serverUrl: string,
@@ -76,17 +76,17 @@ export class SyncApi {
         this.serverUrl = u;
     }
 
-    /** Lazily establish the SecureChannel. Called before the first encrypted
+    /** Lazily establish the ObsetyncSecureChannel. Called before the first encrypted
      *  request; subsequent requests reuse the same shared secret. */
-    private async getChannel(): Promise<SecureChannel> {
+    private async getChannel(): Promise<ObsetyncSecureChannel> {
         if (this.channel) return this.channel;
         if (!this.serverBoxPubBase64) {
-            throw new Error("SyncApi: server box pubkey missing — re-enroll the device");
+            throw new Error("ObsetyncApi: server box pubkey missing — re-enroll the device");
         }
         if (!this.bearerTokenHex) {
-            throw new Error("SyncApi: bearer token missing — re-enroll the device");
+            throw new Error("ObsetyncApi: bearer token missing — re-enroll the device");
         }
-        this.channel = await SecureChannel.create(this.serverBoxPubBase64, this.bearerTokenHex);
+        this.channel = await ObsetyncSecureChannel.create(this.serverBoxPubBase64, this.bearerTokenHex);
         return this.channel;
     }
 
@@ -253,7 +253,7 @@ export class SyncApi {
     // --- Internal: encrypted request/response ---
 
     /**
-     * Seal `body` with the SecureChannel, POST it to `path`, unseal the
+     * Seal `body` with the ObsetyncSecureChannel, POST it to `path`, unseal the
      * response. This is the single code path for every sync API call.
      *
      * Note: every route maps to POST on the wire even if the semantic method
@@ -298,7 +298,7 @@ export class SyncApi {
         try {
             plaintext = await channel.decryptResponse(method, path, wireResp);
         } catch (e) {
-            if (e instanceof SecureTransportError) {
+            if (e instanceof ObsetyncSecureTransportError) {
                 throw new Error(`decrypt ${method} ${path}: ${e.message}`);
             }
             throw e;
