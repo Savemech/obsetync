@@ -491,7 +491,7 @@ Consequences:
   interchangeable on the wire and an attacker could pin a stale read
   result indefinitely. Binding `nonce_req` makes the GCM tag specific
   to the exact request being answered. (Back-ported to v1 in release
-  1.2.3 — the v1 response AAD also binds `nonce_req` since then; see
+  1.3.0 — the v1 response AAD also binds `nonce_req` since then; see
   `docs/transport.md` §6.)
 - Truncation and extension fail (GCM tag covers entire ciphertext).
 
