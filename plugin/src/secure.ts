@@ -21,9 +21,14 @@
  *
  *   [64B bearer_token_hex_ASCII] [actual body bytes]
  *
- * AAD (authenticated but visible on wire):
+ * AAD (authenticated, never on the wire):
  *
- *   "obsetync/v1 <METHOD> <PATH>"
+ *   request:   "obsetync/v1 <METHOD> <PATH>"
+ *   response:  "obsetync/v1 <METHOD> <PATH>" || nonce_req
+ *
+ * The response AAD binds the 12-byte nonce of the request it answers, so an
+ * in-session MITM can't substitute the response of one request for another
+ * with the same method + path (e.g. feeding us a stale GET /root answer).
  *
  * A single `ObsetyncSecureChannel` instance caches the ECDH shared secret for its
  * lifetime, so per-request work is just HKDF + AES-GCM (microseconds).
@@ -74,6 +79,29 @@ function concat(...chunks: Uint8Array[]): Uint8Array {
 function buildAad(method: string, path: string): Uint8Array {
     const text = `${AAD_PREFIX} ${method} ${path}`;
     return new TextEncoder().encode(text);
+}
+
+/** Response AAD = request AAD || nonce_req (replay binding, see header). */
+function buildResponseAad(
+    method: string,
+    path: string,
+    nonceReq: Uint8Array,
+): Uint8Array {
+    return concat(buildAad(method, path), nonceReq);
+}
+
+/**
+ * Extract the 12-byte nonce from a sealed request envelope (bytes 1..13).
+ * The caller keeps it to verify the response — wire-format knowledge stays
+ * in this module.
+ */
+export function extractRequestNonce(wireRequest: Uint8Array): Uint8Array {
+    if (wireRequest.length < REQUEST_HEADER_LEN) {
+        throw new ObsetyncSecureTransportError(
+            `request envelope too short to contain a nonce: ${wireRequest.length} bytes`,
+        );
+    }
+    return wireRequest.slice(1, 1 + NONCE_LEN);
 }
 
 /**
@@ -217,13 +245,18 @@ export class ObsetyncSecureChannel {
     }
 
     /**
-     * Open a response body received for the given request line. Throws
-     * `ObsetyncSecureTransportError` if the body is malformed, tampered, or was
-     * encrypted against a different session.
+     * Open a response body received for the given request line. `nonceReq`
+     * is the nonce of the request this response answers (see
+     * `extractRequestNonce`) — the AAD binds it, so a response minted for a
+     * different request fails authentication. Throws
+     * `ObsetyncSecureTransportError` if the body is malformed, tampered,
+     * replayed from another request, or encrypted against a different
+     * session.
      */
     async decryptResponse(
         method: string,
         path: string,
+        nonceReq: Uint8Array,
         wireBody: Uint8Array,
     ): Promise<Uint8Array> {
         if (wireBody.length < RESPONSE_HEADER_LEN + TAG_LEN) {
@@ -237,9 +270,14 @@ export class ObsetyncSecureChannel {
         // slice() returns a fresh ArrayBuffer-backed view — subarray() would
         // return a view sharing wireBody's backing store, which modern TS
         // types as potentially SharedArrayBuffer and rejects for Web Crypto.
+        if (nonceReq.length !== NONCE_LEN) {
+            throw new ObsetyncSecureTransportError(
+                `request nonce must be ${NONCE_LEN} bytes, got ${nonceReq.length}`,
+            );
+        }
         const nonce = wireBody.slice(1, 1 + NONCE_LEN);
         const ct = wireBody.slice(RESPONSE_HEADER_LEN);
-        const aad = buildAad(method, path);
+        const aad = buildResponseAad(method, path, nonceReq);
         const key = await this.deriveAesKey(nonce, INFO_S2C, "decrypt");
 
         try {

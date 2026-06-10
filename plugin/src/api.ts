@@ -1,5 +1,9 @@
 import { requestUrl, RequestUrlParam } from "obsidian";
-import { ObsetyncSecureChannel, ObsetyncSecureTransportError } from "./secure";
+import {
+    ObsetyncSecureChannel,
+    ObsetyncSecureTransportError,
+    extractRequestNonce,
+} from "./secure";
 
 export interface FileDelta {
     action: "added" | "modified" | "deleted" | "renamed";
@@ -264,6 +268,9 @@ export class ObsetyncApi {
     private async sealed(method: string, path: string, body: Uint8Array): Promise<FetchLike> {
         const channel = await this.getChannel();
         const wireBody = await channel.encryptRequest(method, path, body);
+        // The response AAD binds this request's nonce — keep it so the
+        // answer can't be swapped with one minted for another request.
+        const nonceReq = extractRequestNonce(wireBody);
 
         const params: RequestUrlParam = {
             url: `${this.serverUrl}${path}`,
@@ -296,7 +303,7 @@ export class ObsetyncApi {
         const wireResp = new Uint8Array(res.arrayBuffer);
         let plaintext: Uint8Array;
         try {
-            plaintext = await channel.decryptResponse(method, path, wireResp);
+            plaintext = await channel.decryptResponse(method, path, nonceReq, wireResp);
         } catch (e) {
             if (e instanceof ObsetyncSecureTransportError) {
                 throw new Error(`decrypt ${method} ${path}: ${e.message}`);

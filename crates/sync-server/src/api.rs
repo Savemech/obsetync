@@ -167,6 +167,7 @@ async fn secure_envelope(
         &decrypted.shared_secret,
         method.as_str(),
         &path,
+        &decrypted.nonce_req,
     ) {
         Ok(b) => b,
         Err(e) => {

@@ -248,6 +248,9 @@ impl WireClient {
             path,
             body,
         )?;
+        // Response AAD binds the request nonce (bytes 1..13 of the envelope) —
+        // keep it to verify the answer belongs to exactly this request.
+        let nonce_req: [u8; NONCE_LEN] = envelope[1..1 + NONCE_LEN].try_into().unwrap();
 
         let url = format!("{}{}", self.base_url, path);
         let resp = self
@@ -273,6 +276,7 @@ impl WireClient {
                 &self.creds.server_box_pub,
                 semantic_method,
                 path,
+                &nonce_req,
                 &body,
             )
             .context("decrypt response")?
@@ -551,6 +555,7 @@ fn decrypt_response(
     server_pub: &PublicKey,
     method: &str,
     path: &str,
+    nonce_req: &[u8; NONCE_LEN],
     body: &[u8],
 ) -> Result<Vec<u8>> {
     if body.len() < RESPONSE_HEADER_LEN + TAG_LEN {
@@ -565,7 +570,9 @@ fn decrypt_response(
     let shared = eph_priv.diffie_hellman(server_pub);
     let key = hkdf_key(shared.as_bytes(), &nonce, INFO_S2C);
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
-    let aad = build_aad(method, path);
+    // Response AAD = request AAD || nonce_req (replay binding, see secure.rs).
+    let mut aad = build_aad(method, path);
+    aad.extend_from_slice(nonce_req);
 
     cipher
         .decrypt(Nonce::from_slice(&nonce), Payload { msg: ct, aad: &aad })

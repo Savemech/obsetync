@@ -34,10 +34,13 @@
 //!
 //! ## AAD
 //!
-//! `"obsetync/v1"` || ASCII-uppercased HTTP method || HTTP path.
-//! Binds ciphertext to the exact request line so captured blobs can't be
-//! replayed against a different endpoint. The method + path themselves are
-//! already on the wire (they're in the HTTP request line), so AAD is only
+//! Request:  `"obsetync/v1 <METHOD> <PATH>"`.
+//! Response: `"obsetync/v1 <METHOD> <PATH>" || nonce_req` — the response AAD
+//! additionally binds the 12-byte nonce of the request it answers, so an
+//! in-session MITM can't substitute the response of one request for another
+//! that shares the same method + path (e.g. replaying a stale `GET /root`
+//! answer to mask a newer one). AAD bytes never travel on the wire; the
+//! method + path are already in the HTTP request line, so AAD is only
 //! authenticated, not confidential.
 //!
 //! Bearer token lives in the *encrypted* plaintext as a 64-char ASCII prefix.
@@ -91,6 +94,9 @@ pub struct DecryptedRequest {
     pub bearer_token: String,
     pub inner_body: Vec<u8>,
     pub shared_secret: [u8; KEY_LEN],
+    /// Nonce of the request envelope — [`encrypt_response`] folds it into the
+    /// response AAD so the answer is bound to exactly this request.
+    pub nonce_req: [u8; NONCE_LEN],
 }
 
 fn build_aad(method: &str, path: &str) -> Vec<u8> {
@@ -100,6 +106,14 @@ fn build_aad(method: &str, path: &str) -> Vec<u8> {
     aad.extend_from_slice(method.as_bytes());
     aad.push(b' ');
     aad.extend_from_slice(path.as_bytes());
+    aad
+}
+
+/// Response AAD = request AAD || nonce_req. Binding the request nonce closes
+/// in-session response replay across requests with identical method + path.
+fn build_response_aad(method: &str, path: &str, nonce_req: &[u8; NONCE_LEN]) -> Vec<u8> {
+    let mut aad = build_aad(method, path);
+    aad.extend_from_slice(nonce_req);
     aad
 }
 
@@ -165,17 +179,20 @@ pub fn decrypt_request(
         bearer_token,
         inner_body,
         shared_secret: shared_bytes,
+        nonce_req: nonce_bytes,
     })
 }
 
 /// Encrypt a response body for the client that shares `shared_secret` with us.
-/// The AAD of the response binds method + path too, so the client can't be
-/// tricked into accepting a response minted for a different endpoint.
+/// The AAD binds method + path + the request's nonce, so the client can't be
+/// tricked into accepting a response minted for a different endpoint — or for
+/// a different request to the same endpoint within the session.
 pub fn encrypt_response(
     body: &[u8],
     shared_secret: &[u8; KEY_LEN],
     method: &str,
     path: &str,
+    nonce_req: &[u8; NONCE_LEN],
 ) -> Result<Vec<u8>, SecureError> {
     // Fresh random 12-byte nonce. AES-GCM allows ~2^32 random nonces with a
     // single key before collision probability matters; we derive a *new* key
@@ -190,7 +207,7 @@ pub fn encrypt_response(
 
     let key_bytes = hkdf_key(shared_secret, &nonce_bytes, INFO_S2C);
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
-    let aad = build_aad(method, path);
+    let aad = build_response_aad(method, path, nonce_req);
 
     let ct = cipher
         .encrypt(
@@ -304,12 +321,13 @@ mod tests {
             &decrypted.shared_secret,
             "PUT",
             "/api/v1/root/svx-main",
+            &decrypted.nonce_req,
         )
         .unwrap();
 
         // Symmetric round-trip of response: derive same shared_secret on client
         // (in real plugin, client has it cached), extract nonce, derive s2c key,
-        // decrypt and check.
+        // decrypt and check. Response AAD binds the request nonce.
         let client_shared = client_priv.diffie_hellman(&server_pub);
         assert_eq!(client_shared.as_bytes(), &decrypted.shared_secret);
 
@@ -323,11 +341,77 @@ mod tests {
                 Nonce::from_slice(&nonce),
                 Payload {
                     msg: ct,
-                    aad: &build_aad("PUT", "/api/v1/root/svx-main"),
+                    aad: &build_response_aad("PUT", "/api/v1/root/svx-main", &decrypted.nonce_req),
                 },
             )
             .unwrap();
         assert_eq!(&plain, response_body);
+    }
+
+    /// Regression for in-session response replay: a response sealed for
+    /// request A must NOT decrypt when verified against request B's nonce,
+    /// even though both requests share method + path + session.
+    #[test]
+    fn response_is_bound_to_request_nonce() {
+        let (server_priv, server_pub) = make_server_keypair();
+        let (client_priv, _) = make_client_keypair();
+
+        let make_wire = || {
+            encrypt_request_for_tests(
+                &client_priv,
+                &server_pub,
+                &bearer_64(),
+                "GET",
+                "/api/v1/root/svx-main",
+                b"",
+            )
+        };
+        let wire_a = make_wire();
+        let wire_b = make_wire();
+
+        let dec_a = decrypt_request(&wire_a, &server_priv, "GET", "/api/v1/root/svx-main").unwrap();
+        let dec_b = decrypt_request(&wire_b, &server_priv, "GET", "/api/v1/root/svx-main").unwrap();
+        assert_ne!(dec_a.nonce_req, dec_b.nonce_req);
+        // Both requests rode the same client keypair — one session secret,
+        // exactly like the real plugin's per-session channel. The request
+        // nonce is therefore the ONLY thing distinguishing the two AADs.
+        assert_eq!(dec_a.shared_secret, dec_b.shared_secret);
+        let resp_for_a = encrypt_response(
+            b"stale root",
+            &dec_a.shared_secret,
+            "GET",
+            "/api/v1/root/svx-main",
+            &dec_a.nonce_req,
+        )
+        .unwrap();
+
+        let nonce: [u8; NONCE_LEN] = resp_for_a[1..1 + NONCE_LEN].try_into().unwrap();
+        let ct = &resp_for_a[RESPONSE_HEADER_LEN..];
+        let key = hkdf_key(&dec_a.shared_secret, &nonce, INFO_S2C);
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+
+        // Verifying against request B's nonce must fail...
+        let replayed = cipher.decrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: ct,
+                aad: &build_response_aad("GET", "/api/v1/root/svx-main", &dec_b.nonce_req),
+            },
+        );
+        assert!(
+            replayed.is_err(),
+            "response replay across requests must fail"
+        );
+
+        // ...while the legitimate nonce still opens it.
+        let ok = cipher.decrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: ct,
+                aad: &build_response_aad("GET", "/api/v1/root/svx-main", &dec_a.nonce_req),
+            },
+        );
+        assert_eq!(ok.unwrap(), b"stale root");
     }
 
     #[test]
