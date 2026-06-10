@@ -46,6 +46,11 @@ const context = await esbuild.context({
     treeShaking: true,
     outfile: "main.js",
     minify: production,
+    // Identifier minification would mangle class names (ObsetyncSyncEngine →
+    // `ht`), erasing the heap-snapshot / Performance-trace attribution the
+    // Obsetync* prefixes exist for. keepNames pins class + function .name in
+    // release builds at a few KB of bundle overhead.
+    keepNames: true,
 });
 
 if (production) {
