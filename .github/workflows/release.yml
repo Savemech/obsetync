@@ -26,6 +26,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The repo-root manifest.json is what the Obsidian community-plugin bot
+      # reads; plugin/manifest.json is what local/dev installs copy. They must
+      # be byte-identical so the store listing and the installed plugin agree.
+      - name: manifest.json root == plugin copy
+        run: |
+          cmp -s manifest.json plugin/manifest.json \
+            || { echo "::error::manifest.json and plugin/manifest.json differ — keep them in sync"; exit 1; }
+
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: 1.95.0
@@ -94,9 +102,11 @@ jobs:
       - name: Stage flat release assets
         run: |
           mkdir -p release
-          # Files BRAT / Obsidian auto-updater download directly:
+          # Files BRAT / Obsidian auto-updater download directly. The manifest
+          # comes from the repo root (canonical, read by the community-plugin
+          # bot); precheck guarantees it equals plugin/manifest.json.
           cp plugin/main.js                   release/main.js
-          cp plugin/manifest.json             release/manifest.json
+          cp manifest.json                    release/manifest.json
           cp plugin/wasm/sync_core.js         release/sync_core.js
           cp plugin/wasm/sync_core_bg.wasm    release/sync_core_bg.wasm
           cp versions.json                    release/versions.json

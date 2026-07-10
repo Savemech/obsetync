@@ -65,6 +65,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Repo-root manifest.json (read by the Obsidian community-plugin bot) must
+      # stay byte-identical to plugin/manifest.json (used by local/dev installs).
+      - name: manifest.json root == plugin copy
+        working-directory: ${{ github.workspace }}
+        run: |
+          cmp -s manifest.json plugin/manifest.json \
+            || { echo "::error::manifest.json and plugin/manifest.json differ — keep them in sync"; exit 1; }
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20

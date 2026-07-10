@@ -182,9 +182,18 @@ The server exposes two ports on the host:
 
 ## Installing the plugin in Obsidian
 
-Three paths, pick whichever suits your platform:
+Pick whichever suits your platform:
 
-### A. BRAT (recommended — works on desktop and iOS)
+### A. Community plugins (once approved)
+
+Once ObsetyNC is accepted into the Obsidian Community Plugins directory:
+
+1. In Obsidian, open **Settings → Community plugins** and disable Restricted Mode if it's on.
+2. **Browse**, search for *ObsetyNC*, click **Install**, then **Enable**.
+
+Obsidian keeps it up to date automatically. Until the directory listing lands, use BRAT or a manual install below.
+
+### B. BRAT (works today on desktop and iOS)
 
 [BRAT](https://github.com/TfTHacker/obsidian42-brat) ("Beta Reviewers Auto-update Tester") is a community plugin that installs and auto-updates plugins directly from GitHub releases.
 
@@ -196,7 +205,7 @@ Three paths, pick whichever suits your platform:
 
 Subsequent releases auto-update via BRAT — no further action needed.
 
-### B. Manual install (no BRAT, fully offline after first download)
+### C. Manual install (no BRAT, fully offline after first download)
 
 1. Go to the [Releases page](https://github.com/Savemech/obsetync/releases/latest) and download `obsetync-<version>.zip`.
 2. Unzip it — you'll see an `obsetync/` folder containing `main.js`, `manifest.json`, `sync_core.js`, `sync_core_bg.wasm`.
@@ -378,5 +387,14 @@ Then `just ship` does:
 6. If `OBSETYNC_VAULT` is set: rebuild plugin artifacts and copy `main.js` + `manifest.json` + `sync_core_bg.wasm` into that vault
 
 Public users: ignore `just ship` — `just build` + `just up` is the full flow.
+
+## License
+
+ObsetyNC's own source code is licensed under the **[PolyForm Noncommercial License 1.0.0](LICENSE)**.
+
+- **Free for any noncommercial use** — personal vaults, hobby projects, study, and use by charitable, educational, or government organizations. You may run it, modify it, and redistribute it for noncommercial purposes.
+- **Commercial use is reserved to the author.** Using ObsetyNC for a commercial purpose requires a separate commercial license. Contact **Anton Strukov (Savemech)** — savemech@gmail.com.
+
+The plugin and server bundle third-party open-source components under their own permissive licenses (MIT / Apache-2.0 / ISC / BSD / 0BSD); see **[THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md)**. There are no ads and no in-app payments — the plugin is free to use noncommercially and requires only a server you host yourself.
 
 
