@@ -65,8 +65,10 @@ services:
       # Probe the actual /health route via the binary's built-in healthcheck
       # subcommand — the hardened runtime image has no curl, and the old
       # `getent hosts` probe never touched the server at all (it reported
-      # "unhealthy" for 4 weeks while the server was fine).
-      test: ["CMD", "/usr/local/bin/sync-server", "healthcheck"]
+      # "unhealthy" for 4 weeks while the server was fine). PATH-based so the
+      # same probe works in both the Dockerfile image (/usr/local/bin) and
+      # the nix image (nix-store path exported via config.Env).
+      test: ["CMD", "sync-server", "healthcheck"]
       interval: 30s
       timeout: 5s
       retries: 3

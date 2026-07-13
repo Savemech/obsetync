@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "e2e-tests"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1412,7 +1412,7 @@ dependencies = [
 
 [[package]]
 name = "sync-core"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1434,14 +1434,14 @@ dependencies = [
 
 [[package]]
 name = "sync-schema"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "flatbuffers",
 ]
 
 [[package]]
 name = "sync-server"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "aes-gcm",
  "axum",

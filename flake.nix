@@ -188,6 +188,10 @@
           config = {
             Entrypoint   = [ "${sync-server}/bin/sync-server" ];
             Cmd          = [ "run" "--data-dir" "/data" ];
+            # PATH so the compose healthcheck can run `sync-server
+            # healthcheck` without hardcoding a nix-store path (the
+            # Dockerfile image serves the same probe from /usr/local/bin).
+            Env          = [ "PATH=${sync-server}/bin" ];
             ExposedPorts = {
               "27182/tcp" = {};
               "27183/tcp" = {};
