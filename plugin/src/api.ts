@@ -11,6 +11,11 @@ export interface FileDelta {
     old_path?: string;
     hash?: string;
     size?: number;
+    /** Server-side mtime of the entry. Present on added/modified deltas from
+     *  servers ≥ 1.4.0. Required to rebase the local Merkle tree to the exact
+     *  server root after a pull (leaf hashes cover mtime); when absent the
+     *  rebase still runs but root parity can't be byte-verified. */
+    mtime_ms?: number;
 }
 
 export interface PushResult {

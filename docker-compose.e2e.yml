@@ -38,6 +38,14 @@ services:
     restart: "no"
     environment:
       RUST_LOG: "${RUST_LOG:-sync_server=info,warn}"
+      # Stale-tree guard, scaled to e2e-sized vaults (a handful of files).
+      # Production keeps the defaults (blast floor 200 / 25%, mtime K=25,
+      # 12h skew allowance) — here the floor drops so the tripwires are
+      # actually exercisable by five-file fixtures.
+      OBSETYNC_GUARD: "enforce"
+      OBSETYNC_GUARD_BLAST_MIN: "2"
+      OBSETYNC_GUARD_BLAST_PCT: "25"
+      OBSETYNC_GUARD_MTIME_K: "2"
     depends_on:
       e2e-init:
         condition: service_completed_successfully

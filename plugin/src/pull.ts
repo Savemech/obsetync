@@ -1,7 +1,7 @@
 import { ObsetyncApi, FileDelta } from "./api";
 import { PlatformIO } from "./platform";
 import { ObsetyncSyncBase } from "./sync-base";
-import { hashFileStreaming, type WasmModule } from "./push";
+import { hashFileStreaming, type WasmModule, type WasmTree } from "./push";
 
 const CHUNK_THRESHOLD = 1_048_576; // 1MB
 const DOWNLOAD_CONCURRENCY = 6;
@@ -10,10 +10,29 @@ const DOWNLOAD_CONCURRENCY = 6;
  *  file as an addition." Matches the all-zero branch in `post_diff`. */
 const ZERO_ROOT = "0".repeat(64);
 
+export interface PullResult {
+    /** Server's current root hash after this pull (from getRoot). */
+    newRootHash: string | null;
+    newRootBytes: Uint8Array | null;
+    applied: number;
+    /** True when the rebased local tree reproduces `newRootHash` exactly,
+     *  false when it doesn't, null when no comparison was possible (no tree,
+     *  tree not yet bootstrapped, or no server root). The caller must only
+     *  advance its treeBaseRoot on `true` — never past content it hasn't
+     *  verifiably applied (that's how the 2026-07-13 revert started). */
+    treeParity: boolean | null;
+    /** True when every applied upsert delta carried the server-side
+     *  mtime_ms (server ≥ 1.4.0). Without it exact parity is unreachable
+     *  because leaf hashes cover mtime. */
+    deltasHadMtime: boolean;
+}
+
 /**
- * Pull path: fetch server-computed deltas and apply to the local vault.
- * Pure HTTP — no WASM needed except for `wasm_root_hash_from_bytes` to
- * extract the root hash from the server's root blob after a fresh seed.
+ * Pull path: fetch server-computed deltas, apply to the local vault, and
+ * REBASE the in-memory Merkle tree with the same deltas. The tree must
+ * advance in lockstep with disk + sync-base: a tree left behind on pull is
+ * exactly the stale tree that, pushed later with a freshly-observed parent,
+ * fast-forwards the server back in time (incident 2026-07-13).
  */
 export async function pull(
     api: ObsetyncApi,
@@ -22,8 +41,13 @@ export async function pull(
     vaultId: string,
     localRootHash: string | null,
     wasm: WasmModule | null,
-    onProgress?: (msg: string) => void
-): Promise<{ newRootHash: string | null; newRootBytes: Uint8Array | null; applied: number }> {
+    tree: WasmTree | null,
+    onProgress?: (msg: string) => void,
+    /** Called with every path this pull is about to touch (targets, rename
+     *  old_paths, deletions) BEFORE any disk write, so the engine can tell
+     *  its own write-echo vault events apart from real user edits. */
+    onDeltasKnown?: (paths: string[]) => void,
+): Promise<PullResult> {
     // --- First-time client: bulk-seed from the server ------------------
     //
     // The server's `post_diff` treats an all-zeros device_root as "empty
@@ -34,9 +58,20 @@ export async function pull(
         onProgress?.("first sync: downloading all files from server...");
         const deltas = await api.getDiff(vaultId, ZERO_ROOT);
         if (!deltas || deltas.length === 0) {
-            return { newRootHash: null, newRootBytes: null, applied: 0 };
+            return {
+                newRootHash: null,
+                newRootBytes: null,
+                applied: 0,
+                treeParity: null,
+                deltasHadMtime: false,
+            };
         }
+        onDeltasKnown?.(deltaPaths(deltas));
         await applyDeltas(api, io, syncBase, wasm, deltas, onProgress);
+
+        // Rebase: sync-base was just seeded with the full server state, so a
+        // fresh bootstrap from it materializes the server's tree locally.
+        const deltasHadMtime = rebaseTree(tree, syncBase, deltas);
 
         // Establish newRootHash + raw root bytes from the server's current
         // root. Caller persists the bytes to cached-root.bin so restart
@@ -55,7 +90,13 @@ export async function pull(
         syncBase.setLastSyncTimestamp(Date.now());
         await syncBase.save();
         onProgress?.(`first sync: applied ${deltas.length} files`);
-        return { newRootHash, newRootBytes, applied: deltas.length };
+        return {
+            newRootHash,
+            newRootBytes,
+            applied: deltas.length,
+            treeParity: parity(tree, newRootHash),
+            deltasHadMtime,
+        };
     }
 
     onProgress?.("checking for remote changes...");
@@ -65,18 +106,16 @@ export async function pull(
         // Empty delta list can mean one of two things:
         //
         //   (a) Same root on both sides — server sends 304, middleware
-        //       promotes to 200 with empty body. localRootHash stays valid.
+        //       promotes to 200 with empty body.
         //   (b) Different roots but identical content (only mtime/size
         //       differ between server and client trees). Server computed
-        //       deltas and got []. We MUST advance localRootHash here —
-        //       otherwise every future pull will keep returning 0 deltas
-        //       against our stale root and we'll be stuck forever, even
-        //       though the server is semantically ahead.
+        //       deltas and got [].
         //
-        // We can't distinguish (a) from (b) on the client (middleware ate
-        // the 304 status to keep the AEAD envelope intact). Cheapest
-        // correct fix: always refresh the server root when pull returns
-        // empty deltas. Adds one HTTP round-trip per idle pull — fine.
+        // We still refresh the server root for observability, but the
+        // CALLER must not advance its treeBaseRoot past a root whose
+        // content it hasn't verifiably applied — signalled via treeParity.
+        // (An earlier version advanced unconditionally here; combined with
+        // the tree-less pull path it let sync state outrun reality.)
         syncBase.setLastSyncTimestamp(Date.now());
         await syncBase.save();
 
@@ -92,11 +131,23 @@ export async function pull(
         }
 
         onProgress?.("up to date");
-        return { newRootHash, newRootBytes, applied: 0 };
+        return {
+            newRootHash,
+            newRootBytes,
+            applied: 0,
+            treeParity: parity(tree, newRootHash),
+            deltasHadMtime: false,
+        };
     }
 
     onProgress?.(`${deltas.length} changes to apply`);
+    onDeltasKnown?.(deltaPaths(deltas));
     await applyDeltas(api, io, syncBase, wasm, deltas, onProgress);
+
+    // Rebase the Merkle tree with the exact deltas just applied to disk +
+    // sync-base. THE key invariant of the pull path: tree, sync-base, and
+    // disk advance together or not at all.
+    const deltasHadMtime = rebaseTree(tree, syncBase, deltas);
 
     // Extract the new root hash from the server's current root bytes so
     // subsequent incremental syncs know what to diff against.
@@ -114,7 +165,114 @@ export async function pull(
     syncBase.setLastSyncTimestamp(Date.now());
     await syncBase.save();
 
-    return { newRootHash, newRootBytes, applied: deltas.length };
+    return {
+        newRootHash,
+        newRootBytes,
+        applied: deltas.length,
+        treeParity: parity(tree, newRootHash),
+        deltasHadMtime,
+    };
+}
+
+/** Every vault path a delta set will touch (targets + rename sources). */
+function deltaPaths(deltas: FileDelta[]): string[] {
+    const paths: string[] = [];
+    for (const d of deltas) {
+        paths.push(d.path);
+        if (d.old_path) paths.push(d.old_path);
+    }
+    return paths;
+}
+
+/** Compare the tree's actual root to the server's. Null when either side
+ *  is unavailable (no tree yet, or the root fetch failed). */
+function parity(tree: WasmTree | null, serverRootHash: string | null): boolean | null {
+    if (!tree || !serverRootHash) return null;
+    let local: string | null = null;
+    try {
+        local = tree.root_hash_hex() ?? null;
+    } catch {
+        return null;
+    }
+    if (!local) return null;
+    return local === serverRootHash;
+}
+
+/**
+ * Mirror a just-applied delta set into the WASM Merkle tree (D1 fix).
+ *
+ * - Tree not bootstrapped yet → build it from sync-base, which at this
+ *   point already reflects the deltas. One O(n log n) build.
+ * - Tree live → one delete_batch (deletions + rename old_paths) and one
+ *   update_batch (adds/mods/renames), same batching the push path uses.
+ *
+ * Entry mtimes come from the server's delta (`mtime_ms`) so leaf metadata
+ * — and therefore the root hash — can match the server byte-for-byte.
+ * Falls back to sync-base's recorded tree-mtime when a delta lacks it
+ * (server < 1.4.0); returns whether every upsert carried a server mtime.
+ */
+function rebaseTree(
+    tree: WasmTree | null,
+    syncBase: ObsetyncSyncBase,
+    deltas: FileDelta[],
+): boolean {
+    let allHadMtime = true;
+    for (const d of deltas) {
+        if (d.action !== "deleted" && d.mtime_ms === undefined) allHadMtime = false;
+    }
+    if (!tree) return allHadMtime;
+
+    try {
+        if (!tree.root_hash_hex()) {
+            // Bootstrap from sync-base (already delta-updated). Mirrors the
+            // first-push bootstrap in push.ts.
+            const paths = syncBase.allPaths();
+            const entries = paths.map((p) => {
+                const e = syncBase.getEntry(p)!;
+                return {
+                    path: p,
+                    hash: e.hash,
+                    mtime_ms: syncBase.getTreeMtime(p) ?? e.mtime,
+                    size: e.size,
+                };
+            });
+            tree.build_from_entries(JSON.stringify(entries));
+            return allHadMtime;
+        }
+
+        const deletePaths: string[] = [];
+        const upserts: { path: string; hash: string; mtime_ms: number; size: number }[] = [];
+        for (const d of deltas) {
+            if (d.action === "deleted") {
+                deletePaths.push(d.path);
+            } else if (d.action === "renamed") {
+                if (d.old_path) deletePaths.push(d.old_path);
+                if (d.hash) {
+                    upserts.push({
+                        path: d.path,
+                        hash: d.hash,
+                        mtime_ms: d.mtime_ms ?? syncBase.getTreeMtime(d.path) ?? Date.now(),
+                        size: d.size ?? syncBase.getEntry(d.path)?.size ?? 0,
+                    });
+                }
+            } else if (d.hash) {
+                upserts.push({
+                    path: d.path,
+                    hash: d.hash,
+                    mtime_ms: d.mtime_ms ?? syncBase.getTreeMtime(d.path) ?? Date.now(),
+                    size: d.size ?? syncBase.getEntry(d.path)?.size ?? 0,
+                });
+            }
+        }
+        if (deletePaths.length > 0) tree.delete_batch(JSON.stringify(deletePaths));
+        if (upserts.length > 0) tree.update_batch(JSON.stringify(upserts));
+    } catch (e) {
+        // A failed rebase leaves the tree behind disk/sync-base — the caller
+        // sees treeParity=false and blocks pushes rather than publishing a
+        // root derived from a diverged tree.
+        console.error("[obsetync] tree rebase after pull failed:", e);
+    }
+    return allHadMtime;
 }
 
 /** Counters for the three-tier resolution of a content delta. Summed
@@ -166,7 +324,8 @@ async function applyDeltas(
                     delta.path,
                     delta.hash,
                     stat?.mtime ?? Date.now(),
-                    stat?.size ?? 0
+                    stat?.size ?? 0,
+                    delta.mtime_ms,
                 );
             }
         }
@@ -247,7 +406,13 @@ async function applyContentDelta(
             try {
                 const actualHash = await hashFileStreaming(delta.path, io, wasm);
                 if (actualHash === delta.hash) {
-                    syncBase.setEntry(delta.path, delta.hash, stat.mtime, stat.size);
+                    syncBase.setEntry(
+                        delta.path,
+                        delta.hash,
+                        stat.mtime,
+                        stat.size,
+                        delta.mtime_ms,
+                    );
                     stats.localHit++;
                     stats.bytesSkipped += size || stat.size;
                     return;
@@ -276,6 +441,7 @@ async function applyContentDelta(
         delta.hash,
         postStat?.mtime ?? Date.now(),
         postStat?.size ?? size,
+        delta.mtime_ms,
     );
 }
 

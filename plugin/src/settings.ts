@@ -390,16 +390,24 @@ export class ObsetyncSettingTab extends PluginSettingTab {
             line.createSpan({ text: value });
         };
 
-        const localRoot  = engine?.getLocalRootHash() ?? null;
+        // Compare the TREE's real root against the server — comparing two
+        // server-derived values used to read "in sync" while the tree
+        // silently diverged (incident 2026-07-13).
+        const treeRoot   = engine?.getTreeRootHash() ?? null;
+        const baseRoot   = engine?.getTreeBaseRoot() ?? null;
         const serverRoot = engine?.getLastObservedServerRoot() ?? null;
-        const inSync     = !!localRoot && !!serverRoot && localRoot === serverRoot;
-        const syncLabel  = inSync
-            ? "✓ in sync"
-            : engine?.getState() ?? "not-initialized";
+        const inSync     = !!treeRoot && !!serverRoot && treeRoot === serverRoot;
+        const blocked    = engine?.isPushBlocked() ?? false;
+        const syncLabel  = blocked
+            ? "⛔ paused — run Full Rescan"
+            : inSync
+                ? "✓ in sync"
+                : engine?.getState() ?? "not-initialized";
 
         row("Sync",         syncLabel);
         row("Last sync",    relTime(engine?.getLastSyncTimestamp() ?? 0));
-        row("Local root",   t(localRoot));
+        row("Tree root",    t(treeRoot));
+        row("Base root",    t(baseRoot));
         row("Server root",  t(serverRoot));
         row("sync-base",    `${engine?.getSyncBaseCount() ?? 0} entries`);
         row("Vault files",  `${engine?.getVaultFileCount() ?? 0}`);

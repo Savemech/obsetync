@@ -436,6 +436,43 @@ async fn get_root(
     Ok((StatusCode::OK, data))
 }
 
+/// Run the stale-tree guard scan and, depending on OBSETYNC_GUARD, refuse
+/// the commit (409), log a warning, or do nothing. Called before every
+/// `set_current_root` in `put_root` — both fast-forward and merge commits.
+async fn enforce_guard(
+    state: &SharedState,
+    vault_id: &str,
+    current: sync_core::chunk::RootNode,
+    candidate: sync_core::chunk::RootNode,
+    branch: &'static str,
+) -> Result<(), ServerError> {
+    let cfg = crate::guard::config();
+    if cfg.mode == crate::guard::GuardMode::Off {
+        return Ok(());
+    }
+    let index_base = state.layout.base.join("index");
+    let scan = crate::guard::scan(index_base, current, candidate)
+        .await
+        .map_err(|e| ServerError::Internal(format!("guard scan failed: {}", e)))?;
+    if let Some(reason) = scan.triggered(cfg) {
+        tracing::warn!(
+            vault = %vault_id,
+            branch,
+            reason,
+            deletions = scan.deletions,
+            content_changes = scan.content_changes,
+            mtime_regressions = scan.mtime_regressions,
+            current_total = scan.current_total,
+            enforced = (cfg.mode == crate::guard::GuardMode::Enforce),
+            "put_root: guard tripwire"
+        );
+        if cfg.mode == crate::guard::GuardMode::Enforce {
+            return Err(ServerError::Conflict(scan.reject_body(reason)));
+        }
+    }
+    Ok(())
+}
+
 async fn put_root(
     State(state): State<SharedState>,
     Path(vault_id): Path<String>,
@@ -495,7 +532,18 @@ async fn put_root(
                 .map_err(|_| ServerError::BadRequest("invalid X-Parent-Root header".into()))?;
 
             if current_hash == parent_hash {
-                // Fast-forward — parent matches current, accept directly.
+                // Fast-forward — parent matches current. The parent claim is
+                // self-asserted (a client with a stale tree but a fresh root
+                // poller satisfies this check while reverting the vault —
+                // incident 2026-07-13), so gate the commit on a content scan.
+                let current_data = state
+                    .vaults
+                    .get_root(&vault_id, &current_hash)
+                    .ok_or_else(|| ServerError::Internal("current root data missing".into()))?;
+                let current_root = sync_core::chunk::RootNode::deserialize(&current_data)
+                    .map_err(|e| ServerError::Internal(format!("corrupt current root: {}", e)))?;
+                enforce_guard(&state, &vault_id, current_root, incoming_root.clone(), "ff").await?;
+
                 state.vaults.set_current_root(&vault_id, &incoming_hash)?;
                 tracing::info!(
                     vault = %vault_id,
@@ -554,6 +602,21 @@ async fn put_root(
                     .store_root(&vault_id, &merged_hash, &merged_bytes)?;
                 let idx_path = state.layout.index_path(&merged_hash);
                 write_blob(&idx_path, &merged_bytes)?;
+
+                // A merge with a poisoned base (claimed parent newer than the
+                // pusher's real tree epoch) silently reverts every file the
+                // stale side "didn't change since base" — scan the outcome
+                // against current before committing it.
+                let current_root_again = sync_core::chunk::RootNode::deserialize(&current_data)
+                    .map_err(|e| ServerError::Internal(format!("corrupt current root: {}", e)))?;
+                enforce_guard(
+                    &state,
+                    &vault_id,
+                    current_root_again,
+                    merge_result.new_root.clone(),
+                    "merge",
+                )
+                .await?;
 
                 // Update current.
                 state.vaults.set_current_root(&vault_id, &merged_hash)?;
@@ -698,11 +761,16 @@ enum WireDelta {
         path: String,
         hash: String,
         size: u64,
+        /// Server-side mtime of the entry, so pulling clients can rebase
+        /// their local Merkle tree to byte-identical leaf metadata (leaf
+        /// hashes cover mtime). Older clients ignore the extra field.
+        mtime_ms: u64,
     },
     Modified {
         path: String,
         hash: String,
         size: u64,
+        mtime_ms: u64,
     },
     Deleted {
         path: String,
@@ -718,15 +786,27 @@ impl From<&sync_core::diff::FileDelta> for WireDelta {
     fn from(d: &sync_core::diff::FileDelta) -> Self {
         use sync_core::diff::FileDelta as F;
         match d {
-            F::Added { path, hash, size } => WireDelta::Added {
+            F::Added {
+                path,
+                hash,
+                size,
+                mtime_ms,
+            } => WireDelta::Added {
                 path: path.clone(),
                 hash: hash_to_hex(hash),
                 size: *size,
+                mtime_ms: *mtime_ms,
             },
-            F::Modified { path, hash, size } => WireDelta::Modified {
+            F::Modified {
+                path,
+                hash,
+                size,
+                mtime_ms,
+            } => WireDelta::Modified {
                 path: path.clone(),
                 hash: hash_to_hex(hash),
                 size: *size,
+                mtime_ms: *mtime_ms,
             },
             F::Deleted { path } => WireDelta::Deleted { path: path.clone() },
             F::Renamed {

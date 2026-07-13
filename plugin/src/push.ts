@@ -101,10 +101,13 @@ export async function push(
     tree: WasmTree,
     vaultId: string,
     changes: FileChange[],
-    /** The root hash the server currently holds (from the last pull or push result).
-     *  Used as X-Parent-Root so the server can fast-forward or merge correctly.
-     *  Must be captured BEFORE tree updates — never the new root we're about to push. */
-    serverRootHash: string | null,
+    /** The server root this device's tree state was DERIVED from — i.e. the
+     *  last root the tree verifiably reconciled with (engine.treeBaseRoot),
+     *  NOT merely the last root observed on the server. The server uses it
+     *  as the merge base, so lying here (e.g. sending a freshly-polled
+     *  current root while the tree is stale) turns a divergence into a
+     *  "fast-forward" that reverts the whole vault — incident 2026-07-13. */
+    baseRootHash: string | null,
     onProgress?: (msg: string) => void
 ): Promise<{ newRootHash: string | null; conflicts: any[] }> {
     if (changes.length === 0) {
@@ -123,7 +126,16 @@ export async function push(
         } else {
             const entries = paths.map(p => {
                 const e = syncBase.getEntry(p)!;
-                return { path: p, hash: e.hash, mtime_ms: e.mtime, size: e.size };
+                // treeMtime (server-side mtime for pulled files) keeps the
+                // rebuilt leaf metadata identical to the server's — leaf
+                // hashes cover mtime, so this is what makes the rebuilt
+                // root reproducible.
+                return {
+                    path: p,
+                    hash: e.hash,
+                    mtime_ms: syncBase.getTreeMtime(p) ?? e.mtime,
+                    size: e.size,
+                };
             });
             tree.build_from_entries(JSON.stringify(entries));
         }
@@ -345,8 +357,10 @@ export async function push(
     }
 
     // Push root once after all batches.
-    // parentHash = what the server had BEFORE this push (for fast-forward detection).
-    const parentHash = serverRootHash ?? "";
+    // parentHash = the base this tree state descends from. An honest base
+    // lets the server fast-forward when we're truly current and pick the
+    // correct three-way-merge base when we're not.
+    const parentHash = baseRootHash ?? "";
     const rootBytes  = tree.root_bytes();
     if (!rootBytes) {
         console.warn(`[obsetync] push: tree.root_bytes() returned null — tree uninitialised?`);

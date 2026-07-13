@@ -153,14 +153,25 @@ export default class ObsetyncPlugin extends Plugin {
         if (this.syncEngine) {
             push("--- Sync state ---");
             try {
-                const localRoot  = this.syncEngine.getLocalRootHash();
+                const treeRoot   = this.syncEngine.getTreeRootHash();
+                const baseRoot   = this.syncEngine.getTreeBaseRoot();
                 const serverRoot = this.syncEngine.getLastObservedServerRoot();
-                const inSync = !!localRoot && localRoot === serverRoot;
+                // Truth = the TREE's own root vs the server, not one server-
+                // derived value vs another (the pre-1.4.0 display compared
+                // observed-vs-observed and read "in sync" while the tree
+                // silently drifted for days).
+                const inSync = !!treeRoot && treeRoot === serverRoot;
+                const treeCount = this.syncEngine.getTreeFileCount();
+                const baseCount = this.syncEngine.getSyncBaseCount();
                 push(`Engine state:      ${this.syncEngine.getState()}`);
-                push(`In sync:           ${inSync ? "yes ✓" : "no"}`);
-                push(`Local root hash:   ${trunc(localRoot, 24)}`);
+                push(`In sync (tree):    ${inSync ? "yes ✓" : "no"}`);
+                push(`Push blocked:      ${this.syncEngine.isPushBlocked() ? "YES — run Full Rescan" : "no"}`);
+                push(`Tree root hash:    ${trunc(treeRoot, 24)}`);
+                push(`Tree base root:    ${trunc(baseRoot, 24)}`);
                 push(`Last server root:  ${trunc(serverRoot, 24)}`);
-                push(`sync-base entries: ${this.syncEngine.getSyncBaseCount()}`);
+                push(`Observed root:     ${trunc(this.syncEngine.getLocalRootHash(), 24)}`);
+                push(`Tree files:        ${treeCount < 0 ? "(not bootstrapped)" : treeCount}`);
+                push(`sync-base entries: ${baseCount}`);
                 push(`Vault file count:  ${this.syncEngine.getVaultFileCount()}`);
                 push(`Last sync (ts):    ${fmt(this.syncEngine.getLastSyncTimestamp())}`);
                 const err = this.syncEngine.getLastError();

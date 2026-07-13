@@ -6,6 +6,7 @@ mod config;
 mod devices;
 mod enrollment;
 mod error;
+mod guard;
 mod secure;
 mod state;
 mod storage;
@@ -48,6 +49,13 @@ enum Command {
         #[arg(long, default_value = "27183")]
         admin_port: u16,
     },
+    /// Probe /health of a running server and exit 0/1. Intended for
+    /// container HEALTHCHECKs — the hardened runtime image has no curl.
+    Healthcheck {
+        /// URL to probe.
+        #[arg(long, default_value = "http://127.0.0.1:27182/health")]
+        url: String,
+    },
 }
 
 #[tokio::main]
@@ -88,6 +96,45 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Command::Healthcheck { url } => match cmd_healthcheck(&url) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("healthcheck failed: {}", e);
+                std::process::exit(1);
+            }
+        },
+    }
+}
+
+/// Minimal blocking HTTP/1.1 GET over std::net — no client-lib dependency,
+/// works inside the read-only distroless-style runtime image.
+fn cmd_healthcheck(url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{Read, Write};
+
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or("healthcheck expects an http:// URL")?;
+    let (host_port, path) = match rest.split_once('/') {
+        Some((hp, p)) => (hp, format!("/{}", p)),
+        None => (rest, "/health".to_string()),
+    };
+
+    let mut stream = std::net::TcpStream::connect(host_port)?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+    write!(
+        stream,
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        path, host_port
+    )?;
+
+    let mut response = String::new();
+    stream.take(4096).read_to_string(&mut response)?;
+    let status_line = response.lines().next().unwrap_or("");
+    if status_line.contains(" 200 ") {
+        Ok(())
+    } else {
+        Err(format!("unexpected response: {}", status_line).into())
     }
 }
 

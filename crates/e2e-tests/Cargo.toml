@@ -57,3 +57,8 @@ required-features = ["e2e"]
 name = "transport_security"
 path = "tests/transport_security.rs"
 required-features = ["e2e"]
+
+[[test]]
+name = "stale_tree_revert"
+path = "tests/stale_tree_revert.rs"
+required-features = ["e2e"]

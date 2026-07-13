@@ -41,6 +41,23 @@ export class ObsetyncSyncEngine {
     private lastError: { ts: number; message: string; origin: string } | null = null;
     /** Snapshots of observed remote / local roots for the debug panel. */
     private lastPullServerRoot: string | null = null;
+    /** The server root this device's Merkle tree was last VERIFIABLY
+     *  reconciled with — the honest putRoot parent (merge base). Distinct
+     *  from `localRootHash`, which is merely the last root observed on the
+     *  server; conflating the two is what let a stale tree fast-forward the
+     *  fleet back in time (incident 2026-07-13). Persisted in sync-base. */
+    private treeBaseRoot: string | null = null;
+    /** Set when the tree demonstrably diverged from the state pull applied.
+     *  While set, pushes are refused (queued, not dropped) — publishing a
+     *  root from an untrusted tree is how vaults get reverted. Cleared by a
+     *  verified pull-rebase or a full rescan. */
+    private pushBlocked = false;
+    /** Paths the in-flight pull is writing — vault events for them are our
+     *  own echoes, not user edits, and must not be queued for push-back. */
+    private expectedPullWrites = new Set<string>();
+    /** debouncedPush from attachVaultListeners, kept so sync completion can
+     *  drain user edits that arrived mid-sync. */
+    private debouncedPush: (() => void) | null = null;
 
     constructor(
         private app: App,
@@ -107,9 +124,41 @@ export class ObsetyncSyncEngine {
         return this.lastPullServerRoot;
     }
 
+    /** The verified base root pushes descend from (honest putRoot parent). */
+    getTreeBaseRoot(): string | null {
+        return this.treeBaseRoot;
+    }
+
+    /** The WASM tree's actual current root — NOT the observed server root. */
+    getTreeRootHash(): string | null {
+        try {
+            const h = this.tree.root_hash_hex();
+            return h && h.length > 0 ? h : null;
+        } catch {
+            return null;
+        }
+    }
+
+    /** File count inside the WASM tree (compare against sync-base count). */
+    getTreeFileCount(): number {
+        try { return this.tree.root_hash_hex() ? this.tree.total_files() : -1; } catch { return -1; }
+    }
+
+    isPushBlocked(): boolean {
+        return this.pushBlocked;
+    }
+
     /** Start the sync engine: run startup sequence, attach listeners, start timer. */
     async start(): Promise<void> {
         console.log("[obsetync] starting sync engine");
+
+        // Restore the verified base root persisted in lockstep with sync-base.
+        // Null on first run and on pre-1.4.0 sync-base files — established by
+        // the first verified pull below.
+        this.treeBaseRoot = this.syncBase.treeBaseRoot;
+        if (this.treeBaseRoot) {
+            console.log(`[obsetync] tree base root: ${this.treeBaseRoot.slice(0, 16)}`);
+        }
 
         // Step 0: Verify connectivity. /health is the only plaintext route.
         try {
@@ -252,7 +301,12 @@ export class ObsetyncSyncEngine {
             if (paths.length > 0) {
                 const entries = paths.map(p => {
                     const e = this.syncBase.getEntry(p)!;
-                    return { path: p, hash: e.hash, mtime_ms: e.mtime, size: e.size };
+                    return {
+                        path: p,
+                        hash: e.hash,
+                        mtime_ms: this.syncBase.getTreeMtime(p) ?? e.mtime,
+                        size: e.size,
+                    };
                 });
                 this.tree.build_from_entries(JSON.stringify(entries));
             }
@@ -421,7 +475,11 @@ export class ObsetyncSyncEngine {
         return { smallUploaded, largeUploaded, treeChunksUploaded, bytes };
     }
 
-    /** Force a full vault scan (Layer 4). */
+    /** Force a full vault scan (Layer 4). Doubles as the recovery action for
+     *  a diverged tree: the in-memory tree is rebuilt from sync-base (the
+     *  state corresponding to treeBaseRoot) before scanning, so whatever
+     *  in-memory drift caused a push block is discarded, the block lifted,
+     *  and local differences re-queued from disk truth. */
     async fullScan(): Promise<void> {
         this.state = "scanning";
         this.onStatusUpdate("sync ⟳");
@@ -430,6 +488,25 @@ export class ObsetyncSyncEngine {
         const endSpan = perfSpan("scan.full");
 
         try {
+            try {
+                const entries = this.syncBase.allPaths().map((p) => {
+                    const e = this.syncBase.getEntry(p)!;
+                    return {
+                        path: p,
+                        hash: e.hash,
+                        mtime_ms: this.syncBase.getTreeMtime(p) ?? e.mtime,
+                        size: e.size,
+                    };
+                });
+                this.tree.build_from_entries(JSON.stringify(entries));
+                if (this.pushBlocked) {
+                    console.log("[obsetync] full scan rebuilt the tree — push unblocked");
+                    this.pushBlocked = false;
+                }
+            } catch (e) {
+                console.error("[obsetync] full scan tree rebuild failed:", e);
+            }
+
             // statBulk() reads all file stats from Obsidian's in-memory cache —
             // no async IPC calls, O(n) in-memory map construction.
             const statMap = this.io.statBulk();
@@ -545,16 +622,73 @@ export class ObsetyncSyncEngine {
                 this.io,
                 this.syncBase,
                 this.vaultId,
-                this.localRootHash,
+                // Diff from the VERIFIED base when we have one — never from a
+                // merely-observed root that may be ahead of our applied state.
+                this.treeBaseRoot ?? this.localRootHash,
                 this.wasm,
+                this.tree,
+                undefined,
+                // Vault events for paths the pull itself writes are echoes,
+                // not user edits — register them before apply starts.
+                (paths) => {
+                    for (const p of paths) this.expectedPullWrites.add(p);
+                },
             );
             if (result.newRootHash) {
                 this.localRootHash = result.newRootHash;
                 this.lastPullServerRoot = result.newRootHash;
             }
-            // Persist the raw root bytes so cached-root.bin seeds
-            // localRootHash on the next plugin start — otherwise a fresh
-            // iPhone would re-seed every launch.
+            await this.adoptPullResult(result);
+        } catch (e: any) {
+            console.error("[obsetync] pull error:", e);
+            this.lastError = { ts: Date.now(), origin: "pull", message: String(e?.message ?? e) };
+            this.state = "error";
+            this.onStatusUpdate("sync ✗");
+        } finally {
+            endSpan();
+            this.expectedPullWrites.clear();
+            this.syncing = false;
+            if (this.state !== "error") {
+                this.state = "idle";
+                this.onStatusUpdate("sync ✓");
+            }
+            // Drain user edits that arrived while we were syncing.
+            if (this.pendingChanges.length > 0) this.debouncedPush?.();
+        }
+    }
+
+    /**
+     * Decide what the pull result means for the verified base (D2/D3 core).
+     *
+     * - Exact parity (tree root == server root): adopt as treeBaseRoot,
+     *   persist root bytes, clear any block. The only unconditional advance.
+     * - Parity failed after applying deltas that carried server mtimes: the
+     *   tree diverged from what we just applied — BLOCK pushes until a full
+     *   rescan; publishing from this tree could revert other devices.
+     * - Parity failed against a pre-1.4.0 server (no mtimes on the wire):
+     *   exactness is unreachable (leaf hashes cover mtime). Adopt only when
+     *   tree and sync-base agree on file count; otherwise block.
+     * - Nothing applied + no parity: keep the current base. Merging from an
+     *   older base is always safe — advancing past unapplied content is not
+     *   (that's how sync state used to outrun reality).
+     */
+    private async adoptPullResult(result: {
+        newRootHash: string | null;
+        newRootBytes: Uint8Array | null;
+        applied: number;
+        treeParity: boolean | null;
+        deltasHadMtime: boolean;
+    }): Promise<void> {
+        const adopt = async (hash: string) => {
+            if (this.treeBaseRoot !== hash) {
+                this.treeBaseRoot = hash;
+                this.syncBase.setTreeBaseRoot(hash);
+                await this.syncBase.save();
+            }
+            if (this.pushBlocked) {
+                console.log("[obsetync] tree re-verified against server — push unblocked");
+                this.pushBlocked = false;
+            }
             if (result.newRootBytes) {
                 try {
                     const path = ".obsidian/plugins/obsetync/cached-root.bin";
@@ -566,18 +700,60 @@ export class ObsetyncSyncEngine {
                     console.warn("[obsetync] failed to save cached root after pull:", e);
                 }
             }
-        } catch (e: any) {
-            console.error("[obsetync] pull error:", e);
-            this.lastError = { ts: Date.now(), origin: "pull", message: String(e?.message ?? e) };
-            this.state = "error";
-            this.onStatusUpdate("sync ✗");
-        } finally {
-            endSpan();
-            this.syncing = false;
-            if (this.state !== "error") {
-                this.state = "idle";
-                this.onStatusUpdate("sync ✓");
+        };
+
+        if (result.treeParity === true && result.newRootHash) {
+            await adopt(result.newRootHash);
+            return;
+        }
+
+        if (result.treeParity === false && result.newRootHash) {
+            const treeCount = this.getTreeFileCount();
+            const baseCount = this.syncBase.entryCount();
+            const epsilon = Math.max(8, Math.ceil(baseCount * 0.005));
+            const countsAgree = treeCount >= 0 && Math.abs(treeCount - baseCount) <= epsilon;
+
+            if (result.applied > 0 && result.deltasHadMtime) {
+                this.pushBlocked = true;
+                console.error(
+                    `[obsetync] tree root ${this.getTreeRootHash()?.slice(0, 16)} != ` +
+                    `server root ${result.newRootHash.slice(0, 16)} after verified rebase — ` +
+                    `pushes blocked, run "Full Rescan" to recover`,
+                );
+                new Notice(
+                    "Obsetync: local index diverged from server — sync paused. " +
+                    "Run 'Force full rescan' in settings to recover.",
+                    10000,
+                );
+                return;
             }
+
+            // Pre-1.4.0 server (deltas without mtimes) or metadata-only root
+            // drift: exact parity is unattainable. Content-wise we HAVE
+            // applied everything the server reported, so the observed root is
+            // an honest base — but only while tree and sync-base agree.
+            if (countsAgree) {
+                if (!this.treeBaseRoot || result.applied > 0) {
+                    console.warn(
+                        `[obsetync] adopting server root ${result.newRootHash.slice(0, 16)} as base ` +
+                        `without byte parity (server deltas carried no mtimes); ` +
+                        `tree=${treeCount} sync-base=${baseCount}`,
+                    );
+                    await adopt(result.newRootHash);
+                }
+                return;
+            }
+
+            this.pushBlocked = true;
+            console.error(
+                `[obsetync] tree/sync-base divergence: tree=${treeCount} files, ` +
+                `sync-base=${baseCount} (epsilon=${epsilon}) — pushes blocked`,
+            );
+            new Notice(
+                "Obsetync: local index inconsistent — sync paused. " +
+                "Run 'Force full rescan' in settings to recover.",
+                10000,
+            );
         }
     }
 
@@ -589,6 +765,47 @@ export class ObsetyncSyncEngine {
             );
             return;
         }
+
+        // --- Publish guards -------------------------------------------------
+        // Never publish a root we can't vouch for; changes stay queued.
+        if (this.pushBlocked) {
+            console.warn(
+                `[obsetync] push refused: tree diverged from server ` +
+                `(${this.pendingChanges.length} changes queued) — run Full Rescan`,
+            );
+            return;
+        }
+        // A device that has both local state and a visible server root but no
+        // verified base would have to fabricate its parent — exactly the lie
+        // that reverted the vault. Wait for pull to establish the base.
+        if (!this.treeBaseRoot && this.lastPullServerRoot && this.syncBase.entryCount() > 0) {
+            console.warn(
+                "[obsetync] push deferred: no verified base root yet " +
+                "(waiting for a pull to reconcile the tree)",
+            );
+            return;
+        }
+        // Cheap structural invariant: tree and sync-base advance in lockstep
+        // now; a widening gap means a rebase was missed somewhere.
+        const treeCount = this.getTreeFileCount();
+        if (treeCount >= 0) {
+            const baseCount = this.syncBase.entryCount();
+            const epsilon = Math.max(8, Math.ceil(baseCount * 0.005));
+            if (Math.abs(treeCount - baseCount) > epsilon) {
+                this.pushBlocked = true;
+                console.error(
+                    `[obsetync] push refused: tree=${treeCount} files vs ` +
+                    `sync-base=${baseCount} (epsilon=${epsilon}) — run Full Rescan`,
+                );
+                new Notice(
+                    "Obsetync: local index inconsistent — sync paused. " +
+                    "Run 'Force full rescan' in settings to recover.",
+                    10000,
+                );
+                return;
+            }
+        }
+
         this.syncing = true;
         this.state = "pushing";
         const endSpan = perfSpan("sync.push");
@@ -612,7 +829,9 @@ export class ObsetyncSyncEngine {
                 this.tree,
                 this.vaultId,
                 batch,
-                this.localRootHash,
+                // HONEST parent: the base our tree state descends from — never
+                // the last root merely observed on the server.
+                this.treeBaseRoot,
                 (text) => {
                     this.onStatusUpdate(text);
                     notice?.setMessage(text);
@@ -620,6 +839,17 @@ export class ObsetyncSyncEngine {
             );
             if (result.newRootHash) {
                 this.localRootHash = result.newRootHash;
+            }
+            // Our just-pushed root is now in the server's history, so it is a
+            // valid (and honest) base for the next push — on a fast-forward it
+            // IS the server's current root; after a server-side merge the next
+            // pull will converge us onto the merged root and re-adopt.
+            const ourRoot = this.getTreeRootHash();
+            const newBase = ourRoot ?? result.newRootHash;
+            if (newBase && this.treeBaseRoot !== newBase) {
+                this.treeBaseRoot = newBase;
+                this.syncBase.setTreeBaseRoot(newBase);
+                await this.syncBase.save();
             }
 
             // Persist the new root so the WASM tree can be restored on restart.
@@ -644,6 +874,8 @@ export class ObsetyncSyncEngine {
                 this.state = "idle";
                 this.onStatusUpdate("sync ✓");
             }
+            // Drain user edits that arrived while we were pushing.
+            if (this.pendingChanges.length > 0) this.debouncedPush?.();
         }
     }
 
@@ -737,18 +969,32 @@ export class ObsetyncSyncEngine {
         }
     }
 
-    /** Layer 1: attach live vault event listeners. */
+    /** Layer 1: attach live vault event listeners.
+     *
+     *  Events are journaled + queued even while a sync is in flight — the old
+     *  `if (this.syncing) return` dropped genuine user edits made during a
+     *  long pull. The one thing we must NOT queue is the pull's own disk
+     *  writes echoing back as vault events; those are recognized via
+     *  `expectedPullWrites` (registered before applyDeltas touches disk). */
     private attachVaultListeners(): void {
-        const debouncedPush = debounce(
+        this.debouncedPush = debounce(
             () => this.pushPending(),
             3000,
             true
         );
+        const debouncedPush = () => this.debouncedPush?.();
+
+        /** True → this event is our own pull writing to disk; consume it. */
+        const isPullEcho = (path: string): boolean => {
+            if (!this.syncing || !this.expectedPullWrites.has(path)) return false;
+            this.expectedPullWrites.delete(path);
+            return true;
+        };
 
         this.eventRefs.push(
             this.app.vault.on("modify", async (file: TAbstractFile) => {
                 if (!(file instanceof TFile)) return;
-                if (this.syncing || this.isSyncInternal(file.path)) return;
+                if (this.isSyncInternal(file.path) || isPullEcho(file.path)) return;
                 await this.journal.append({
                     action: "modified",
                     path: file.path,
@@ -772,7 +1018,7 @@ export class ObsetyncSyncEngine {
         this.eventRefs.push(
             this.app.vault.on("create", async (file: TAbstractFile) => {
                 if (!(file instanceof TFile)) return;
-                if (this.syncing || this.isSyncInternal(file.path)) return;
+                if (this.isSyncInternal(file.path) || isPullEcho(file.path)) return;
                 await this.journal.append({
                     action: "created",
                     path: file.path,
@@ -795,7 +1041,7 @@ export class ObsetyncSyncEngine {
 
         this.eventRefs.push(
             this.app.vault.on("delete", async (file: TAbstractFile) => {
-                if (this.syncing || this.isSyncInternal(file.path)) return;
+                if (this.isSyncInternal(file.path) || isPullEcho(file.path)) return;
                 await this.journal.append({
                     action: "deleted",
                     path: file.path,
@@ -813,7 +1059,11 @@ export class ObsetyncSyncEngine {
         this.eventRefs.push(
             this.app.vault.on("rename", async (file: TAbstractFile, oldPath: string) => {
                 if (!(file instanceof TFile)) return;
-                if (this.syncing || this.isSyncInternal(file.path)) return;
+                if (this.isSyncInternal(file.path)) return;
+                // A pull-applied rename echoes as one event with both paths.
+                const echoNew = isPullEcho(file.path);
+                const echoOld = isPullEcho(oldPath);
+                if (echoNew || echoOld) return;
                 await this.journal.append({
                     action: "deleted",
                     path: oldPath,

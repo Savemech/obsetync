@@ -11,11 +11,17 @@ pub enum FileDelta {
         path: String,
         hash: FileHash,
         size: u64,
+        /// mtime of the target entry, so a puller can mirror the server's
+        /// leaf metadata exactly (leaf hashes cover mtime — without this a
+        /// delta-rebased client tree can never reproduce the server root).
+        mtime_ms: u64,
     },
     Modified {
         path: String,
         hash: FileHash,
         size: u64,
+        /// See `Added::mtime_ms`.
+        mtime_ms: u64,
     },
     Deleted {
         path: String,
@@ -78,6 +84,7 @@ pub async fn compute_deltas<S: ChunkStore>(
                         path: e.path,
                         hash: e.hash,
                         size: e.size_bytes,
+                        mtime_ms: e.mtime_ms,
                     });
                 }
                 j += 1;
@@ -101,6 +108,7 @@ pub async fn compute_deltas<S: ChunkStore>(
                 path: e.path,
                 hash: e.hash,
                 size: e.size_bytes,
+                mtime_ms: e.mtime_ms,
             });
         }
     }
@@ -129,6 +137,7 @@ fn diff_entries(
                         path: to[j].path.clone(),
                         hash: to[j].hash,
                         size: to[j].size_bytes,
+                        mtime_ms: to[j].mtime_ms,
                     });
                 }
                 i += 1;
@@ -145,6 +154,7 @@ fn diff_entries(
                     path: to[j].path.clone(),
                     hash: to[j].hash,
                     size: to[j].size_bytes,
+                    mtime_ms: to[j].mtime_ms,
                 });
                 j += 1;
             }
@@ -160,6 +170,7 @@ fn diff_entries(
             path: entry.path.clone(),
             hash: entry.hash,
             size: entry.size_bytes,
+            mtime_ms: entry.mtime_ms,
         });
     }
 }
@@ -292,10 +303,16 @@ mod tests {
         let deltas = compute_deltas(&store, &r1, &r2).await.unwrap();
         assert_eq!(deltas.len(), 1);
         match &deltas[0] {
-            FileDelta::Modified { path, hash, size } => {
+            FileDelta::Modified {
+                path,
+                hash,
+                size,
+                mtime_ms,
+            } => {
                 assert_eq!(path, "a.md");
                 assert_eq!(*hash, sync_core_hash(b"new-content-bigger"));
                 assert_eq!(*size, 100, "make_entry hardcodes 100");
+                assert_eq!(*mtime_ms, 1000, "make_entry hardcodes 1000");
             }
             _ => panic!("expected Modified, got {:?}", &deltas[0]),
         }
@@ -353,15 +370,22 @@ mod tests {
             path: "a.md".into(),
             hash: h,
             size: 5,
+            mtime_ms: 42,
         };
         let json = serde_json::to_string(&d).unwrap();
         assert!(json.contains("added"));
         let back: FileDelta = serde_json::from_str(&json).unwrap();
         match back {
-            FileDelta::Added { path, hash, size } => {
+            FileDelta::Added {
+                path,
+                hash,
+                size,
+                mtime_ms,
+            } => {
                 assert_eq!(path, "a.md");
                 assert_eq!(hash, h);
                 assert_eq!(size, 5);
+                assert_eq!(mtime_ms, 42);
             }
             _ => panic!("expected Added"),
         }
