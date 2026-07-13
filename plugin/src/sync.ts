@@ -217,6 +217,17 @@ export class ObsetyncSyncEngine {
      * anything missing. Cheap when the server is fully populated (one
      * checkContent call with N hashes), correct when it isn't. */
     async forceSync(): Promise<void> {
+        // Another cycle already holds the engine (e.g. the startup
+        // first-sync). Every sub-step below would silently yield to it and
+        // forceSync would finish in ~1ms — reporting "complete" for work it
+        // never did. Say what's actually happening instead.
+        if (this.syncing) {
+            console.log(
+                `[obsetync] forceSync skipped: another sync in progress (state=${this.state})`
+            );
+            new Notice("Obsetync: sync already in progress — hang tight.");
+            return;
+        }
         const t0 = Date.now();
         console.log(
             `[obsetync] forceSync start: pending=${this.pendingChanges.length} ` +
