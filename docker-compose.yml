@@ -89,6 +89,7 @@ services:
        rm -rf /out/wasm &&
        cp /build/plugin/main.js                /out/ &&
        cp /build/plugin/manifest.json          /out/ &&
+       cp /build/plugin/styles.css             /out/ &&
        cp /build/plugin/wasm/sync_core.js      /out/ &&
        cp /build/plugin/wasm/sync_core_bg.wasm /out/ &&
        echo 'Plugin files written to ./dist/plugin'"
