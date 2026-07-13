@@ -106,6 +106,7 @@ ship-plugin: build-plugin
     mkdir -p "{{vault}}"
     cp dist/plugin/main.js                 "{{vault}}/"
     cp dist/plugin/manifest.json           "{{vault}}/"
+    cp dist/plugin/styles.css              "{{vault}}/"
     cp dist/plugin/sync_core.js            "{{vault}}/"
     cp dist/plugin/sync_core_bg.wasm       "{{vault}}/"
 

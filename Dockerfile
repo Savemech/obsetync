@@ -130,7 +130,7 @@ RUN --mount=type=cache,id=npm-cache,target=/root/.npm \
     npm ci --no-audit --no-fund
 
 # Bring in sources + the WASM produced by the rust-builder stage.
-COPY plugin/tsconfig.json plugin/esbuild.config.mjs plugin/manifest.json ./
+COPY plugin/tsconfig.json plugin/esbuild.config.mjs plugin/manifest.json plugin/styles.css ./
 COPY plugin/src ./src
 COPY --from=rust-builder /build/plugin/wasm ./wasm
 
@@ -184,6 +184,7 @@ FROM scratch AS plugin-dist
 
 COPY --from=plugin-builder /build/plugin/main.js                  /main.js
 COPY --from=plugin-builder /build/plugin/manifest.json            /manifest.json
+COPY --from=plugin-builder /build/plugin/styles.css               /styles.css
 COPY --from=plugin-builder /build/plugin/wasm/sync_core.js        /sync_core.js
 COPY --from=plugin-builder /build/plugin/wasm/sync_core_bg.wasm   /sync_core_bg.wasm
 

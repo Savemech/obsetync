@@ -248,9 +248,14 @@ export class ObsetyncApi {
         const adminUrl = this.serverUrl
             .replace(/^https:/, "http:")
             .replace(/:\d+$/, ":27183");
-        const res = await fetch(`${adminUrl}/admin/enrollment/${code}`);
-        const body = await res.json();
-        if (!res.ok) throw new Error(`enrollment failed: ${body.error ?? res.status}`);
+        const res = await requestUrl({
+            url: `${adminUrl}/admin/enrollment/${code}`,
+            throw: false,
+        });
+        const body = res.json;
+        if (res.status < 200 || res.status >= 300) {
+            throw new Error(`enrollment failed: ${body?.error ?? res.status}`);
+        }
         return body;
     }
 

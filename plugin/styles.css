@@ -1,0 +1,47 @@
+/* ObsetyNC plugin styles.
+   Obsidian auto-loads styles.css from the plugin folder, so all styling lives
+   here as classes (the review bot rejects inline element.style assignments). */
+
+/* --- Settings: connection status --- */
+.obsetync-status {
+    margin-bottom: 8px;
+}
+.obsetync-connected {
+    color: var(--text-success);
+    font-weight: var(--font-semibold);
+}
+.obsetync-disconnected {
+    color: var(--text-error);
+    font-weight: var(--font-semibold);
+}
+
+/* --- Settings: status box rows --- */
+.obsetync-status-label {
+    color: var(--text-muted);
+}
+.obsetync-status-error {
+    color: var(--text-error);
+    margin-top: 4px;
+}
+.obsetync-refresh-btn {
+    margin-top: 8px;
+}
+
+/* --- Debug modal --- */
+.obsetync-debug-pre {
+    max-height: 60vh;
+    overflow: auto;
+    font-size: var(--font-smaller);
+    white-space: pre-wrap;
+    word-break: break-all;
+    user-select: text;
+    border: 1px solid var(--background-modifier-border);
+    padding: 12px;
+    background: var(--background-primary-alt);
+    border-radius: var(--radius-s);
+}
+.obsetync-modal-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 12px;
+}

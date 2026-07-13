@@ -15,17 +15,11 @@ export class ObsetyncDebugModal extends Modal {
 
         contentEl.createEl("h2", { text: "ObsetyNC debug info" });
 
-        const pre = contentEl.createEl("pre", { text: this.text });
-        pre.setAttribute(
-            "style",
-            "max-height: 60vh; overflow: auto; font-size: 11px; " +
-                "white-space: pre-wrap; word-break: break-all; user-select: text; " +
-                "border: 1px solid var(--background-modifier-border); padding: 12px; " +
-                "background: var(--background-primary-alt); border-radius: 4px;"
-        );
+        contentEl.createEl("pre", { text: this.text, cls: "obsetync-debug-pre" });
 
-        const actions = contentEl.createDiv({ cls: "modal-button-container" });
-        actions.setAttribute("style", "display: flex; gap: 8px; margin-top: 12px;");
+        const actions = contentEl.createDiv({
+            cls: "modal-button-container obsetync-modal-actions",
+        });
 
         const copyBtn = actions.createEl("button", {
             text: "Copy to clipboard",

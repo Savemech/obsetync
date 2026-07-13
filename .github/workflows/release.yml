@@ -107,6 +107,7 @@ jobs:
           # bot); precheck guarantees it equals plugin/manifest.json.
           cp plugin/main.js                   release/main.js
           cp manifest.json                    release/manifest.json
+          cp plugin/styles.css                release/styles.css
           cp plugin/wasm/sync_core.js         release/sync_core.js
           cp plugin/wasm/sync_core_bg.wasm    release/sync_core_bg.wasm
           cp versions.json                    release/versions.json
@@ -115,6 +116,7 @@ jobs:
           mkdir -p zip-staging/obsetync
           cp release/main.js                  zip-staging/obsetync/
           cp release/manifest.json            zip-staging/obsetync/
+          cp release/styles.css               zip-staging/obsetync/
           cp release/sync_core.js             zip-staging/obsetync/
           cp release/sync_core_bg.wasm        zip-staging/obsetync/
           (cd zip-staging && zip -r ../release/obsetync-${{ github.ref_name }}.zip obsetync)
@@ -128,6 +130,7 @@ jobs:
           files: |
             release/main.js
             release/manifest.json
+            release/styles.css
             release/sync_core.js
             release/sync_core_bg.wasm
             release/versions.json

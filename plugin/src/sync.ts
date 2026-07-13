@@ -1,7 +1,7 @@
 import { App, TAbstractFile, TFile, debounce, Notice } from "obsidian";
 
 /** Yield control to the JS event loop (audio, render, IPC callbacks). */
-const yieldToUI = () => new Promise<void>(r => setTimeout(r, 0));
+const yieldToUI = () => new Promise<void>(r => window.setTimeout(r, 0));
 
 /** Bytes → human-readable short form. Used in status/progress messages. */
 function formatBytes(n: number): string {
@@ -18,7 +18,7 @@ const LARGE_FILE_THRESHOLD = 1_048_576; // 1 MB
 import { ObsetyncApi } from "./api";
 import { PlatformIO } from "./platform";
 import { ObsetyncSyncBase } from "./sync-base";
-import { ObsetyncJournal, JournalEntry } from "./journal";
+import { ObsetyncJournal } from "./journal";
 import { perfSpan } from "./debug-log";
 import { pull } from "./pull";
 import { push, hashFileStreaming, streamingHash, FileChange, WasmModule, WasmTree } from "./push";
@@ -35,7 +35,7 @@ export class ObsetyncSyncEngine {
     private localRootHash: string | null;
     private pendingChanges: FileChange[] = [];
     private syncing = false;
-    private syncTimer: ReturnType<typeof setInterval> | null = null;
+    private syncTimer: number | null = null;
     private eventRefs: any[] = [];
     /** Most recent pull/push failure — surfaced by the debug panel. */
     private lastError: { ts: number; message: string; origin: string } | null = null;
@@ -140,7 +140,7 @@ export class ObsetyncSyncEngine {
 
         // 5. Start periodic pull timer.
         console.log("[obsetync] ready");
-        this.syncTimer = setInterval(() => {
+        this.syncTimer = window.setInterval(() => {
             this.pullRemote().catch((e) =>
                 console.error("[obsetync] periodic pull error:", e)
             );
@@ -150,7 +150,7 @@ export class ObsetyncSyncEngine {
     /** Stop the sync engine. */
     stop(): void {
         if (this.syncTimer) {
-            clearInterval(this.syncTimer);
+            window.clearInterval(this.syncTimer);
             this.syncTimer = null;
         }
         for (const ref of this.eventRefs) {

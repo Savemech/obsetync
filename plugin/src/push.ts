@@ -370,7 +370,7 @@ export async function push(
 }
 
 /** Yield control back to the JS event loop so Obsidian stays responsive. */
-const yieldToUI = () => new Promise<void>(r => setTimeout(r, 0));
+const yieldToUI = () => new Promise<void>(r => window.setTimeout(r, 0));
 
 /**
  * Hash file bytes via the streaming WASM Hasher — feeds data in 64 KB slices.

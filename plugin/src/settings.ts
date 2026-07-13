@@ -48,7 +48,7 @@ export class ObsetyncSettingTab extends PluginSettingTab {
         const { containerEl } = this;
         containerEl.empty();
 
-        containerEl.createEl("h2", { text: "ObsetyNC Sync" });
+        new Setting(containerEl).setName("ObsetyNC Sync").setHeading();
 
         // Connection status.
         const statusEl = containerEl.createDiv({ cls: "obsetync-status" });
@@ -116,7 +116,7 @@ export class ObsetyncSettingTab extends PluginSettingTab {
 
         // Enrollment.
         const enrollDiv = containerEl.createDiv();
-        enrollDiv.createEl("h3", { text: "Enrollment" });
+        new Setting(enrollDiv).setName("Enrollment").setHeading();
 
         if (!this.plugin.settings.enrolled) {
             let enrollCode = "";
@@ -239,7 +239,7 @@ export class ObsetyncSettingTab extends PluginSettingTab {
             );
 
         // Actions.
-        containerEl.createEl("h3", { text: "Actions" });
+        new Setting(containerEl).setName("Actions").setHeading();
 
         new Setting(containerEl)
             .setName("Sync Now")
@@ -383,8 +383,10 @@ export class ObsetyncSettingTab extends PluginSettingTab {
 
         const row = (label: string, value: string) => {
             const line = box.createDiv();
-            const l = line.createSpan({ text: `${label.padEnd(14, " ")} ` });
-            l.setAttribute("style", "color: var(--text-muted);");
+            line.createSpan({
+                text: `${label.padEnd(14, " ")} `,
+                cls: "obsetync-status-label",
+            });
             line.createSpan({ text: value });
         };
 
@@ -406,8 +408,7 @@ export class ObsetyncSettingTab extends PluginSettingTab {
 
         const err = engine?.getLastError();
         if (err) {
-            const errLine = box.createDiv();
-            errLine.setAttribute("style", "color: var(--text-error); margin-top: 4px;");
+            const errLine = box.createDiv({ cls: "obsetync-status-error" });
             errLine.setText(
                 `Last error:   [${err.origin}] ${err.message.slice(0, 120)}${
                     err.message.length > 120 ? "…" : ""
@@ -415,11 +416,10 @@ export class ObsetyncSettingTab extends PluginSettingTab {
             );
         }
 
-        const refresh = box.createEl("button", { text: "↻ Refresh" });
-        refresh.setAttribute(
-            "style",
-            "margin-top: 8px; padding: 4px 10px; font-size: 11px; cursor: pointer;"
-        );
+        const refresh = box.createEl("button", {
+            text: "↻ Refresh",
+            cls: "obsetync-refresh-btn",
+        });
         refresh.onclick = () => this.display();
     }
 }

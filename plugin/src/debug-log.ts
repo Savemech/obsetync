@@ -156,7 +156,7 @@ class ObsetyncCrashLogger {
      *  healthy sessions never create or touch the file (and never churn
      *  third-party folder syncers watching the vault). */
     private header: string | null = null;
-    private flushTimer: ReturnType<typeof setTimeout> | null = null;
+    private flushTimer: number | null = null;
     private lastFlushMs = 0;
     /** Serialises read+write cycles so appends never interleave. */
     private writeChain: Promise<void> = Promise.resolve();
@@ -204,7 +204,7 @@ class ObsetyncCrashLogger {
         window.removeEventListener("error", this.onError);
         window.removeEventListener("unhandledrejection", this.onRejection);
         if (this.flushTimer !== null) {
-            clearTimeout(this.flushTimer);
+            window.clearTimeout(this.flushTimer);
             this.flushTimer = null;
         }
         this.flushNow(); // best effort — plugin is unloading
@@ -272,7 +272,7 @@ class ObsetyncCrashLogger {
         // not wait out a debounce timer. Followers batch up for a second.
         const delay =
             Date.now() - this.lastFlushMs >= CRASH_FLUSH_MS ? 0 : CRASH_FLUSH_MS;
-        this.flushTimer = setTimeout(() => {
+        this.flushTimer = window.setTimeout(() => {
             this.flushTimer = null;
             this.flushNow();
         }, delay);

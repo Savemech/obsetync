@@ -1,4 +1,4 @@
-import { ObsetyncApi, FileDelta, FileManifest } from "./api";
+import { ObsetyncApi, FileDelta } from "./api";
 import { PlatformIO } from "./platform";
 import { ObsetyncSyncBase } from "./sync-base";
 import { hashFileStreaming, type WasmModule } from "./push";

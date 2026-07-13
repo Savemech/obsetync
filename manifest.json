@@ -1,10 +1,10 @@
 {
     "id": "obsetync",
     "name": "ObsetyNC",
-    "version": "1.3.1",
+    "version": "1.3.2",
     "minAppVersion": "1.4.0",
     "description": "Self-hosted vault sync with a content-addressed chunk store and Merkle tree — works on desktop and iOS.",
     "author": "Savemech",
-    "authorUrl": "https://github.com/Savemech/obsetync",
+    "authorUrl": "https://github.com/Savemech",
     "isDesktopOnly": false
 }
