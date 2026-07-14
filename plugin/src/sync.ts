@@ -876,7 +876,22 @@ export class ObsetyncSyncEngine {
         applied: number;
         treeParity: boolean | null;
         deltasHadMtime: boolean;
+        failedCount: number;
     }): Promise<void> {
+        // Files this pull couldn't fetch leave the tree missing content the
+        // server has. Adopting the server root as our base now would let a
+        // later fast-forward read those gaps as deletions and propagate them
+        // (the 2026-07-13 failure mode). Hold the base where it is — merges
+        // from an older base always preserve the other side's changes — and
+        // let the deferred files retry on the next pull.
+        if (result.failedCount > 0) {
+            console.warn(
+                `[obsetync] pull deferred ${result.failedCount} unfetched file(s) — ` +
+                `base root NOT advanced; retrying next pull`,
+            );
+            return;
+        }
+
         const adopt = async (hash: string) => {
             if (this.treeBaseRoot !== hash) {
                 this.treeBaseRoot = hash;
@@ -973,10 +988,17 @@ export class ObsetyncSyncEngine {
             );
             return;
         }
-        // A device that has both local state and a visible server root but no
+        // A device that has both local state and a KNOWN server root but no
         // verified base would have to fabricate its parent — exactly the lie
-        // that reverted the vault. Wait for pull to establish the base.
-        if (!this.treeBaseRoot && this.lastPullServerRoot && this.syncBase.entryCount() > 0) {
+        // that reverted the vault. The server root counts whether it came from
+        // a completed pull (lastPullServerRoot) OR merely the root we seeded
+        // from cached-root.bin at startup (localRootHash): a pull that keeps
+        // CRASHING never sets lastPullServerRoot, which used to let this guard
+        // slip and spray empty-parent putRoots (→ 400 storm, incident
+        // 2026-07-15). A genuinely-first push to an empty vault has neither
+        // signal, so it still proceeds.
+        const serverRootKnown = this.lastPullServerRoot ?? this.localRootHash;
+        if (!this.treeBaseRoot && serverRootKnown && this.syncBase.entryCount() > 0) {
             console.warn(
                 "[obsetync] push deferred: no verified base root yet " +
                 "(waiting for a pull to reconcile the tree)",

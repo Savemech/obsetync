@@ -25,6 +25,12 @@ export interface PullResult {
      *  mtime_ms (server ≥ 1.4.0). Without it exact parity is unreachable
      *  because leaf hashes cover mtime. */
     deltasHadMtime: boolean;
+    /** Files this pull could not fetch (after one retry) and DEFERRED —
+     *  left untouched on disk, excluded from the tree rebase, retried next
+     *  pull. Non-zero means the tree is knowingly missing content the server
+     *  has, so the caller must NOT advance treeBaseRoot (a later fast-forward
+     *  would read those gaps as deletions — the 2026-07-13 failure mode). */
+    failedCount: number;
 }
 
 /**
@@ -72,14 +78,18 @@ export async function pull(
                 applied: 0,
                 treeParity: null,
                 deltasHadMtime: false,
+                failedCount: 0,
             };
         }
         onDeltasKnown?.(deltaPaths(deltas));
-        await applyDeltas(api, io, syncBase, wasm, deltas, onProgress, skipPaths);
+        const failed = await applyDeltas(api, io, syncBase, wasm, deltas, onProgress, skipPaths);
 
         // Rebase: sync-base was just seeded with the full server state, so a
         // fresh bootstrap from it materializes the server's tree locally.
-        const deltasHadMtime = rebaseTree(tree, syncBase, deltas);
+        // Deferred files never got a sync-base entry, so the bootstrap already
+        // excludes them; filter the delta list too for the incremental branch.
+        const appliedDeltas = excludeDeltas(deltas, failed);
+        const deltasHadMtime = rebaseTree(tree, syncBase, appliedDeltas);
 
         // Establish newRootHash + raw root bytes from the server's current
         // root. Caller persists the bytes to cached-root.bin so restart
@@ -97,13 +107,14 @@ export async function pull(
 
         syncBase.setLastSyncTimestamp(Date.now());
         await syncBase.save();
-        onProgress?.(`first sync: applied ${deltas.length} files`);
+        onProgress?.(`first sync: applied ${deltas.length - failed.length} files`);
         return {
             newRootHash,
             newRootBytes,
-            applied: deltas.length,
+            applied: deltas.length - failed.length,
             treeParity: parity(tree, newRootHash),
             deltasHadMtime,
+            failedCount: failed.length,
         };
     }
 
@@ -145,17 +156,20 @@ export async function pull(
             applied: 0,
             treeParity: parity(tree, newRootHash),
             deltasHadMtime: false,
+            failedCount: 0,
         };
     }
 
     onProgress?.(`${deltas.length} changes to apply`);
     onDeltasKnown?.(deltaPaths(deltas));
-    await applyDeltas(api, io, syncBase, wasm, deltas, onProgress, skipPaths);
+    const failed = await applyDeltas(api, io, syncBase, wasm, deltas, onProgress, skipPaths);
 
     // Rebase the Merkle tree with the exact deltas just applied to disk +
     // sync-base. THE key invariant of the pull path: tree, sync-base, and
-    // disk advance together or not at all.
-    const deltasHadMtime = rebaseTree(tree, syncBase, deltas);
+    // disk advance together or not at all — so DEFERRED (unfetched) files are
+    // excluded here, or the tree would claim content that never hit disk.
+    const appliedDeltas = excludeDeltas(deltas, failed);
+    const deltasHadMtime = rebaseTree(tree, syncBase, appliedDeltas);
 
     // Extract the new root hash from the server's current root bytes so
     // subsequent incremental syncs know what to diff against.
@@ -176,10 +190,20 @@ export async function pull(
     return {
         newRootHash,
         newRootBytes,
-        applied: deltas.length,
+        applied: deltas.length - failed.length,
         treeParity: parity(tree, newRootHash),
         deltasHadMtime,
+        failedCount: failed.length,
     };
+}
+
+/** Drop the deferred (unfetched) deltas from a set before rebasing the tree,
+ *  so the tree never advances past content that isn't on disk. Identity match
+ *  — `failed` holds the very objects from `deltas`. */
+function excludeDeltas(deltas: FileDelta[], failed: FileDelta[]): FileDelta[] {
+    if (failed.length === 0) return deltas;
+    const drop = new Set(failed);
+    return deltas.filter((d) => !drop.has(d));
 }
 
 /** Every vault path a delta set will touch (targets + rename sources). */
@@ -311,7 +335,7 @@ async function applyDeltas(
     deltas: FileDelta[],
     onProgress?: (msg: string) => void,
     skipPaths?: Set<string>,
-): Promise<void> {
+): Promise<FileDelta[]> {
     const renames: FileDelta[] = [];
     const deletions: FileDelta[] = [];
     const modifications: FileDelta[] = [];
@@ -372,32 +396,68 @@ async function applyDeltas(
     };
 
     const toDownload = [...modifications, ...additions];
+    // Files that threw while applying (a dropped connection, a large-file
+    // manifest fetch that timed out under memory pressure on mobile). A single
+    // one of these MUST NOT abort the whole pull: a 68k-delta catch-up on a
+    // stale device would then restart from zero forever (incident 2026-07-15).
+    // We collect them, retry once, and defer whatever still fails.
+    const failed: FileDelta[] = [];
     const startedAt = Date.now();
     for (let i = 0; i < toDownload.length; i += DOWNLOAD_CONCURRENCY) {
         const batch = toDownload.slice(i, i + DOWNLOAD_CONCURRENCY);
-        await Promise.all(
+        const results = await Promise.allSettled(
             batch.map((delta) => applyContentDelta(api, io, syncBase, wasm, delta, stats))
         );
+        results.forEach((r, j) => {
+            if (r.status === "rejected") failed.push(batch[j]);
+        });
         // One tick per batch: position, what was verified-for-free vs actually
-        // downloaded, bytes moved, and the current rate — everything a human
-        // needs to see that a big pull is alive and how far along it is.
+        // downloaded, bytes moved, deferred count, and the current rate —
+        // everything a human needs to see that a big pull is alive and moving.
         const done = Math.min(i + DOWNLOAD_CONCURRENCY, toDownload.length);
         const verified = stats.cacheHit + stats.localHit;
         const elapsed = (Date.now() - startedAt) / 1000;
         const rate = elapsed > 0 ? ` · ${(done / elapsed).toFixed(0)} f/s` : "";
+        const failMsg = failed.length > 0 ? ` · ✗${failed.length} deferred` : "";
         onProgress?.(
             `${done}/${toDownload.length} files applied · ` +
-            `✓${verified} verified · ↓${stats.downloaded} (${fmtBytes(stats.bytesDownloaded)})${rate}`
+            `✓${verified} verified · ↓${stats.downloaded} (${fmtBytes(stats.bytesDownloaded)})${failMsg}${rate}`
         );
+    }
+
+    // One retry pass — most failures are transient. A file that STILL fails is
+    // deferred: disk untouched, sync-base entry unchanged, and (by the caller)
+    // excluded from the tree rebase, so the tree never claims content that
+    // isn't on disk. The next pull retries it.
+    const unfetched: FileDelta[] = [];
+    if (failed.length > 0) {
+        console.warn(`[obsetync] pull: ${failed.length} file(s) failed first pass — retrying once`);
+        for (const delta of failed) {
+            try {
+                await applyContentDelta(api, io, syncBase, wasm, delta, stats);
+            } catch (e) {
+                unfetched.push(delta);
+                console.warn(`[obsetync] pull: deferring ${delta.path}: ${String((e as any)?.message ?? e)}`);
+            }
+        }
+        if (unfetched.length > 0) {
+            console.error(
+                `[obsetync] pull: ${unfetched.length} file(s) could not be fetched — deferred to ` +
+                `next pull: ${unfetched.slice(0, 5).map((d) => d.path).join(", ")}` +
+                `${unfetched.length > 5 ? ", …" : ""}`
+            );
+        }
     }
 
     if (toDownload.length > 0) {
         console.log(
             `[obsetync] applyDeltas: ${stats.cacheHit} cache-hit, ` +
-            `${stats.localHit} local-hash-hit, ${stats.downloaded} downloaded — ` +
+            `${stats.localHit} local-hash-hit, ${stats.downloaded} downloaded, ` +
+            `${unfetched.length} deferred — ` +
             `${fmtBytes(stats.bytesSkipped)} saved, ${fmtBytes(stats.bytesDownloaded)} transferred`
         );
     }
+    return unfetched;
 }
 
 /** Human-readable byte count for progress messages. */
