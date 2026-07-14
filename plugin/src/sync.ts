@@ -15,7 +15,8 @@ function formatBytes(n: number): string {
  *  during upload via FastCDC (wasm_chunk_file returns file_hash). This keeps
  *  WASM linear memory bounded to ~1 MB per file regardless of vault content. */
 const LARGE_FILE_THRESHOLD = 1_048_576; // 1 MB
-import { ObsetyncApi } from "./api";
+import { ObsetyncApi, PushConflict } from "./api";
+import { conflictCopyPath } from "./conflict-ui";
 import { PlatformIO } from "./platform";
 import { ObsetyncSyncBase } from "./sync-base";
 import { ObsetyncJournal } from "./journal";
@@ -73,6 +74,8 @@ export class ObsetyncSyncEngine {
         private onStatusUpdate: (text: string) => void = () => {},
         initialRootHash: string | null = null,
         private syncObsidianConfig: boolean = false,
+        /** Human device name — stamped into conflict-copy filenames. */
+        private deviceName: string = "device",
     ) {
         this.localRootHash = initialRootHash;
     }
@@ -593,8 +596,17 @@ export class ObsetyncSyncEngine {
                 // Let Electron's audio/render callbacks run between every read group.
                 await yieldToUI();
 
+                // Tick every batch — the slow phase here is the HASHING, and
+                // the old placement (inside the flush guard) meant vaults with
+                // <500 changes showed "Scanning vault..." frozen to the end.
+                const done = Math.min(i + READ_CONCURRENCY, toHash.length);
+                notice.setMessage(
+                    `Obsetync: scanning ${done}/${toHash.length} · ${totalChanges} changed`,
+                );
+                this.onStatusUpdate(`⟳ ${done}/${toHash.length}`);
+                this.progressHeartbeat("fullScan", `${done}/${toHash.length} hashed, ${totalChanges} changed`);
+
                 if (pending.length >= FLUSH_BATCH) {
-                    notice.setMessage(`Syncing... ${Math.min(i + READ_CONCURRENCY, toHash.length)}/${toHash.length}`);
                     await flushPending();
                 }
             }
@@ -627,6 +639,24 @@ export class ObsetyncSyncEngine {
         this.onStatusUpdate("sync ↓");
         const endSpan = perfSpan("sync.pull");
 
+        // Live progress: every tick lands in the status bar; a persistent
+        // Notice appears only once REAL work is detected (first-sync or a
+        // non-trivial delta), so idle 30s polls stay silent. A 31-minute
+        // first-sync once ran with zero feedback because this callback was
+        // simply never passed — pull's per-batch ticks all landed in void.
+        // (ref-object because TS control-flow can't see the closure assign)
+        const noticeRef: { n: Notice | null } = { n: null };
+        const progress = (msg: string) => {
+            this.onStatusUpdate(`↓ ${msg}`);
+            const isRealWork = /files applied|changes to apply|first sync/.test(msg);
+            if (noticeRef.n) {
+                noticeRef.n.setMessage(`Obsetync ↓ ${msg}`);
+            } else if (isRealWork) {
+                noticeRef.n = new Notice(`Obsetync ↓ ${msg}`, 0);
+            }
+            this.progressHeartbeat("pull", msg);
+        };
+
         try {
             const result = await pull(
                 this.api,
@@ -638,12 +668,18 @@ export class ObsetyncSyncEngine {
                 this.treeBaseRoot ?? this.localRootHash,
                 this.wasm,
                 this.tree,
-                undefined,
+                progress,
                 // Vault events for paths the pull itself writes are echoes,
                 // not user edits — register them before apply starts.
                 (paths) => {
                     for (const p of paths) this.expectedPullWrites.add(p);
                 },
+                // Editor safety: paths with UNSYNCED local edits keep their
+                // disk bytes — the queued push + server merge reconcile them.
+                // Without this, the startup order (pull → journal recovery)
+                // could overwrite last session's edits before recovery reads
+                // them.
+                this.unsyncedLocalPaths(),
             );
             if (result.newRootHash) {
                 this.localRootHash = result.newRootHash;
@@ -657,6 +693,7 @@ export class ObsetyncSyncEngine {
             this.onStatusUpdate("sync ✗");
         } finally {
             endSpan();
+            noticeRef.n?.hide();
             this.expectedPullWrites.clear();
             this.syncing = false;
             if (this.state !== "error") {
@@ -665,6 +702,31 @@ export class ObsetyncSyncEngine {
             }
             // Drain user edits that arrived while we were syncing.
             if (this.pendingChanges.length > 0) this.debouncedPush?.();
+        }
+    }
+
+    /** Every path whose newest bytes exist only locally: queued-but-unpushed
+     *  changes plus unsynced journal entries. Pull must not overwrite these. */
+    private unsyncedLocalPaths(): Set<string> {
+        const paths = new Set<string>();
+        for (const c of this.pendingChanges) paths.add(c.path);
+        try {
+            for (const e of this.journal.unsynced()) paths.add(e.path);
+        } catch {
+            // Journal unavailable — pending queue alone still protects live edits.
+        }
+        return paths;
+    }
+
+    /** Rate-limited progress line into the console/debug ring buffer, so
+     *  long operations leave a visible trail in the debug panel even when
+     *  nobody is watching the status bar (at most one line per 5s). */
+    private lastHeartbeatMs = 0;
+    private progressHeartbeat(op: string, msg: string): void {
+        const now = Date.now();
+        if (now - this.lastHeartbeatMs >= 5000) {
+            this.lastHeartbeatMs = now;
+            console.log(`[obsetync] ${op} progress: ${msg}`);
         }
     }
 
@@ -851,6 +913,15 @@ export class ObsetyncSyncEngine {
             if (result.newRootHash) {
                 this.localRootHash = result.newRootHash;
             }
+            // Unmergeable same-file divergences: the server kept the OTHER
+            // side in the tree and our version lost. Preserve our bytes as a
+            // conflict copy NOW — the next pull will overwrite the original
+            // path with the winner. The copy then syncs out as a normal new
+            // file, visible on every device.
+            if (result.conflicts.length > 0) {
+                await this.preserveConflictCopies(result.conflicts as PushConflict[]);
+            }
+
             // Our just-pushed root is now in the server's history, so it is a
             // valid (and honest) base for the next push — on a fast-forward it
             // IS the server's current root; after a server-side merge the next
@@ -890,6 +961,50 @@ export class ObsetyncSyncEngine {
         }
     }
 
+    /** Preserve OUR losing side of unmergeable conflicts as sibling copies
+     *  ("doc (conflict Laptop 2026-07-14 0132).md"). Content comes from the
+     *  server by our own side_b hash — we uploaded that blob moments ago, so
+     *  it is authoritative even if the local file changed since. Falls back
+     *  to the local bytes when the blob fetch fails (e.g. large chunked
+     *  files, which never text-merge and aren't blob-addressable). */
+    private async preserveConflictCopies(conflicts: PushConflict[]): Promise<void> {
+        let preserved = 0;
+        const now = new Date();
+        for (const c of conflicts) {
+            if (!c.path || !c.side_b_hash) continue;
+            const copyPath = conflictCopyPath(c.path, this.deviceName, now);
+            try {
+                let bytes: Uint8Array | null = null;
+                try {
+                    bytes = await this.api.getContent(c.side_b_hash);
+                } catch {
+                    // Blob not fetchable (chunked large file) — use the local
+                    // file, which still holds our losing bytes until the next
+                    // pull applies the winner.
+                    bytes = await this.io.readFile(c.path);
+                }
+                if (!bytes) continue;
+                await this.io.writeFile(copyPath, bytes);
+                preserved++;
+                console.log(
+                    `[obsetync] conflict on ${c.path} — our version preserved as ${copyPath}`,
+                );
+            } catch (e) {
+                console.error(`[obsetync] failed to preserve conflict copy for ${c.path}:`, e);
+            }
+        }
+        if (preserved > 0) {
+            new Notice(
+                `Obsetync: ${preserved} conflict${preserved > 1 ? "s" : ""} — your version${
+                    preserved > 1 ? "s were" : " was"
+                } saved as "(conflict …)" cop${preserved > 1 ? "ies" : "y"} next to the file${
+                    preserved > 1 ? "s" : ""
+                }. Use the "Show sync conflicts" command to resolve.`,
+                12000,
+            );
+        }
+    }
+
     /** Layer 2: recover unsynced entries from the persistent journal. */
     private async recoverFromJournal(): Promise<void> {
         const unsynced = this.journal.unsynced();
@@ -898,7 +1013,12 @@ export class ObsetyncSyncEngine {
         console.log(
             `[obsetync] recovering ${unsynced.length} changes from journal`
         );
+        const notice =
+            unsynced.length >= 20
+                ? new Notice(`Obsetync: recovering ${unsynced.length} journaled changes…`, 0)
+                : null;
 
+        let processed = 0;
         for (const entry of unsynced) {
             if (entry.action === "deleted") {
                 this.pendingChanges.push({ action: "deleted", path: entry.path });
@@ -914,7 +1034,12 @@ export class ObsetyncSyncEngine {
                     // File might have been deleted since journal entry.
                 }
             }
+            processed++;
+            this.onStatusUpdate(`⟳ journal ${processed}/${unsynced.length}`);
+            notice?.setMessage(`Obsetync: journal recovery ${processed}/${unsynced.length}`);
+            this.progressHeartbeat("journal", `${processed}/${unsynced.length}`);
         }
+        notice?.hide();
 
         if (this.pendingChanges.length > 0) {
             await this.pushPending();
@@ -945,6 +1070,10 @@ export class ObsetyncSyncEngine {
         if (toHash.length === 0) return;
 
         const READ_CONCURRENCY = 4;
+        const notice =
+            toHash.length >= 20
+                ? new Notice(`Obsetync: checking ${toHash.length} recently-touched files…`, 0)
+                : null;
         let found = 0;
         for (let i = 0; i < toHash.length; i += READ_CONCURRENCY) {
             const batch = toHash.slice(i, i + READ_CONCURRENCY);
@@ -972,7 +1101,12 @@ export class ObsetyncSyncEngine {
                 this.pendingChanges.push(change);
             }
             await yieldToUI();
+            const done = Math.min(i + READ_CONCURRENCY, toHash.length);
+            this.onStatusUpdate(`⟳ scan ${done}/${toHash.length}`);
+            notice?.setMessage(`Obsetync: mtime scan ${done}/${toHash.length} · ${found} changed`);
+            this.progressHeartbeat("mtimeScan", `${done}/${toHash.length}, ${found} changed`);
         }
+        notice?.hide();
 
         if (found > 0) {
             console.log(`[obsetync] mtime scan found ${found} unsynced changes`);

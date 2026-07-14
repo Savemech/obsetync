@@ -18,16 +18,26 @@ export interface FileDelta {
     mtime_ms?: number;
 }
 
+/** One unmergeable same-file divergence from a server-side merge. The server
+ *  keeps side A (its current) in the tree; side B's blob stays retrievable by
+ *  `side_b_hash` so the losing device can preserve its version as a conflict
+ *  copy. (This mirrors the server's actual JSON — an earlier version of this
+ *  type described a resolution/preserved_as flow that never existed.) */
+export interface PushConflict {
+    path: string;
+    base_hash: string;
+    side_a_hash: string;
+    side_b_hash: string;
+}
+
 export interface PushResult {
     accepted?: boolean;
     merged?: boolean;
     root_hash: string;
-    conflicts?: Array<{
-        path: string;
-        resolution: string;
-        preserved_as?: string;
-    }>;
+    conflicts?: PushConflict[];
     auto_resolved?: number;
+    /** Same-file two-sided text edits line-merged server-side (server ≥ 1.5.0). */
+    text_merged?: number;
 }
 
 export interface FileManifest {

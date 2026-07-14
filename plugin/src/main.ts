@@ -377,6 +377,7 @@ export default class ObsetyncPlugin extends Plugin {
             (text) => this.updateStatusBar(text),
             cachedRootHash,
             this.settings.syncObsidianConfig,
+            this.settings.deviceName || "device",
         );
 
         // Start.

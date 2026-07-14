@@ -47,6 +47,14 @@ export async function pull(
      *  old_paths, deletions) BEFORE any disk write, so the engine can tell
      *  its own write-echo vault events apart from real user edits. */
     onDeltasKnown?: (paths: string[]) => void,
+    /** Paths with UNSYNCED local edits (pending queue / journal). Their disk
+     *  state is newer than anything the server can send — applying the
+     *  server's version would overwrite bytes that exist nowhere else (the
+     *  startup order is pull → journal recovery, so a journaled edit from
+     *  last session would be clobbered before recovery ever reads it).
+     *  These paths are skipped on DISK but still applied to the tree: the
+     *  local edit pushes right after, and the server merge reconciles. */
+    skipPaths?: Set<string>,
 ): Promise<PullResult> {
     // --- First-time client: bulk-seed from the server ------------------
     //
@@ -67,7 +75,7 @@ export async function pull(
             };
         }
         onDeltasKnown?.(deltaPaths(deltas));
-        await applyDeltas(api, io, syncBase, wasm, deltas, onProgress);
+        await applyDeltas(api, io, syncBase, wasm, deltas, onProgress, skipPaths);
 
         // Rebase: sync-base was just seeded with the full server state, so a
         // fresh bootstrap from it materializes the server's tree locally.
@@ -142,7 +150,7 @@ export async function pull(
 
     onProgress?.(`${deltas.length} changes to apply`);
     onDeltasKnown?.(deltaPaths(deltas));
-    await applyDeltas(api, io, syncBase, wasm, deltas, onProgress);
+    await applyDeltas(api, io, syncBase, wasm, deltas, onProgress, skipPaths);
 
     // Rebase the Merkle tree with the exact deltas just applied to disk +
     // sync-base. THE key invariant of the pull path: tree, sync-base, and
@@ -302,16 +310,35 @@ async function applyDeltas(
     wasm: WasmModule | null,
     deltas: FileDelta[],
     onProgress?: (msg: string) => void,
+    skipPaths?: Set<string>,
 ): Promise<void> {
     const renames: FileDelta[] = [];
     const deletions: FileDelta[] = [];
     const modifications: FileDelta[] = [];
     const additions: FileDelta[] = [];
+    const deferred: string[] = [];
     for (const d of deltas) {
+        // Locally-edited paths keep their disk bytes; the pending push +
+        // server merge reconcile them. (Renames are included when either
+        // end touches an edited path.)
+        if (
+            skipPaths &&
+            (skipPaths.has(d.path) || (d.old_path !== undefined && skipPaths.has(d.old_path)))
+        ) {
+            deferred.push(d.path);
+            continue;
+        }
         if (d.action === "renamed") renames.push(d);
         else if (d.action === "deleted") deletions.push(d);
         else if (d.action === "modified") modifications.push(d);
         else additions.push(d);
+    }
+    if (deferred.length > 0) {
+        console.log(
+            `[obsetync] pull deferred ${deferred.length} locally-edited file(s): ` +
+            `${deferred.slice(0, 3).join(", ")}${deferred.length > 3 ? ", …" : ""} — ` +
+            `local bytes win until the pending push merges them`,
+        );
     }
 
     for (const delta of renames) {
@@ -345,26 +372,39 @@ async function applyDeltas(
     };
 
     const toDownload = [...modifications, ...additions];
+    const startedAt = Date.now();
     for (let i = 0; i < toDownload.length; i += DOWNLOAD_CONCURRENCY) {
         const batch = toDownload.slice(i, i + DOWNLOAD_CONCURRENCY);
         await Promise.all(
             batch.map((delta) => applyContentDelta(api, io, syncBase, wasm, delta, stats))
         );
+        // One tick per batch: position, what was verified-for-free vs actually
+        // downloaded, bytes moved, and the current rate — everything a human
+        // needs to see that a big pull is alive and how far along it is.
+        const done = Math.min(i + DOWNLOAD_CONCURRENCY, toDownload.length);
+        const verified = stats.cacheHit + stats.localHit;
+        const elapsed = (Date.now() - startedAt) / 1000;
+        const rate = elapsed > 0 ? ` · ${(done / elapsed).toFixed(0)} f/s` : "";
         onProgress?.(
-            `${Math.min(i + DOWNLOAD_CONCURRENCY, toDownload.length)}/${toDownload.length} files applied`
+            `${done}/${toDownload.length} files applied · ` +
+            `✓${verified} verified · ↓${stats.downloaded} (${fmtBytes(stats.bytesDownloaded)})${rate}`
         );
     }
 
     if (toDownload.length > 0) {
-        const fmt = (n: number) => (n >= 1_048_576)
-            ? `${(n / 1_048_576).toFixed(1)} MB`
-            : n >= 1024 ? `${(n / 1024).toFixed(0)} KB` : `${n} B`;
         console.log(
             `[obsetync] applyDeltas: ${stats.cacheHit} cache-hit, ` +
             `${stats.localHit} local-hash-hit, ${stats.downloaded} downloaded — ` +
-            `${fmt(stats.bytesSkipped)} saved, ${fmt(stats.bytesDownloaded)} transferred`
+            `${fmtBytes(stats.bytesSkipped)} saved, ${fmtBytes(stats.bytesDownloaded)} transferred`
         );
     }
+}
+
+/** Human-readable byte count for progress messages. */
+function fmtBytes(n: number): string {
+    if (n >= 1_048_576) return `${(n / 1_048_576).toFixed(1)} MB`;
+    if (n >= 1024) return `${(n / 1024).toFixed(0)} KB`;
+    return `${n} B`;
 }
 
 async function applyContentDelta(
