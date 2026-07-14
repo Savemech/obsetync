@@ -448,6 +448,9 @@ pub struct PutRootResponse {
     pub conflicts: Vec<FileConflictWire>,
     #[serde(default)]
     pub auto_resolved: usize,
+    /// Same-file two-sided text edits merged at the content level (1.5.0+).
+    #[serde(default)]
+    pub text_merged: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

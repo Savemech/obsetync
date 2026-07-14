@@ -1,26 +1,33 @@
 use std::path::PathBuf;
 use sync_core::chunk::RootNode;
+use sync_core::content_store::DiskContentStore;
 use sync_core::diff::FileDelta;
 use sync_core::merge::MergeResult;
 use sync_core::store::DiskChunkStore;
 
 /// Run sync-core's `merge_trees` in a blocking task with a LocalSet
 /// to handle the `!Send` futures from `ChunkStore` trait.
+///
+/// `content_base` is the small-blob content root (`<data>/content`) — the
+/// merge reads base/A/B file bytes from it for content-level text merges
+/// and writes merged blobs back so pullers can fetch them by hash.
 pub async fn run_merge(
     index_base: PathBuf,
+    content_base: PathBuf,
     base: RootNode,
     side_a: RootNode,
     side_b: RootNode,
 ) -> Result<MergeResult, String> {
     tokio::task::spawn_blocking(move || {
         let store = DiskChunkStore::new(&index_base);
+        let content = DiskContentStore::new(&content_base);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| e.to_string())?;
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async {
-            sync_core::merge::merge_trees(&store, &base, &side_a, &side_b)
+            sync_core::merge::merge_trees(&store, &content, &base, &side_a, &side_b)
                 .await
                 .map_err(|e| e.to_string())
         })
@@ -120,9 +127,15 @@ mod tests {
         let side_a =
             build_tree_on_disk(dir.path().to_path_buf(), vec![make_entry("a.md", "y")]).await;
         let side_b = base.clone();
-        let result = run_merge(dir.path().to_path_buf(), base, side_a, side_b)
-            .await
-            .unwrap();
+        let result = run_merge(
+            dir.path().to_path_buf(),
+            dir.path().join("content"),
+            base,
+            side_a,
+            side_b,
+        )
+        .await
+        .unwrap();
         assert!(result.file_conflicts.is_empty());
         assert_eq!(result.new_root.total_files, 1);
     }
@@ -136,9 +149,15 @@ mod tests {
             build_tree_on_disk(dir.path().to_path_buf(), vec![make_entry("a.md", "side-a")]).await;
         let side_b =
             build_tree_on_disk(dir.path().to_path_buf(), vec![make_entry("a.md", "side-b")]).await;
-        let result = run_merge(dir.path().to_path_buf(), base, side_a, side_b)
-            .await
-            .unwrap();
+        let result = run_merge(
+            dir.path().to_path_buf(),
+            dir.path().join("content"),
+            base,
+            side_a,
+            side_b,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.file_conflicts.len(), 1);
         assert_eq!(result.file_conflicts[0].path, "a.md");
     }

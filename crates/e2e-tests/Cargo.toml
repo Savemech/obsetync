@@ -62,3 +62,13 @@ required-features = ["e2e"]
 name = "stale_tree_revert"
 path = "tests/stale_tree_revert.rs"
 required-features = ["e2e"]
+
+[[test]]
+name = "concurrency"
+path = "tests/concurrency.rs"
+required-features = ["e2e"]
+
+[[test]]
+name = "text_merge"
+path = "tests/text_merge.rs"
+required-features = ["e2e"]

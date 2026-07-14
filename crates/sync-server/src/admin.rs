@@ -470,6 +470,11 @@ async fn rollback_vault(
         .get_root(&vault_id, &hash)
         .ok_or_else(|| ServerErrorHtml("root not found in history".into()))?;
 
+    // Same per-vault write lock as put_root — a rollback racing an in-flight
+    // push is the same lost-update bug in admin clothing.
+    let vault_lock = state.vault_lock(&vault_id);
+    let _vault_guard = vault_lock.lock().await;
+
     state
         .vaults
         .set_current_root(&vault_id, &hash)

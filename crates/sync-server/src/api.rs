@@ -506,6 +506,16 @@ async fn put_root(
     let idx_path = state.layout.index_path(&incoming_hash);
     write_blob(&idx_path, &incoming_bytes)?;
 
+    // Serialize the read-modify-write on `current` per vault. Without this,
+    // two concurrent pushes both observe the same current, both pass the
+    // fast-forward check (or merge against a stale current), and the second
+    // set_current_root silently drops the first push. Held across the guard
+    // scan and merge awaits by design — pushes to ONE vault are serialized
+    // (ms for fast-forwards, worst-case seconds for a huge merge), different
+    // vaults never contend.
+    let vault_lock = state.vault_lock(&vault_id);
+    let _vault_guard = vault_lock.lock().await;
+
     let current_root_hash = state.vaults.get_current_root(&vault_id);
 
     match current_root_hash {
@@ -586,12 +596,20 @@ async fn put_root(
                 let base_root = sync_core::chunk::RootNode::deserialize(&base_data)
                     .map_err(|e| ServerError::Internal(format!("corrupt base root: {}", e)))?;
 
-                // Run merge via the bridge (handles !Send).
+                // Run merge via the bridge (handles !Send). The content root
+                // lets the merge line-merge same-file text edits and store
+                // the merged blob where pullers fetch content by hash.
                 let index_base = state.layout.base.join("index");
-                let merge_result =
-                    bridge::run_merge(index_base, base_root, current_root, incoming_root)
-                        .await
-                        .map_err(|e| ServerError::Internal(format!("merge failed: {}", e)))?;
+                let content_base = state.layout.base.join("content");
+                let merge_result = bridge::run_merge(
+                    index_base,
+                    content_base,
+                    base_root,
+                    current_root,
+                    incoming_root,
+                )
+                .await
+                .map_err(|e| ServerError::Internal(format!("merge failed: {}", e)))?;
 
                 let merged_hash = merge_result.new_root.hash();
                 let merged_bytes = merge_result.new_root.serialize();
@@ -640,6 +658,7 @@ async fn put_root(
                     parent = %&hash_to_hex(&parent_hash)[..16],
                     current = %&hash_to_hex(&current_hash)[..16],
                     auto_resolved = merge_result.auto_resolved_count,
+                    text_merged = merge_result.text_merged_count,
                     conflicts = conflicts.len(),
                     "put_root: merged divergent roots"
                 );
@@ -651,6 +670,7 @@ async fn put_root(
                         "root_hash": hash_to_hex(&merged_hash),
                         "conflicts": conflicts,
                         "auto_resolved": merge_result.auto_resolved_count,
+                        "text_merged": merge_result.text_merged_count,
                     })
                     .to_string(),
                 ))
