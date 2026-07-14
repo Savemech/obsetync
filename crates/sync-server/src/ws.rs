@@ -291,6 +291,40 @@ async fn session_v2(
                                     );
                                 }
                             }
+                            Some("ops") => {
+                                // Ph4 live co-editing: an opaque Yjs update for
+                                // one note. Persist it to the durable log
+                                // (durability never depends on any one client)
+                                // and fan the SAME frame out to the note's
+                                // peers; the server never interprets the blob.
+                                let vault = v.get("vault").and_then(|x| x.as_str()).unwrap_or("");
+                                let note = v.get("note").and_then(|x| x.as_str()).unwrap_or("");
+                                if !note.is_empty() && vaults.iter().any(|s| s == vault) {
+                                    if let Some(b64) = v.get("update").and_then(|x| x.as_str()) {
+                                        use base64::prelude::*;
+                                        match BASE64_STANDARD.decode(b64) {
+                                            Ok(update)
+                                                if update.len() <= crate::crdt::MAX_UPDATE_BYTES =>
+                                            {
+                                                if let Err(e) = crate::crdt::append(
+                                                    &state.layout,
+                                                    vault,
+                                                    note,
+                                                    &update,
+                                                ) {
+                                                    tracing::warn!(vault, note, err = %e, "ws: crdt append failed");
+                                                }
+                                                state.publish_frame(vault, inner.clone());
+                                            }
+                                            Ok(_) => tracing::warn!(
+                                                device = %device_short,
+                                                "ws: oversized crdt update dropped"
+                                            ),
+                                            Err(_) => {} // malformed base64 — ignore
+                                        }
+                                    }
+                                }
+                            }
                             _ => {} // re-subs etc. ignored in v2.0
                         }
                     }

@@ -263,6 +263,11 @@ pub fn sync_router(state: SharedState) -> Router {
         )
         .route("/api/v1/rollback/{vault_id}", post(post_rollback))
         .route("/api/v1/ws-ticket", post(post_ws_ticket))
+        // Ph4 CRDT: fetch a note's durable update log (bootstrap a hot doc);
+        // replace it with a compacted snapshot. Live deltas flow over the WS
+        // `ops` frame; these two ride the sealed HTTP channel.
+        .route("/api/v1/crdt/{vault_id}", post(post_crdt_get))
+        .route("/api/v1/crdt/{vault_id}/compact", post(post_crdt_compact))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             secure_envelope,
@@ -574,6 +579,51 @@ async fn post_ws_ticket(
             "server_eph_pub": outcome.server_eph_pub_b64,
         })
         .to_string(),
+    ))
+}
+
+/// POST /api/v1/crdt/{vault_id} — body is the note path (UTF-8). Returns the
+/// note's raw durable update log (`[u32 len][blob]`… frames) so a device can
+/// bootstrap the Yjs doc by applying each frame. Empty body on a fresh note.
+async fn post_crdt_get(
+    State(state): State<SharedState>,
+    Path(vault_id): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<impl IntoResponse, ServerError> {
+    let note = std::str::from_utf8(&body)
+        .map_err(|_| ServerError::BadRequest("note path not UTF-8".into()))?;
+    let log = crate::crdt::read_log(&state.layout, &vault_id, note)
+        .map_err(|e| ServerError::Internal(format!("crdt read: {}", e)))?;
+    Ok((StatusCode::OK, log))
+}
+
+/// POST /api/v1/crdt/{vault_id}/compact — body is
+/// `[u16 LE path_len][note path][snapshot update]`. Replaces the note's log
+/// with one compacted Yjs update (client sends encodeStateAsUpdateV2 when the
+/// log grows or the note goes cold). Atomic replace.
+async fn post_crdt_compact(
+    State(state): State<SharedState>,
+    Path(vault_id): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<impl IntoResponse, ServerError> {
+    if body.len() < 2 {
+        return Err(ServerError::BadRequest("compact body too short".into()));
+    }
+    let path_len = u16::from_le_bytes([body[0], body[1]]) as usize;
+    if body.len() < 2 + path_len {
+        return Err(ServerError::BadRequest(
+            "compact body: bad path length".into(),
+        ));
+    }
+    let note = std::str::from_utf8(&body[2..2 + path_len])
+        .map_err(|_| ServerError::BadRequest("note path not UTF-8".into()))?
+        .to_owned();
+    let snapshot = &body[2 + path_len..];
+    crate::crdt::compact(&state.layout, &vault_id, &note, snapshot)
+        .map_err(|e| ServerError::Internal(format!("crdt compact: {}", e)))?;
+    Ok((
+        StatusCode::OK,
+        serde_json::json!({ "ok": true }).to_string(),
     ))
 }
 

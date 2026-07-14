@@ -400,3 +400,119 @@ async fn v2_presence_roundtrip_between_sessions() {
     .expect("no offline frame");
     assert_eq!(offline["name"], "presence-bob");
 }
+
+// --- Ph4: CRDT op relay + durable per-note log --------------------------------
+
+/// Split a raw CRDT log ([u32 LE len][blob]…) into blobs (mirrors the server).
+fn split_crdt_frames(log: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 4 <= log.len() {
+        let len = u32::from_le_bytes([log[i], log[i + 1], log[i + 2], log[i + 3]]) as usize;
+        i += 4;
+        if i + len > log.len() {
+            break;
+        }
+        out.push(log[i..i + len].to_vec());
+        i += len;
+    }
+    out
+}
+
+#[tokio::test]
+async fn crdt_ops_relay_and_durable_log() {
+    let env = harness().await;
+    let vault = unique_vault_id("crdt");
+    let a = WireClient::new(&env, env.enroll_device("crdt-a").await.unwrap());
+    let b = WireClient::new(&env, env.enroll_device("crdt-b").await.unwrap());
+    // Vault must exist.
+    push_vault_snapshot(
+        &a,
+        &vault,
+        &[("seed.md".to_string(), b"x\n".to_vec())],
+        ZERO_HASH_HEX,
+    )
+    .await
+    .unwrap();
+
+    let (mut ws_a, mut crypto_a) = v2::open_v2_session(&env, &a, &vault).await;
+    let (mut ws_b, mut crypto_b) = v2::open_v2_session(&env, &b, &vault).await;
+
+    let note = "notes/live.md";
+    let update = b"YJS-UPDATE-ONE".to_vec();
+    use base64::prelude::*;
+    let ops = serde_json::json!({
+        "v": 2, "t": "ops", "vault": vault, "note": note,
+        "update": BASE64_STANDARD.encode(&update),
+    })
+    .to_string();
+
+    // A publishes one op.
+    ws_a.send(Message::Binary(crypto_a.seal(&ops).into()))
+        .await
+        .unwrap();
+
+    // (1) RELAY: B receives the exact op frame.
+    let seen = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match ws_b.next().await {
+                Some(Ok(Message::Binary(data))) => {
+                    let v = crypto_b.open(&data);
+                    if v["t"] == "ops" && v["note"] == note {
+                        return v;
+                    }
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("ws_b ended: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("B never received the relayed op");
+    assert_eq!(
+        BASE64_STANDARD
+            .decode(seen["update"].as_str().unwrap())
+            .unwrap(),
+        update,
+        "relayed op must carry A's exact update bytes",
+    );
+
+    // (2) DURABILITY: a fresh device fetches the note's log over sealed HTTP
+    // and finds A's update — durability doesn't depend on any client staying.
+    let c = WireClient::new(&env, env.enroll_device("crdt-c").await.unwrap());
+    let r = c
+        .raw("POST", &format!("/api/v1/crdt/{vault}"), note.as_bytes())
+        .await
+        .unwrap();
+    assert!(r.status.is_success(), "crdt get: {}", r.status);
+    let frames = split_crdt_frames(&r.body);
+    assert_eq!(
+        frames,
+        vec![update.clone()],
+        "durable log must hold A's update"
+    );
+
+    // (3) COMPACT: replace the log with a snapshot; the log is now just that.
+    let snapshot = b"YJS-SNAPSHOT-V2".to_vec();
+    let mut compact_body = (note.len() as u16).to_le_bytes().to_vec();
+    compact_body.extend_from_slice(note.as_bytes());
+    compact_body.extend_from_slice(&snapshot);
+    let r = c
+        .raw(
+            "POST",
+            &format!("/api/v1/crdt/{vault}/compact"),
+            &compact_body,
+        )
+        .await
+        .unwrap();
+    assert!(r.status.is_success(), "crdt compact: {}", r.status);
+    let r = c
+        .raw("POST", &format!("/api/v1/crdt/{vault}"), note.as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(
+        split_crdt_frames(&r.body),
+        vec![snapshot],
+        "after compaction the log is exactly the snapshot",
+    );
+}

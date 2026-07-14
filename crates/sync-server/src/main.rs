@@ -3,6 +3,7 @@ mod api;
 mod box_key;
 mod bridge;
 mod config;
+mod crdt;
 mod devices;
 mod enrollment;
 mod error;

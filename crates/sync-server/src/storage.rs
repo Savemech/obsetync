@@ -85,6 +85,18 @@ impl StorageLayout {
         std::fs::create_dir_all(self.vault_roots_dir(vault_id))
     }
 
+    // --- CRDT logs (Ph4: live co-editing) ---
+
+    /// Append-only log of Yjs update blobs for one hot note. `note_hash_hex`
+    /// is a hash of the note path (computed by the caller) so arbitrary note
+    /// paths can't traverse the filesystem.
+    pub fn crdt_log_path(&self, vault_id: &str, note_hash_hex: &str) -> PathBuf {
+        self.base
+            .join("crdt")
+            .join(vault_id)
+            .join(format!("{}.log", note_hash_hex))
+    }
+
     // --- Devices ---
 
     pub fn device_dir(&self, fingerprint: &str) -> PathBuf {
