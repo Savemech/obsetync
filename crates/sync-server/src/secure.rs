@@ -341,7 +341,11 @@ mod tests {
                 Nonce::from_slice(&nonce),
                 Payload {
                     msg: ct,
-                    aad: &build_response_aad("PUT", "/api/v1/root/example-vault", &decrypted.nonce_req),
+                    aad: &build_response_aad(
+                        "PUT",
+                        "/api/v1/root/example-vault",
+                        &decrypted.nonce_req,
+                    ),
                 },
             )
             .unwrap();
@@ -369,8 +373,10 @@ mod tests {
         let wire_a = make_wire();
         let wire_b = make_wire();
 
-        let dec_a = decrypt_request(&wire_a, &server_priv, "GET", "/api/v1/root/example-vault").unwrap();
-        let dec_b = decrypt_request(&wire_b, &server_priv, "GET", "/api/v1/root/example-vault").unwrap();
+        let dec_a =
+            decrypt_request(&wire_a, &server_priv, "GET", "/api/v1/root/example-vault").unwrap();
+        let dec_b =
+            decrypt_request(&wire_b, &server_priv, "GET", "/api/v1/root/example-vault").unwrap();
         assert_ne!(dec_a.nonce_req, dec_b.nonce_req);
         // Both requests rode the same client keypair — one session secret,
         // exactly like the real plugin's per-session channel. The request
