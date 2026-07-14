@@ -42,3 +42,6 @@ tasks/
 *.pem
 *.key
 obsetync-test-plan.md
+
+# local, never committed — real names for the pre-commit guard
+.secrets-denylist
