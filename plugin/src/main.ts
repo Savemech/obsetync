@@ -179,6 +179,14 @@ export default class ObsetyncPlugin extends Plugin {
                 push(`sync-base entries: ${baseCount}`);
                 push(`Vault file count:  ${this.syncEngine.getVaultFileCount()}`);
                 push(`Last sync (ts):    ${fmt(this.syncEngine.getLastSyncTimestamp())}`);
+                const wsState = this.syncEngine.getWsState();
+                const wsAge = this.syncEngine.getWsLastFrameAgeMs();
+                push(
+                    `Realtime (WS):     ${wsState}` +
+                    (wsState === "connected" && wsAge >= 0
+                        ? ` · last frame ${Math.round(wsAge / 1000)}s ago`
+                        : ""),
+                );
                 const err = this.syncEngine.getLastError();
                 if (err) {
                     push(`Last error:        [${err.origin}] ${err.message}`);
@@ -383,6 +391,7 @@ export default class ObsetyncPlugin extends Plugin {
             cachedRootHash,
             this.settings.syncObsidianConfig,
             this.settings.deviceName || "device",
+            this.settings.realtimeWs,
         );
 
         // Start.

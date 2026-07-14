@@ -30,6 +30,12 @@ pub struct AppState {
     /// mutex it hands out IS held across the whole critical section,
     /// including merge and guard-scan awaits.
     vault_locks: StdMutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    /// Per-vault "root changed" broadcast — the Ph2 notify channel's fan-out.
+    /// Publishers fire-and-forget after every set_current_root; WebSocket
+    /// sessions subscribe per vault. Send is sync and non-blocking; a
+    /// receiver that lags past the 16-message buffer just misses frames and
+    /// falls back to its regular poll (data never depends on this channel).
+    notifiers: StdMutex<HashMap<String, tokio::sync::broadcast::Sender<String>>>,
 }
 
 impl AppState {
@@ -51,6 +57,7 @@ impl AppState {
             server_priv_bytes: priv_bytes,
             started_at: Instant::now(),
             vault_locks: StdMutex::new(HashMap::new()),
+            notifiers: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -63,6 +70,31 @@ impl AppState {
             .entry(vault_id.to_string())
             .or_default()
             .clone()
+    }
+
+    /// Announce a new current root to any live WebSocket subscribers.
+    /// No subscribers → no channel is even created; never blocks.
+    pub fn notify_root_changed(&self, vault_id: &str, root_hex: &str) {
+        let sender = self
+            .notifiers
+            .lock()
+            .expect("notifiers poisoned")
+            .get(vault_id)
+            .cloned();
+        if let Some(tx) = sender {
+            // Err just means nobody is listening right now — fine.
+            let _ = tx.send(root_hex.to_string());
+        }
+    }
+
+    /// Subscribe to a vault's root changes (creates the channel on first use).
+    pub fn subscribe_roots(&self, vault_id: &str) -> tokio::sync::broadcast::Receiver<String> {
+        self.notifiers
+            .lock()
+            .expect("notifiers poisoned")
+            .entry(vault_id.to_string())
+            .or_insert_with(|| tokio::sync::broadcast::channel(16).0)
+            .subscribe()
     }
 }
 

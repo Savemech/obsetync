@@ -17,6 +17,7 @@ function formatBytes(n: number): string {
 const LARGE_FILE_THRESHOLD = 1_048_576; // 1 MB
 import { ObsetyncApi, PushConflict } from "./api";
 import { conflictCopyPath } from "./conflict-ui";
+import { ObsetyncWsChannel, WsState } from "./ws";
 import { PlatformIO } from "./platform";
 import { ObsetyncSyncBase } from "./sync-base";
 import { ObsetyncJournal } from "./journal";
@@ -76,9 +77,17 @@ export class ObsetyncSyncEngine {
         private syncObsidianConfig: boolean = false,
         /** Human device name — stamped into conflict-copy filenames. */
         private deviceName: string = "device",
+        /** Ph2 notify channel: server pushes "root changed" over WebSocket;
+         *  polling drops to a slow safety-net cadence while it's alive. */
+        private realtimeWs: boolean = true,
     ) {
         this.localRootHash = initialRootHash;
     }
+
+    /** The WS notify channel (null when disabled or before start()). */
+    private wsChannel: ObsetyncWsChannel | null = null;
+    /** Epoch-ms of the last completed pull — drives the slow-poll decision. */
+    private lastPullDoneMs = 0;
 
     getState(): SyncState {
         return this.state;
@@ -190,13 +199,30 @@ export class ObsetyncSyncEngine {
         console.log("[obsetync] step 4: attach vault listeners");
         this.attachVaultListeners();
 
-        // 5. Start periodic pull timer.
+        // 5. Start periodic pull timer. While the WS notify channel is live,
+        // frames trigger pulls within seconds and the timer degrades to a
+        // slow safety net (4× the interval); the moment the socket drops,
+        // full-cadence polling resumes automatically.
         console.log("[obsetync] ready");
         this.syncTimer = window.setInterval(() => {
+            const wsLive = this.wsChannel?.isConnected() ?? false;
+            if (wsLive && Date.now() - this.lastPullDoneMs < this.syncInterval * 4 - 500) {
+                return; // notify channel owns the fast path right now
+            }
             this.pullRemote().catch((e) =>
                 console.error("[obsetync] periodic pull error:", e)
             );
         }, this.syncInterval);
+
+        // 6. Notify channel (Ph2): "root changed" frames → immediate pull.
+        if (this.realtimeWs) {
+            this.wsChannel = new ObsetyncWsChannel(this.api, this.vaultId, () => {
+                this.pullRemote().catch((e) =>
+                    console.error("[obsetync] ws-triggered pull error:", e)
+                );
+            });
+            this.wsChannel.start();
+        }
     }
 
     /** Stop the sync engine. */
@@ -205,10 +231,22 @@ export class ObsetyncSyncEngine {
             window.clearInterval(this.syncTimer);
             this.syncTimer = null;
         }
+        this.wsChannel?.stop();
+        this.wsChannel = null;
         for (const ref of this.eventRefs) {
             this.app.vault.offref(ref);
         }
         this.eventRefs = [];
+    }
+
+    /** WS notify-channel state for the debug panel / status box. */
+    getWsState(): WsState {
+        return this.wsChannel?.getState() ?? "off";
+    }
+
+    /** ms since the last WS frame, -1 when never/off. */
+    getWsLastFrameAgeMs(): number {
+        return this.wsChannel?.lastFrameAgeMs() ?? -1;
     }
 
     /** Force a full sync cycle (pull → reconcile content → push pending).
@@ -699,6 +737,7 @@ export class ObsetyncSyncEngine {
             if (this.state !== "error") {
                 this.state = "idle";
                 this.onStatusUpdate("sync ✓");
+                this.lastPullDoneMs = Date.now();
             }
             // Drain user edits that arrived while we were syncing.
             if (this.pendingChanges.length > 0) this.debouncedPush?.();

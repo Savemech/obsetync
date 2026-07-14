@@ -21,6 +21,11 @@ use x25519_dalek::StaticSecret;
 /// but the full-file manifest path can push a megabyte or two).
 const MAX_BODY_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB
 
+/// Authenticated device id, inserted into request extensions by
+/// `secure_envelope` after bearer validation.
+#[derive(Clone)]
+pub struct DeviceIdExt(pub String);
+
 /// Secure-envelope middleware. Every protected route body is a sealed
 /// blob: `[ver | nonce | client_eph_pub | ciphertext+tag]`. We decrypt
 /// the request using the server's long-term X25519 private key, validate
@@ -122,6 +127,10 @@ async fn secure_envelope(
 
     let device_short = device_id[..device_id.len().min(12)].to_owned();
     let inner_body_len = decrypted.inner_body.len();
+
+    // Hand the authenticated device identity to inner handlers that need it
+    // (e.g. ws-ticket minting binds the ticket to the requesting device).
+    parts.extensions.insert(DeviceIdExt(device_id.clone()));
 
     // Restore the semantic HTTP method so axum's per-method routing
     // (`get(...)` / `put(...)` / `post(...)`) dispatches to the right
@@ -253,6 +262,7 @@ pub fn sync_router(state: SharedState) -> Router {
             get(get_history).post(history_dispatcher),
         )
         .route("/api/v1/rollback/{vault_id}", post(post_rollback))
+        .route("/api/v1/ws-ticket", post(post_ws_ticket))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             secure_envelope,
@@ -262,6 +272,11 @@ pub fn sync_router(state: SharedState) -> Router {
         // Health is public (plaintext) — clients ping it before enrollment to
         // check connectivity without needing the server's box pubkey.
         .route("/health", get(health))
+        // The notify WebSocket is a sibling of the sealed routes: it
+        // self-authenticates with a single-use ticket (minted over the
+        // sealed /api/v1/ws-ticket) because secure_envelope buffers whole
+        // responses and cannot wrap a stream. Frames carry no secrets.
+        .route("/api/v1/ws", get(crate::ws::ws_route))
         .merge(protected)
         .with_state(state)
 }
@@ -516,6 +531,21 @@ async fn history_dispatcher(
     }
 }
 
+/// POST /api/v1/ws-ticket — mint a single-use, short-TTL ticket bound to the
+/// authenticated device, spendable once on the /api/v1/ws handshake. Sealed
+/// like every sync route; the ticket itself carries no standing authority.
+async fn post_ws_ticket(
+    State(state): State<SharedState>,
+    axum::Extension(device): axum::Extension<DeviceIdExt>,
+) -> Result<impl IntoResponse, ServerError> {
+    let t = crate::ws_ticket::mint(&state.layout, &device.0)
+        .map_err(|e| ServerError::Internal(format!("ticket mint failed: {}", e)))?;
+    Ok((
+        StatusCode::OK,
+        serde_json::json!({ "ticket": t.ticket, "expires_at": t.expires_at }).to_string(),
+    ))
+}
+
 /// POST /api/v1/rollback/{vault_id} — body is the 64-hex target root hash.
 /// Moves `current` back to a root already in history. Deliberately BYPASSES
 /// the stale-tree guard: a rollback is an explicit, human-initiated revert —
@@ -542,6 +572,7 @@ async fn post_rollback(
     let _vault_guard = vault_lock.lock().await;
 
     state.vaults.set_current_root(&vault_id, &hash)?;
+    state.notify_root_changed(&vault_id, &hash_to_hex(&hash));
 
     tracing::warn!(
         vault = %vault_id,
@@ -641,6 +672,7 @@ async fn put_root(
         None => {
             // First push — accept directly.
             state.vaults.set_current_root(&vault_id, &incoming_hash)?;
+            state.notify_root_changed(&vault_id, &hash_to_hex(&incoming_hash));
             tracing::info!(
                 vault = %vault_id,
                 root  = %&hash_to_hex(&incoming_hash)[..16],
@@ -674,6 +706,7 @@ async fn put_root(
                 enforce_guard(&state, &vault_id, current_root, incoming_root.clone(), "ff").await?;
 
                 state.vaults.set_current_root(&vault_id, &incoming_hash)?;
+                state.notify_root_changed(&vault_id, &hash_to_hex(&incoming_hash));
                 tracing::info!(
                     vault = %vault_id,
                     root  = %&hash_to_hex(&incoming_hash)[..16],
@@ -757,6 +790,7 @@ async fn put_root(
 
                 // Update current.
                 state.vaults.set_current_root(&vault_id, &merged_hash)?;
+                state.notify_root_changed(&vault_id, &hash_to_hex(&merged_hash));
 
                 let conflicts: Vec<_> = merge_result
                     .file_conflicts

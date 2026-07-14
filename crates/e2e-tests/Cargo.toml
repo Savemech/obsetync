@@ -28,6 +28,9 @@ hkdf = "0.12"
 sha2 = "0.10"
 anyhow = "1"
 tar = "0.4"
+# WS notify-channel tests: raw tungstenite client against /api/v1/ws.
+tokio-tungstenite = "0.26"
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 
 [[test]]
 name = "smoke"
@@ -77,4 +80,9 @@ required-features = ["e2e"]
 [[test]]
 name = "history_export"
 path = "tests/history_export.rs"
+required-features = ["e2e"]
+
+[[test]]
+name = "realtime_ws"
+path = "tests/realtime_ws.rs"
 required-features = ["e2e"]

@@ -19,6 +19,9 @@ export interface SyncSettings {
     autoSync: boolean;
     syncPriority: SyncPriority;
     syncObsidianConfig: boolean;
+    /** Ph2 notify channel: WebSocket "root changed" push → pulls in seconds;
+     *  polling degrades to a slow safety net while the socket is live. */
+    realtimeWs: boolean;
     enrolled: boolean;
     deviceId: string;
     bearerToken: string;
@@ -33,6 +36,7 @@ export const DEFAULT_SETTINGS: SyncSettings = {
     autoSync: true,
     syncPriority: "sequential",
     syncObsidianConfig: false,
+    realtimeWs: true,
     enrolled: false,
     deviceId: "",
     bearerToken: "",
@@ -216,6 +220,25 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                     .onChange(async (value) => {
                         this.plugin.settings.syncObsidianConfig = value;
                         await this.plugin.saveSettings();
+                    })
+            );
+
+        new Setting(containerEl)
+            .setName("Realtime sync")
+            .setDesc(
+                "The server pushes change notifications over a WebSocket, so " +
+                "edits from other devices arrive within seconds; polling drops " +
+                "to a slow safety net while the socket is alive. If the " +
+                "connection fails, normal polling resumes automatically. " +
+                "Takes effect after reloading the plugin."
+            )
+            .addToggle((toggle) =>
+                toggle
+                    .setValue(this.plugin.settings.realtimeWs)
+                    .onChange(async (value) => {
+                        this.plugin.settings.realtimeWs = value;
+                        await this.plugin.saveSettings();
+                        new Notice("Obsetync: reload the plugin to apply the realtime setting.");
                     })
             );
 

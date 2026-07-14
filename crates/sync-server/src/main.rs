@@ -10,6 +10,8 @@ mod guard;
 mod secure;
 mod state;
 mod storage;
+mod ws;
+mod ws_ticket;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;

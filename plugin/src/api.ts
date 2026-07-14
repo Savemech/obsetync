@@ -105,6 +105,19 @@ export class ObsetyncApi {
         this.serverUrl = u;
     }
 
+    /** Normalized server base URL — the WS channel derives ws:// from it. */
+    get baseUrl(): string {
+        return this.serverUrl;
+    }
+
+    /** Mint a single-use, short-TTL WebSocket ticket over the sealed channel.
+     *  The ticket — not the bearer — goes into the ws:// URL. */
+    async mintWsTicket(): Promise<{ ticket: string; expires_at: number }> {
+        const res = await this.sealed("POST", "/api/v1/ws-ticket", new Uint8Array());
+        if (!res.ok) throw new Error(`ws-ticket failed: ${res.status}`);
+        return await res.json();
+    }
+
     /** Lazily establish the ObsetyncSecureChannel. Called before the first encrypted
      *  request; subsequent requests reuse the same shared secret. */
     private async getChannel(): Promise<ObsetyncSecureChannel> {

@@ -483,6 +483,7 @@ async fn rollback_vault(
         .vaults
         .set_current_root(&vault_id, &hash)
         .map_err(|e| ServerErrorHtml(format!("rollback failed: {}", e)))?;
+    state.notify_root_changed(&vault_id, &hash_to_hex(&hash));
 
     Ok(Redirect::to(&format!("/admin/vaults/{}", vault_id)))
 }
