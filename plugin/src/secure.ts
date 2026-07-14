@@ -50,6 +50,10 @@ const AAD_PREFIX = "obsetync/v1";
 const INFO_C2S = "obsetync/v1/c2s";
 const INFO_S2C = "obsetync/v1/s2c";
 
+const WS_AAD_PREFIX = "obsetync/ws/v2";
+const WS_INFO_C2S = "obsetync/ws/v2/c2s";
+const WS_INFO_S2C = "obsetync/ws/v2/s2c";
+
 export class ObsetyncSecureTransportError extends Error {
     constructor(msg: string) {
         super(msg);
@@ -293,6 +297,129 @@ export class ObsetyncSecureChannel {
             throw new ObsetyncSecureTransportError(
                 "response decryption failed (tampered, wrong server key, mismatched AAD, " +
                 "or client/server version mismatch — update server and plugin together)",
+            );
+        }
+    }
+}
+
+// --- WebSocket sealed frames (v2) --------------------------------------------
+//
+// Mirrors crates/sync-server/src/secure.rs's ws_seal/ws_open exactly:
+//
+//   shared  = X25519(client_eph_priv, server_eph_pub)     (fresh per ticket)
+//   c2s_key = HKDF-SHA256(salt = ticket_hex_bytes, ikm = shared, info = "obsetync/ws/v2/c2s")
+//   s2c_key = HKDF-SHA256(salt = ticket_hex_bytes, ikm = shared, info = "obsetync/ws/v2/s2c")
+//
+//   frame   = [12B nonce | AES-256-GCM ct || 16B tag]  (Binary ws message)
+//   AAD     = "obsetync/ws/v2 <dir> " || seq_be8       (per-direction counters)
+//
+// Sequence counters in the AAD kill replay/reordering inside the session; a
+// frame that fails to open means tampering or desync — the channel reconnects
+// with a fresh ticket.
+
+/** Client half of the WS ticket key exchange. Generate BEFORE minting the
+ *  ticket; send `pubB64` in the mint request; keep `priv` for the session. */
+export function generateWsEphKeypair(): { priv: Uint8Array; pubB64: string } {
+    const priv = new Uint8Array(PUBKEY_LEN);
+    crypto.getRandomValues(priv);
+    const pub = x25519.getPublicKey(priv);
+    let bin = "";
+    for (const b of pub) bin += String.fromCharCode(b);
+    return { priv, pubB64: btoa(bin) };
+}
+
+function wsAad(dir: "c2s" | "s2c", seq: number): Uint8Array {
+    const prefix = new TextEncoder().encode(`${WS_AAD_PREFIX} ${dir} `);
+    const seqBytes = new Uint8Array(8);
+    new DataView(seqBytes.buffer).setBigUint64(0, BigInt(seq), false); // big-endian
+    return concat(prefix, seqBytes);
+}
+
+/** Sealed-frame context for one WS session (v2). */
+export class ObsetyncWsSession {
+    private seqOut = 0;
+    private seqIn = 0;
+
+    private constructor(
+        private readonly c2sKey: CryptoKey,
+        private readonly s2cKey: CryptoKey,
+    ) {}
+
+    /** Derive both directional keys from the mint exchange. Zeroes the
+     *  ephemeral private key once the shared secret is established. */
+    static async create(
+        clientEphPriv: Uint8Array,
+        serverEphPubB64: string,
+        ticketHex: string,
+    ): Promise<ObsetyncWsSession> {
+        const serverPub = decodeBase64(serverEphPubB64);
+        if (serverPub.length !== PUBKEY_LEN) {
+            throw new ObsetyncSecureTransportError("server_eph_pub must be 32 bytes");
+        }
+        const shared = x25519.getSharedSecret(clientEphPriv, serverPub);
+        clientEphPriv.fill(0);
+
+        const hkdfKey = await crypto.subtle.importKey("raw", bs(shared), "HKDF", false, [
+            "deriveBits",
+        ]);
+        const salt = new TextEncoder().encode(ticketHex);
+        const derive = async (info: string, usage: KeyUsage): Promise<CryptoKey> => {
+            const bits = await crypto.subtle.deriveBits(
+                {
+                    name: "HKDF",
+                    hash: "SHA-256",
+                    salt: bs(salt),
+                    info: bs(new TextEncoder().encode(info)),
+                },
+                hkdfKey,
+                256,
+            );
+            return crypto.subtle.importKey("raw", bits, { name: "AES-GCM", length: 256 }, false, [
+                usage,
+            ]);
+        };
+        return new ObsetyncWsSession(
+            await derive(WS_INFO_C2S, "encrypt"),
+            await derive(WS_INFO_S2C, "decrypt"),
+        );
+    }
+
+    /** Seal an inner JSON frame for sending (c2s). */
+    async seal(innerJson: string): Promise<Uint8Array> {
+        const nonce = randomNonce();
+        const aad = wsAad("c2s", this.seqOut);
+        this.seqOut++;
+        const ct = new Uint8Array(
+            await crypto.subtle.encrypt(
+                { name: "AES-GCM", iv: bs(nonce), additionalData: bs(aad) },
+                this.c2sKey,
+                bs(new TextEncoder().encode(innerJson)),
+            ),
+        );
+        return concat(nonce, ct);
+    }
+
+    /** Open a received sealed frame (s2c). Throws on tamper/desync. */
+    async open(frame: Uint8Array): Promise<string> {
+        if (frame.length < NONCE_LEN + TAG_LEN) {
+            throw new ObsetyncSecureTransportError("ws frame too short");
+        }
+        const nonce = frame.slice(0, NONCE_LEN);
+        const ct = frame.slice(NONCE_LEN);
+        const aad = wsAad("s2c", this.seqIn);
+        this.seqIn++;
+        try {
+            const plain = new Uint8Array(
+                await crypto.subtle.decrypt(
+                    { name: "AES-GCM", iv: bs(nonce), additionalData: bs(aad) },
+                    this.s2cKey,
+                    bs(ct),
+                ),
+            );
+            return new TextDecoder().decode(plain);
+        } catch {
+            throw new ObsetyncSecureTransportError(
+                "ws frame failed to open (tampered or sequence desync)",
             );
         }
     }

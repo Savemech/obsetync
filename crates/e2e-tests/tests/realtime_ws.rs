@@ -140,3 +140,263 @@ async fn tickets_are_single_use_and_garbage_is_rejected() {
         other => panic!("garbage ticket must be rejected, got {other:?}"),
     }
 }
+
+// --- v2: sealed frames + presence (Ph3) --------------------------------------
+
+mod v2 {
+    use super::*;
+    use aes_gcm::aead::{Aead, Payload};
+    use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+
+    const WS_AAD_PREFIX: &[u8] = b"obsetync/ws/v2";
+
+    pub struct WsCrypto {
+        c2s: [u8; 32],
+        s2c: [u8; 32],
+        seq_in: u64,
+        seq_out: u64,
+    }
+
+    impl WsCrypto {
+        pub fn derive(shared: &[u8], ticket_hex: &str) -> Self {
+            let key = |info: &[u8]| -> [u8; 32] {
+                let hk = Hkdf::<Sha256>::new(Some(ticket_hex.as_bytes()), shared);
+                let mut out = [0u8; 32];
+                hk.expand(info, &mut out).unwrap();
+                out
+            };
+            Self {
+                c2s: key(b"obsetync/ws/v2/c2s"),
+                s2c: key(b"obsetync/ws/v2/s2c"),
+                seq_in: 0,
+                seq_out: 0,
+            }
+        }
+
+        fn aad(dir: &str, seq: u64) -> Vec<u8> {
+            let mut aad = WS_AAD_PREFIX.to_vec();
+            aad.push(b' ');
+            aad.extend_from_slice(dir.as_bytes());
+            aad.push(b' ');
+            aad.extend_from_slice(&seq.to_be_bytes());
+            aad
+        }
+
+        pub fn seal(&mut self, inner: &str) -> Vec<u8> {
+            let mut nonce = [0u8; 12];
+            use rand::RngCore;
+            rand::rng().fill_bytes(&mut nonce);
+            let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.c2s));
+            let aad = Self::aad("c2s", self.seq_out);
+            self.seq_out += 1;
+            let ct = cipher
+                .encrypt(
+                    Nonce::from_slice(&nonce),
+                    Payload {
+                        msg: inner.as_bytes(),
+                        aad: &aad,
+                    },
+                )
+                .unwrap();
+            let mut out = nonce.to_vec();
+            out.extend_from_slice(&ct);
+            out
+        }
+
+        pub fn open(&mut self, frame: &[u8]) -> serde_json::Value {
+            let (nonce, ct) = frame.split_at(12);
+            let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.s2c));
+            let aad = Self::aad("s2c", self.seq_in);
+            self.seq_in += 1;
+            let plain = cipher
+                .decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad: &aad })
+                .expect("sealed frame must open");
+            serde_json::from_slice(&plain).unwrap()
+        }
+    }
+
+    /// Full v2 client: keypair → mint → connect → auth → sealed ready → sub.
+    pub async fn open_v2_session(
+        env: &E2eEnv,
+        client: &WireClient,
+        vault: &str,
+    ) -> (
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        WsCrypto,
+    ) {
+        // Ephemeral keys + mint with our pubkey.
+        use rand::RngCore;
+        let mut priv_bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut priv_bytes);
+        let client_secret = x25519_dalek::StaticSecret::from(priv_bytes);
+        let client_pub = x25519_dalek::PublicKey::from(&client_secret);
+        use base64::prelude::*;
+        let body = serde_json::json!({
+            "client_eph_pub": BASE64_STANDARD.encode(client_pub.as_bytes()),
+        })
+        .to_string();
+        let r = client
+            .raw("POST", "/api/v1/ws-ticket", body.as_bytes())
+            .await
+            .unwrap();
+        assert!(r.status.is_success(), "v2 mint: {}", r.status);
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        let ticket = v["ticket"].as_str().unwrap().to_string();
+        let server_pub_b64 = v["server_eph_pub"]
+            .as_str()
+            .expect("v2 mint must return server_eph_pub");
+        let server_pub_bytes: [u8; 32] = BASE64_STANDARD
+            .decode(server_pub_b64)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let shared = client_secret.diffie_hellman(&x25519_dalek::PublicKey::from(server_pub_bytes));
+        let mut crypto = WsCrypto::derive(shared.as_bytes(), &ticket);
+
+        // Connect WITHOUT ticket in URL; auth is the first (plaintext) frame.
+        let url = format!("{}/api/v1/ws", env.base_url.replace("http://", "ws://"));
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        ws.send(Message::Text(
+            serde_json::json!({"v":2,"t":"auth","ticket":ticket})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+
+        // Sealed ready must arrive (s2c seq 0).
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Binary(data))) => return crypto.open(&data),
+                    Some(Ok(_)) => continue,
+                    other => panic!("ws ended before ready: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("no sealed ready");
+        assert_eq!(ready["t"], "ready");
+
+        // Sealed sub (c2s seq 0).
+        let sub = crypto.seal(&serde_json::json!({"v":2,"t":"sub","vaults":[vault]}).to_string());
+        ws.send(Message::Binary(sub.into())).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        (ws, crypto)
+    }
+}
+
+#[tokio::test]
+async fn v2_sealed_session_delivers_root_frames() {
+    let env = harness().await;
+    let vault = unique_vault_id("ws-v2");
+    let watcher = WireClient::new(&env, env.enroll_device("v2-watcher").await.unwrap());
+    let pusher = WireClient::new(&env, env.enroll_device("v2-pusher").await.unwrap());
+
+    let base = vec![("doc.md".to_string(), b"base\n".to_vec())];
+    let (base_root, _) = push_vault_snapshot(&pusher, &vault, &base, ZERO_HASH_HEX)
+        .await
+        .unwrap();
+    let parent = hash_to_hex(&base_root.hash());
+
+    let (mut ws, mut crypto) = v2::open_v2_session(&env, &watcher, &vault).await;
+
+    let v2_files = vec![("doc.md".to_string(), b"edited\n".to_vec())];
+    let (new_root, _) = push_vault_snapshot(&pusher, &vault, &v2_files, &parent)
+        .await
+        .unwrap();
+    let new_root_hex = hash_to_hex(&new_root.hash());
+
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Binary(data))) => {
+                    let v = crypto.open(&data);
+                    if v["t"] == "root" && v["vault"] == vault.as_str() {
+                        return v["root"].as_str().unwrap().to_string();
+                    }
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("ws ended: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("no sealed root frame");
+    assert_eq!(frame, new_root_hex);
+}
+
+#[tokio::test]
+async fn v2_presence_roundtrip_between_sessions() {
+    let env = harness().await;
+    let vault = unique_vault_id("ws-presence");
+    let alice = WireClient::new(&env, env.enroll_device("presence-alice").await.unwrap());
+    let bob = WireClient::new(&env, env.enroll_device("presence-bob").await.unwrap());
+
+    // Vault must exist for enrollment-independent flows; push a baseline.
+    push_vault_snapshot(
+        &alice,
+        &vault,
+        &[("a.md".to_string(), b"x\n".to_vec())],
+        ZERO_HASH_HEX,
+    )
+    .await
+    .unwrap();
+
+    let (mut ws_a, mut crypto_a) = v2::open_v2_session(&env, &alice, &vault).await;
+    let (mut ws_b, mut crypto_b) = v2::open_v2_session(&env, &bob, &vault).await;
+
+    // Bob announces he's editing notes/secret.md (sealed — the whole point).
+    let presence = crypto_b.seal(
+        &serde_json::json!({
+            "v":2, "t":"presence", "vault": vault, "file": "notes/secret.md", "state": "active",
+        })
+        .to_string(),
+    );
+    ws_b.send(Message::Binary(presence.into())).await.unwrap();
+
+    // Alice receives it with bob's device NAME resolved by the server.
+    let seen = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match ws_a.next().await {
+                Some(Ok(Message::Binary(data))) => {
+                    let v = crypto_a.open(&data);
+                    if v["t"] == "presence" && v["state"] == "active" {
+                        return v;
+                    }
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("ws ended: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("no presence frame");
+    assert_eq!(seen["file"], "notes/secret.md");
+    assert_eq!(seen["name"], "presence-bob");
+
+    // Bob disconnects → alice gets the offline frame (presence cleared).
+    drop(ws_b);
+    let offline = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match ws_a.next().await {
+                Some(Ok(Message::Binary(data))) => {
+                    let v = crypto_a.open(&data);
+                    if v["t"] == "presence" && v["state"] == "offline" {
+                        return v;
+                    }
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("ws ended: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("no offline frame");
+    assert_eq!(offline["name"], "presence-bob");
+}

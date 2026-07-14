@@ -17,7 +17,7 @@ function formatBytes(n: number): string {
 const LARGE_FILE_THRESHOLD = 1_048_576; // 1 MB
 import { ObsetyncApi, PushConflict } from "./api";
 import { conflictCopyPath } from "./conflict-ui";
-import { ObsetyncWsChannel, WsState } from "./ws";
+import { ObsetyncWsChannel, PresenceUpdate, WsState } from "./ws";
 import { PlatformIO } from "./platform";
 import { ObsetyncSyncBase } from "./sync-base";
 import { ObsetyncJournal } from "./journal";
@@ -80,6 +80,9 @@ export class ObsetyncSyncEngine {
         /** Ph2 notify channel: server pushes "root changed" over WebSocket;
          *  polling drops to a slow safety-net cadence while it's alive. */
         private realtimeWs: boolean = true,
+        /** Ph3: broadcast which file this device is looking at (receiving
+         *  presence always works; this only gates SENDING ours). */
+        private sharePresence: boolean = true,
     ) {
         this.localRootHash = initialRootHash;
     }
@@ -88,6 +91,14 @@ export class ObsetyncSyncEngine {
     private wsChannel: ObsetyncWsChannel | null = null;
     /** Epoch-ms of the last completed pull — drives the slow-poll decision. */
     private lastPullDoneMs = 0;
+    /** Ph3 presence: device(short) → latest update from the fleet. */
+    private presence = new Map<string, PresenceUpdate & { ts: number }>();
+    /** Path this device currently has open (what we advertise). */
+    private myOpenFile: string | null = null;
+    private presenceHeartbeat: number | null = null;
+    private workspaceRefs: any[] = [];
+    /** Throttle "X is editing this file" notices: `${device}:${file}` → ts. */
+    private busyNoticeShown = new Map<string, number>();
 
     getState(): SyncState {
         return this.state;
@@ -214,15 +225,82 @@ export class ObsetyncSyncEngine {
             );
         }, this.syncInterval);
 
-        // 6. Notify channel (Ph2): "root changed" frames → immediate pull.
+        // 6. Notify channel (Ph2) + presence (Ph3): "root changed" frames →
+        // immediate pull; presence frames → fleet awareness map.
         if (this.realtimeWs) {
-            this.wsChannel = new ObsetyncWsChannel(this.api, this.vaultId, () => {
-                this.pullRemote().catch((e) =>
-                    console.error("[obsetync] ws-triggered pull error:", e)
-                );
-            });
+            this.wsChannel = new ObsetyncWsChannel(
+                this.api,
+                this.vaultId,
+                () => {
+                    this.pullRemote().catch((e) =>
+                        console.error("[obsetync] ws-triggered pull error:", e)
+                    );
+                },
+                (p) => this.handlePresence(p),
+            );
             this.wsChannel.start();
+
+            // Advertise which file we're looking at: on every active-leaf
+            // change + a periodic refresh so the server-side TTL (90s)
+            // doesn't expire us mid-edit.
+            if (this.sharePresence) {
+                this.workspaceRefs.push(
+                    this.app.workspace.on("active-leaf-change", () => {
+                        this.advertisePresence();
+                    }),
+                );
+                this.presenceHeartbeat = window.setInterval(
+                    () => this.advertisePresence(),
+                    45_000,
+                );
+            }
         }
+    }
+
+    /** Send our current open file to the fleet (Ph3). */
+    private advertisePresence(): void {
+        if (!this.sharePresence || !this.wsChannel?.isConnected()) return;
+        const file = this.app.workspace.getActiveFile()?.path ?? null;
+        this.myOpenFile = file;
+        this.wsChannel.sendPresence(file, file ? "active" : "idle");
+    }
+
+    /** Fold a fleet presence update into the map; nudge the user if someone
+     *  else is actively in the file we currently have open. */
+    private handlePresence(p: PresenceUpdate): void {
+        if (p.state === "offline") {
+            this.presence.delete(p.device);
+        } else {
+            this.presence.set(p.device, { ...p, ts: Date.now() });
+        }
+
+        if (
+            p.state === "active" &&
+            p.file &&
+            this.myOpenFile &&
+            p.file === this.myOpenFile
+        ) {
+            const key = `${p.device}:${p.file}`;
+            const last = this.busyNoticeShown.get(key) ?? 0;
+            if (Date.now() - last > 5 * 60_000) {
+                this.busyNoticeShown.set(key, Date.now());
+                new Notice(`Obsetync: ${p.name} is editing this file right now.`, 8000);
+            }
+        }
+    }
+
+    /** Live fleet presence (for the debug panel / status bar), stale-swept. */
+    getPresence(): Array<PresenceUpdate & { ts: number }> {
+        const now = Date.now();
+        for (const [k, v] of this.presence) {
+            if (now - v.ts > 120_000) this.presence.delete(k);
+        }
+        return [...this.presence.values()];
+    }
+
+    /** How many OTHER devices are active right now. */
+    getActivePeerCount(): number {
+        return this.getPresence().filter((p) => p.state === "active").length;
     }
 
     /** Stop the sync engine. */
@@ -233,6 +311,14 @@ export class ObsetyncSyncEngine {
         }
         this.wsChannel?.stop();
         this.wsChannel = null;
+        if (this.presenceHeartbeat !== null) {
+            window.clearInterval(this.presenceHeartbeat);
+            this.presenceHeartbeat = null;
+        }
+        for (const ref of this.workspaceRefs) {
+            this.app.workspace.offref(ref);
+        }
+        this.workspaceRefs = [];
         for (const ref of this.eventRefs) {
             this.app.vault.offref(ref);
         }

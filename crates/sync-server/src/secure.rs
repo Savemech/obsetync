@@ -509,3 +509,146 @@ mod tests {
         assert_eq!(dec_b.inner_body, b"msg from b");
     }
 }
+
+// --- WebSocket sealed frames (Ph3, wire v2) ----------------------------------
+//
+// The notify channel's v1 frames were plaintext JSON — fine while they only
+// carried root hashes, unacceptable once presence frames name FILE PATHS and
+// Ph4 ops carry note content. v2 seals every frame after the auth handshake
+// with per-session directional keys:
+//
+//   shared   = X25519(server_eph_priv, client_eph_pub)      (fresh per ticket)
+//   c2s_key  = HKDF-SHA256(salt = ticket_bytes, ikm = shared, info = "obsetync/ws/v2/c2s")
+//   s2c_key  = HKDF-SHA256(salt = ticket_bytes, ikm = shared, info = "obsetync/ws/v2/s2c")
+//
+// Frame (Binary ws message): [ 12B nonce | AES-256-GCM ciphertext || 16B tag ]
+// AAD = "obsetync/ws/v2 <dir> <seq_be8>" where <dir> ∈ {c2s, s2c} and seq is
+// each direction's monotonically increasing frame counter. TCP already
+// guarantees ordering, so a seq mismatch means tampering/replay → close.
+
+const WS_INFO_C2S: &[u8] = b"obsetync/ws/v2/c2s";
+const WS_INFO_S2C: &[u8] = b"obsetync/ws/v2/s2c";
+const WS_AAD_PREFIX: &[u8] = b"obsetync/ws/v2";
+
+/// Directional key pair for one WS session.
+pub struct WsSessionKeys {
+    pub c2s: [u8; KEY_LEN],
+    pub s2c: [u8; KEY_LEN],
+}
+
+/// Derive the session keys from the ECDH shared secret and the ticket (salt).
+pub fn derive_ws_keys(shared: &[u8; KEY_LEN], ticket_hex: &str) -> WsSessionKeys {
+    WsSessionKeys {
+        c2s: hkdf_key(shared, ticket_hex.as_bytes(), WS_INFO_C2S),
+        s2c: hkdf_key(shared, ticket_hex.as_bytes(), WS_INFO_S2C),
+    }
+}
+
+fn ws_aad(dir: &str, seq: u64) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(WS_AAD_PREFIX.len() + 1 + dir.len() + 1 + 8);
+    aad.extend_from_slice(WS_AAD_PREFIX);
+    aad.push(b' ');
+    aad.extend_from_slice(dir.as_bytes());
+    aad.push(b' ');
+    aad.extend_from_slice(&seq.to_be_bytes());
+    aad
+}
+
+/// Seal one frame. `dir` is the SENDER's direction ("c2s" or "s2c").
+pub fn ws_seal(
+    key: &[u8; KEY_LEN],
+    dir: &str,
+    seq: u64,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, SecureError> {
+    let mut nonce = [0u8; NONCE_LEN];
+    use rand::RngCore;
+    rand::rng().fill_bytes(&mut nonce);
+
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    let aad = ws_aad(dir, seq);
+    let ct = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
+        .map_err(|e| SecureError::AeadSeal(e.to_string()))?;
+
+    let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// Open one frame sealed by the peer whose direction is `dir`.
+pub fn ws_open(
+    key: &[u8; KEY_LEN],
+    dir: &str,
+    seq: u64,
+    frame: &[u8],
+) -> Result<Vec<u8>, SecureError> {
+    if frame.len() < NONCE_LEN + TAG_LEN {
+        return Err(SecureError::TooShort(frame.len(), NONCE_LEN + TAG_LEN));
+    }
+    let (nonce, ct) = frame.split_at(NONCE_LEN);
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    let aad = ws_aad(dir, seq);
+    cipher
+        .decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad: &aad })
+        .map_err(|_| SecureError::AeadOpen)
+}
+
+#[cfg(test)]
+mod ws_frame_tests {
+    use super::*;
+
+    fn keys() -> WsSessionKeys {
+        derive_ws_keys(&[7u8; KEY_LEN], &"ab".repeat(32))
+    }
+
+    #[test]
+    fn seal_open_roundtrip_both_directions() {
+        let k = keys();
+        let frame = ws_seal(&k.c2s, "c2s", 0, b"{\"t\":\"sub\"}").unwrap();
+        assert_eq!(
+            ws_open(&k.c2s, "c2s", 0, &frame).unwrap(),
+            b"{\"t\":\"sub\"}"
+        );
+
+        let frame = ws_seal(&k.s2c, "s2c", 5, b"{\"t\":\"root\"}").unwrap();
+        assert_eq!(
+            ws_open(&k.s2c, "s2c", 5, &frame).unwrap(),
+            b"{\"t\":\"root\"}"
+        );
+    }
+
+    #[test]
+    fn wrong_seq_or_direction_fails() {
+        let k = keys();
+        let frame = ws_seal(&k.c2s, "c2s", 3, b"x").unwrap();
+        // Replay at another position dies on AAD.
+        assert!(ws_open(&k.c2s, "c2s", 4, &frame).is_err());
+        // Cross-direction reflection dies on key AND AAD.
+        assert!(ws_open(&k.s2c, "s2c", 3, &frame).is_err());
+    }
+
+    #[test]
+    fn keys_differ_per_direction_and_ticket() {
+        let a = derive_ws_keys(&[7u8; KEY_LEN], &"aa".repeat(32));
+        let b = derive_ws_keys(&[7u8; KEY_LEN], &"bb".repeat(32));
+        assert_ne!(a.c2s, a.s2c);
+        assert_ne!(a.c2s, b.c2s);
+    }
+
+    #[test]
+    fn tampered_frame_fails() {
+        let k = keys();
+        let mut frame = ws_seal(&k.c2s, "c2s", 0, b"payload").unwrap();
+        let last = frame.len() - 1;
+        frame[last] ^= 0x01;
+        assert!(ws_open(&k.c2s, "c2s", 0, &frame).is_err());
+    }
+}

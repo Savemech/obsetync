@@ -187,6 +187,18 @@ export default class ObsetyncPlugin extends Plugin {
                         ? ` · last frame ${Math.round(wsAge / 1000)}s ago`
                         : ""),
                 );
+                const fleet = this.syncEngine.getPresence();
+                if (fleet.length > 0) {
+                    push(`Fleet presence:`);
+                    for (const p of fleet) {
+                        push(
+                            `  ${p.name.padEnd(16)} ${p.state.padEnd(7)} ` +
+                            `${p.file ?? "(no file)"}`
+                        );
+                    }
+                } else {
+                    push(`Fleet presence:    (nobody else online)`);
+                }
                 const err = this.syncEngine.getLastError();
                 if (err) {
                     push(`Last error:        [${err.origin}] ${err.message}`);
@@ -392,6 +404,7 @@ export default class ObsetyncPlugin extends Plugin {
             this.settings.syncObsidianConfig,
             this.settings.deviceName || "device",
             this.settings.realtimeWs,
+            this.settings.sharePresence,
         );
 
         // Start.
@@ -439,7 +452,9 @@ export default class ObsetyncPlugin extends Plugin {
     }
 
     private updateStatusBar(text: string): void {
-        this.statusBarEl?.setText(text);
+        // Presence suffix: how many OTHER devices are active right now (Ph3).
+        const peers = this.syncEngine?.getActivePeerCount() ?? 0;
+        this.statusBarEl?.setText(peers > 0 ? `${text} · 👥${peers}` : text);
     }
 }
 

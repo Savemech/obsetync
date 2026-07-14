@@ -22,6 +22,9 @@ export interface SyncSettings {
     /** Ph2 notify channel: WebSocket "root changed" push → pulls in seconds;
      *  polling degrades to a slow safety net while the socket is live. */
     realtimeWs: boolean;
+    /** Ph3: broadcast which file this device has open (sealed frames only).
+     *  Receiving fleet presence always works; this gates sending ours. */
+    sharePresence: boolean;
     enrolled: boolean;
     deviceId: string;
     bearerToken: string;
@@ -37,6 +40,7 @@ export const DEFAULT_SETTINGS: SyncSettings = {
     syncPriority: "sequential",
     syncObsidianConfig: false,
     realtimeWs: true,
+    sharePresence: true,
     enrolled: false,
     deviceId: "",
     bearerToken: "",
@@ -239,6 +243,24 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                         this.plugin.settings.realtimeWs = value;
                         await this.plugin.saveSettings();
                         new Notice("Obsetync: reload the plugin to apply the realtime setting.");
+                    })
+            );
+
+        new Setting(containerEl)
+            .setName("Share presence")
+            .setDesc(
+                "Tell your other devices which note this one has open, and get " +
+                "a heads-up when you open a note someone else is editing. " +
+                "Travels only over the sealed realtime channel; nothing is " +
+                "stored on the server. Takes effect after reloading the plugin."
+            )
+            .addToggle((toggle) =>
+                toggle
+                    .setValue(this.plugin.settings.sharePresence)
+                    .onChange(async (value) => {
+                        this.plugin.settings.sharePresence = value;
+                        await this.plugin.saveSettings();
+                        new Notice("Obsetync: reload the plugin to apply the presence setting.");
                     })
             );
 

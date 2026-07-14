@@ -36,6 +36,9 @@ pub struct AppState {
     /// receiver that lags past the 16-message buffer just misses frames and
     /// falls back to its regular poll (data never depends on this channel).
     notifiers: StdMutex<HashMap<String, tokio::sync::broadcast::Sender<String>>>,
+    /// Ephemeral presence: vault → device → (name, file, state). Ph3. Never
+    /// persisted; refreshed by clients, expired by TTL, cleared on close.
+    presence: StdMutex<HashMap<String, HashMap<String, PresenceEntry>>>,
 }
 
 impl AppState {
@@ -58,6 +61,7 @@ impl AppState {
             started_at: Instant::now(),
             vault_locks: StdMutex::new(HashMap::new()),
             notifiers: StdMutex::new(HashMap::new()),
+            presence: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -72,9 +76,10 @@ impl AppState {
             .clone()
     }
 
-    /// Announce a new current root to any live WebSocket subscribers.
-    /// No subscribers → no channel is even created; never blocks.
-    pub fn notify_root_changed(&self, vault_id: &str, root_hex: &str) {
+    /// Publish a ready-to-send inner frame (JSON string) to a vault's live
+    /// WebSocket subscribers. No subscribers → no channel is even created;
+    /// never blocks.
+    pub fn publish_frame(&self, vault_id: &str, frame_json: String) {
         let sender = self
             .notifiers
             .lock()
@@ -83,11 +88,20 @@ impl AppState {
             .cloned();
         if let Some(tx) = sender {
             // Err just means nobody is listening right now — fine.
-            let _ = tx.send(root_hex.to_string());
+            let _ = tx.send(frame_json);
         }
     }
 
-    /// Subscribe to a vault's root changes (creates the channel on first use).
+    /// Announce a new current root to any live WebSocket subscribers.
+    pub fn notify_root_changed(&self, vault_id: &str, root_hex: &str) {
+        self.publish_frame(
+            vault_id,
+            serde_json::json!({ "v": 1, "t": "root", "vault": vault_id, "root": root_hex })
+                .to_string(),
+        );
+    }
+
+    /// Subscribe to a vault's frames (creates the channel on first use).
     pub fn subscribe_roots(&self, vault_id: &str) -> tokio::sync::broadcast::Receiver<String> {
         self.notifiers
             .lock()
@@ -96,6 +110,118 @@ impl AppState {
             .or_insert_with(|| tokio::sync::broadcast::channel(16).0)
             .subscribe()
     }
+
+    // --- Presence (Ph3) ---------------------------------------------------
+    //
+    // Ephemeral only: who is looking at which file right now. Never persisted;
+    // entries expire when not refreshed and are cleared on session close.
+
+    /// Record a device's presence and broadcast it to the vault's subscribers.
+    pub fn set_presence(
+        &self,
+        vault_id: &str,
+        device_id: &str,
+        device_name: &str,
+        file: Option<String>,
+        state: &str,
+    ) {
+        let now = now_ms();
+        {
+            let mut map = self.presence.lock().expect("presence poisoned");
+            let vault = map.entry(vault_id.to_string()).or_default();
+            vault.insert(
+                device_id.to_string(),
+                PresenceEntry {
+                    device_name: device_name.to_string(),
+                    file: file.clone(),
+                    state: state.to_string(),
+                    updated_ms: now,
+                },
+            );
+            // Opportunistic sweep of stale entries for this vault.
+            vault.retain(|_, e| now.saturating_sub(e.updated_ms) < PRESENCE_TTL_MS);
+        }
+        self.publish_frame(
+            vault_id,
+            presence_frame(vault_id, device_id, device_name, file.as_deref(), state),
+        );
+    }
+
+    /// Remove a device's presence (session closed) and broadcast "offline".
+    pub fn clear_presence(&self, vault_id: &str, device_id: &str) {
+        let removed = {
+            let mut map = self.presence.lock().expect("presence poisoned");
+            map.get_mut(vault_id)
+                .map(|vault| vault.remove(device_id))
+                .flatten()
+        };
+        if let Some(entry) = removed {
+            self.publish_frame(
+                vault_id,
+                presence_frame(vault_id, device_id, &entry.device_name, None, "offline"),
+            );
+        }
+    }
+
+    /// Current live presence for a vault as ready-to-send frames — served to
+    /// fresh subscribers so they immediately see who is where.
+    pub fn presence_snapshot(&self, vault_id: &str) -> Vec<String> {
+        let now = now_ms();
+        let mut map = self.presence.lock().expect("presence poisoned");
+        let Some(vault) = map.get_mut(vault_id) else {
+            return Vec::new();
+        };
+        vault.retain(|_, e| now.saturating_sub(e.updated_ms) < PRESENCE_TTL_MS);
+        vault
+            .iter()
+            .map(|(device_id, e)| {
+                presence_frame(
+                    vault_id,
+                    device_id,
+                    &e.device_name,
+                    e.file.as_deref(),
+                    &e.state,
+                )
+            })
+            .collect()
+    }
+}
+
+/// How long a presence entry survives without a refresh. Clients re-send
+/// every ~45s while a file is open.
+const PRESENCE_TTL_MS: u64 = 90_000;
+
+pub struct PresenceEntry {
+    pub device_name: String,
+    pub file: Option<String>,
+    pub state: String,
+    pub updated_ms: u64,
+}
+
+fn presence_frame(
+    vault_id: &str,
+    device_id: &str,
+    device_name: &str,
+    file: Option<&str>,
+    state: &str,
+) -> String {
+    serde_json::json!({
+        "v": 1,
+        "t": "presence",
+        "vault": vault_id,
+        "device": &device_id[..device_id.len().min(12)],
+        "name": device_name,
+        "file": file,
+        "state": state,
+    })
+    .to_string()
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 pub type SharedState = Arc<AppState>;

@@ -534,15 +534,46 @@ async fn history_dispatcher(
 /// POST /api/v1/ws-ticket — mint a single-use, short-TTL ticket bound to the
 /// authenticated device, spendable once on the /api/v1/ws handshake. Sealed
 /// like every sync route; the ticket itself carries no standing authority.
+///
+/// v2 (sealed frames): the body carries `{"client_eph_pub": "<base64>"}` —
+/// the server answers with its own ephemeral pubkey and both sides derive
+/// the per-session directional AEAD keys. An empty body mints a legacy v1
+/// (plaintext, root-frames-only) ticket for older clients.
 async fn post_ws_ticket(
     State(state): State<SharedState>,
     axum::Extension(device): axum::Extension<DeviceIdExt>,
+    body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
-    let t = crate::ws_ticket::mint(&state.layout, &device.0)
+    let client_eph_pub: Option<[u8; 32]> = if body.is_empty() {
+        None
+    } else {
+        let v: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|_| ServerError::BadRequest("ws-ticket body must be JSON".into()))?;
+        match v.get("client_eph_pub").and_then(|p| p.as_str()) {
+            Some(b64) => {
+                use base64::prelude::*;
+                let bytes = BASE64_STANDARD
+                    .decode(b64)
+                    .map_err(|_| ServerError::BadRequest("client_eph_pub: bad base64".into()))?;
+                let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+                    ServerError::BadRequest("client_eph_pub must be 32 bytes".into())
+                })?;
+                Some(arr)
+            }
+            None => None,
+        }
+    };
+
+    let outcome = crate::ws_ticket::mint(&state.layout, &device.0, client_eph_pub)
         .map_err(|e| ServerError::Internal(format!("ticket mint failed: {}", e)))?;
     Ok((
         StatusCode::OK,
-        serde_json::json!({ "ticket": t.ticket, "expires_at": t.expires_at }).to_string(),
+        serde_json::json!({
+            "ticket": outcome.ticket.ticket,
+            "expires_at": outcome.ticket.expires_at,
+            "server_eph_pub": outcome.server_eph_pub_b64,
+        })
+        .to_string(),
     ))
 }
 

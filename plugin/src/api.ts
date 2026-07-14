@@ -110,10 +110,19 @@ export class ObsetyncApi {
         return this.serverUrl;
     }
 
-    /** Mint a single-use, short-TTL WebSocket ticket over the sealed channel.
-     *  The ticket — not the bearer — goes into the ws:// URL. */
-    async mintWsTicket(): Promise<{ ticket: string; expires_at: number }> {
-        const res = await this.sealed("POST", "/api/v1/ws-ticket", new Uint8Array());
+    /** Mint a single-use, short-TTL WebSocket ticket over the sealed channel,
+     *  exchanging ephemeral X25519 pubkeys so both sides derive the sealed-
+     *  frame session keys (wire v2). The ticket travels once, in the first
+     *  (plaintext) auth frame — never in a URL. */
+    async mintWsTicket(clientEphPubB64: string): Promise<{
+        ticket: string;
+        expires_at: number;
+        server_eph_pub?: string;
+    }> {
+        const body = new TextEncoder().encode(
+            JSON.stringify({ client_eph_pub: clientEphPubB64 }),
+        );
+        const res = await this.sealed("POST", "/api/v1/ws-ticket", body);
         if (!res.ok) throw new Error(`ws-ticket failed: ${res.status}`);
         return await res.json();
     }
