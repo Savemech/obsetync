@@ -27,6 +27,7 @@ aes-gcm = { version = "0.10", default-features = false, features = ["aes", "allo
 hkdf = "0.12"
 sha2 = "0.10"
 anyhow = "1"
+tar = "0.4"
 
 [[test]]
 name = "smoke"
@@ -71,4 +72,9 @@ required-features = ["e2e"]
 [[test]]
 name = "text_merge"
 path = "tests/text_merge.rs"
+required-features = ["e2e"]
+
+[[test]]
+name = "history_export"
+path = "tests/history_export.rs"
 required-features = ["e2e"]

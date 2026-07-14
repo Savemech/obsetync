@@ -30,6 +30,16 @@ export interface PushConflict {
     side_b_hash: string;
 }
 
+/** One point of the vault's server-side root history. */
+export interface HistoryEntry {
+    root: string;
+    parent: string | null;
+    created_ms: number;
+    device_id: string;
+    total_files: number;
+    current: boolean;
+}
+
 export interface PushResult {
     accepted?: boolean;
     merged?: boolean;
@@ -117,6 +127,25 @@ export class ObsetyncApi {
         if (res.status === 404) return null;
         if (!res.ok) throw new Error(`getRoot failed: ${res.status}`);
         return new Uint8Array(await res.arrayBuffer());
+    }
+
+    /** Recent root history for the rollback UI, newest first. */
+    async getHistory(vaultId: string): Promise<HistoryEntry[]> {
+        const path = `/api/v1/history/${vaultId}`;
+        const res = await this.sealed("GET", path, new Uint8Array());
+        if (!res.ok) throw new Error(`getHistory failed: ${res.status}`);
+        const body = await res.json();
+        return (body?.roots ?? []) as HistoryEntry[];
+    }
+
+    /** Roll the vault's current root back to an earlier point in history.
+     *  The server validates the hash exists; devices converge on their next
+     *  pull. Deliberately bypasses the stale-tree guard server-side — this
+     *  is the explicit, human-initiated revert. */
+    async rollbackVault(vaultId: string, rootHash: string): Promise<void> {
+        const path = `/api/v1/rollback/${vaultId}`;
+        const res = await this.sealed("POST", path, new TextEncoder().encode(rootHash));
+        if (!res.ok) throw new Error(`rollback failed: ${res.status}`);
     }
 
     async putRoot(

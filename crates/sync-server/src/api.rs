@@ -248,6 +248,11 @@ pub fn sync_router(state: SharedState) -> Router {
             "/api/v1/content/chunks/check",
             post(post_content_chunks_check),
         )
+        .route(
+            "/api/v1/history/{vault_id}",
+            get(get_history).post(history_dispatcher),
+        )
+        .route("/api/v1/rollback/{vault_id}", post(post_rollback))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             secure_envelope,
@@ -434,6 +439,120 @@ async fn get_root(
         .ok_or_else(|| ServerError::NotFound("root data missing".into()))?;
 
     Ok((StatusCode::OK, data))
+}
+
+/// How many history entries `get_history` returns at most. Every root file
+/// must be read to sort by creation time, so the read cost is the full
+/// history regardless — the cap only bounds the response size.
+const HISTORY_LIMIT: usize = 50;
+
+/// GET /api/v1/history/{vault_id} — the vault's recent root history, newest
+/// first, decoded from the stored RootNode metadata. This is what powers the
+/// plugin's rollback UI: pick a point in time, roll the vault back to it.
+async fn get_history(
+    State(state): State<SharedState>,
+    Path(vault_id): Path<String>,
+) -> Result<impl IntoResponse, ServerError> {
+    if !state.vaults.vault_exists(&vault_id) {
+        return Err(ServerError::NotFound(format!(
+            "vault '{}' not found",
+            vault_id
+        )));
+    }
+    let current = state.vaults.get_current_root(&vault_id);
+    let current_hex = current.map(|h| hash_to_hex(&h));
+
+    let roots_dir = state.layout.vault_roots_dir(&vault_id);
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    if let Ok(dir) = std::fs::read_dir(&roots_dir) {
+        for e in dir.filter_map(|e| e.ok()) {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".bin") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(e.path()) else {
+                continue;
+            };
+            let Ok(root) = sync_core::chunk::RootNode::deserialize(&bytes) else {
+                continue; // skip corrupt entries rather than failing the listing
+            };
+            let hex = hash_to_hex(&root.hash());
+            entries.push(serde_json::json!({
+                "root": hex,
+                "parent": root.parent_hash.map(|h| hash_to_hex(&h)),
+                "created_ms": root.created_ms,
+                "device_id": root.device_id,
+                "total_files": root.total_files,
+                "current": Some(&hex) == current_hex.as_ref(),
+            }));
+        }
+    }
+    entries.sort_by(|a, b| {
+        b["created_ms"]
+            .as_u64()
+            .unwrap_or(0)
+            .cmp(&a["created_ms"].as_u64().unwrap_or(0))
+    });
+    entries.truncate(HISTORY_LIMIT);
+
+    Ok((
+        StatusCode::OK,
+        serde_json::json!({ "roots": entries }).to_string(),
+    ))
+}
+
+/// POST-tunnel dispatcher for /api/v1/history (see sync_router comment).
+async fn history_dispatcher(
+    State(state): State<SharedState>,
+    Path(vault_id): Path<String>,
+    request: Request,
+) -> Response {
+    match semantic_method(request.headers()) {
+        Some(ref m) if m == Method::GET => match get_history(State(state), Path(vault_id)).await {
+            Ok(r) => r.into_response(),
+            Err(e) => e.into_response(),
+        },
+        _ => (StatusCode::METHOD_NOT_ALLOWED, "unsupported method").into_response(),
+    }
+}
+
+/// POST /api/v1/rollback/{vault_id} — body is the 64-hex target root hash.
+/// Moves `current` back to a root already in history. Deliberately BYPASSES
+/// the stale-tree guard: a rollback is an explicit, human-initiated revert —
+/// the exact operation the guard exists to stop when it happens silently.
+/// Devices converge on their next pull (the diff is ancestry-agnostic).
+async fn post_rollback(
+    State(state): State<SharedState>,
+    Path(vault_id): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<impl IntoResponse, ServerError> {
+    let hex = std::str::from_utf8(&body)
+        .map_err(|_| ServerError::BadRequest("rollback body must be a hex root hash".into()))?
+        .trim();
+    let hash = hex_to_hash(hex).map_err(|_| ServerError::BadRequest("invalid root hash".into()))?;
+
+    state
+        .vaults
+        .get_root(&vault_id, &hash)
+        .ok_or_else(|| ServerError::NotFound("root not found in history".into()))?;
+
+    // Same per-vault write lock as put_root — a rollback racing an in-flight
+    // push is a lost update.
+    let vault_lock = state.vault_lock(&vault_id);
+    let _vault_guard = vault_lock.lock().await;
+
+    state.vaults.set_current_root(&vault_id, &hash)?;
+
+    tracing::warn!(
+        vault = %vault_id,
+        root = %&hash_to_hex(&hash)[..16],
+        "rollback via sync API — vault current moved backwards on request"
+    );
+
+    Ok((
+        StatusCode::OK,
+        serde_json::json!({ "ok": true, "root_hash": hash_to_hex(&hash) }).to_string(),
+    ))
 }
 
 /// Run the stale-tree guard scan and, depending on OBSETYNC_GUARD, refuse

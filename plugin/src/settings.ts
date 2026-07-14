@@ -356,6 +356,93 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                     }
                 })
             );
+
+        // History & rollback.
+        new Setting(containerEl).setName("History").setHeading();
+        const historyList = containerEl.createDiv({ cls: "obsetync-history-list" });
+        new Setting(containerEl)
+            .setName("Server root history")
+            .setDesc(
+                "Every sync produces a new root; the server keeps them all. " +
+                "Load the recent history to inspect it or roll the whole vault " +
+                "back to an earlier point (devices converge on their next sync)."
+            )
+            .addButton((btn) =>
+                btn.setButtonText("Load history").onClick(async () => {
+                    await this.renderHistory(historyList);
+                })
+            );
+    }
+
+    /** Fetch and render the vault's recent root history with rollback
+     *  buttons. Rollback is two-click (button flips to "Confirm?") — it
+     *  rewinds every device in the fleet, so no accidental single clicks. */
+    private async renderHistory(listEl: HTMLElement): Promise<void> {
+        const api = this.plugin.apiOrNull();
+        const vaultId = this.plugin.settings.vaultId;
+        if (!api || !vaultId) {
+            new Notice("Not enrolled yet — no history to show.");
+            return;
+        }
+        listEl.empty();
+        listEl.createSpan({ text: "Loading history…", cls: "obsetync-status-label" });
+        let entries;
+        try {
+            entries = await api.getHistory(vaultId);
+        } catch (e: any) {
+            listEl.empty();
+            new Notice(`History failed: ${e?.message ?? e}`);
+            return;
+        }
+        listEl.empty();
+        if (entries.length === 0) {
+            listEl.createSpan({ text: "No roots yet.", cls: "obsetync-status-label" });
+            return;
+        }
+
+        for (const entry of entries) {
+            const when = new Date(entry.created_ms);
+            const pad = (n: number) => String(n).padStart(2, "0");
+            const stamp =
+                `${when.getFullYear()}-${pad(when.getMonth() + 1)}-${pad(when.getDate())} ` +
+                `${pad(when.getHours())}:${pad(when.getMinutes())}`;
+            const row = new Setting(listEl)
+                .setName(`${stamp}${entry.current ? "  ← current" : ""}`)
+                .setDesc(
+                    `${entry.total_files} files · device ${entry.device_id.slice(0, 12)} · ` +
+                    `root ${entry.root.slice(0, 12)}…`
+                );
+            if (!entry.current) {
+                row.addButton((btn) => {
+                    let armed = false;
+                    btn.setButtonText("Roll back").onClick(async () => {
+                        if (!armed) {
+                            armed = true;
+                            btn.setButtonText("Confirm?");
+                            btn.setWarning();
+                            window.setTimeout(() => {
+                                armed = false;
+                                btn.setButtonText("Roll back");
+                                btn.removeCta();
+                            }, 5000);
+                            return;
+                        }
+                        try {
+                            await api.rollbackVault(vaultId, entry.root);
+                            new Notice(
+                                `Rolled back to ${entry.root.slice(0, 12)}… — syncing…`
+                            );
+                            // Converge this device immediately; others follow
+                            // on their next poll.
+                            await this.plugin.syncEngineOrNull()?.forceSync();
+                            await this.renderHistory(listEl);
+                        } catch (e: any) {
+                            new Notice(`Rollback failed: ${e?.message ?? e}`);
+                        }
+                    });
+                });
+            }
+        }
     }
 
     /** Non-sensitive status snapshot rendered inline in the settings tab. */

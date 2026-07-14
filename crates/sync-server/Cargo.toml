@@ -18,6 +18,12 @@ axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
+# Vault export: tar assembled into an anonymous tempfile (auto-reclaimed by
+# the OS on close), streamed out via tokio-util's ReaderStream — bounded
+# memory regardless of vault size.
+tar = "0.4"
+tempfile = "3"
+tokio-util = { version = "0.7", features = ["io"] }
 sha2 = "0.10"
 rand = "0.9"
 thiserror = { workspace = true }

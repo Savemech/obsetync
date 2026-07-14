@@ -117,6 +117,11 @@ export default class ObsetyncPlugin extends Plugin {
         return this.syncEngine ?? null;
     }
 
+    /** Expose the API client for the settings tab (history/rollback UI). */
+    apiOrNull(): ObsetyncApi | null {
+        return this.api ?? null;
+    }
+
     /** Gathers a human-readable snapshot of plugin state + live diagnostics. */
     async getDebugInfo(): Promise<string> {
         const lines: string[] = [];

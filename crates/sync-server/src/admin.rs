@@ -29,6 +29,10 @@ pub fn admin_router(state: SharedState) -> Router {
         .route("/admin/vaults", get(vault_list))
         .route("/admin/vaults/{vault_id}", get(vault_detail))
         .route("/admin/vaults/{vault_id}/rollback", post(rollback_vault))
+        .route(
+            "/admin/vaults/{vault_id}/export/{root_hash}",
+            get(export_vault),
+        )
         .route("/admin/enrollment/{code}", get(claim_enrollment))
         .layer(cors)
         .with_state(state)
@@ -426,8 +430,8 @@ async fn vault_detail(
                 String::new()
             };
             format!(
-                "<tr><td><code>{:.16}...</code>{marker}</td><td>{rollback}</td></tr>",
-                hash
+                r#"<tr><td><code>{:.16}...</code>{marker}</td><td>{rollback} <a class="btn-small" href="/admin/vaults/{}/export/{}">export</a></td></tr>"#,
+                hash, vault_id, hash
             )
         })
         .collect();
@@ -481,6 +485,112 @@ async fn rollback_vault(
         .map_err(|e| ServerErrorHtml(format!("rollback failed: {}", e)))?;
 
     Ok(Redirect::to(&format!("/admin/vaults/{}", vault_id)))
+}
+
+// --- Vault export ---
+
+/// GET /admin/vaults/{vault_id}/export/{root_hash} — download the vault as
+/// it looked at any root in history, as a tar archive. Small files come
+/// straight from the blob store; chunked large files are reassembled from
+/// their FastCDC manifests. The tar is assembled into an anonymous tempfile
+/// (blocking task) and streamed out, so memory stays bounded no matter how
+/// big the vault is.
+async fn export_vault(
+    State(state): State<SharedState>,
+    Path((vault_id, root_hash)): Path<(String, String)>,
+) -> Result<axum::response::Response, ServerErrorHtml> {
+    let hash = sync_core::hash::hex_to_hash(&root_hash)
+        .map_err(|_| ServerErrorHtml("invalid root hash".into()))?;
+    let root_bytes = state
+        .vaults
+        .get_root(&vault_id, &hash)
+        .ok_or_else(|| ServerErrorHtml("root not found in history".into()))?;
+    let root = sync_core::chunk::RootNode::deserialize(&root_bytes)
+        .map_err(|e| ServerErrorHtml(format!("corrupt root: {}", e)))?;
+
+    let entries = crate::bridge::run_list_entries(state.layout.base.join("index"), root)
+        .await
+        .map_err(|e| ServerErrorHtml(format!("failed to list entries: {}", e)))?;
+
+    let layout = state.layout.clone();
+    let file_count = entries.len();
+    let tar_file = tokio::task::spawn_blocking(move || -> Result<std::fs::File, String> {
+        use std::io::{Read, Seek, Write};
+
+        // Anonymous tempfile: the OS reclaims it when the handle drops, even
+        // if the download is abandoned mid-stream.
+        let tmp = tempfile::tempfile().map_err(|e| e.to_string())?;
+        let mut builder = tar::Builder::new(&tmp);
+
+        for entry in &entries {
+            let blob_path = layout.content_blob_path(&entry.hash);
+            let mut data: Vec<u8> = Vec::new();
+            if blob_path.exists() {
+                std::fs::File::open(&blob_path)
+                    .and_then(|mut f| f.read_to_end(&mut data))
+                    .map_err(|e| format!("{}: {}", entry.path, e))?;
+            } else {
+                // Large file — reassemble from its manifest's chunk list.
+                let manifest_path = layout.content_manifest_path(&entry.hash);
+                let manifest_json = std::fs::read(&manifest_path)
+                    .map_err(|e| format!("{}: manifest missing: {}", entry.path, e))?;
+                let manifest: sync_core::content_store::FileManifest =
+                    serde_json::from_slice(&manifest_json)
+                        .map_err(|e| format!("{}: corrupt manifest: {}", entry.path, e))?;
+                data.reserve(manifest.total_size as usize);
+                for chunk in &manifest.chunks {
+                    let chunk_path = layout.content_chunk_path(&chunk.hash);
+                    std::fs::File::open(&chunk_path)
+                        .and_then(|mut f| f.read_to_end(&mut data))
+                        .map_err(|e| format!("{}: chunk missing: {}", entry.path, e))?;
+                }
+            }
+
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(entry.mtime_ms / 1000);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, &entry.path, data.as_slice())
+                .map_err(|e| format!("{}: tar append: {}", entry.path, e))?;
+        }
+
+        let mut inner = builder.into_inner().map_err(|e| e.to_string())?;
+        inner.flush().map_err(|e| e.to_string())?;
+        let mut file = tmp;
+        file.seek(std::io::SeekFrom::Start(0))
+            .map_err(|e| e.to_string())?;
+        Ok(file)
+    })
+    .await
+    .map_err(|e| ServerErrorHtml(format!("export task failed: {}", e)))?
+    .map_err(ServerErrorHtml)?;
+
+    tracing::info!(
+        vault = %vault_id,
+        root = %&root_hash[..root_hash.len().min(16)],
+        files = file_count,
+        "admin export served"
+    );
+
+    let stream = tokio_util::io::ReaderStream::new(tokio::fs::File::from_std(tar_file));
+    let filename = format!("{}-{}.tar", vault_id, &root_hash[..root_hash.len().min(8)]);
+    Ok((
+        StatusCode::OK,
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/x-tar".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{}\"", filename),
+            ),
+        ],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response())
 }
 
 // --- Enrollment Claim ---
@@ -544,17 +654,23 @@ struct ServerErrorHtml(String);
 
 impl IntoResponse for ServerErrorHtml {
     fn into_response(self) -> axum::response::Response {
-        Html(format!(
-            r#"<!DOCTYPE html>
+        // Human-facing HTML, machine-truthful status: these pages used to
+        // ship with 200 OK, which made scripted admin calls (export, curl'd
+        // rollbacks) impossible to error-check.
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Html(format!(
+                r#"<!DOCTYPE html>
 <html><head><title>Error - ObsetyNC</title>{CSS}</head>
 <body>
 <h1>Error</h1>
 <p class="error">{}</p>
 <p><a href="/admin">Back to dashboard</a></p>
 </body></html>"#,
-            self.0
-        ))
-        .into_response()
+                self.0
+            )),
+        )
+            .into_response()
     }
 }
 

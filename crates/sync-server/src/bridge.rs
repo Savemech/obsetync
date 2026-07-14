@@ -36,6 +36,36 @@ pub async fn run_merge(
     .map_err(|e| format!("join error: {}", e))?
 }
 
+/// Load every file entry reachable from a root (all subtrees flattened),
+/// in a blocking task with a LocalSet — used by the admin export to
+/// materialize a snapshot without touching merge/diff logic.
+pub async fn run_list_entries(
+    index_base: PathBuf,
+    root: RootNode,
+) -> Result<Vec<sync_core::chunk::FileEntry>, String> {
+    tokio::task::spawn_blocking(move || {
+        let store = DiskChunkStore::new(&index_base);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let mut entries = Vec::with_capacity(root.total_files as usize);
+            for (_prefix, child_hash) in &root.children {
+                let mut child = sync_core::tree::load_all_entries(&store, child_hash)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                entries.append(&mut child);
+            }
+            entries.sort();
+            Ok(entries)
+        })
+    })
+    .await
+    .map_err(|e| format!("join error: {}", e))?
+}
+
 /// Run sync-core's `compute_deltas` in a blocking task with a LocalSet.
 pub async fn run_diff(
     index_base: PathBuf,

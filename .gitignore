@@ -41,3 +41,4 @@ tasks/
 *.crt
 *.pem
 *.key
+obsetync-test-plan.md

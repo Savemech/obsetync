@@ -45,3 +45,10 @@
     gap: 8px;
     margin-top: 12px;
 }
+
+/* --- Settings: server root history --- */
+.obsetync-history-list {
+    margin: 6px 0 12px;
+    max-height: 40vh;
+    overflow-y: auto;
+}
