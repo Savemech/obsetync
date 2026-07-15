@@ -589,6 +589,21 @@ async fn purge_vault(
 
 // --- Vault export ---
 
+/// Wire shape of a stored large-file manifest. The plugin serializes chunk
+/// hashes as hex STRINGS and the server stores the JSON verbatim, so the export
+/// must decode that — not `content_store::FileManifest`, whose `[u8;32]` hash
+/// fields reject a hex string ("expected an array of length 32").
+#[derive(serde::Deserialize)]
+struct WireManifest {
+    total_size: u64,
+    chunks: Vec<WireChunk>,
+}
+
+#[derive(serde::Deserialize)]
+struct WireChunk {
+    hash: String,
+}
+
 /// GET /admin/vaults/{vault_id}/export/{root_hash} — download the vault as
 /// it looked at any root in history, as a tar archive. Small files come
 /// straight from the blob store; chunked large files are reassembled from
@@ -631,15 +646,22 @@ async fn export_vault(
                     .map_err(|e| format!("{}: {}", entry.path, e))?;
             } else {
                 // Large file — reassemble from its manifest's chunk list.
+                // Manifests are stored VERBATIM as the plugin uploads them
+                // (see put_manifest), which encodes hashes as hex STRINGS — not
+                // the [u8;32] arrays of content_store::FileManifest. Deserialize
+                // that wire shape; the strict FileManifest deserialize is what
+                // failed with "invalid type: string … expected an array of
+                // length 32".
                 let manifest_path = layout.content_manifest_path(&entry.hash);
                 let manifest_json = std::fs::read(&manifest_path)
                     .map_err(|e| format!("{}: manifest missing: {}", entry.path, e))?;
-                let manifest: sync_core::content_store::FileManifest =
-                    serde_json::from_slice(&manifest_json)
-                        .map_err(|e| format!("{}: corrupt manifest: {}", entry.path, e))?;
+                let manifest: WireManifest = serde_json::from_slice(&manifest_json)
+                    .map_err(|e| format!("{}: corrupt manifest: {}", entry.path, e))?;
                 data.reserve(manifest.total_size as usize);
                 for chunk in &manifest.chunks {
-                    let chunk_path = layout.content_chunk_path(&chunk.hash);
+                    let chunk_hash = sync_core::hash::hex_to_hash(&chunk.hash)
+                        .map_err(|_| format!("{}: bad chunk hash '{}'", entry.path, chunk.hash))?;
+                    let chunk_path = layout.content_chunk_path(&chunk_hash);
                     std::fs::File::open(&chunk_path)
                         .and_then(|mut f| f.read_to_end(&mut data))
                         .map_err(|e| format!("{}: chunk missing: {}", entry.path, e))?;
@@ -895,6 +917,25 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tempfile::tempdir;
+
+    #[test]
+    fn wire_manifest_decodes_plugin_hex_hashes() {
+        // The exact shape the plugin uploads (hashes as hex strings) — the
+        // strict content_store::FileManifest ([u8;32]) rejects this, which is
+        // what broke the export. WireManifest must accept it, and each hex
+        // chunk hash must convert back to a 32-byte hash for the chunk path.
+        let json = br#"{
+            "file_hash": "5142e2d80264df76ec6936a5ae124aa037f4303cceb705e76b096b2657e2d8c8",
+            "total_size": 4096,
+            "chunks": [
+                {"hash": "5142e2d80264df76ec6936a5ae124aa037f4303cceb705e76b096b2657e2d8c8", "offset": 0, "size": 4096}
+            ]
+        }"#;
+        let m: WireManifest = serde_json::from_slice(json).unwrap();
+        assert_eq!(m.total_size, 4096);
+        assert_eq!(m.chunks.len(), 1);
+        assert!(sync_core::hash::hex_to_hash(&m.chunks[0].hash).is_ok());
+    }
 
     #[test]
     fn format_bytes_units() {
