@@ -28,12 +28,16 @@ build-image:
 build-artifacts: build-binary build-plugin
 
 # Extract just the server binary to ./dist/bin/sync-server.
+# --build: the binary is baked into the image at build time, so rebuild it from
+# current source before running or `run` ships whatever the last image had.
 build-binary:
-    docker compose run --rm binary
+    docker compose run --build --rm binary
 
 # Extract just the plugin files to ./dist/plugin/.
+# --build: main.js/manifest.json are compiled INTO the plugin-builder image, so
+# without a rebuild `run` copies stale artifacts (e.g. an old version) to dist/.
 build-plugin:
-    docker compose run --rm plugin
+    docker compose run --build --rm plugin
 
 # Build the dev image (carries Rust + Node + wasm-pack toolchain).
 build-dev:
