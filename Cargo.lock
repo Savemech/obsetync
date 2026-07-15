@@ -411,7 +411,7 @@ dependencies = [
 
 [[package]]
 name = "e2e-tests"
-version = "1.9.1"
+version = "1.9.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1452,7 +1452,7 @@ dependencies = [
 
 [[package]]
 name = "sync-core"
-version = "1.9.1"
+version = "1.9.2"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1474,14 +1474,14 @@ dependencies = [
 
 [[package]]
 name = "sync-schema"
-version = "1.9.1"
+version = "1.9.2"
 dependencies = [
  "flatbuffers",
 ]
 
 [[package]]
 name = "sync-server"
-version = "1.9.1"
+version = "1.9.2"
 dependencies = [
  "aes-gcm",
  "axum",
@@ -1496,6 +1496,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "similar",
  "sync-core",
  "tar",
  "tempfile",

@@ -28,6 +28,8 @@ tower-http = { version = "0.6", features = ["trace", "cors"] }
 # memory regardless of vault size.
 tar = "0.4"
 tempfile = "3"
+# Admin diff viewer: unified line diffs between two versions of a file.
+similar = "2"
 tokio-util = { version = "0.7", features = ["io"] }
 sha2 = "0.10"
 rand = "0.9"

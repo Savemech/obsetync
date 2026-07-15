@@ -2,7 +2,7 @@ use crate::devices;
 use crate::enrollment;
 use crate::state::SharedState;
 use axum::{
-    extract::{Form, Path, State},
+    extract::{Form, Path, Query, State},
     http::{Method, StatusCode},
     response::{Html, IntoResponse, Redirect},
     routing::{get, post},
@@ -30,6 +30,14 @@ pub fn admin_router(state: SharedState) -> Router {
         .route("/admin/vaults/{vault_id}", get(vault_detail))
         .route("/admin/vaults/{vault_id}/rollback", post(rollback_vault))
         .route("/admin/vaults/{vault_id}/purge", post(purge_vault))
+        .route(
+            "/admin/vaults/{vault_id}/diff/{from_hash}/{to_hash}",
+            get(diff_vaults),
+        )
+        .route(
+            "/admin/vaults/{vault_id}/filediff/{old_hash}/{new_hash}",
+            get(file_diff),
+        )
         .route(
             "/admin/vaults/{vault_id}/export/{root_hash}",
             get(export_vault),
@@ -400,39 +408,86 @@ async fn vault_detail(
         .map(|h| hash_to_hex(&h))
         .unwrap_or_else(|| "none".into());
 
-    // List all roots in history.
+    // Load each root's metadata so history reads chronologically (roots are
+    // stored by hash, not time) and we can offer per-revision "what changed"
+    // diffs via parent_hash.
+    struct RootMeta {
+        hash: String,
+        created_ms: u64,
+        total_files: u64,
+        parent: Option<String>,
+    }
     let roots_dir = state.layout.vault_roots_dir(&vault_id);
-    let mut roots = Vec::new();
+    let mut metas: Vec<RootMeta> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&roots_dir) {
         for entry in entries.filter_map(|e| e.ok()) {
             let name = entry.file_name().to_string_lossy().to_string();
-            if let Some(hash) = name.strip_suffix(".bin") {
-                roots.push(hash.to_string());
-            }
+            let Some(hash) = name.strip_suffix(".bin") else {
+                continue;
+            };
+            let Ok(h) = sync_core::hash::hex_to_hash(hash) else {
+                continue;
+            };
+            let Some(bytes) = state.vaults.get_root(&vault_id, &h) else {
+                continue;
+            };
+            let Ok(r) = sync_core::chunk::RootNode::deserialize(&bytes) else {
+                continue;
+            };
+            metas.push(RootMeta {
+                hash: hash.to_string(),
+                created_ms: r.created_ms,
+                total_files: r.total_files,
+                parent: r.parent_hash.map(|p| hash_to_hex(&p)),
+            });
         }
     }
-    roots.sort();
-    roots.reverse();
+    // Newest first; roots without a timestamp sink, tie-broken by hash for
+    // stable ordering.
+    metas.sort_by(|a, b| b.created_ms.cmp(&a.created_ms).then(a.hash.cmp(&b.hash)));
 
-    let root_rows: String = roots
+    let root_rows: String = metas
         .iter()
-        .map(|hash| {
-            let is_current = hash == &current_hex;
-            let marker = if is_current { " (current)" } else { "" };
+        .map(|m| {
+            let is_current = m.hash == current_hex;
+            let marker = if is_current {
+                " <strong>(current)</strong>"
+            } else {
+                ""
+            };
             let rollback = if !is_current {
                 format!(
-                    r#"<form method="POST" action="/admin/vaults/{}/rollback" style="display:inline">
-                    <input type="hidden" name="root_hash" value="{}">
-                    <button type="submit" class="btn-small">rollback</button>
-                    </form>"#,
-                    vault_id, hash
+                    r#"<form method="POST" action="/admin/vaults/{}/rollback" style="display:inline"><input type="hidden" name="root_hash" value="{}"><button type="submit" class="btn-small">rollback</button></form> "#,
+                    vault_id, m.hash
+                )
+            } else {
+                String::new()
+            };
+            let what_changed = match &m.parent {
+                Some(p) => format!(
+                    r#"<a class="btn-small" href="/admin/vaults/{}/diff/{}/{}">what changed</a> "#,
+                    vault_id, p, m.hash
+                ),
+                None => String::new(),
+            };
+            let diff_current = if !is_current {
+                format!(
+                    r#"<a class="btn-small" href="/admin/vaults/{}/diff/{}/{}">diff→current</a> "#,
+                    vault_id, m.hash, current_hex
                 )
             } else {
                 String::new()
             };
             format!(
-                r#"<tr><td><code>{:.16}...</code>{marker}</td><td>{rollback} <a class="btn-small" href="/admin/vaults/{}/export/{}">export</a></td></tr>"#,
-                hash, vault_id, hash
+                r#"<tr><td>{when}</td><td><code>{hash:.16}…</code>{marker}</td><td>{files}</td><td>{rollback}{what_changed}{diff_current}<a class="btn-small" href="/admin/vaults/{vault}/export/{hash}">export</a></td></tr>"#,
+                when = format_time(m.created_ms),
+                hash = m.hash,
+                marker = marker,
+                files = m.total_files,
+                rollback = rollback,
+                what_changed = what_changed,
+                diff_current = diff_current,
+                vault = vault_id,
             )
         })
         .collect();
@@ -444,8 +499,9 @@ async fn vault_detail(
 <h1><a href="/admin">ObsetyNC</a> / <a href="/admin/vaults">Vaults</a> / {vault_id}</h1>
 <p>Current root: <code>{:.16}...</code></p>
 <h2>Root History</h2>
+<p><strong>what changed</strong> = files this version's push added/modified/deleted (vs its parent); <strong>diff→current</strong> = everything since this version.</p>
 <table>
-<tr><th>Root Hash</th><th></th></tr>
+<tr><th>When</th><th>Root</th><th>Files</th><th>Actions</th></tr>
 {root_rows}
 </table>
 <h2>Purge ignored paths</h2>
@@ -604,6 +660,39 @@ struct WireChunk {
     hash: String,
 }
 
+/// Read a file's full content from the content store by hash — a single blob,
+/// or reassembled from its chunk manifest for large files. Blocking I/O; call
+/// inside spawn_blocking. Shared by the export and the file-diff viewer.
+fn read_file_content(
+    layout: &crate::storage::StorageLayout,
+    hash: &sync_core::hash::FileHash,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let blob_path = layout.content_blob_path(hash);
+    if blob_path.exists() {
+        let mut data = Vec::new();
+        std::fs::File::open(&blob_path)
+            .and_then(|mut f| f.read_to_end(&mut data))
+            .map_err(|e| e.to_string())?;
+        return Ok(data);
+    }
+    let manifest_path = layout.content_manifest_path(hash);
+    let manifest_json =
+        std::fs::read(&manifest_path).map_err(|e| format!("manifest missing: {}", e))?;
+    let manifest: WireManifest =
+        serde_json::from_slice(&manifest_json).map_err(|e| format!("corrupt manifest: {}", e))?;
+    let mut data = Vec::with_capacity(manifest.total_size as usize);
+    for chunk in &manifest.chunks {
+        let chunk_hash = sync_core::hash::hex_to_hash(&chunk.hash)
+            .map_err(|_| format!("bad chunk hash '{}'", chunk.hash))?;
+        let chunk_path = layout.content_chunk_path(&chunk_hash);
+        std::fs::File::open(&chunk_path)
+            .and_then(|mut f| f.read_to_end(&mut data))
+            .map_err(|e| format!("chunk missing: {}", e))?;
+    }
+    Ok(data)
+}
+
 /// GET /admin/vaults/{vault_id}/export/{root_hash} — download the vault as
 /// it looked at any root in history, as a tar archive. Small files come
 /// straight from the blob store; chunked large files are reassembled from
@@ -630,43 +719,20 @@ async fn export_vault(
     let layout = state.layout.clone();
     let file_count = entries.len();
     let tar_file = tokio::task::spawn_blocking(move || -> Result<std::fs::File, String> {
-        use std::io::{Read, Seek, Write};
+        use std::io::{Seek, Write};
 
-        // Anonymous tempfile: the OS reclaims it when the handle drops, even
-        // if the download is abandoned mid-stream.
-        let tmp = tempfile::tempfile().map_err(|e| e.to_string())?;
+        // Build the tar on the DATA filesystem, which has room for a full-vault
+        // tar — NOT the process temp dir, which on the hardened container is a
+        // small tmpfs where a large vault dies with ENOSPC. Still auto-removed
+        // when the handle drops (even if the download is abandoned mid-stream).
+        let tmp_dir = layout.base.join(".export-tmp");
+        std::fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
+        let tmp = tempfile::tempfile_in(&tmp_dir).map_err(|e| e.to_string())?;
         let mut builder = tar::Builder::new(&tmp);
 
         for entry in &entries {
-            let blob_path = layout.content_blob_path(&entry.hash);
-            let mut data: Vec<u8> = Vec::new();
-            if blob_path.exists() {
-                std::fs::File::open(&blob_path)
-                    .and_then(|mut f| f.read_to_end(&mut data))
-                    .map_err(|e| format!("{}: {}", entry.path, e))?;
-            } else {
-                // Large file — reassemble from its manifest's chunk list.
-                // Manifests are stored VERBATIM as the plugin uploads them
-                // (see put_manifest), which encodes hashes as hex STRINGS — not
-                // the [u8;32] arrays of content_store::FileManifest. Deserialize
-                // that wire shape; the strict FileManifest deserialize is what
-                // failed with "invalid type: string … expected an array of
-                // length 32".
-                let manifest_path = layout.content_manifest_path(&entry.hash);
-                let manifest_json = std::fs::read(&manifest_path)
-                    .map_err(|e| format!("{}: manifest missing: {}", entry.path, e))?;
-                let manifest: WireManifest = serde_json::from_slice(&manifest_json)
-                    .map_err(|e| format!("{}: corrupt manifest: {}", entry.path, e))?;
-                data.reserve(manifest.total_size as usize);
-                for chunk in &manifest.chunks {
-                    let chunk_hash = sync_core::hash::hex_to_hash(&chunk.hash)
-                        .map_err(|_| format!("{}: bad chunk hash '{}'", entry.path, chunk.hash))?;
-                    let chunk_path = layout.content_chunk_path(&chunk_hash);
-                    std::fs::File::open(&chunk_path)
-                        .and_then(|mut f| f.read_to_end(&mut data))
-                        .map_err(|e| format!("{}: chunk missing: {}", entry.path, e))?;
-                }
-            }
+            let data = read_file_content(&layout, &entry.hash)
+                .map_err(|e| format!("{}: {}", entry.path, e))?;
 
             let mut header = tar::Header::new_gnu();
             header.set_size(data.len() as u64);
@@ -938,6 +1004,30 @@ mod tests {
     }
 
     #[test]
+    fn html_escape_neutralizes_markup() {
+        assert_eq!(
+            html_escape("<a href=\"x\">&y"),
+            "&lt;a href=&quot;x&quot;&gt;&amp;y"
+        );
+    }
+
+    #[test]
+    fn pct_encode_spaces_slashes_unicode() {
+        assert_eq!(pct_encode("a b/c"), "a%20b%2Fc");
+        assert_eq!(pct_encode("note.md"), "note.md");
+        assert_eq!(pct_encode("café"), "caf%C3%A9"); // multi-byte UTF-8 encoded
+    }
+
+    #[test]
+    fn unified_diff_html_classes_each_line() {
+        let unified = "--- before\n+++ after\n@@ -1 +1 @@\n-old\n+new\n ctx\n";
+        let html = render_unified_diff_html(unified);
+        for cls in ["l-m", "l-h", "l-d", "l-a", "l-c"] {
+            assert!(html.contains(cls), "missing {cls} in {html}");
+        }
+    }
+
+    #[test]
     fn format_bytes_units() {
         assert_eq!(format_bytes(0), "0 B");
         assert_eq!(format_bytes(512), "512 B");
@@ -1036,6 +1126,270 @@ mod tests {
     }
 }
 
+// --- Version diff viewer (svn-like: file summary + per-file drill-down) ---
+
+const ZERO_HASH_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Percent-encode a string for a URL query value (path labels have spaces,
+/// slashes, and non-ASCII).
+fn pct_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// Colorize a `similar` unified diff into HTML lines.
+fn render_unified_diff_html(unified: &str) -> String {
+    let mut out = String::from("<div class=\"diff\">");
+    for line in unified.lines() {
+        let cls = if line.starts_with("@@") {
+            "h"
+        } else if line.starts_with("+++") || line.starts_with("---") {
+            "m"
+        } else if line.starts_with('+') {
+            "a"
+        } else if line.starts_with('-') {
+            "d"
+        } else {
+            "c"
+        };
+        out.push_str(&format!(
+            "<span class=\"l-{}\">{}</span>",
+            cls,
+            html_escape(line)
+        ));
+    }
+    out.push_str("</div>");
+    out
+}
+
+/// GET /admin/vaults/{vault}/diff/{from}/{to} — file-level summary of what
+/// changed between two roots (added / modified / deleted), each row linking to
+/// a per-file content diff. Diffing by flattened entry maps (not compute_deltas)
+/// gives us BOTH the old and new hash per modified file for the drill-down.
+async fn diff_vaults(
+    State(state): State<SharedState>,
+    Path((vault_id, from_hex, to_hex)): Path<(String, String, String)>,
+) -> Result<Html<String>, ServerErrorHtml> {
+    let load = |hex: &str| -> Result<sync_core::chunk::RootNode, ServerErrorHtml> {
+        let hash = sync_core::hash::hex_to_hash(hex)
+            .map_err(|_| ServerErrorHtml("invalid root hash".into()))?;
+        let bytes = state
+            .vaults
+            .get_root(&vault_id, &hash)
+            .ok_or_else(|| ServerErrorHtml("root not found in history".into()))?;
+        sync_core::chunk::RootNode::deserialize(&bytes)
+            .map_err(|e| ServerErrorHtml(format!("corrupt root: {}", e)))
+    };
+    let from_root = load(&from_hex)?;
+    let to_root = load(&to_hex)?;
+
+    let index = state.layout.base.join("index");
+    let from_entries = crate::bridge::run_list_entries(index.clone(), from_root)
+        .await
+        .map_err(|e| ServerErrorHtml(format!("list from-root: {}", e)))?;
+    let to_entries = crate::bridge::run_list_entries(index, to_root)
+        .await
+        .map_err(|e| ServerErrorHtml(format!("list to-root: {}", e)))?;
+
+    use std::collections::BTreeMap;
+    let from_map: BTreeMap<&str, &sync_core::chunk::FileEntry> =
+        from_entries.iter().map(|e| (e.path.as_str(), e)).collect();
+    let to_map: BTreeMap<&str, &sync_core::chunk::FileEntry> =
+        to_entries.iter().map(|e| (e.path.as_str(), e)).collect();
+
+    struct Change<'a> {
+        status: char,
+        path: &'a str,
+        old: Option<&'a sync_core::chunk::FileEntry>,
+        new: Option<&'a sync_core::chunk::FileEntry>,
+    }
+    let mut changes: Vec<Change> = Vec::new();
+    for (path, to_e) in &to_map {
+        match from_map.get(path) {
+            None => changes.push(Change {
+                status: 'A',
+                path,
+                old: None,
+                new: Some(to_e),
+            }),
+            Some(from_e) if from_e.hash != to_e.hash => changes.push(Change {
+                status: 'M',
+                path,
+                old: Some(from_e),
+                new: Some(to_e),
+            }),
+            Some(_) => {}
+        }
+    }
+    for (path, from_e) in &from_map {
+        if !to_map.contains_key(path) {
+            changes.push(Change {
+                status: 'D',
+                path,
+                old: Some(from_e),
+                new: None,
+            });
+        }
+    }
+    changes.sort_by(|a, b| a.path.cmp(b.path));
+
+    let total = changes.len();
+    const MAX_ROWS: usize = 3000;
+
+    let mut rows = String::new();
+    for c in changes.iter().take(MAX_ROWS) {
+        let old_hex = c
+            .old
+            .map(|e| hash_to_hex(&e.hash))
+            .unwrap_or_else(|| ZERO_HASH_HEX.to_string());
+        let new_hex = c
+            .new
+            .map(|e| hash_to_hex(&e.hash))
+            .unwrap_or_else(|| ZERO_HASH_HEX.to_string());
+        let size = match (c.old, c.new) {
+            (Some(o), Some(n)) => {
+                format!(
+                    "{} → {}",
+                    format_bytes(o.size_bytes),
+                    format_bytes(n.size_bytes)
+                )
+            }
+            (None, Some(n)) => format!("+{}", format_bytes(n.size_bytes)),
+            (Some(o), None) => format!("−{}", format_bytes(o.size_bytes)),
+            (None, None) => String::new(),
+        };
+        rows.push_str(&format!(
+            r#"<tr class="d-{status}"><td>{status}</td><td><code>{path}</code></td><td>{size}</td><td><a class="btn-small" href="/admin/vaults/{vault}/filediff/{old}/{new}?path={enc}">view</a></td></tr>"#,
+            status = c.status,
+            path = html_escape(c.path),
+            size = size,
+            vault = vault_id,
+            old = old_hex,
+            new = new_hex,
+            enc = pct_encode(c.path),
+        ));
+    }
+
+    let truncated = if total > MAX_ROWS {
+        format!(
+            "<p class=\"footer\">Showing first {} of {} changes.</p>",
+            MAX_ROWS, total
+        )
+    } else {
+        String::new()
+    };
+    let summary = if total == 0 {
+        "<p>No file changes between these two versions.</p>".to_string()
+    } else {
+        format!(
+            "<p>{} change(s). Use <strong>view</strong> to drill into a file.</p><table><tr><th></th><th>Path</th><th>Size</th><th></th></tr>{}</table>{}",
+            total, rows, truncated
+        )
+    };
+
+    Ok(Html(format!(
+        r#"<!DOCTYPE html>
+<html><head><title>diff - {vault}</title>{CSS}</head><body>
+<h1><a href="/admin">ObsetyNC</a> / <a href="/admin/vaults">Vaults</a> / <a href="/admin/vaults/{vault}">{vault}</a> / diff</h1>
+<p>From <code>{from:.16}…</code> → <code>{to:.16}…</code></p>
+{summary}
+<p><a href="/admin/vaults/{vault}">Back to vault</a></p>
+</body></html>"#,
+        vault = vault_id,
+        from = from_hex,
+        to = to_hex,
+        summary = summary,
+    )))
+}
+
+#[derive(serde::Deserialize)]
+struct FileDiffQuery {
+    path: Option<String>,
+}
+
+/// GET /admin/vaults/{vault}/filediff/{old}/{new}?path=… — unified line diff of
+/// one file between two content hashes. A zero hash means "absent on that side"
+/// (an add is all-inserts, a delete all-removes). Content is read BY HASH, so
+/// the `path` query is a display label only — no traversal.
+async fn file_diff(
+    State(state): State<SharedState>,
+    Path((vault_id, old_hex, new_hex)): Path<(String, String, String)>,
+    Query(q): Query<FileDiffQuery>,
+) -> Result<Html<String>, ServerErrorHtml> {
+    let label = q.path.unwrap_or_default();
+    let layout = state.layout.clone();
+    let (old, new) = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Vec<u8>), String> {
+        let read = |hex: &str| -> Result<Vec<u8>, String> {
+            if hex == ZERO_HASH_HEX {
+                return Ok(Vec::new());
+            }
+            let h = sync_core::hash::hex_to_hash(hex).map_err(|_| "invalid hash".to_string())?;
+            read_file_content(&layout, &h)
+        };
+        Ok((read(&old_hex)?, read(&new_hex)?))
+    })
+    .await
+    .map_err(|e| ServerErrorHtml(format!("diff task failed: {}", e)))?
+    .map_err(ServerErrorHtml)?;
+
+    const MAX_DIFF_BYTES: usize = 1024 * 1024; // 1 MiB per side
+    let body = if old.len() > MAX_DIFF_BYTES || new.len() > MAX_DIFF_BYTES {
+        format!(
+            "<p>File too large to diff inline ({} → {}).</p>",
+            format_bytes(old.len() as u64),
+            format_bytes(new.len() as u64)
+        )
+    } else {
+        match (std::str::from_utf8(&old), std::str::from_utf8(&new)) {
+            (Ok(a), Ok(b)) => {
+                let unified = similar::TextDiff::from_lines(a, b)
+                    .unified_diff()
+                    .context_radius(3)
+                    .header("before", "after")
+                    .to_string();
+                if unified.trim().is_empty() {
+                    "<p>No textual differences (metadata-only change).</p>".to_string()
+                } else {
+                    render_unified_diff_html(&unified)
+                }
+            }
+            _ => format!(
+                "<p>Binary file — content not shown ({} → {}).</p>",
+                format_bytes(old.len() as u64),
+                format_bytes(new.len() as u64)
+            ),
+        }
+    };
+
+    Ok(Html(format!(
+        r#"<!DOCTYPE html>
+<html><head><title>file diff</title>{CSS}</head><body>
+<h1><a href="/admin">ObsetyNC</a> / <a href="/admin/vaults/{vault}">{vault}</a> / file diff</h1>
+<p><code>{label}</code></p>
+{body}
+<p><a href="/admin/vaults/{vault}">Back to vault</a></p>
+</body></html>"#,
+        vault = vault_id,
+        label = html_escape(&label),
+        body = body,
+    )))
+}
+
 const CSS: &str = r#"<style>
 body { font-family: -apple-system, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; color: #333; }
 h1 { border-bottom: 2px solid #eee; padding-bottom: 10px; }
@@ -1060,4 +1414,14 @@ code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; font-size: 0.9
 .kpi-val   { font-size: 1.3em; font-weight: 600; margin-top: 4px; color: #1a73e8; }
 .kpi-sub   { font-size: 0.75em; color: #888; font-weight: 400; }
 .footer    { color: #888; font-size: 0.85em; margin-top: 30px; }
+.d-A td:first-child { color: #2e7d32; font-weight: 700; }
+.d-M td:first-child { color: #ef6c00; font-weight: 700; }
+.d-D td:first-child { color: #c62828; font-weight: 700; }
+.diff { background: #fbfbfb; border: 1px solid #ddd; border-radius: 4px; padding: 12px; overflow-x: auto; font-size: 0.85em; line-height: 1.4; }
+.diff span { display: block; white-space: pre; }
+.l-a { background: #e6ffed; color: #22863a; }
+.l-d { background: #ffeef0; color: #b31d28; }
+.l-h { background: #f1f8ff; color: #005cc5; }
+.l-m { color: #6a737d; }
+.l-c { color: #444; }
 </style>"#;
