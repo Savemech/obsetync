@@ -99,10 +99,7 @@ mod tests {
     #[test]
     fn dir_anywhere_matches_nested_subtree() {
         let p = pats(&["target/"]);
-        assert!(matches_any(
-            "code/myapp/target/debug/deps/lib.rmeta",
-            &p
-        ));
+        assert!(matches_any("code/myapp/target/debug/deps/lib.rmeta", &p));
         assert!(matches_any("target/x.rlib", &p));
     }
 
