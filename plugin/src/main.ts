@@ -145,6 +145,7 @@ export default class ObsetyncPlugin extends Plugin {
         push(`Sync interval:     ${this.settings.syncIntervalMs}ms`);
         push(`Sync priority:     ${this.settings.syncPriority}`);
         push(`Sync .obsidian/:   ${this.settings.syncObsidianConfig}`);
+        push(`Ignore patterns:   ${this.settings.ignorePatterns.length} (${this.settings.ignorePatterns.slice(0, 4).join(", ")}${this.settings.ignorePatterns.length > 4 ? ", …" : ""})`);
         push(`Auto-sync:         ${this.settings.autoSync}`);
         push("");
 
@@ -405,6 +406,7 @@ export default class ObsetyncPlugin extends Plugin {
             this.settings.deviceName || "device",
             this.settings.realtimeWs,
             this.settings.sharePresence,
+            this.settings.ignorePatterns,
         );
 
         // Start.

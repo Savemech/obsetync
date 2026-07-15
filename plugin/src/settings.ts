@@ -1,6 +1,7 @@
 import { App, PluginSettingTab, Setting, Notice } from "obsidian";
 import type ObsetyncPlugin from "./main";
 import { ObsetyncDebugModal } from "./debug-modal";
+import { DEFAULT_IGNORE_PATTERNS } from "./ignore";
 
 export type SyncPriority =
     | "sequential"   // as found (default)
@@ -19,6 +20,12 @@ export interface SyncSettings {
     autoSync: boolean;
     syncPriority: SyncPriority;
     syncObsidianConfig: boolean;
+    /** Slice 2: gitignore-style patterns whose paths are never synced — not
+     *  pushed, pulled, or tracked. Defaults exclude build output (target/,
+     *  node_modules/), .git/, and OS junk. Keep identical across the fleet:
+     *  a device that ignores a path another device still tracks won't delete
+     *  it, but won't converge on it either. */
+    ignorePatterns: string[];
     /** Ph2 notify channel: WebSocket "root changed" push → pulls in seconds;
      *  polling degrades to a slow safety net while the socket is live. */
     realtimeWs: boolean;
@@ -39,6 +46,7 @@ export const DEFAULT_SETTINGS: SyncSettings = {
     autoSync: true,
     syncPriority: "sequential",
     syncObsidianConfig: false,
+    ignorePatterns: [...DEFAULT_IGNORE_PATTERNS],
     realtimeWs: true,
     sharePresence: true,
     enrolled: false,
@@ -226,6 +234,29 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                         await this.plugin.saveSettings();
                     })
             );
+
+        new Setting(containerEl)
+            .setName("Ignore patterns")
+            .setDesc(
+                "Paths matching these gitignore-style patterns are never synced — " +
+                "not pushed, pulled, or tracked. One per line. Defaults exclude build " +
+                "output (target/, node_modules/), .git/, and OS junk — the usual cause " +
+                "of a vault ballooning to tens of thousands of files. Keep these " +
+                "identical on every device. Takes effect after reloading the plugin."
+            )
+            .addTextArea((ta) => {
+                ta.setPlaceholder("target/\nnode_modules/\n.git/\n*.tmp")
+                    .setValue(this.plugin.settings.ignorePatterns.join("\n"))
+                    .onChange(async (value) => {
+                        this.plugin.settings.ignorePatterns = value
+                            .split("\n")
+                            .map((s) => s.trim())
+                            .filter((s) => s.length > 0);
+                        await this.plugin.saveSettings();
+                    });
+                ta.inputEl.rows = 6;
+                ta.inputEl.addClass("obsetync-ignore-input");
+            });
 
         new Setting(containerEl)
             .setName("Realtime sync")

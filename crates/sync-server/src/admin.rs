@@ -29,6 +29,7 @@ pub fn admin_router(state: SharedState) -> Router {
         .route("/admin/vaults", get(vault_list))
         .route("/admin/vaults/{vault_id}", get(vault_detail))
         .route("/admin/vaults/{vault_id}/rollback", post(rollback_vault))
+        .route("/admin/vaults/{vault_id}/purge", post(purge_vault))
         .route(
             "/admin/vaults/{vault_id}/export/{root_hash}",
             get(export_vault),
@@ -447,6 +448,17 @@ async fn vault_detail(
 <tr><th>Root Hash</th><th></th></tr>
 {root_rows}
 </table>
+<h2>Purge ignored paths</h2>
+<p>Remove build output / junk (target/, node_modules/, .git/, …) from the current
+root in one shot, so devices that ignore those paths can converge. This is
+<strong>reversible</strong> — the pre-purge root stays in history above; roll back
+to undo. Local files on each device are kept; they are only untracked. One
+pattern per line, gitignore-style (<code>target/</code>, <code>*.tmp</code>).</p>
+<form method="POST" action="/admin/vaults/{vault_id}/purge"
+      onsubmit="return confirm('Purge matching paths from the current root? Reversible via rollback.')">
+<textarea name="patterns" rows="5" cols="48" placeholder="target/&#10;node_modules/&#10;.git/&#10;*.tmp"></textarea><br>
+<button type="submit" class="btn-small">purge</button>
+</form>
 <p><a href="/admin/vaults">Back to vaults</a></p>
 </body></html>"#,
         current_hex,
@@ -484,6 +496,93 @@ async fn rollback_vault(
         .set_current_root(&vault_id, &hash)
         .map_err(|e| ServerErrorHtml(format!("rollback failed: {}", e)))?;
     state.notify_root_changed(&vault_id, &hash_to_hex(&hash));
+
+    Ok(Redirect::to(&format!("/admin/vaults/{}", vault_id)))
+}
+
+// --- Purge ignored paths (Slice 2b) ---
+
+#[derive(serde::Deserialize)]
+struct PurgeForm {
+    patterns: String,
+}
+
+/// POST /admin/vaults/{vault_id}/purge — rebuild the current root without the
+/// paths matching the operator's gitignore-style patterns, and make it current.
+/// Guard-exempt and COW-reversible (the pre-purge root stays in history), by the
+/// same rationale as rollback: it is a deliberate operator action, not a client
+/// push. Clients that ignore those paths untrack them on the next pull WITHOUT
+/// deleting local files; a non-ignoring client would delete its copies, so the
+/// fleet must share the ignore patterns first.
+async fn purge_vault(
+    State(state): State<SharedState>,
+    Path(vault_id): Path<String>,
+    Form(form): Form<PurgeForm>,
+) -> Result<Redirect, ServerErrorHtml> {
+    let patterns: Vec<String> = form
+        .patterns
+        .split(['\n', ','])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if patterns.is_empty() {
+        return Err(ServerErrorHtml("no purge patterns given".into()));
+    }
+
+    // Serialize with put_root/rollback: a purge racing an in-flight push is the
+    // same lost-update hazard. Held across the whole read-modify-write.
+    let vault_lock = state.vault_lock(&vault_id);
+    let _vault_guard = vault_lock.lock().await;
+
+    let current_hash = state
+        .vaults
+        .get_current_root(&vault_id)
+        .ok_or_else(|| ServerErrorHtml("vault has no current root".into()))?;
+    let current_bytes = state
+        .vaults
+        .get_root(&vault_id, &current_hash)
+        .ok_or_else(|| ServerErrorHtml("current root data missing".into()))?;
+    let current_root = sync_core::chunk::RootNode::deserialize(&current_bytes)
+        .map_err(|e| ServerErrorHtml(format!("corrupt current root: {}", e)))?;
+
+    let (mut new_root, removed, kept) =
+        crate::bridge::run_purge(state.layout.base.join("index"), current_root, patterns)
+            .await
+            .map_err(|e| ServerErrorHtml(format!("purge failed: {}", e)))?;
+
+    if removed == 0 {
+        // Nothing matched — don't mint a redundant identical root.
+        return Ok(Redirect::to(&format!("/admin/vaults/{}", vault_id)));
+    }
+
+    // Link the new root to the one it descends from so history stays a chain.
+    // (parent_hash is metadata, not part of the content hash.)
+    new_root.parent_hash = Some(current_hash);
+    let new_bytes = new_root.serialize();
+    let new_hash = new_root.hash();
+
+    state
+        .vaults
+        .store_root(&vault_id, &new_hash, &new_bytes)
+        .map_err(|e| ServerErrorHtml(format!("store root failed: {}", e)))?;
+    let idx_path = state.layout.index_path(&new_hash);
+    crate::storage::write_blob(&idx_path, &new_bytes)
+        .map_err(|e| ServerErrorHtml(format!("write index failed: {}", e)))?;
+
+    state
+        .vaults
+        .set_current_root(&vault_id, &new_hash)
+        .map_err(|e| ServerErrorHtml(format!("set current failed: {}", e)))?;
+    state.notify_root_changed(&vault_id, &hash_to_hex(&new_hash));
+
+    tracing::warn!(
+        vault = %vault_id,
+        removed,
+        kept,
+        root = %&hash_to_hex(&new_hash)[..16],
+        parent = %&hash_to_hex(&current_hash)[..16],
+        "admin purge: removed ignored paths from current root (reversible via rollback)"
+    );
 
     Ok(Redirect::to(&format!("/admin/vaults/{}", vault_id)))
 }

@@ -61,6 +61,12 @@ export async function pull(
      *  These paths are skipped on DISK but still applied to the tree: the
      *  local edit pushes right after, and the server merge reconciles. */
     skipPaths?: Set<string>,
+    /** Slice 2 ignore predicate. Ignored UPSERTS are dropped (never fetched —
+     *  this is what stops a stale device choking on a target/ binary — never
+     *  tracked, never in the tree). Ignored DELETES untrack the path (sync-base
+     *  + tree) WITHOUT deleting disk, so a server-side purge of ignored paths
+     *  converges the fleet while every device keeps its local copy. */
+    isIgnored?: (path: string) => boolean,
 ): Promise<PullResult> {
     // --- First-time client: bulk-seed from the server ------------------
     //
@@ -82,13 +88,21 @@ export async function pull(
             };
         }
         onDeltasKnown?.(deltaPaths(deltas));
-        const failed = await applyDeltas(api, io, syncBase, wasm, deltas, onProgress, skipPaths);
+        const { kept, ignoredDeletes, ignoredUpserts } = splitIgnored(deltas, isIgnored);
+        for (const d of ignoredDeletes) syncBase.removeEntry(d.path);
+        if (ignoredUpserts > 0 || ignoredDeletes.length > 0) {
+            console.log(
+                `[obsetync] pull: skipped ${ignoredUpserts} ignored addition(s), ` +
+                `untracked ${ignoredDeletes.length} ignored deletion(s)`,
+            );
+        }
+        const failed = await applyDeltas(api, io, syncBase, wasm, kept, onProgress, skipPaths);
 
         // Rebase: sync-base was just seeded with the full server state, so a
         // fresh bootstrap from it materializes the server's tree locally.
         // Deferred files never got a sync-base entry, so the bootstrap already
         // excludes them; filter the delta list too for the incremental branch.
-        const appliedDeltas = excludeDeltas(deltas, failed);
+        const appliedDeltas = excludeDeltas(kept, failed).concat(ignoredDeletes);
         const deltasHadMtime = rebaseTree(tree, syncBase, appliedDeltas);
 
         // Establish newRootHash + raw root bytes from the server's current
@@ -107,11 +121,11 @@ export async function pull(
 
         syncBase.setLastSyncTimestamp(Date.now());
         await syncBase.save();
-        onProgress?.(`first sync: applied ${deltas.length - failed.length} files`);
+        onProgress?.(`first sync: applied ${kept.length - failed.length} files`);
         return {
             newRootHash,
             newRootBytes,
-            applied: deltas.length - failed.length,
+            applied: kept.length - failed.length,
             treeParity: parity(tree, newRootHash),
             deltasHadMtime,
             failedCount: failed.length,
@@ -162,13 +176,24 @@ export async function pull(
 
     onProgress?.(`${deltas.length} changes to apply`);
     onDeltasKnown?.(deltaPaths(deltas));
-    const failed = await applyDeltas(api, io, syncBase, wasm, deltas, onProgress, skipPaths);
+    const { kept, ignoredDeletes, ignoredUpserts } = splitIgnored(deltas, isIgnored);
+    // Untrack ignored paths the server dropped (a purge) WITHOUT touching disk.
+    for (const d of ignoredDeletes) syncBase.removeEntry(d.path);
+    if (ignoredUpserts > 0 || ignoredDeletes.length > 0) {
+        console.log(
+            `[obsetync] pull: skipped ${ignoredUpserts} ignored upsert(s), ` +
+            `untracked ${ignoredDeletes.length} ignored deletion(s)`,
+        );
+    }
+    const failed = await applyDeltas(api, io, syncBase, wasm, kept, onProgress, skipPaths);
 
     // Rebase the Merkle tree with the exact deltas just applied to disk +
     // sync-base. THE key invariant of the pull path: tree, sync-base, and
     // disk advance together or not at all — so DEFERRED (unfetched) files are
     // excluded here, or the tree would claim content that never hit disk.
-    const appliedDeltas = excludeDeltas(deltas, failed);
+    // Ignored deletions ARE included: they drop the leaf so the tree converges
+    // with a server that purged them.
+    const appliedDeltas = excludeDeltas(kept, failed).concat(ignoredDeletes);
     const deltasHadMtime = rebaseTree(tree, syncBase, appliedDeltas);
 
     // Extract the new root hash from the server's current root bytes so
@@ -190,7 +215,7 @@ export async function pull(
     return {
         newRootHash,
         newRootBytes,
-        applied: deltas.length - failed.length,
+        applied: kept.length - failed.length,
         treeParity: parity(tree, newRootHash),
         deltasHadMtime,
         failedCount: failed.length,
@@ -204,6 +229,30 @@ function excludeDeltas(deltas: FileDelta[], failed: FileDelta[]): FileDelta[] {
     if (failed.length === 0) return deltas;
     const drop = new Set(failed);
     return deltas.filter((d) => !drop.has(d));
+}
+
+/** Partition a delta set by the ignore predicate (Slice 2):
+ *   - `kept`           — normal deltas to apply to disk.
+ *   - `ignoredDeletes` — ignored paths the server dropped: untrack them (tree +
+ *                        sync-base) but keep the local file on disk.
+ *  Ignored UPSERTS are discarded outright (never fetched, never tracked). */
+function splitIgnored(
+    deltas: FileDelta[],
+    isIgnored?: (path: string) => boolean,
+): { kept: FileDelta[]; ignoredDeletes: FileDelta[]; ignoredUpserts: number } {
+    if (!isIgnored) return { kept: deltas, ignoredDeletes: [], ignoredUpserts: 0 };
+    const kept: FileDelta[] = [];
+    const ignoredDeletes: FileDelta[] = [];
+    let ignoredUpserts = 0;
+    for (const d of deltas) {
+        if (isIgnored(d.path)) {
+            if (d.action === "deleted") ignoredDeletes.push(d);
+            else ignoredUpserts++;
+            continue;
+        }
+        kept.push(d);
+    }
+    return { kept, ignoredDeletes, ignoredUpserts };
 }
 
 /** Every vault path a delta set will touch (targets + rename sources). */

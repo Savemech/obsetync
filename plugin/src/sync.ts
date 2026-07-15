@@ -25,6 +25,7 @@ import { perfSpan } from "./debug-log";
 import { pull } from "./pull";
 import { push, hashFileStreaming, streamingHash, FileChange, WasmModule, WasmTree } from "./push";
 import { SyncPriority } from "./settings";
+import { compileIgnore, type CompiledIgnore } from "./ignore";
 
 export type SyncState = "idle" | "pulling" | "pushing" | "scanning" | "error";
 
@@ -83,9 +84,15 @@ export class ObsetyncSyncEngine {
         /** Ph3: broadcast which file this device is looking at (receiving
          *  presence always works; this only gates SENDING ours). */
         private sharePresence: boolean = true,
+        /** Slice 2: gitignore-style patterns for paths that never sync. */
+        ignorePatterns: string[] = [],
     ) {
         this.localRootHash = initialRootHash;
+        this.ignore = compileIgnore(ignorePatterns);
     }
+
+    /** Compiled ignore matcher (Slice 2). Empty ⇒ nothing ignored. */
+    private ignore: CompiledIgnore;
 
     /** The WS notify channel (null when disabled or before start()). */
     private wsChannel: ObsetyncWsChannel | null = null;
@@ -658,7 +665,7 @@ export class ObsetyncSyncEngine {
             // Phase 1: fast mtime+size filter (synchronous, no I/O).
             const toHash: Array<{ path: string; stat: { mtime: number; size: number } }> = [];
             for (const [path, stat] of statMap) {
-                if (this.isSyncInternal(path)) continue;
+                if (this.isExcluded(path)) continue;
                 const base = this.syncBase.getEntry(path);
                 if (base && stat.mtime === base.mtime && stat.size === base.size) continue;
                 toHash.push({ path, stat });
@@ -738,7 +745,7 @@ export class ObsetyncSyncEngine {
 
             // Phase 3: deletions — files in sync-base that no longer exist.
             for (const path of this.syncBase.allPaths()) {
-                if (!statMap.has(path) && !this.isSyncInternal(path)) {
+                if (!statMap.has(path) && !this.isExcluded(path)) {
                     pending.push({ action: "deleted", path });
                     totalChanges++;
                 }
@@ -804,6 +811,8 @@ export class ObsetyncSyncEngine {
                 // could overwrite last session's edits before recovery reads
                 // them.
                 this.unsyncedLocalPaths(),
+                // Slice 2: never fetch ignored paths; untrack them if purged.
+                (p) => this.isIgnored(p),
             );
             if (result.newRootHash) {
                 this.localRootHash = result.newRootHash;
@@ -1207,7 +1216,7 @@ export class ObsetyncSyncEngine {
         }
         const toHash: Array<{ path: string; stat: { mtime: number; size: number } }> = [];
         for (const [path, stat] of allStats) {
-            if (this.isSyncInternal(path)) continue;
+            if (this.isExcluded(path)) continue;
             if (stat.mtime <= lastSync) continue;
             const base = this.syncBase.getEntry(path);
             if (base && stat.mtime === base.mtime && stat.size === base.size) continue;
@@ -1286,7 +1295,7 @@ export class ObsetyncSyncEngine {
         this.eventRefs.push(
             this.app.vault.on("modify", async (file: TAbstractFile) => {
                 if (!(file instanceof TFile)) return;
-                if (this.isSyncInternal(file.path) || isPullEcho(file.path)) return;
+                if (this.isExcluded(file.path) || isPullEcho(file.path)) return;
                 await this.journal.append({
                     action: "modified",
                     path: file.path,
@@ -1310,7 +1319,7 @@ export class ObsetyncSyncEngine {
         this.eventRefs.push(
             this.app.vault.on("create", async (file: TAbstractFile) => {
                 if (!(file instanceof TFile)) return;
-                if (this.isSyncInternal(file.path) || isPullEcho(file.path)) return;
+                if (this.isExcluded(file.path) || isPullEcho(file.path)) return;
                 await this.journal.append({
                     action: "created",
                     path: file.path,
@@ -1333,7 +1342,7 @@ export class ObsetyncSyncEngine {
 
         this.eventRefs.push(
             this.app.vault.on("delete", async (file: TAbstractFile) => {
-                if (this.isSyncInternal(file.path) || isPullEcho(file.path)) return;
+                if (this.isExcluded(file.path) || isPullEcho(file.path)) return;
                 await this.journal.append({
                     action: "deleted",
                     path: file.path,
@@ -1351,7 +1360,7 @@ export class ObsetyncSyncEngine {
         this.eventRefs.push(
             this.app.vault.on("rename", async (file: TAbstractFile, oldPath: string) => {
                 if (!(file instanceof TFile)) return;
-                if (this.isSyncInternal(file.path)) return;
+                if (this.isExcluded(file.path)) return;
                 // A pull-applied rename echoes as one event with both paths.
                 const echoNew = isPullEcho(file.path);
                 const echoOld = isPullEcho(oldPath);
@@ -1401,6 +1410,21 @@ export class ObsetyncSyncEngine {
             path.startsWith(".obsidian/plugins/obsetync/") ||
             path.includes("chunk-cache/")
         );
+    }
+
+    /** User-configured ignore (Slice 2). */
+    isIgnored(path: string): boolean {
+        return this.ignore.test(path);
+    }
+
+    /** A path that must never enter sync from THIS device: the plugin's own
+     *  internal files, or a user-ignored path. Used at every write-detection
+     *  chokepoint (vault events, full scan, mtime scan). Applying it in the
+     *  full-scan delete-detection is what stops a local `cargo clean` from
+     *  propagating target/ DELETIONS to the fleet — ignored paths that vanish
+     *  from disk are simply not tracked, never deleted. */
+    private isExcluded(path: string): boolean {
+        return this.isSyncInternal(path) || this.isIgnored(path);
     }
 }
 

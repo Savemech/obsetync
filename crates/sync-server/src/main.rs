@@ -8,6 +8,7 @@ mod devices;
 mod enrollment;
 mod error;
 mod guard;
+mod ignore_match;
 mod secure;
 mod state;
 mod storage;
