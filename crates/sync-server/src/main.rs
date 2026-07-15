@@ -204,6 +204,26 @@ async fn cmd_run(
         "server listening (AEAD envelope over HTTP: X25519 + HKDF-SHA256 + AES-256-GCM)"
     );
 
+    // Background: rotate revoked devices out completely after the TTL (default
+    // 30 days; OBSETYNC_REVOKED_TTL_DAYS to tune). Runs on startup, then hourly.
+    {
+        let state = state.clone();
+        let ttl_secs = std::env::var("OBSETYNC_REVOKED_TTL_DAYS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(30)
+            .saturating_mul(86_400);
+        tokio::spawn(async move {
+            loop {
+                let removed = devices::purge_expired_revoked(&state.layout, ttl_secs);
+                if removed > 0 {
+                    tracing::info!(removed, "devices: rotated out expired revoked devices");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+    }
+
     tokio::select! {
         r = axum::serve(sync_listener, sync_app) => {
             if let Err(e) = r { tracing::error!("sync server error: {}", e); }

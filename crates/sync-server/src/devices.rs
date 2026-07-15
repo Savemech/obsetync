@@ -78,15 +78,72 @@ pub fn touch_last_seen(layout: &StorageLayout, device_id: &str) -> Result<(), st
     Ok(())
 }
 
-/// Mark a device revoked — subsequent requests with its bearer token are rejected.
+/// Mark a device revoked — subsequent requests with its bearer token are
+/// rejected. The revocation timestamp is written so a background sweep can
+/// rotate the device out completely after the TTL.
 pub fn revoke_device(layout: &StorageLayout, device_id: &str) -> Result<(), std::io::Error> {
     let dir = layout.device_dir(device_id);
-    fs::write(dir.join("revoked"), "")?;
+    fs::write(dir.join("revoked"), now_ms().to_string())?;
     Ok(())
 }
 
 pub fn is_revoked(layout: &StorageLayout, device_id: &str) -> bool {
     layout.device_dir(device_id).join("revoked").exists()
+}
+
+/// Epoch-ms when a device was revoked, or None if it isn't revoked. An old
+/// empty `revoked` marker (written before timestamps) reads as `Some(0)`.
+pub fn revoked_at(layout: &StorageLayout, device_id: &str) -> Option<u64> {
+    let p = layout.device_dir(device_id).join("revoked");
+    let s = fs::read_to_string(&p).ok()?;
+    Some(s.trim().parse::<u64>().unwrap_or(0))
+}
+
+/// Remove a device completely: its token mapping FIRST — with the directory
+/// gone a lingering token would otherwise look up a device_id whose
+/// (now-absent) `revoked` marker no longer trips `is_revoked`, silently
+/// un-revoking it — then the directory.
+pub fn delete_device(layout: &StorageLayout, device_id: &str) -> Result<(), std::io::Error> {
+    if let Some(info) = get_device(layout, device_id) {
+        let _ = fs::remove_file(layout.token_path(&info.bearer_token));
+    }
+    let dir = layout.device_dir(device_id);
+    if dir.exists() {
+        fs::remove_dir_all(&dir)?;
+    }
+    Ok(())
+}
+
+/// Delete revoked devices whose revocation is older than `ttl_secs`. Old empty
+/// markers (pre-timestamp) get their clock started now, so they age out over
+/// the next window instead of vanishing at once. Returns the count removed.
+pub fn purge_expired_revoked(layout: &StorageLayout, ttl_secs: u64) -> usize {
+    let now = now_ms();
+    let ttl_ms = ttl_secs.saturating_mul(1000);
+    let mut removed = 0;
+    let Ok(entries) = fs::read_dir(layout.base.join("devices")) else {
+        return 0;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        if entry.file_name() == "tokens" {
+            continue;
+        }
+        let device_id = entry.file_name().to_string_lossy().to_string();
+        match revoked_at(layout, &device_id) {
+            None => {}
+            Some(0) => {
+                let _ = fs::write(entry.path().join("revoked"), now.to_string());
+            }
+            Some(ts) if now.saturating_sub(ts) >= ttl_ms => {
+                removed += delete_device(layout, &device_id).is_ok() as usize;
+            }
+            Some(_) => {}
+        }
+    }
+    removed
 }
 
 pub fn list_devices(layout: &StorageLayout) -> Result<Vec<DeviceInfo>, std::io::Error> {
@@ -197,6 +254,53 @@ mod tests {
         assert!(!is_revoked(&layout, "dev"));
         revoke_device(&layout, "dev").unwrap();
         assert!(is_revoked(&layout, "dev"));
+        // A timestamp is recorded (not the old empty marker).
+        assert!(revoked_at(&layout, "dev").unwrap() > 0);
+    }
+
+    #[test]
+    fn delete_device_removes_dir_and_token() {
+        let (_d, layout) = fresh_layout();
+        register_device(&layout, "dev", "x", &token_64()).unwrap();
+        assert!(lookup_token(&layout, &token_64()).is_some());
+        delete_device(&layout, "dev").unwrap();
+        // Gone entirely: no device.json, no token mapping (so the token can't
+        // be looked up and wrongly slip past is_revoked).
+        assert!(get_device(&layout, "dev").is_none());
+        assert!(lookup_token(&layout, &token_64()).is_none());
+    }
+
+    #[test]
+    fn purge_keeps_recent_revocations_removes_expired() {
+        let (_d, layout) = fresh_layout();
+        register_device(&layout, "fresh", "x", &"a".repeat(64)).unwrap();
+        register_device(&layout, "stale", "y", &"b".repeat(64)).unwrap();
+        revoke_device(&layout, "fresh").unwrap(); // revoked "now"
+                                                  // Backdate "stale"'s revocation well past a 30-day TTL.
+        let long_ago = now_ms().saturating_sub(31 * 86_400 * 1000);
+        fs::write(
+            layout.device_dir("stale").join("revoked"),
+            long_ago.to_string(),
+        )
+        .unwrap();
+
+        let removed = purge_expired_revoked(&layout, 30 * 86_400);
+        assert_eq!(removed, 1);
+        assert!(get_device(&layout, "fresh").is_some()); // within TTL — kept
+        assert!(get_device(&layout, "stale").is_none()); // expired — gone
+    }
+
+    #[test]
+    fn purge_starts_the_clock_on_old_empty_markers() {
+        let (_d, layout) = fresh_layout();
+        register_device(&layout, "old", "x", &token_64()).unwrap();
+        // Simulate a pre-timestamp revoked marker (empty file).
+        fs::write(layout.device_dir("old").join("revoked"), "").unwrap();
+        assert_eq!(revoked_at(&layout, "old"), Some(0));
+
+        let removed = purge_expired_revoked(&layout, 30 * 86_400);
+        assert_eq!(removed, 0); // not deleted — clock only just started
+        assert!(revoked_at(&layout, "old").unwrap() > 0); // now stamped
     }
 
     #[test]

@@ -2,7 +2,7 @@ use crate::devices;
 use crate::enrollment;
 use crate::state::SharedState;
 use axum::{
-    extract::{Form, Path, Query, State},
+    extract::{Form, Path, State},
     http::{Method, StatusCode},
     response::{Html, IntoResponse, Redirect},
     routing::{get, post},
@@ -30,13 +30,14 @@ pub fn admin_router(state: SharedState) -> Router {
         .route("/admin/vaults/{vault_id}", get(vault_detail))
         .route("/admin/vaults/{vault_id}/rollback", post(rollback_vault))
         .route("/admin/vaults/{vault_id}/purge", post(purge_vault))
+        .route("/admin/vaults/{vault_id}/explorer", get(explorer))
         .route(
-            "/admin/vaults/{vault_id}/diff/{from_hash}/{to_hash}",
-            get(diff_vaults),
+            "/admin/vaults/{vault_id}/api/diff/{from_hash}/{to_hash}",
+            get(api_diff),
         )
         .route(
-            "/admin/vaults/{vault_id}/filediff/{old_hash}/{new_hash}",
-            get(file_diff),
+            "/admin/vaults/{vault_id}/api/filediff/{old_hash}/{new_hash}",
+            get(api_filediff),
         )
         .route(
             "/admin/vaults/{vault_id}/export/{root_hash}",
@@ -311,7 +312,30 @@ async fn device_detail(
     };
 
     let revoke_btn = if revoked {
-        "<p><em>This device has been revoked.</em></p>".to_string()
+        let ttl_days: u64 = std::env::var("OBSETYNC_REVOKED_TTL_DAYS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30);
+        let note = match devices::revoked_at(&state.layout, &device_id) {
+            Some(ts) if ts > 0 => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let age_days = now.saturating_sub(ts) / (86_400 * 1000);
+                let remaining = ttl_days.saturating_sub(age_days);
+                format!(
+                    "This device was revoked {} — its data is removed completely in ~{} day(s).",
+                    format_time(ts),
+                    remaining
+                )
+            }
+            _ => format!(
+                "This device has been revoked — its data is removed completely ~{} days after revocation.",
+                ttl_days
+            ),
+        };
+        format!("<p><em>{}</em></p>", note)
     } else {
         format!(
             r#"<form method="POST" action="/admin/devices/{}/revoke" onsubmit="return confirm('Revoke this device?')">
@@ -415,7 +439,6 @@ async fn vault_detail(
         hash: String,
         created_ms: u64,
         total_files: u64,
-        parent: Option<String>,
     }
     let roots_dir = state.layout.vault_roots_dir(&vault_id);
     let mut metas: Vec<RootMeta> = Vec::new();
@@ -438,7 +461,6 @@ async fn vault_detail(
                 hash: hash.to_string(),
                 created_ms: r.created_ms,
                 total_files: r.total_files,
-                parent: r.parent_hash.map(|p| hash_to_hex(&p)),
             });
         }
     }
@@ -463,30 +485,13 @@ async fn vault_detail(
             } else {
                 String::new()
             };
-            let what_changed = match &m.parent {
-                Some(p) => format!(
-                    r#"<a class="btn-small" href="/admin/vaults/{}/diff/{}/{}">what changed</a> "#,
-                    vault_id, p, m.hash
-                ),
-                None => String::new(),
-            };
-            let diff_current = if !is_current {
-                format!(
-                    r#"<a class="btn-small" href="/admin/vaults/{}/diff/{}/{}">diff→current</a> "#,
-                    vault_id, m.hash, current_hex
-                )
-            } else {
-                String::new()
-            };
             format!(
-                r#"<tr><td>{when}</td><td><code>{hash:.16}…</code>{marker}</td><td>{files}</td><td>{rollback}{what_changed}{diff_current}<a class="btn-small" href="/admin/vaults/{vault}/export/{hash}">export</a></td></tr>"#,
+                r#"<tr><td>{when}</td><td><code>{hash:.16}…</code>{marker}</td><td>{files}</td><td>{rollback}<a class="btn-small" href="/admin/vaults/{vault}/export/{hash}">export</a></td></tr>"#,
                 when = format_time(m.created_ms),
                 hash = m.hash,
                 marker = marker,
                 files = m.total_files,
                 rollback = rollback,
-                what_changed = what_changed,
-                diff_current = diff_current,
                 vault = vault_id,
             )
         })
@@ -499,7 +504,7 @@ async fn vault_detail(
 <h1><a href="/admin">ObsetyNC</a> / <a href="/admin/vaults">Vaults</a> / {vault_id}</h1>
 <p>Current root: <code>{:.16}...</code></p>
 <h2>Root History</h2>
-<p><strong>what changed</strong> = files this version's push added/modified/deleted (vs its parent); <strong>diff→current</strong> = everything since this version.</p>
+<p><a class="btn" href="/admin/vaults/{vault_id}/explorer">🔍 Open version explorer</a> &nbsp; browse every version, see changed files (svn-style), and diff them inline — all on one page.</p>
 <table>
 <tr><th>When</th><th>Root</th><th>Files</th><th>Actions</th></tr>
 {root_rows}
@@ -1012,22 +1017,6 @@ mod tests {
     }
 
     #[test]
-    fn pct_encode_spaces_slashes_unicode() {
-        assert_eq!(pct_encode("a b/c"), "a%20b%2Fc");
-        assert_eq!(pct_encode("note.md"), "note.md");
-        assert_eq!(pct_encode("café"), "caf%C3%A9"); // multi-byte UTF-8 encoded
-    }
-
-    #[test]
-    fn unified_diff_html_classes_each_line() {
-        let unified = "--- before\n+++ after\n@@ -1 +1 @@\n-old\n+new\n ctx\n";
-        let html = render_unified_diff_html(unified);
-        for cls in ["l-m", "l-h", "l-d", "l-a", "l-c"] {
-            assert!(html.contains(cls), "missing {cls} in {html}");
-        }
-    }
-
-    #[test]
     fn format_bytes_units() {
         assert_eq!(format_bytes(0), "0 B");
         assert_eq!(format_bytes(512), "512 B");
@@ -1137,54 +1126,14 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// Percent-encode a string for a URL query value (path labels have spaces,
-/// slashes, and non-ASCII).
-fn pct_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{:02X}", b)),
-        }
-    }
-    out
-}
-
-/// Colorize a `similar` unified diff into HTML lines.
-fn render_unified_diff_html(unified: &str) -> String {
-    let mut out = String::from("<div class=\"diff\">");
-    for line in unified.lines() {
-        let cls = if line.starts_with("@@") {
-            "h"
-        } else if line.starts_with("+++") || line.starts_with("---") {
-            "m"
-        } else if line.starts_with('+') {
-            "a"
-        } else if line.starts_with('-') {
-            "d"
-        } else {
-            "c"
-        };
-        out.push_str(&format!(
-            "<span class=\"l-{}\">{}</span>",
-            cls,
-            html_escape(line)
-        ));
-    }
-    out.push_str("</div>");
-    out
-}
-
-/// GET /admin/vaults/{vault}/diff/{from}/{to} — file-level summary of what
-/// changed between two roots (added / modified / deleted), each row linking to
-/// a per-file content diff. Diffing by flattened entry maps (not compute_deltas)
-/// gives us BOTH the old and new hash per modified file for the drill-down.
-async fn diff_vaults(
+/// GET /admin/vaults/{vault}/api/diff/{from}/{to} — JSON list of file changes
+/// (added / modified / deleted) between two roots. Diffing flattened entry maps
+/// (not compute_deltas) yields BOTH the old and new hash per modified file, so
+/// the explorer can diff each file directly. fetch()-driven; no navigation.
+async fn api_diff(
     State(state): State<SharedState>,
     Path((vault_id, from_hex, to_hex)): Path<(String, String, String)>,
-) -> Result<Html<String>, ServerErrorHtml> {
+) -> Result<axum::Json<serde_json::Value>, ServerErrorHtml> {
     let load = |hex: &str| -> Result<sync_core::chunk::RootNode, ServerErrorHtml> {
         let hash = sync_core::hash::hex_to_hash(hex)
             .map_err(|_| ServerErrorHtml("invalid root hash".into()))?;
@@ -1248,90 +1197,40 @@ async fn diff_vaults(
     }
     changes.sort_by(|a, b| a.path.cmp(b.path));
 
-    let total = changes.len();
-    const MAX_ROWS: usize = 3000;
+    // No cap — return every change; the explorer renders them via event
+    // delegation so even tens of thousands of rows stay responsive.
+    let rows: Vec<serde_json::Value> = changes
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "s": c.status.to_string(),
+                "path": c.path,
+                "old": c
+                    .old
+                    .map(|e| hash_to_hex(&e.hash))
+                    .unwrap_or_else(|| ZERO_HASH_HEX.to_string()),
+                "new": c
+                    .new
+                    .map(|e| hash_to_hex(&e.hash))
+                    .unwrap_or_else(|| ZERO_HASH_HEX.to_string()),
+            })
+        })
+        .collect();
 
-    let mut rows = String::new();
-    for c in changes.iter().take(MAX_ROWS) {
-        let old_hex = c
-            .old
-            .map(|e| hash_to_hex(&e.hash))
-            .unwrap_or_else(|| ZERO_HASH_HEX.to_string());
-        let new_hex = c
-            .new
-            .map(|e| hash_to_hex(&e.hash))
-            .unwrap_or_else(|| ZERO_HASH_HEX.to_string());
-        let size = match (c.old, c.new) {
-            (Some(o), Some(n)) => {
-                format!(
-                    "{} → {}",
-                    format_bytes(o.size_bytes),
-                    format_bytes(n.size_bytes)
-                )
-            }
-            (None, Some(n)) => format!("+{}", format_bytes(n.size_bytes)),
-            (Some(o), None) => format!("−{}", format_bytes(o.size_bytes)),
-            (None, None) => String::new(),
-        };
-        rows.push_str(&format!(
-            r#"<tr class="d-{status}"><td>{status}</td><td><code>{path}</code></td><td>{size}</td><td><a class="btn-small" href="/admin/vaults/{vault}/filediff/{old}/{new}?path={enc}">view</a></td></tr>"#,
-            status = c.status,
-            path = html_escape(c.path),
-            size = size,
-            vault = vault_id,
-            old = old_hex,
-            new = new_hex,
-            enc = pct_encode(c.path),
-        ));
-    }
-
-    let truncated = if total > MAX_ROWS {
-        format!(
-            "<p class=\"footer\">Showing first {} of {} changes.</p>",
-            MAX_ROWS, total
-        )
-    } else {
-        String::new()
-    };
-    let summary = if total == 0 {
-        "<p>No file changes between these two versions.</p>".to_string()
-    } else {
-        format!(
-            "<p>{} change(s). Use <strong>view</strong> to drill into a file.</p><table><tr><th></th><th>Path</th><th>Size</th><th></th></tr>{}</table>{}",
-            total, rows, truncated
-        )
-    };
-
-    Ok(Html(format!(
-        r#"<!DOCTYPE html>
-<html><head><title>diff - {vault}</title>{CSS}</head><body>
-<h1><a href="/admin">ObsetyNC</a> / <a href="/admin/vaults">Vaults</a> / <a href="/admin/vaults/{vault}">{vault}</a> / diff</h1>
-<p>From <code>{from:.16}…</code> → <code>{to:.16}…</code></p>
-{summary}
-<p><a href="/admin/vaults/{vault}">Back to vault</a></p>
-</body></html>"#,
-        vault = vault_id,
-        from = from_hex,
-        to = to_hex,
-        summary = summary,
-    )))
+    Ok(axum::Json(serde_json::json!({
+        "total": rows.len(),
+        "changes": rows,
+    })))
 }
 
-#[derive(serde::Deserialize)]
-struct FileDiffQuery {
-    path: Option<String>,
-}
-
-/// GET /admin/vaults/{vault}/filediff/{old}/{new}?path=… — unified line diff of
-/// one file between two content hashes. A zero hash means "absent on that side"
-/// (an add is all-inserts, a delete all-removes). Content is read BY HASH, so
-/// the `path` query is a display label only — no traversal.
-async fn file_diff(
+/// GET /admin/vaults/{vault}/api/filediff/{old}/{new} — JSON unified line diff
+/// of one file between two content hashes. A zero hash = "absent on that side"
+/// (add = all-inserts, delete = all-removes). Read BY HASH → no traversal; the
+/// explorer supplies the display path itself.
+async fn api_filediff(
     State(state): State<SharedState>,
-    Path((vault_id, old_hex, new_hex)): Path<(String, String, String)>,
-    Query(q): Query<FileDiffQuery>,
-) -> Result<Html<String>, ServerErrorHtml> {
-    let label = q.path.unwrap_or_default();
+    Path((_vault_id, old_hex, new_hex)): Path<(String, String, String)>,
+) -> Result<axum::Json<serde_json::Value>, ServerErrorHtml> {
     let layout = state.layout.clone();
     let (old, new) = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Vec<u8>), String> {
         let read = |hex: &str| -> Result<Vec<u8>, String> {
@@ -1347,13 +1246,16 @@ async fn file_diff(
     .map_err(|e| ServerErrorHtml(format!("diff task failed: {}", e)))?
     .map_err(ServerErrorHtml)?;
 
-    const MAX_DIFF_BYTES: usize = 1024 * 1024; // 1 MiB per side
-    let body = if old.len() > MAX_DIFF_BYTES || new.len() > MAX_DIFF_BYTES {
-        format!(
-            "<p>File too large to diff inline ({} → {}).</p>",
-            format_bytes(old.len() as u64),
-            format_bytes(new.len() as u64)
-        )
+    const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024; // 2 MiB per side
+    let val = if old.len() > MAX_DIFF_BYTES || new.len() > MAX_DIFF_BYTES {
+        serde_json::json!({
+            "kind": "toolarge",
+            "msg": format!(
+                "File too large to diff inline ({} → {}).",
+                format_bytes(old.len() as u64),
+                format_bytes(new.len() as u64)
+            ),
+        })
     } else {
         match (std::str::from_utf8(&old), std::str::from_utf8(&new)) {
             (Ok(a), Ok(b)) => {
@@ -1363,32 +1265,215 @@ async fn file_diff(
                     .header("before", "after")
                     .to_string();
                 if unified.trim().is_empty() {
-                    "<p>No textual differences (metadata-only change).</p>".to_string()
+                    serde_json::json!({
+                        "kind": "same",
+                        "msg": "No textual differences (metadata-only change).",
+                    })
                 } else {
-                    render_unified_diff_html(&unified)
+                    serde_json::json!({ "kind": "text", "unified": unified })
                 }
             }
-            _ => format!(
-                "<p>Binary file — content not shown ({} → {}).</p>",
-                format_bytes(old.len() as u64),
-                format_bytes(new.len() as u64)
-            ),
+            _ => serde_json::json!({
+                "kind": "binary",
+                "msg": format!(
+                    "Binary file — content not shown ({} → {}).",
+                    format_bytes(old.len() as u64),
+                    format_bytes(new.len() as u64)
+                ),
+            }),
         }
     };
-
-    Ok(Html(format!(
-        r#"<!DOCTYPE html>
-<html><head><title>file diff</title>{CSS}</head><body>
-<h1><a href="/admin">ObsetyNC</a> / <a href="/admin/vaults/{vault}">{vault}</a> / file diff</h1>
-<p><code>{label}</code></p>
-{body}
-<p><a href="/admin/vaults/{vault}">Back to vault</a></p>
-</body></html>"#,
-        vault = vault_id,
-        label = html_escape(&label),
-        body = body,
-    )))
+    Ok(axum::Json(val))
 }
+
+/// GET /admin/vaults/{vault}/explorer — single-page, three-pane history + diff
+/// browser: versions → changed files (svn A/M/D) → unified line diff, all in one
+/// page (fetch-driven, no navigation). Monospace = Meslo Nerd Font.
+async fn explorer(
+    State(state): State<SharedState>,
+    Path(vault_id): Path<String>,
+) -> Result<Html<String>, ServerErrorHtml> {
+    let current_hex = state
+        .vaults
+        .get_current_root(&vault_id)
+        .map(|h| hash_to_hex(&h))
+        .unwrap_or_default();
+
+    struct Meta {
+        hash: String,
+        created_ms: u64,
+        total_files: u64,
+        parent: Option<String>,
+    }
+    let roots_dir = state.layout.vault_roots_dir(&vault_id);
+    let mut metas: Vec<Meta> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&roots_dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(hash) = name.strip_suffix(".bin") else {
+                continue;
+            };
+            let Ok(h) = sync_core::hash::hex_to_hash(hash) else {
+                continue;
+            };
+            let Some(bytes) = state.vaults.get_root(&vault_id, &h) else {
+                continue;
+            };
+            let Ok(r) = sync_core::chunk::RootNode::deserialize(&bytes) else {
+                continue;
+            };
+            metas.push(Meta {
+                hash: hash.to_string(),
+                created_ms: r.created_ms,
+                total_files: r.total_files,
+                parent: r.parent_hash.map(|p| hash_to_hex(&p)),
+            });
+        }
+    }
+    metas.sort_by(|a, b| b.created_ms.cmp(&a.created_ms).then(a.hash.cmp(&b.hash)));
+
+    let versions: Vec<serde_json::Value> = metas
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "hash": m.hash,
+                "short": &m.hash[..m.hash.len().min(12)],
+                "parent": m.parent,
+                "files": m.total_files,
+                "when": format_time(m.created_ms),
+                "current": m.hash == current_hex,
+            })
+        })
+        .collect();
+    let versions_json = serde_json::to_string(&versions).unwrap_or_else(|_| "[]".into());
+    let vault_json = serde_json::to_string(&vault_id).unwrap_or_else(|_| "\"\"".into());
+
+    let page = EXPLORER_HTML
+        .replace("__VAULT_H__", &html_escape(&vault_id))
+        .replace("__VAULT_JSON__", &vault_json)
+        .replace("__VERSIONS_JSON__", &versions_json)
+        .replace("__ZERO__", ZERO_HASH_HEX);
+    Ok(Html(page))
+}
+
+const EXPLORER_HTML: &str = r##"<!DOCTYPE html><html><head><meta charset="utf-8"><title>__VAULT_H__ — explorer</title>
+<style>
+:root{--mono:"MesloLGS Nerd Font","MesloLGS NF","MesloLGM Nerd Font","MesloLGL Nerd Font","Meslo Nerd Font",ui-monospace,Menlo,Consolas,monospace;}
+*{box-sizing:border-box;}
+html,body{margin:0;height:100%;}
+body{font-family:var(--mono);font-size:13px;color:#1e1e1e;display:flex;flex-direction:column;}
+.top{padding:8px 14px;border-bottom:1px solid #ddd;font-size:14px;flex:0 0 auto;}
+.top a{color:#1a73e8;text-decoration:none;}
+.top .hint{color:#888;font-size:12px;}
+.explorer{flex:1 1 auto;display:flex;min-height:0;}
+.pane{overflow:auto;border-right:1px solid #e2e2e2;min-width:0;}
+.pane.versions{flex:0 0 270px;}
+.pane.files{flex:0 0 440px;}
+.pane.diff{flex:1 1 auto;border-right:none;}
+.ph{margin:0;padding:8px 12px;background:#f4f4f4;position:sticky;top:0;font-size:13px;border-bottom:1px solid #e2e2e2;font-weight:600;}
+.ver{padding:8px 12px;cursor:pointer;border-bottom:1px solid #f1f1f1;display:flex;flex-direction:column;gap:2px;}
+.ver:hover{background:#eef6ff;}
+.ver.sel{background:#dcebfc;}
+.ver .when{color:#555;font-size:12px;}
+.ver .cur{color:#2e7d32;font-weight:700;}
+.ver .cnt{color:#999;font-size:12px;}
+.hint{padding:10px 12px;color:#888;font-size:12px;}
+.frow{padding:5px 12px;cursor:pointer;display:flex;gap:8px;white-space:nowrap;border-bottom:1px solid #f6f6f6;}
+.frow:hover{background:#eef6ff;}
+.frow.sel{background:#dcebfc;}
+.st{font-weight:700;width:1.1em;flex:0 0 auto;}
+.s-A .st{color:#2e7d32;} .s-M .st{color:#ef6c00;} .s-D .st{color:#c62828;}
+.fp{overflow:hidden;text-overflow:ellipsis;}
+.count{padding:8px 12px;color:#999;font-size:12px;}
+.fhead{padding:8px 12px;background:#fafafa;border-bottom:1px solid #eee;font-size:12px;word-break:break-all;position:sticky;top:0;}
+.diffbox{padding:6px 0;}
+.diffbox span{display:block;white-space:pre;padding:0 12px;font-size:13px;line-height:1.45;}
+.l-a{background:#e6ffed;color:#22863a;} .l-d{background:#ffeef0;color:#b31d28;}
+.l-h{background:#f1f8ff;color:#005cc5;} .l-m{color:#6a737d;} .l-c{color:#24292e;}
+</style></head><body>
+<div class="top"><a href="/admin/vaults/__VAULT_H__">← __VAULT_H__</a> &nbsp; version explorer &nbsp; <span class="hint">click a version → click or hover a file</span></div>
+<div class="explorer">
+  <div class="pane versions"><div class="ph">Versions</div><div id="versions"></div></div>
+  <div class="pane files"><div class="ph">Changed files</div><div id="files"><div class="hint">select a version</div></div></div>
+  <div class="pane diff"><div class="ph">Diff</div><div id="diff"><div class="hint">select a file</div></div></div>
+</div>
+<script>
+const VAULT=__VAULT_JSON__;
+const VERSIONS=__VERSIONS_JSON__;
+const ZERO="__ZERO__";
+const cache={};
+let CHANGES=[];
+function E(id){return document.getElementById(id);}
+function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
+function api(p){return "/admin/vaults/"+encodeURIComponent(VAULT)+p;}
+function renderVersions(){
+  E("versions").innerHTML=VERSIONS.map(function(v,i){
+    return '<div class="ver" data-i="'+i+'"><span class="when">'+esc(v.when)+(v.current?' <span class="cur">(current)</span>':'')+
+      '</span><span>'+esc(v.short)+'…</span><span class="cnt">'+v.files+' files</span></div>';
+  }).join("");
+  E("versions").addEventListener("click",function(ev){
+    const d=ev.target.closest(".ver"); if(d) selectVersion(+d.dataset.i,d);
+  });
+}
+async function selectVersion(i,node){
+  document.querySelectorAll(".ver.sel").forEach(function(e){e.classList.remove("sel");});
+  node.classList.add("sel");
+  const v=VERSIONS[i];
+  E("diff").innerHTML='<div class="hint">select a file</div>';
+  E("files").innerHTML='<div class="hint">loading…</div>';
+  const from=v.parent||ZERO;
+  try{
+    const r=await fetch(api("/api/diff/"+from+"/"+v.hash));
+    if(!r.ok){E("files").innerHTML='<div class="hint">failed to load changes</div>';return;}
+    renderFiles(await r.json());
+  }catch(e){E("files").innerHTML='<div class="hint">error loading changes</div>';}
+}
+function renderFiles(d){
+  CHANGES=d.changes||[];
+  if(!d.total){E("files").innerHTML='<div class="hint">no file changes in this version</div>';return;}
+  let html='<div class="count">'+d.total+' changed files</div>';
+  html+=CHANGES.map(function(c,i){
+    return '<div class="frow s-'+c.s+'" data-i="'+i+'"><span class="st">'+c.s+'</span><span class="fp" title="'+esc(c.path)+'">'+esc(c.path)+'</span></div>';
+  }).join("");
+  E("files").innerHTML=html;
+}
+let hp=null;
+function fileEvent(ev){
+  const r=ev.target.closest(".frow"); if(!r) return;
+  const c=CHANGES[+r.dataset.i]; if(!c) return;
+  if(ev.type==="click"){clearTimeout(hp);showDiff(c,r);}
+  else{clearTimeout(hp);hp=setTimeout(function(){showDiff(c,r);},120);}
+}
+async function showDiff(c,r){
+  document.querySelectorAll(".frow.sel").forEach(function(e){e.classList.remove("sel");});
+  r.classList.add("sel");
+  const key=c.old+"_"+c.new;
+  const head='<div class="fhead">'+esc(c.path)+'</div>';
+  if(cache[key]){E("diff").innerHTML=head+cache[key];return;}
+  E("diff").innerHTML=head+'<div class="hint">loading…</div>';
+  try{
+    const rr=await fetch(api("/api/filediff/"+c.old+"/"+c.new));
+    if(!rr.ok){E("diff").innerHTML=head+'<div class="hint">failed to load diff</div>';return;}
+    const d=await rr.json();
+    const body=d.kind==="text"?colorize(d.unified):'<div class="hint">'+esc(d.msg||d.kind)+'</div>';
+    cache[key]=body;
+    E("diff").innerHTML=head+body;
+  }catch(e){E("diff").innerHTML=head+'<div class="hint">error loading diff</div>';}
+}
+function colorize(u){
+  let out='<div class="diffbox">';
+  const lines=u.split("\n");
+  for(let k=0;k<lines.length;k++){
+    const line=lines[k];
+    const cls=line.startsWith("@@")?"h":(line.startsWith("+++")||line.startsWith("---"))?"m":line.startsWith("+")?"a":line.startsWith("-")?"d":"c";
+    out+='<span class="l-'+cls+'">'+esc(line.length?line:" ")+'</span>';
+  }
+  return out+"</div>";
+}
+E("files").addEventListener("click",fileEvent);
+E("files").addEventListener("mouseover",fileEvent);
+renderVersions();
+</script></body></html>"##;
 
 const CSS: &str = r#"<style>
 body { font-family: -apple-system, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; color: #333; }
