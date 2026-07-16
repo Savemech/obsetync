@@ -26,6 +26,10 @@ pub fn admin_router(state: SharedState) -> Router {
         )
         .route("/admin/devices/{device_id}", get(device_detail))
         .route("/admin/devices/{device_id}/revoke", post(revoke_device))
+        .route(
+            "/admin/devices/{device_id}/approve-deletion",
+            post(approve_deletion),
+        )
         .route("/admin/vaults", get(vault_list))
         .route("/admin/vaults/{vault_id}", get(vault_detail))
         .route("/admin/vaults/{vault_id}/rollback", post(rollback_vault))
@@ -346,6 +350,20 @@ async fn device_detail(
         )
     };
 
+    let approve_section = if revoked {
+        String::new()
+    } else if let Some(ms) = devices::deletion_bypass_remaining_ms(&state.layout, &device_id) {
+        format!(
+            r#"<p class="success">✅ One-time bulk-deletion approval is <strong>active</strong> — expires in ~{} min. This device's next push bypasses the blast-radius guard once, then it's consumed.</p>"#,
+            (ms / 60_000).max(1)
+        )
+    } else {
+        format!(
+            r#"<h3>Bulk deletion</h3><p>If this device is stuck pushing a large but <em>intentional</em> deletion (you removed a build tree, say) and the guard keeps rejecting it (409), approve a <strong>one-time</strong> bypass for its next push. The guard stays fully on for every other device and every later push.</p><form method="POST" action="/admin/devices/{}/approve-deletion" onsubmit="return confirm('Allow this device to bypass the deletion guard ONCE on its next push?')"><button type="submit" class="btn-small">Approve one-time bulk deletion</button></form>"#,
+            device_id
+        )
+    };
+
     Ok(Html(format!(
         r#"<!DOCTYPE html>
 <html><head><title>{} - ObsetyNC</title>{CSS}</head>
@@ -358,6 +376,7 @@ async fn device_detail(
 <tr><td>Last Seen</td><td>{}</td></tr>
 </table>
 {revoke_btn}
+{approve_section}
 <p><a href="/admin/devices">Back to devices</a></p>
 </body></html>"#,
         device.name,
@@ -379,6 +398,25 @@ async fn revoke_device(
     tracing::info!(
         device = %&device_id[..device_id.len().min(12)],
         "devices: revoked"
+    );
+    Ok(Redirect::to(&format!("/admin/devices/{}", device_id)))
+}
+
+// --- One-time bulk-deletion approval ---
+
+/// POST /admin/devices/{device_id}/approve-deletion — grant this device a
+/// single guard bypass so an intentional bulk change (e.g. deleting a build
+/// tree the guard would otherwise reject) can land on its NEXT push. Expires in
+/// 15 minutes if unused; consumed by exactly one push.
+async fn approve_deletion(
+    State(state): State<SharedState>,
+    Path(device_id): Path<String>,
+) -> Result<Redirect, ServerErrorHtml> {
+    devices::grant_deletion_bypass(&state.layout, &device_id, 15 * 60)
+        .map_err(|e| ServerErrorHtml(format!("approve failed: {}", e)))?;
+    tracing::warn!(
+        device = %&device_id[..device_id.len().min(12)],
+        "devices: granted a one-time guard bypass (bulk-deletion approval)"
     );
     Ok(Redirect::to(&format!("/admin/devices/{}", device_id)))
 }

@@ -325,11 +325,18 @@ async fn root_dispatcher(
             Err(e) => e.into_response(),
         },
         Some(ref m) if m == Method::PUT => {
+            // The device id (injected by secure_envelope) lives in the request
+            // extensions — grab it before consuming the body.
+            let device = request
+                .extensions()
+                .get::<DeviceIdExt>()
+                .cloned()
+                .unwrap_or_else(|| DeviceIdExt(String::new()));
             let body = match consume_body(request).await {
                 Ok(b) => b,
                 Err(r) => return r,
             };
-            match put_root(State(state), Path(vault_id), body).await {
+            match put_root(State(state), Path(vault_id), axum::Extension(device), body).await {
                 Ok(r) => r.into_response(),
                 Err(e) => e.into_response(),
             }
@@ -673,6 +680,7 @@ async fn post_rollback(
 async fn enforce_guard(
     state: &SharedState,
     vault_id: &str,
+    device_id: &str,
     current: sync_core::chunk::RootNode,
     candidate: sync_core::chunk::RootNode,
     branch: &'static str,
@@ -698,6 +706,20 @@ async fn enforce_guard(
             "put_root: guard tripwire"
         );
         if cfg.mode == crate::guard::GuardMode::Enforce {
+            // One-time, admin-approved bypass for an INTENTIONAL bulk change the
+            // guard can't distinguish from a runaway (e.g. deleting a build
+            // tree). Consumed here so it applies to exactly this one push.
+            if crate::devices::consume_deletion_bypass(&state.layout, device_id) {
+                tracing::warn!(
+                    vault = %vault_id,
+                    branch,
+                    device = %&device_id[..device_id.len().min(12)],
+                    reason,
+                    deletions = scan.deletions,
+                    "put_root: guard BYPASSED (admin-approved one-time deletion)"
+                );
+                return Ok(());
+            }
             return Err(ServerError::Conflict(scan.reject_body(reason)));
         }
     }
@@ -707,6 +729,7 @@ async fn enforce_guard(
 async fn put_root(
     State(state): State<SharedState>,
     Path(vault_id): Path<String>,
+    axum::Extension(device): axum::Extension<DeviceIdExt>,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
     // Parent hash is prepended to the body as a 64-byte ASCII prefix (hex
@@ -784,7 +807,15 @@ async fn put_root(
                     .ok_or_else(|| ServerError::Internal("current root data missing".into()))?;
                 let current_root = sync_core::chunk::RootNode::deserialize(&current_data)
                     .map_err(|e| ServerError::Internal(format!("corrupt current root: {}", e)))?;
-                enforce_guard(&state, &vault_id, current_root, incoming_root.clone(), "ff").await?;
+                enforce_guard(
+                    &state,
+                    &vault_id,
+                    &device.0,
+                    current_root,
+                    incoming_root.clone(),
+                    "ff",
+                )
+                .await?;
 
                 state.vaults.set_current_root(&vault_id, &incoming_hash)?;
                 state.notify_root_changed(&vault_id, &hash_to_hex(&incoming_hash));
@@ -863,6 +894,7 @@ async fn put_root(
                 enforce_guard(
                     &state,
                     &vault_id,
+                    &device.0,
                     current_root_again,
                     merge_result.new_root.clone(),
                     "merge",

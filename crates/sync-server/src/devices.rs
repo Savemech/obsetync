@@ -146,6 +146,44 @@ pub fn purge_expired_revoked(layout: &StorageLayout, ttl_secs: u64) -> usize {
     removed
 }
 
+/// Grant a ONE-TIME guard bypass for this device's next push — lets an operator
+/// approve an intentional bulk change (e.g. deleting a 40k-file build tree) that
+/// the blast-radius guard would otherwise reject. Stored with an expiry so an
+/// unused grant can't linger and weaken the guard indefinitely.
+pub fn grant_deletion_bypass(
+    layout: &StorageLayout,
+    device_id: &str,
+    ttl_secs: u64,
+) -> Result<(), std::io::Error> {
+    let expiry = now_ms().saturating_add(ttl_secs.saturating_mul(1000));
+    fs::write(
+        layout.device_dir(device_id).join("guard-bypass"),
+        expiry.to_string(),
+    )
+}
+
+/// Consume the one-time guard bypass: removes the marker (so it's used at most
+/// once, even if it turns out to be expired) and returns whether it was valid.
+pub fn consume_deletion_bypass(layout: &StorageLayout, device_id: &str) -> bool {
+    let p = layout.device_dir(device_id).join("guard-bypass");
+    let Ok(s) = fs::read_to_string(&p) else {
+        return false;
+    };
+    let _ = fs::remove_file(&p);
+    s.trim()
+        .parse::<u64>()
+        .map(|exp| now_ms() < exp)
+        .unwrap_or(false)
+}
+
+/// Remaining ms on a pending (unexpired) bypass — for the admin UI; does NOT
+/// consume it. `None` when there's no valid grant.
+pub fn deletion_bypass_remaining_ms(layout: &StorageLayout, device_id: &str) -> Option<u64> {
+    let s = fs::read_to_string(layout.device_dir(device_id).join("guard-bypass")).ok()?;
+    let exp = s.trim().parse::<u64>().ok()?;
+    exp.checked_sub(now_ms()).filter(|&r| r > 0)
+}
+
 pub fn list_devices(layout: &StorageLayout) -> Result<Vec<DeviceInfo>, std::io::Error> {
     let devices_dir = layout.base.join("devices");
     let mut devices = Vec::new();
@@ -301,6 +339,31 @@ mod tests {
         let removed = purge_expired_revoked(&layout, 30 * 86_400);
         assert_eq!(removed, 0); // not deleted — clock only just started
         assert!(revoked_at(&layout, "old").unwrap() > 0); // now stamped
+    }
+
+    #[test]
+    fn deletion_bypass_grant_then_consume_once() {
+        let (_d, layout) = fresh_layout();
+        register_device(&layout, "dev", "x", &token_64()).unwrap();
+        assert!(deletion_bypass_remaining_ms(&layout, "dev").is_none());
+        grant_deletion_bypass(&layout, "dev", 900).unwrap();
+        assert!(deletion_bypass_remaining_ms(&layout, "dev").is_some());
+        // First consume succeeds and removes the marker; a second one fails.
+        assert!(consume_deletion_bypass(&layout, "dev"));
+        assert!(deletion_bypass_remaining_ms(&layout, "dev").is_none());
+        assert!(!consume_deletion_bypass(&layout, "dev"));
+    }
+
+    #[test]
+    fn deletion_bypass_expired_is_not_valid() {
+        let (_d, layout) = fresh_layout();
+        register_device(&layout, "dev", "x", &token_64()).unwrap();
+        // An already-expired marker.
+        fs::write(layout.device_dir("dev").join("guard-bypass"), "1").unwrap();
+        assert!(deletion_bypass_remaining_ms(&layout, "dev").is_none());
+        // Consuming it removes the marker and reports invalid.
+        assert!(!consume_deletion_bypass(&layout, "dev"));
+        assert!(!layout.device_dir("dev").join("guard-bypass").exists());
     }
 
     #[test]
