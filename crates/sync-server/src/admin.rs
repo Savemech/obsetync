@@ -31,6 +31,7 @@ pub fn admin_router(state: SharedState) -> Router {
         .route("/admin/vaults/{vault_id}/rollback", post(rollback_vault))
         .route("/admin/vaults/{vault_id}/purge", post(purge_vault))
         .route("/admin/vaults/{vault_id}/explorer", get(explorer))
+        .route("/admin/vaults/{vault_id}/api/stats", get(api_stats))
         .route(
             "/admin/vaults/{vault_id}/api/diff/{from_hash}/{to_hash}",
             get(api_diff),
@@ -1286,6 +1287,83 @@ async fn api_filediff(
     Ok(axum::Json(val))
 }
 
+/// GET /admin/vaults/{vault}/api/stats — per-version change size (files + bytes
+/// vs the parent root), for the explorer's version list. Uses the Merkle diff
+/// (compute_deltas), which only descends into changed subtrees, so each version
+/// is cheap even in a 40k-file vault. The explorer fetches this AFTER rendering
+/// the list, so the page stays instant; bounded to the most recent versions so
+/// a huge history can't stall it.
+async fn api_stats(
+    State(state): State<SharedState>,
+    Path(vault_id): Path<String>,
+) -> Result<axum::Json<serde_json::Value>, ServerErrorHtml> {
+    // (hash, parent, created_ms) for every root that has a parent in history.
+    let roots_dir = state.layout.vault_roots_dir(&vault_id);
+    let mut items: Vec<(String, String, u64)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&roots_dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(hash) = name.strip_suffix(".bin") else {
+                continue;
+            };
+            let Ok(h) = sync_core::hash::hex_to_hash(hash) else {
+                continue;
+            };
+            let Some(bytes) = state.vaults.get_root(&vault_id, &h) else {
+                continue;
+            };
+            let Ok(r) = sync_core::chunk::RootNode::deserialize(&bytes) else {
+                continue;
+            };
+            if let Some(p) = r.parent_hash {
+                items.push((hash.to_string(), hash_to_hex(&p), r.created_ms));
+            }
+        }
+    }
+    items.sort_by(|a, b| b.2.cmp(&a.2)); // most recent first
+    const MAX: usize = 300;
+    items.truncate(MAX);
+
+    let index = state.layout.base.join("index");
+    let mut out = serde_json::Map::new();
+    for (hash_hex, parent_hex, _) in items {
+        let (Ok(h), Ok(p)) = (
+            sync_core::hash::hex_to_hash(&hash_hex),
+            sync_core::hash::hex_to_hash(&parent_hex),
+        ) else {
+            continue;
+        };
+        let (Some(rb), Some(pb)) = (
+            state.vaults.get_root(&vault_id, &h),
+            state.vaults.get_root(&vault_id, &p),
+        ) else {
+            continue;
+        };
+        let (Ok(root), Ok(parent)) = (
+            sync_core::chunk::RootNode::deserialize(&rb),
+            sync_core::chunk::RootNode::deserialize(&pb),
+        ) else {
+            continue;
+        };
+        if let Ok(deltas) = crate::bridge::run_diff(index.clone(), parent, root).await {
+            let files = deltas.len();
+            let bytes: u64 = deltas
+                .iter()
+                .map(|d| match d {
+                    sync_core::diff::FileDelta::Added { size, .. }
+                    | sync_core::diff::FileDelta::Modified { size, .. } => *size,
+                    _ => 0,
+                })
+                .sum();
+            out.insert(
+                hash_hex,
+                serde_json::json!({ "files": files, "bytes": bytes }),
+            );
+        }
+    }
+    Ok(axum::Json(serde_json::Value::Object(out)))
+}
+
 /// GET /admin/vaults/{vault}/explorer — single-page, three-pane history + diff
 /// browser: versions → changed files (svn A/M/D) → unified line diff, all in one
 /// page (fetch-driven, no navigation). Monospace = Meslo Nerd Font.
@@ -1367,7 +1445,7 @@ body{font-family:var(--mono);font-size:13px;color:#1e1e1e;display:flex;flex-dire
 .top .hint{color:#888;font-size:12px;}
 .explorer{flex:1 1 auto;display:flex;min-height:0;}
 .pane{overflow:auto;border-right:1px solid #e2e2e2;min-width:0;}
-.pane.versions{flex:0 0 270px;}
+.pane.versions{flex:0 0 340px;}
 .pane.files{flex:0 0 440px;}
 .pane.diff{flex:1 1 auto;border-right:none;}
 .ph{margin:0;padding:8px 12px;background:#f4f4f4;position:sticky;top:0;font-size:13px;border-bottom:1px solid #e2e2e2;font-weight:600;}
@@ -1377,6 +1455,10 @@ body{font-family:var(--mono);font-size:13px;color:#1e1e1e;display:flex;flex-dire
 .ver .when{color:#555;font-size:12px;}
 .ver .cur{color:#2e7d32;font-weight:700;}
 .ver .cnt{color:#999;font-size:12px;}
+.vhash{word-break:break-all;color:#333;font-size:12px;line-height:1.35;}
+.vstat{color:#1a73e8;font-size:12px;}
+.vstat .tot{color:#999;}
+.chc{color:#6a737d;font-size:12px;font-weight:400;}
 .hint{padding:10px 12px;color:#888;font-size:12px;}
 .frow{padding:5px 12px;cursor:pointer;display:flex;gap:8px;white-space:nowrap;border-bottom:1px solid #f6f6f6;}
 .frow:hover{background:#eef6ff;}
@@ -1409,7 +1491,7 @@ function api(p){return "/admin/vaults/"+encodeURIComponent(VAULT)+p;}
 function renderVersions(){
   E("versions").innerHTML=VERSIONS.map(function(v,i){
     return '<div class="ver" data-i="'+i+'"><span class="when">'+esc(v.when)+(v.current?' <span class="cur">(current)</span>':'')+
-      '</span><span>'+esc(v.short)+'…</span><span class="cnt">'+v.files+' files</span></div>';
+      '</span><span class="vhash">'+esc(v.hash)+'</span><span class="vstat" id="vs'+i+'">'+v.files+' files total</span></div>';
   }).join("");
   E("versions").addEventListener("click",function(ev){
     const d=ev.target.closest(".ver"); if(d) selectVersion(+d.dataset.i,d);
@@ -1448,17 +1530,29 @@ async function showDiff(c,r){
   document.querySelectorAll(".frow.sel").forEach(function(e){e.classList.remove("sel");});
   r.classList.add("sel");
   const key=c.old+"_"+c.new;
-  const head='<div class="fhead">'+esc(c.path)+'</div>';
-  if(cache[key]){E("diff").innerHTML=head+cache[key];return;}
-  E("diff").innerHTML=head+'<div class="hint">loading…</div>';
+  if(cache[key]){E("diff").innerHTML=cache[key];return;}
+  const plainHead='<div class="fhead">'+esc(c.path)+'</div>';
+  E("diff").innerHTML=plainHead+'<div class="hint">loading…</div>';
   try{
     const rr=await fetch(api("/api/filediff/"+c.old+"/"+c.new));
-    if(!rr.ok){E("diff").innerHTML=head+'<div class="hint">failed to load diff</div>';return;}
+    if(!rr.ok){E("diff").innerHTML=plainHead+'<div class="hint">failed to load diff</div>';return;}
     const d=await rr.json();
-    const body=d.kind==="text"?colorize(d.unified):'<div class="hint">'+esc(d.msg||d.kind)+'</div>';
-    cache[key]=body;
-    E("diff").innerHTML=head+body;
-  }catch(e){E("diff").innerHTML=head+'<div class="hint">error loading diff</div>';}
+    let chc='',body;
+    if(d.kind==="text"){
+      let add=0,del=0;
+      const lines=d.unified.split("\n");
+      for(let k=0;k<lines.length;k++){
+        const l=lines[k];
+        if(l.startsWith("+++")||l.startsWith("---"))continue;
+        if(l.startsWith("+"))add+=l.length-1; else if(l.startsWith("-"))del+=l.length-1;
+      }
+      chc=' <span class="chc">+'+add+' / −'+del+' chars</span>';
+      body=colorize(d.unified);
+    }else{body='<div class="hint">'+esc(d.msg||d.kind)+'</div>';}
+    const html='<div class="fhead">'+esc(c.path)+chc+'</div>'+body;
+    cache[key]=html;
+    E("diff").innerHTML=html;
+  }catch(e){E("diff").innerHTML=plainHead+'<div class="hint">error loading diff</div>';}
 }
 function colorize(u){
   let out='<div class="diffbox">';
@@ -1470,9 +1564,25 @@ function colorize(u){
   }
   return out+"</div>";
 }
+function fmtBytes(n){if(n>=1048576)return (n/1048576).toFixed(1)+" MB";if(n>=1024)return (n/1024).toFixed(0)+" KB";return n+" B";}
+async function loadStats(){
+  try{
+    const r=await fetch(api("/api/stats"));
+    if(!r.ok)return;
+    const s=await r.json();
+    VERSIONS.forEach(function(v,i){
+      const el=document.getElementById("vs"+i);
+      if(!el)return;
+      const st=s[v.hash];
+      if(st){el.innerHTML='<b>'+st.files+'</b> files changed · '+fmtBytes(st.bytes)+' <span class="tot">('+v.files+' total)</span>';}
+      else{el.textContent=v.files+' files (initial import)';}
+    });
+  }catch(e){}
+}
 E("files").addEventListener("click",fileEvent);
 E("files").addEventListener("mouseover",fileEvent);
 renderVersions();
+loadStats();
 </script></body></html>"##;
 
 const CSS: &str = r#"<style>
