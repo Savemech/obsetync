@@ -218,10 +218,17 @@ async fn session_v2(
     for vault in &vaults {
         let mut rx = state.subscribe_roots(vault);
         let tx = out_tx.clone();
+        let my_device = ticket.device_id.clone();
         forwarders.push(tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(frame) => {
+                        // Never echo a device its OWN presence — it already
+                        // knows it has the file open, and "you are editing this"
+                        // is just noise (only OTHER devices should surface).
+                        if is_own_presence(&frame, &my_device) {
+                            continue;
+                        }
                         if tx.send(frame).await.is_err() {
                             break;
                         }
@@ -234,9 +241,12 @@ async fn session_v2(
     }
     drop(out_tx);
 
-    // Fresh subscriber immediately learns who is where.
+    // Fresh subscriber immediately learns who is where (minus itself).
     for vault in &vaults {
         for frame in state.presence_snapshot(vault) {
+            if is_own_presence(&frame, &ticket.device_id) {
+                continue;
+            }
             if let Some(f) = seal.seal(&frame) {
                 if sink.send(Message::Binary(f.into())).await.is_err() {
                     return;
@@ -478,4 +488,35 @@ fn extract_vaults(v: &serde_json::Value) -> Vec<String> {
 
 fn bye(reason: &str) -> String {
     serde_json::json!({"v": 1, "t": "bye", "reason": reason}).to_string()
+}
+
+/// True when `frame` is a presence frame advertising `my_device` — so a session
+/// can skip echoing a device its own presence. Non-presence frames (root
+/// changes, ops) never match, so they always forward.
+fn is_own_presence(frame: &str, my_device: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(frame)
+        .ok()
+        .filter(|v| v.get("t").and_then(|t| t.as_str()) == Some("presence"))
+        .and_then(|v| {
+            v.get("device")
+                .and_then(|d| d.as_str())
+                .map(|d| d == my_device)
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_own_presence;
+
+    #[test]
+    fn own_presence_frame_is_filtered_others_are_not() {
+        let mine = r#"{"v":2,"t":"presence","vault":"v","device":"dev-A","name":"Laptop","file":"a.md","state":"active"}"#;
+        let other = r#"{"v":2,"t":"presence","vault":"v","device":"dev-B","name":"Tablet","file":"a.md","state":"active"}"#;
+        let root = r#"{"v":2,"t":"root","vault":"v","root":"abc"}"#;
+        assert!(is_own_presence(mine, "dev-A"));
+        assert!(!is_own_presence(other, "dev-A")); // another device — keep
+        assert!(!is_own_presence(root, "dev-A")); // not presence — keep
+        assert!(!is_own_presence("not json", "dev-A"));
+    }
 }
