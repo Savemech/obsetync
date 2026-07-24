@@ -218,7 +218,9 @@ async fn session_v2(
     for vault in &vaults {
         let mut rx = state.subscribe_roots(vault);
         let tx = out_tx.clone();
-        let my_device = ticket.device_id.clone();
+        // presence_frame stamps the SHORT (12-char) device id, so compare
+        // against that, not the full ticket id.
+        let my_device = device_short.clone();
         forwarders.push(tokio::spawn(async move {
             loop {
                 match rx.recv().await {
@@ -244,7 +246,7 @@ async fn session_v2(
     // Fresh subscriber immediately learns who is where (minus itself).
     for vault in &vaults {
         for frame in state.presence_snapshot(vault) {
-            if is_own_presence(&frame, &ticket.device_id) {
+            if is_own_presence(&frame, &device_short) {
                 continue;
             }
             if let Some(f) = seal.seal(&frame) {
@@ -518,5 +520,19 @@ mod tests {
         assert!(!is_own_presence(other, "dev-A")); // another device — keep
         assert!(!is_own_presence(root, "dev-A")); // not presence — keep
         assert!(!is_own_presence("not json", "dev-A"));
+    }
+
+    #[test]
+    fn compares_against_the_short_device_id() {
+        // presence_frame stamps the SHORT (12-char) device id, so callers MUST
+        // pass the short form — comparing the FULL id matches nothing (the 1.9.6
+        // bug that let a device see its own presence).
+        let short = "a1b2c3d4e5f6";
+        let full = "a1b2c3d4e5f6aabbccddeeff00112233";
+        let frame = format!(
+            r#"{{"v":1,"t":"presence","vault":"v","device":"{short}","name":"L","file":"a.md","state":"active"}}"#
+        );
+        assert!(is_own_presence(&frame, short)); // short vs short → filtered
+        assert!(!is_own_presence(&frame, full)); // short vs full → the trap
     }
 }
