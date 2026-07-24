@@ -43,6 +43,10 @@ services:
       #   sync_server=debug               → per-request detail + chunk/content uploads
       #   sync_server=trace               → plus AEAD internals
       RUST_LOG: "${RUST_LOG:-sync_server=debug,warn}"
+      # Blast-radius guard. Default `warn`: scans + logs a mass delete/revert
+      # but doesn't block (recover via GUI rollback). `enforce` blocks; `off`
+      # silences the scan. Override in .env: OBSETYNC_GUARD=enforce
+      OBSETYNC_GUARD: "${OBSETYNC_GUARD:-warn}"
     ports:
       # Sync API — exposed publicly (AEAD envelope + bearer token inside the ciphertext).
       - "27182:27182"

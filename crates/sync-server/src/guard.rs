@@ -25,7 +25,8 @@
 //! The incident regressions were ~48h; the default allowance is 12h.
 //!
 //! Tunables (env, read once):
-//!   OBSETYNC_GUARD                enforce | warn | off   (default: enforce)
+//!   OBSETYNC_GUARD                enforce | warn | off   (default: warn — scan
+//!                                 + log but don't block; recover via rollback)
 //!   OBSETYNC_GUARD_MTIME_K        max backwards-content files   (default: 25)
 //!   OBSETYNC_GUARD_MTIME_SKEW_MS  clock-skew allowance before a backwards
 //!                                 mtime counts (default: 43_200_000 = 12h)
@@ -61,10 +62,16 @@ pub struct GuardConfig {
 
 impl GuardConfig {
     fn from_env() -> Self {
+        // Default WARN: the tripwire still SCANS and logs a loud line for a
+        // mass deletion/revert, but does NOT block. The honest-parent client
+        // fix (1.4.0) prevents the incident class at the source, and every root
+        // is kept forever (COW) so a bad push is a one-click GUI rollback —
+        // blocking legitimate bulk cleanups was more friction than value. Set
+        // OBSETYNC_GUARD=enforce to block again, or =off to silence the scan.
         let mode = match std::env::var("OBSETYNC_GUARD").as_deref() {
             Ok("off") => GuardMode::Off,
-            Ok("warn") => GuardMode::Warn,
-            _ => GuardMode::Enforce,
+            Ok("enforce") => GuardMode::Enforce,
+            _ => GuardMode::Warn,
         };
         let parse = |key: &str, default: u64| -> u64 {
             std::env::var(key)
