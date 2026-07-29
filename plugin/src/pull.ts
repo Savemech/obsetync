@@ -31,6 +31,12 @@ export interface PullResult {
      *  has, so the caller must NOT advance treeBaseRoot (a later fast-forward
      *  would read those gaps as deletions — the 2026-07-13 failure mode). */
     failedCount: number;
+    /** Bytes-worth of files this pull actually fetched from the server. Zero
+     *  means every applied delta verified against local disk — the content is
+     *  provably identical to the server, so a tree-hash mismatch is metadata
+     *  (mtime) only, not a real divergence, and is safe to adopt rather than
+     *  pause. */
+    downloaded: number;
 }
 
 /**
@@ -85,6 +91,7 @@ export async function pull(
                 treeParity: null,
                 deltasHadMtime: false,
                 failedCount: 0,
+                downloaded: 0,
             };
         }
         onDeltasKnown?.(deltaPaths(deltas));
@@ -96,7 +103,15 @@ export async function pull(
                 `untracked ${ignoredDeletes.length} ignored deletion(s)`,
             );
         }
-        const failed = await applyDeltas(api, io, syncBase, wasm, kept, onProgress, skipPaths);
+        const { deferred: failed, downloaded } = await applyDeltas(
+            api,
+            io,
+            syncBase,
+            wasm,
+            kept,
+            onProgress,
+            skipPaths,
+        );
 
         // Rebase: sync-base was just seeded with the full server state, so a
         // fresh bootstrap from it materializes the server's tree locally.
@@ -129,6 +144,7 @@ export async function pull(
             treeParity: parity(tree, newRootHash),
             deltasHadMtime,
             failedCount: failed.length,
+            downloaded,
         };
     }
 
@@ -171,6 +187,7 @@ export async function pull(
             treeParity: parity(tree, newRootHash),
             deltasHadMtime: false,
             failedCount: 0,
+            downloaded: 0,
         };
     }
 
@@ -185,7 +202,15 @@ export async function pull(
             `untracked ${ignoredDeletes.length} ignored deletion(s)`,
         );
     }
-    const failed = await applyDeltas(api, io, syncBase, wasm, kept, onProgress, skipPaths);
+    const { deferred: failed, downloaded } = await applyDeltas(
+        api,
+        io,
+        syncBase,
+        wasm,
+        kept,
+        onProgress,
+        skipPaths,
+    );
 
     // Rebase the Merkle tree with the exact deltas just applied to disk +
     // sync-base. THE key invariant of the pull path: tree, sync-base, and
@@ -219,6 +244,7 @@ export async function pull(
         treeParity: parity(tree, newRootHash),
         deltasHadMtime,
         failedCount: failed.length,
+        downloaded,
     };
 }
 
@@ -384,7 +410,7 @@ async function applyDeltas(
     deltas: FileDelta[],
     onProgress?: (msg: string) => void,
     skipPaths?: Set<string>,
-): Promise<FileDelta[]> {
+): Promise<{ deferred: FileDelta[]; downloaded: number }> {
     const renames: FileDelta[] = [];
     const deletions: FileDelta[] = [];
     const modifications: FileDelta[] = [];
@@ -506,7 +532,7 @@ async function applyDeltas(
             `${fmtBytes(stats.bytesSkipped)} saved, ${fmtBytes(stats.bytesDownloaded)} transferred`
         );
     }
-    return unfetched;
+    return { deferred: unfetched, downloaded: stats.downloaded };
 }
 
 /** Human-readable byte count for progress messages. */

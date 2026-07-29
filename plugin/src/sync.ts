@@ -886,6 +886,7 @@ export class ObsetyncSyncEngine {
         treeParity: boolean | null;
         deltasHadMtime: boolean;
         failedCount: number;
+        downloaded: number;
     }): Promise<void> {
         // Files this pull couldn't fetch leave the tree missing content the
         // server has. Adopting the server root as our base now would let a
@@ -935,7 +936,15 @@ export class ObsetyncSyncEngine {
             const epsilon = Math.max(8, Math.ceil(baseCount * 0.005));
             const countsAgree = treeCount >= 0 && Math.abs(treeCount - baseCount) <= epsilon;
 
-            if (result.applied > 0 && result.deltasHadMtime) {
+            // A tree that still doesn't match the server AFTER the pull
+            // actually DOWNLOADED content is a genuine content divergence —
+            // block. But when the pull downloaded NOTHING (every delta verified
+            // against local disk), the content is provably identical and the
+            // only difference is metadata — mtime, which leaf hashes cover.
+            // That's benign: fall through to the count-agreement check and
+            // adopt, instead of nagging "Force full rescan" on a false alarm
+            // that no rescan can fix (the mtimes just drift again).
+            if (result.applied > 0 && result.deltasHadMtime && result.downloaded > 0) {
                 this.pushBlocked = true;
                 console.error(
                     `[obsetync] tree root ${this.getTreeRootHash()?.slice(0, 16)} != ` +
@@ -948,6 +957,12 @@ export class ObsetyncSyncEngine {
                     10000,
                 );
                 return;
+            }
+            if (result.applied > 0 && result.deltasHadMtime && result.downloaded === 0) {
+                console.log(
+                    `[obsetync] tree hash differs from server but the pull downloaded 0 bytes ` +
+                    `(content verified identical) — metadata-only drift, adopting server root`,
+                );
             }
 
             // Pre-1.4.0 server (deltas without mtimes) or metadata-only root
