@@ -1,7 +1,8 @@
 use crate::chunk::ChunkError;
-use crate::hash::{hash_to_hex, FileHash};
+use crate::hash::{hash_bytes, hash_to_hex, FileHash};
+use std::io::Write;
 
-/// Abstract chunk store for index data (LeafChunk, InternalNode, RootNode).
+/// Abstract byte-addressed store for Merkle index data (LeafChunk/InternalNode).
 /// Desktop uses DiskChunkStore. Server uses its own filesystem impl.
 /// iOS WASM uses a JS-backed impl via wasm-bindgen.
 #[async_trait::async_trait(?Send)] // ?Send because WASM is single-threaded
@@ -27,25 +28,45 @@ impl DiskChunkStore {
         let hex = hash_to_hex(hash);
         self.base.join(&hex[..2]).join(&hex[2..])
     }
+
+    fn read_verified(&self, hash: &FileHash) -> Result<Vec<u8>, ChunkError> {
+        let path = self.chunk_path(hash);
+        let data = match std::fs::read(&path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ChunkError::NotFound(hash_to_hex(hash)));
+            }
+            Err(error) => return Err(ChunkError::Io(error)),
+        };
+        if hash_bytes(&data) != *hash {
+            return Err(ChunkError::Deserialize(format!(
+                "index object {} failed content-address validation",
+                hash_to_hex(hash),
+            )));
+        }
+        Ok(data)
+    }
 }
 
 #[async_trait::async_trait(?Send)]
 impl ChunkStore for DiskChunkStore {
     async fn has(&self, hash: &FileHash) -> bool {
-        self.chunk_path(hash).exists()
+        self.read_verified(hash).is_ok()
     }
 
     async fn get(&self, hash: &FileHash) -> Result<Vec<u8>, ChunkError> {
-        let path = self.chunk_path(hash);
-        std::fs::read(&path).map_err(|_| ChunkError::NotFound(hash_to_hex(hash)))
+        self.read_verified(hash)
     }
 
     async fn put(&self, hash: FileHash, data: Vec<u8>) -> Result<(), ChunkError> {
-        let path = self.chunk_path(&hash);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        if hash_bytes(&data) != hash {
+            return Err(ChunkError::Deserialize(format!(
+                "refusing index bytes that do not match {}",
+                hash_to_hex(&hash),
+            )));
         }
-        std::fs::write(&path, &data)?;
+        let path = self.chunk_path(&hash);
+        atomic_write(&path, &data)?;
         Ok(())
     }
 
@@ -56,6 +77,91 @@ impl ChunkStore for DiskChunkStore {
         }
         Ok(())
     }
+}
+
+/// Durable same-directory promotion for native index nodes. A merge or admin
+/// rebuild must never expose a half-written object under its final hash, and a
+/// previously corrupt object must remain repairable by a deterministic put.
+pub(crate) fn atomic_write(path: &std::path::Path, data: &[u8]) -> Result<(), std::io::Error> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "chunk path has no parent")
+    })?;
+    std::fs::create_dir_all(parent)?;
+    if std::fs::read(path).is_ok_and(|existing| existing == data) {
+        return Ok(());
+    }
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let mut opened = None;
+    for attempt in 0..32u8 {
+        let candidate = path.with_extension(format!(
+            "tmp-{}-{nonce:032x}-{attempt:02x}",
+            std::process::id(),
+        ));
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                opened = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    let (tmp, mut file) = opened.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate a unique chunk temp file",
+        )
+    })?;
+    if let Err(error) = file.write_all(data).and_then(|_| file.sync_all()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    drop(file);
+
+    if let Err(rename_error) = std::fs::rename(&tmp, path) {
+        if std::fs::read(path).is_ok_and(|existing| existing == data) {
+            let _ = std::fs::remove_file(&tmp);
+            return Ok(());
+        }
+
+        // Windows cannot rename over an existing destination. Keep the old
+        // object recoverable until the new one has reached the final name.
+        let mut backup_name = tmp.as_os_str().to_os_string();
+        backup_name.push(".backup");
+        let backup = std::path::PathBuf::from(backup_name);
+        let had_existing = path.exists();
+        if had_existing {
+            if let Err(error) = std::fs::rename(path, &backup) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(error);
+            }
+        }
+        if let Err(error) = std::fs::rename(&tmp, path) {
+            if had_existing {
+                let _ = std::fs::rename(&backup, path);
+            }
+            let _ = std::fs::remove_file(&tmp);
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!("chunk promotion failed after rename error {rename_error}: {error}"),
+            ));
+        }
+        if had_existing {
+            let _ = std::fs::remove_file(&backup);
+        }
+    }
+
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 /// In-memory chunk store for testing.
@@ -171,8 +277,8 @@ mod tests {
     async fn disk_store_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let store = DiskChunkStore::new(dir.path());
-        let hash = hash_bytes(b"disk test");
         let data = b"disk test data".to_vec();
+        let hash = hash_bytes(&data);
 
         store.put(hash, data.clone()).await.unwrap();
         assert!(store.has(&hash).await);
@@ -257,12 +363,38 @@ mod tests {
     async fn disk_store_path_layout_uses_first_two_hex() {
         let dir = tempfile::tempdir().unwrap();
         let store = DiskChunkStore::new(dir.path());
-        let h = hash_bytes(b"layout");
-        store.put(h, b"x".to_vec()).await.unwrap();
+        let data = b"layout".to_vec();
+        let h = hash_bytes(&data);
+        store.put(h, data).await.unwrap();
         // The expected on-disk path puts the first two hex chars in a sub-dir.
         let hex = hash_to_hex(&h);
         let expected = dir.path().join(&hex[..2]).join(&hex[2..]);
         assert!(expected.exists(), "expected blob at {:?}", expected);
+    }
+
+    #[tokio::test]
+    async fn disk_store_rejects_and_repairs_a_corrupt_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DiskChunkStore::new(dir.path());
+        let data = b"valid index node".to_vec();
+        let hash = hash_bytes(&data);
+        store.put(hash, data.clone()).await.unwrap();
+
+        std::fs::write(store.chunk_path(&hash), b"same path, wrong bytes").unwrap();
+        assert!(!store.has(&hash).await);
+        assert!(matches!(
+            store.get(&hash).await.unwrap_err(),
+            ChunkError::Deserialize(_)
+        ));
+
+        store.put(hash, data.clone()).await.unwrap();
+        assert_eq!(store.get(&hash).await.unwrap(), data);
+        assert_eq!(
+            std::fs::read_dir(store.chunk_path(&hash).parent().unwrap())
+                .unwrap()
+                .count(),
+            1,
+        );
     }
 
     #[tokio::test]

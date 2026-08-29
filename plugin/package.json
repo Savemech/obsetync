@@ -1,12 +1,12 @@
 {
   "name": "obsetync",
-  "version": "1.9.9",
+  "version": "1.10.1",
   "description": "Self-hosted Obsidian vault sync",
   "main": "main.js",
   "scripts": {
     "build": "node esbuild.config.mjs production",
     "dev": "node esbuild.config.mjs",
-    "test": "esbuild src/ignore.test.ts --bundle --platform=node --format=cjs | node"
+    "test": "esbuild src/plugin.test.ts --bundle --platform=node --format=cjs | node"
   },
   "dependencies": {
     "@noble/curves": "^1.6.0"

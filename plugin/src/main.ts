@@ -7,6 +7,7 @@ import { ObsetyncSyncEngine } from "./sync";
 import { SyncSettings, DEFAULT_SETTINGS, ObsetyncSettingTab } from "./settings";
 import { ObsetyncConflictModal, findConflicts } from "./conflict-ui";
 import { debugLog, crashLog, perfSpan } from "./debug-log";
+import { OperationCheckpoint } from "./operation-checkpoint";
 import type { WasmModule, WasmTree } from "./push";
 
 // Static import of the wasm-bindgen --target web glue. esbuild inlines this
@@ -27,6 +28,7 @@ import initWasm, * as WasmExports from "../wasm/sync_core";
 // separate `sync_core_bg.wasm` file for BRAT/Obsidian to (fail to) deliver.
 // @ts-ignore
 import wasmBytes from "../wasm/sync_core_bg.wasm";
+const embeddedWasmBytes = wasmBytes as unknown as Uint8Array;
 
 export default class ObsetyncPlugin extends Plugin {
     settings: SyncSettings = DEFAULT_SETTINGS;
@@ -37,6 +39,7 @@ export default class ObsetyncPlugin extends Plugin {
     private syncEngine!: ObsetyncSyncEngine;
     private wasm!: WasmModule;
     private tree!: WasmTree;
+    private operationCheckpoint!: OperationCheckpoint;
     private statusBarEl: HTMLElement | null = null;
 
     async onload(): Promise<void> {
@@ -46,14 +49,19 @@ export default class ObsetyncPlugin extends Plugin {
         debugLog.install();
 
         // Persist window-level errors to .obsetync-crash.log in the vault
-        // root. DevTools die with the renderer — that file is the postmortem
-        // evidence when the window goes down (OOM, error storms).
+        // root. This captures JavaScript failures; the separate durable
+        // operation checkpoint diagnoses OS-level renderer kills/Jetsam.
         crashLog.install(this.app, this.manifest.version);
 
         await this.loadSettings();
 
         // Platform I/O.
         this.io = createPlatformIO(this.app);
+        this.operationCheckpoint = new OperationCheckpoint(
+            this.io,
+            this.manifest.version,
+        );
+        await this.operationCheckpoint.initialize();
 
         // Persistence layers.
         this.syncBase = new ObsetyncSyncBase(this.app);
@@ -142,6 +150,8 @@ export default class ObsetyncPlugin extends Plugin {
         push(`Device ID:         ${trunc(this.settings.deviceId, 24)}`);
         push(`Bearer token:      ${this.settings.bearerToken ? "present" : "MISSING"}`);
         push(`Server box pubkey: ${trunc(this.settings.serverBoxPub, 24)}`);
+        push(`HTTP wire:         ${this.settings.wireVersion || "not enrolled for v2"}`);
+        push(`Server eph valid:  ${this.settings.esPubValidUntil ? new Date(this.settings.esPubValidUntil * 1000).toISOString() : "missing"}`);
         push(`Sync interval:     ${this.settings.syncIntervalMs}ms`);
         push(`Sync priority:     ${this.settings.syncPriority}`);
         push(`Sync .obsidian/:   ${this.settings.syncObsidianConfig}`);
@@ -154,6 +164,23 @@ export default class ObsetyncPlugin extends Plugin {
         push(`WASM:              ${this.wasm ? "loaded" : "not loaded"}`);
         push(`Plugin id:         ${this.manifest.id}`);
         push(`Plugin version:    ${this.manifest.version}`);
+        push("");
+
+        push("--- Previous interruption ---");
+        const interruption = this.operationCheckpoint?.getLastInterruption();
+        if (interruption) {
+            push(`Phase:             ${interruption.phase}`);
+            push(`Last checkpoint:   ${fmt(interruption.updatedAt)}`);
+            push(`Started:           ${fmt(interruption.startedAt)}`);
+            push(`Plugin version:    ${interruption.pluginVersion}`);
+            push(`Progress:          ${interruption.detail || "(none)"}`);
+            push(
+                "Meaning:           renderer stopped before this phase returned " +
+                "(on iOS, usually memory-pressure/Jetsam)",
+            );
+        } else {
+            push("No orphaned operation checkpoint found.");
+        }
         push("");
 
         if (this.syncEngine) {
@@ -294,6 +321,13 @@ export default class ObsetyncPlugin extends Plugin {
         this.settings.deviceId     = result.device_id;
         this.settings.bearerToken  = result.bearer_token;
         this.settings.serverBoxPub = result.server_box_pub;
+        if (result.wire_version !== "0x02") {
+            throw new Error(`unsupported enrollment wire version: ${result.wire_version ?? "missing"}`);
+        }
+        this.settings.wireVersion = result.wire_version;
+        this.settings.esPub = result.Es_pub_initial;
+        this.settings.esPubValidUntil = result.Es_pub_valid_until;
+        this.settings.lastOutgoingSeq = 0;
         this.settings.enrolled     = true;
         await this.saveSettings();
 
@@ -339,7 +373,7 @@ export default class ObsetyncPlugin extends Plugin {
 
     private async initSync(): Promise<void> {
         // Spans the whole startup cost: WASM load + engine start (pull,
-        // journal recovery, mtime scan) — finally, so a failed init still
+        // journal recovery, metadata scan) — finally, so a failed init still
         // closes its span and shows how long it ran before dying.
         const endSpan = perfSpan("init");
         try {
@@ -353,16 +387,39 @@ export default class ObsetyncPlugin extends Plugin {
         // Stop existing engine if re-initializing.
         this.syncEngine?.stop();
 
+        if (
+            !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(this.settings.vaultId) ||
+            this.settings.vaultId === "." ||
+            this.settings.vaultId === ".."
+        ) {
+            throw new Error(
+                "Vault ID must be 1–128 ASCII letters, digits, dots, underscores, or hyphens " +
+                "and must start with a letter or digit",
+            );
+        }
+
         // Create API client with the pinned server pubkey + bearer token.
         this.api = new ObsetyncApi(
             this.settings.serverUrl,
             this.settings.serverBoxPub,
             this.settings.bearerToken,
+            {
+                get: () => ({
+                    wireVersion: this.settings.wireVersion,
+                    esPub: this.settings.esPub,
+                    esPubValidUntil: this.settings.esPubValidUntil,
+                    lastOutgoingSeq: this.settings.lastOutgoingSeq,
+                }),
+                update: async (patch) => {
+                    Object.assign(this.settings, patch);
+                    await this.saveSettings();
+                },
+            },
         );
 
-        // Load WASM module.
-        // TODO: implement proper WASM loading from plugin directory.
-        // For now, create a stub that will be replaced when wasm-pack output is available.
+        // Load the bundled WASM module. Sync must fail closed if this cannot
+        // initialize: development hash stubs are not content-address compatible
+        // with the server and must never participate in a real vault.
         this.wasm = await this.loadWasm();
 
         // Create WASM tree.
@@ -407,6 +464,8 @@ export default class ObsetyncPlugin extends Plugin {
             this.settings.realtimeWs,
             this.settings.sharePresence,
             this.settings.ignorePatterns,
+            this.operationCheckpoint,
+            this.settings.autoSync,
         );
 
         // Start.
@@ -426,18 +485,18 @@ export default class ObsetyncPlugin extends Plugin {
         // breaking sync.
         const endSpan = perfSpan("wasm.load");
         try {
-            await initWasm({ module_or_path: wasmBytes });
-            console.log(`[obsetync] WASM loaded (${wasmBytes.byteLength} bytes, inline)`);
+            await initWasm({ module_or_path: embeddedWasmBytes });
+            console.log(`[obsetync] WASM loaded (${embeddedWasmBytes.byteLength} bytes, inline)`);
             return WasmExports as unknown as WasmModule;
         } catch (e: any) {
             const msg = e?.message ?? String(e);
             const name = e?.name ?? "Error";
             const stack = (e?.stack ?? "").split("\n").slice(0, 3).join(" | ");
-            console.warn(
-                `[obsetync] WASM load failed — using stub. ` +
+            console.error(
+                `[obsetync] WASM load failed; sync disabled. ` +
                 `${name}: ${msg} (stack: ${stack})`
             );
-            return createWasmStub();
+            throw new Error(`Obsetync WASM initialization failed: ${msg}`);
         } finally {
             endSpan();
         }
@@ -458,93 +517,4 @@ export default class ObsetyncPlugin extends Plugin {
         const peers = this.syncEngine?.getActivePeerCount() ?? 0;
         this.statusBarEl?.setText(peers > 0 ? `${text} · 👥${peers}` : text);
     }
-}
-
-/** Stub WASM module for development when WASM isn't built yet. */
-function createWasmStub(): WasmModule {
-    return {
-        wasm_hash(_data: Uint8Array): string {
-            // Fallback: use a simple JS hash. Not blake3, just for dev.
-            let hash = 0;
-            for (let i = 0; i < _data.length; i++) {
-                hash = (hash * 31 + _data[i]) | 0;
-            }
-            return hash.toString(16).padStart(64, "0");
-        },
-        wasm_should_chunk(size: number): boolean {
-            return size >= 1_048_576;
-        },
-        wasm_chunk_file(_data: Uint8Array): any {
-            return { file_hash: "stub", total_size: _data.length, chunks: [] };
-        },
-        wasm_get_file_chunk(
-            data: Uint8Array,
-            offset: number,
-            size: number
-        ): Uint8Array {
-            return data.slice(offset, offset + size);
-        },
-        wasm_tree_get_chunk(_tree: any, _hash: string): Uint8Array | null {
-            return null;
-        },
-        wasm_tree_chunk_hashes(_tree: any): string[] {
-            return [];
-        },
-        wasm_root_hash_from_bytes(_bytes: Uint8Array): string | undefined {
-            return undefined;
-        },
-        wasm_hash_batch(data: Uint8Array, offsets: Uint32Array, sizes: Uint32Array): string[] {
-            return Array.from({ length: offsets.length }, (_, i) => {
-                const start = offsets[i];
-                const end   = start + sizes[i];
-                let hash = 0;
-                for (let b = start; b < end; b++) hash = (hash * 31 + data[b]) | 0;
-                return hash.toString(16).padStart(64, "0");
-            });
-        },
-        Hasher: class {
-            private chunks: Uint8Array[] = [];
-            update(chunk: Uint8Array): void { this.chunks.push(chunk); }
-            finalize(): string {
-                // Stub: XOR bytes for a deterministic (non-blake3) result.
-                let h = 0;
-                for (const c of this.chunks) for (const b of c) h = (h * 31 + b) | 0;
-                return h.toString(16).padStart(64, "0");
-            }
-            free(): void { this.chunks = []; }
-        } as any,
-        WasmTree: class {
-            constructor(_vaultId: string, _deviceId: string) {}
-            load_root(_rootBytes: Uint8Array): void {}
-            root_hash_hex(): string | null {
-                return null;
-            }
-            root_bytes(): Uint8Array | null {
-                return null;
-            }
-            total_files(): number {
-                return 0;
-            }
-            update_entry(
-                _path: string,
-                _hash: string,
-                _mtime: number,
-                _size: number
-            ): void {
-                return;
-            }
-            delete_entry(_path: string): void {
-                return;
-            }
-            build_from_entries(_entriesJson: string): void {
-                return;
-            }
-            update_batch(_entriesJson: string): void {
-                return;
-            }
-            delete_batch(_pathsJson: string): void {
-                return;
-            }
-        } as any,
-    };
 }

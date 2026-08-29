@@ -31,10 +31,11 @@ RootNode                     <- single hash that names the vault state
     └── header.png → FileEntry { hash, mtime, size }
 ```
 
-Every node is identified by Blake3 of its serialized form. Every file's `hash`
-is Blake3 of the file's bytes. The bytes themselves live in a separate
-content store, keyed by hash. Identical content across files (or across
-devices) is stored once.
+Leaf and internal nodes are addressed by Blake3 of their deterministic bytes.
+The root hash is a semantic commitment to its ordered prefix/child-hash pairs,
+so history metadata such as device, parent, and timestamp does not change the
+identity of an otherwise identical vault state. Every file's `hash` is Blake3
+of its bytes; identical content across paths or devices is stored once.
 
 Sync is moving these hashes around. Bytes only move when a hash refers to
 content the receiver doesn't already have.
@@ -43,9 +44,10 @@ content the receiver doesn't already have.
 
 Each vault on the server has a pointer file `vaults/<vault>/current` whose
 contents are the hex of the **current root hash**. That's the entire
-authoritative state of a vault — one hash. Every prior root the server has
-ever seen lives in `vaults/<vault>/roots/<hash>.bin` so any push can be
-diffed or merged against any historical state.
+authoritative state of a vault — one hash. Every unique prior state the server
+has accepted lives in `vaults/<vault>/roots/<hash>.bin` so any push can be
+diffed or merged against a retained historical state. Re-entering an identical
+state reuses its semantic hash and does not rewrite its first history metadata.
 
 ### What a client sends
 
@@ -190,51 +192,40 @@ which gives the client everything it needs to materialize a resolution.
 
 ---
 
-## 4. Client-side resolution (per-file strategy)
+## 4. Content merge and visible conflict copies
 
-A server-flagged conflict isn't the end of the story. The client receives
-the `conflicts[]` list and for each entry decides what to write to the
-vault on disk. That decision depends on the file extension via
-`sync_core::sync_rules::SyncRules`:
+For known text extensions below the 1 MiB blob threshold, the server fetches
+strict UTF-8 base/A/B bytes and runs
+`sync_core::conflict::three_way_text_merge`. Non-overlapping line edits produce
+one merged content-addressed blob and no conflict. Overlap, invalid UTF-8,
+missing blobs, binary files, and chunked large files stay unresolved; side A
+remains at the original tree path and the response carries all three hashes.
 
-| strategy        | applies to                              | behaviour on conflict                            |
-|-----------------|-----------------------------------------|--------------------------------------------------|
-| `ConflictCopy`  | unrecognised binary, default            | keep both versions, rename loser to `…-conflict-<hash6>.ext` |
-| `LocalOnly`     | `*.sqlite`, `*.sqlite-wal`, `.DS_Store`, `thumbs.db` | never sync; each device has its own copy |
-| `Immutable`     | `*.png`, `*.jpg`, `*.pdf`, `*.mp4`, `*.zip`, … | "write-once" semantics; loser auto-renamed     |
-| text three-way  | `.md`, `.txt`, `.json`, `.canvas`, …    | attempt three-way line merge; fall back to `ConflictCopy` on overlap |
+The pushing client then preserves its losing side B under a normal visible
+name such as `doc (conflict Laptop 2026-08-29 1430).md`. It prefers the exact
+server blob it just uploaded and falls back to current local bytes for chunked
+large files. The copy enters the ordinary vault event journal and syncs like
+any other new file. There is no hidden conflict database and no silent discard.
 
-The text three-way merge (`sync_core::conflict::three_way_text_merge`)
-diffs base→A and base→B independently. If their changed line ranges don't
-overlap, both edits are applied and the file lands clean. If they do
-overlap, the file falls back to `ConflictCopy` and both versions are
-written to disk with the loser renamed.
+`sync_rules.rs` contains policy types for future configurable binary handling,
+but 1.10.1 does not route merge outcomes through those unused strategies; the
+implemented fallback for every unresolved type is keep-both via conflict copy.
 
 ### Why this split (server tree merge + client file resolve)?
 
-The server is content-blind — it never reads `.md` to understand if it's
-text. Storing every device's conflict-copy logic on the server would
-require shipping the full strategy table to every server install and
-keeping them in sync. Instead the server hands back enough information
-for the client to do the resolution locally, where strategy can evolve
-per-platform.
+The server performs only the deterministic small-text merge. Naming and
+materializing the losing copy stays client-side because it is a vault-visible
+operation that must pass through the same journal and local-edit safeguards as
+any other file creation.
 
 ---
 
 ## 5. Transport guarantees
 
 Conflict resolution is only safe if the inputs are authentic. Every
-protected request rides through an AEAD envelope:
-
-```
-[ 1B version=0x01 ][ 12B nonce ][ 32B client ephemeral pub ][ ciphertext+tag ]
-
-shared       = X25519(client_eph_priv, server_box_pub)
-request_key  = HKDF-SHA256(salt = nonce, ikm = shared, info = "obsetync/v1/c2s")
-ciphertext   = AES-256-GCM(request_key, nonce, plaintext, AAD)
-AAD          = b"obsetync/v1 " + METHOD + b" " + PATH
-plaintext    = bearer_token (64 ASCII hex) || inner_body
-```
+protected request rides through the wire-v2 double-DH AEAD envelope specified
+in [`transport.md`](transport.md). The authenticated plaintext includes the
+bearer, a durable per-device sequence, and the semantic body.
 
 What this buys:
 
@@ -242,15 +233,19 @@ What this buys:
   enrollment, registered server-side) can produce a plaintext that decrypts.
 - **Authorization** — the server pulls the bearer out of the plaintext and
   looks up which device owns it. Revoked devices are rejected.
-- **Replay binding** — AAD binds method+path. An envelope captured on
+- **Replay protection** — AAD binds method+path, response AAD binds the exact
+  request nonce, and the durable sliding sequence window rejects an exact
+  same-endpoint replay. An envelope captured on
   `PUT /api/v1/chunk/aa…` cannot be replayed against `PUT /api/v1/chunk/bb…`
   or `GET /api/v1/chunk/aa…`. Verified by
   [`transport_security::cross_path_replay_is_rejected`](../crates/e2e-tests/tests/transport_security.rs).
-- **Forward secrecy** — every request uses a fresh client ephemeral
-  keypair. If `box.key` leaks tomorrow, captured ciphertexts from yesterday
-  do not become readable.
+- **Window-bounded forward secrecy** — the second DH uses a rotating,
+  memory-only server key. Once its current/previous slots are dropped,
+  stealing `box.key` alone does not open the captured ordinary traffic. See
+  the precise limitations in the transport threat model.
 - **Integrity** — bit-flips in the ciphertext (including the GCM tag) fail
-  to decrypt; the server returns 401 plaintext, never reaches the handler.
+  to decrypt; the server returns the constant 256-byte decoy and never
+  reaches the handler.
 - **Network-level fingerprint resistance** — bearer tokens never appear in
   HTTP headers or URLs. A traffic capture sees `POST /api/v1/...` with an
   opaque ciphertext body and no obvious device identifier.
@@ -307,13 +302,14 @@ deterministic answer the server gives, locked in by the named test.
 
 | scenario                                                                 | server behaviour                          | test                                                                     |
 |--------------------------------------------------------------------------|-------------------------------------------|---------------------------------------------------------------------------|
-| Plaintext POST to a protected route                                      | 401/400 (envelope absent)                 | `transport_security::plaintext_request_to_protected_endpoint_is_rejected` |
-| Envelope encrypted to a forged server pubkey                             | 401 (AEAD open fails)                     | `transport_security::envelope_encrypted_against_wrong_pubkey_is_unauthorized` |
-| Envelope decrypts but bearer is unknown                                  | 401 (lookup miss)                         | `transport_security::unknown_bearer_token_is_unauthorized`                |
-| Envelope signed for `/path1` replayed against `/path2`                   | 401 (AAD mismatch)                        | `transport_security::cross_path_replay_is_rejected`                       |
-| Envelope signed for `PUT` replayed via `X-Obsetync-Method: GET`          | 401 (AAD mismatch)                        | `transport_security::cross_method_replay_is_rejected`                     |
-| Single-byte tamper in ciphertext or tag                                  | 401, blob not stored                      | `transport_security::tampered_ciphertext_is_rejected`                     |
-| Wire byte 0 ≠ 0x01                                                        | 401 (BadVersion)                          | `transport_security::bad_wire_version_byte_is_rejected`                   |
+| Plaintext POST to a protected route                                      | wire 200 + constant 256-byte decoy         | `transport_security::plaintext_request_to_protected_endpoint_gets_constant_decoy` |
+| Envelope encrypted to a forged server pubkey                             | constant decoy; client surfaces unauthorized | `transport_security::envelope_encrypted_against_wrong_pubkey_is_unauthorized` |
+| Envelope decrypts but bearer is unknown                                  | encrypted semantic 401                    | `transport_security::unknown_bearer_status_is_encrypted`                  |
+| Envelope signed for `/path1` replayed against `/path2`                   | constant decoy (AAD mismatch)             | `transport_security::cross_path_replay_is_rejected`                       |
+| Envelope signed for `PUT` replayed via `X-Obsetync-Method: GET`          | constant decoy (AAD mismatch)             | `transport_security::cross_method_replay_is_rejected`                     |
+| Exact envelope replayed to the same endpoint                             | encrypted semantic 401 replay             | `transport_security::exact_same_request_replay_is_rejected_once_opened`   |
+| Single-byte tamper in ciphertext or tag                                  | constant decoy; blob not stored           | `transport_security::tampered_ciphertext_gets_decoy`                      |
+| Wire byte 0 ≠ 0x02                                                        | constant decoy (BadVersion)               | `transport_security::bad_wire_version_gets_constant_decoy`                |
 
 ### Enrollment lifecycle
 
@@ -323,7 +319,7 @@ deterministic answer the server gives, locked in by the named test.
 | Bearer registered → first authenticated request                          | accepted                                  | `enrollment::enrolled_device_can_authenticate_against_sync_api`           |
 | Claim a code that was never issued                                       | 400 with JSON `{ "error": ... }`          | `enrollment::unknown_enrollment_code_is_rejected`                         |
 | Claim the same code twice                                                | second claim 400 (file deleted on first claim) | `enrollment::claimed_code_cannot_be_reclaimed`                       |
-| Revoke device, then make a request with that bearer                      | 403 plaintext "device revoked"            | `enrollment::revoked_device_is_forbidden`                                 |
+| Revoke device, then make a request with that bearer                      | encrypted semantic 403                    | `enrollment::revoked_device_is_forbidden`                                 |
 | Enrollment older than 10 minutes                                         | 400 "enrollment code expired", file purged | unit-tested in `crates/sync-server/src/enrollment.rs::tests`             |
 
 ---
@@ -343,19 +339,18 @@ These are the conscious limitations. They're not bugs:
   file with different bytes ALWAYS produce a conflict, regardless of mtime.
   Mtimes ride in the FileEntry but are advisory; the merge logic ignores
   them.
-- **No rename detection.** A delete of `old.md` plus an add of `new.md`
-  with identical content looks like two unrelated operations to the merge
-  layer (both succeed). The hook for rename inference (`detect_renames`
-  in `sync_core::diff`) is currently a passthrough.
-- **No partial-file merging beyond text three-way.** If two devices both
-  rotate a `.png`, you get two PNGs and a rename (`Immutable` strategy).
-  The system does not attempt image diffing.
-- **No server-side authentication of revoked tokens at the AEAD layer.**
-  Once a device is revoked, the server still decrypts its envelopes
-  (the bearer is in the plaintext, decryption succeeds), but the
-  middleware refuses with 403 right after token lookup. The 403 is
-  plaintext, not encrypted — clients learn revocation without needing a
-  fresh handshake.
+- **Rename inference is intentionally conservative.** Diff emits `Renamed`
+  only when a content hash has exactly one deleted path and one added path.
+  Duplicate-content ambiguity remains delete+add; guessing there could move
+  the wrong copy.
+- **No partial-file merging beyond small strict-UTF-8 text three-way.** If two
+  devices both change a binary or chunked large file, the pushing side is
+  preserved as a visible conflict copy. The system does not attempt image or
+  binary diffing.
+- **Revocation happens after authenticated opening.** The bearer is inside
+  the AEAD plaintext, so the server must open a structurally valid envelope
+  before it can look up the device. It then refuses a revoked device with an
+  encrypted semantic 403; pre-open failures remain the constant decoy.
 
 ---
 
@@ -403,7 +398,7 @@ the way the unit tests imply.
 |----------------------------------|-----------------------------------------------------------------|
 | Merkle tree shape + hashing      | `crates/sync-core/src/chunk.rs`, `crates/sync-core/src/tree.rs` |
 | Tree-level + entry-level merge   | `crates/sync-core/src/merge.rs`                                 |
-| File-level resolution strategies | `crates/sync-core/src/sync_rules.rs`, `crates/sync-core/src/conflict.rs` |
+| Text merge + conflict materialization | `crates/sync-core/src/merge.rs`, `…/conflict.rs`, `plugin/src/sync.ts` |
 | Diff (root → root)               | `crates/sync-core/src/diff.rs`                                  |
 | AEAD wire format                 | `crates/sync-server/src/secure.rs`, `docs/transport.md`         |
 | Server-side merge orchestration  | `crates/sync-server/src/api.rs::put_root`                        |

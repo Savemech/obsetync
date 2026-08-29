@@ -14,14 +14,15 @@ C4Component
 
     Container_Boundary(b_plugin, "ObsetyNC Plugin · TypeScript · main.js") {
         Component(sync_plugin, "ObsetyncPlugin", "main.ts", "Obsidian Plugin entry point. Initialises WASM, wires all components together, registers commands (sync-now, full-rescan, show-conflicts), manages status bar.")
-        Component(sync_engine, "ObsetyncSyncEngine", "sync.ts", "Core orchestrator. 4-layer recovery on startup (live events → journal → mtime scan → full scan). Periodic 30s pull timer. forceSync: pull → reconcileContent → push. Holds localRootHash.")
-        Component(push_engine, "PushEngine", "push.ts", "Streaming 5-phase push: A) hash resolution (wasm_hash_batch for small files, wasm_chunk_file for large); B) batch-check server; C) upload only missing; D) tree.update_batch (one WASM call); E) putRoot. STREAM_BATCH=50, READ_CONCURRENCY=4.")
-        Component(pull_engine, "PullEngine", "pull.ts", "Fetches server-computed deltas and applies them. Per-file 3-tier resolution: tier-1 sync-base cache hit (zero work), tier-2 local hash verify via WASM (repair sync-base, skip download), tier-3 actual download. DOWNLOAD_CONCURRENCY=6.")
+        Component(sync_engine, "ObsetyncSyncEngine", "sync.ts", "Core orchestrator. Attaches listeners before the first network await, coalesces one metadata-only dirty record per path, protects edits arriving during pull, audits all metadata drift and offline deletions, and keeps an honest verified tree base.")
+        Component(push_engine, "PushEngine", "push.ts", "Bounded 5-phase push: batch hash/check/upload, streaming FastCDC planning in WASM, one tree.update_batch, then putRoot. Large files are singleton batches; index uploads have bounded concurrency.")
+        Component(pull_engine, "PullEngine", "pull.ts", "Validates and applies server deltas with cache/local-hash/download tiers. It preserves unknown local bytes as a visible conflict copy; large restores verify chunks plus the fresh ordered stream, and restores/renames checkpoint before recoverable replacement.")
         Component(sync_api, "ObsetyncApi", "api.ts", "HTTP client for all sync API endpoints. Transparently wraps every request and response in the AEAD envelope via ObsetyncSecureChannel. Obsidian requestUrl is the only network primitive used (works identically on desktop and iOS).")
-        Component(secure_channel, "ObsetyncSecureChannel", "secure.ts", "Per-request X25519 ECDH + HKDF-SHA256 + AES-256-GCM. Generates a fresh ephemeral keypair for every HTTP call. Encrypts [bearer_token || body] into the request, decrypts the response. No TLS, no CA.")
-        Component(sync_base, "ObsetyncSyncBase", "sync-base.ts", "Persists the last-successfully-synced state for every file: path → {hash, mtime, size} and lastSyncTimestamp. Loaded from and saved to .obsidian/plugins/obsetync/sync-base.json. Acts as the common ancestor for conflict detection and pull tier-1/2.")
-        Component(journal, "ObsetyncJournal", "journal.ts", "Append-only ring buffer of vault events (create/modify/delete/rename). Written on every vault file-change event before the sync. Read on startup to recover changes that were journaled but not yet pushed (Layer 2 of D-005).")
-        Component(platform_io, "PlatformIO", "platform.ts", "Abstracts the Obsidian vault file API for desktop vs iOS. Provides: readFile (streaming in 64 KB slices), writeFile, deleteFile, renameFile, stat, statBulk, mkdir. Hides WKWebView and Electron API differences.")
+        Component(secure_channel, "ObsetyncSecureChannel", "secure.ts", "Wire-v2 channel: pinned-static + rotating-server double DH, per-message HKDF/AES-GCM keys, encrypted bearer/sequence/status, and request-nonce response binding. One client ephemeral keypair per channel.")
+        Component(sync_base, "ObsetyncSyncBase", "sync-base.ts", "Last-synced path metadata plus verified treeBaseRoot. Atomic rotated JSON snapshot + append-only idempotent WAL checkpoints let a large pull resume without replaying completed batches.")
+        Component(journal, "ObsetyncJournal", "journal.ts", "Serialized append-only event/ack WAL. Exact per-path id watermarks cannot erase a newer edit while an older push is in flight; torn tails are recovered and records compact periodically.")
+        Component(platform_io, "PlatformIO", "platform.ts", "Adapter I/O, binary append, recoverable staging replacement, cached bulk stat, and desktop absolute-path streaming. Mobile whole-file source reads are capped; restore writes are chunked.")
+        Component(operation_checkpoint, "OperationCheckpoint", "operation-checkpoint.ts", "Durable active-phase/progress breadcrumb for pull, push, reconcile, and full scan. An orphaned marker on next launch identifies where an iOS renderer/Jetsam termination occurred.")
         Component(conflict_modal, "ObsetyncConflictModal", "conflict-ui.ts", "Modal dialog that lists three-way merge conflicts found in the vault (files renamed to *.conflict by the server's merge engine). Lets the user inspect and resolve each conflict.")
         Component(settings_tab, "ObsetyncSettingTab", "settings.ts", "Obsidian settings tab. Server URL, vault ID, device name, bearer token, sync interval, reconcile toggle, .obsidian sync option. Also surfaces debug log and enrolled-device list.")
         Component(debug_panel, "ObsetyncDebugLog + ObsetyncDebugModal", "debug-log.ts · debug-modal.ts", "Installs a console.log interceptor at startup to capture every [obsetync] log line into a fixed-size ring buffer. A modal command surfaces them — essential on iOS where there is no developer console.")
@@ -40,15 +41,16 @@ C4Component
 
     Rel(sync_engine, push_engine, "Calls push() on pending changes", "api · io · syncBase · wasm · tree")
     Rel(sync_engine, pull_engine, "Calls pull() on startup and 30s timer", "api · io · syncBase · localRootHash · wasm")
-    Rel(sync_engine, sync_api, "reconcileContent: checkChunks · checkContent · checkManifests · putChunk · putBlob")
+    Rel(sync_engine, sync_api, "reconcileContent: checkChunks · checkContent · checkManifests · putChunk · putContent")
     Rel(sync_engine, sync_base, "allPaths() · getEntry() — bootstrap tree for reconcile")
     Rel(sync_engine, journal, "Appends vault events · replays on crash recovery")
+    Rel(sync_engine, operation_checkpoint, "Begins, progresses, and completes durable phase markers")
     Rel(sync_engine, wasm_core, "reconcile: wasm_tree_chunk_hashes · wasm_tree_get_chunk · tree.build_from_entries")
 
-    Rel(push_engine, sync_api, "checkContent · checkChunks · putBlob · putChunk · putRoot")
+    Rel(push_engine, sync_api, "checkContent · checkChunks · putContent · putContentChunk · putRoot")
     Rel(push_engine, platform_io, "Reads file bytes in batches (READ_CONCURRENCY=4)")
     Rel(push_engine, sync_base, "Reads hash/mtime/size · saves after successful push")
-    Rel(push_engine, wasm_core, "wasm_hash_batch (small files) · wasm_chunk_file (large) · tree.update_batch · tree.root_bytes")
+    Rel(push_engine, wasm_core, "wasm_hash_batch (small files) · WasmChunker (large) · tree.update_batch · tree.root_bytes")
 
     Rel(pull_engine, sync_api, "getDiff · getContent · getContentChunk · getManifest · getRoot")
     Rel(pull_engine, platform_io, "writeFile · renameFile · deleteFile · stat · mkdir")
@@ -68,14 +70,15 @@ C4Component
 | Component | Source file | Role |
 |-----------|-------------|------|
 | **ObsetyncPlugin** | `main.ts` | Obsidian `Plugin` subclass. `onload()` initialises WASM synchronously (base64 Uint8Array → `initWasm()`), creates all component instances, starts `ObsetyncSyncEngine`, registers three commands, adds the status-bar element. `onunload()` stops the engine and removes listeners. |
-| **ObsetyncSyncEngine** | `sync.ts` | The orchestrator. Holds `localRootHash` (the client's view of what is on the server), a `pendingChanges: FileChange[]` queue, and the 30-second interval timer. Startup sequence: `pullRemote → recoverFromJournal → partialMtimeScan → attachVaultListeners`. `forceSync` (Sync Now command) runs `pull → reconcileContent → pushPending`. |
-| **PushEngine** | `push.ts` | A top-level async `push()` function (not a class). Processes `FileChange[]` in batches of 50. Per batch: (A) hash unknown small files in one `wasm_hash_batch` call, large files via `wasm_chunk_file`; (B) two HTTP requests to learn what the server is missing; (C) upload only the missing pieces; (D) collect tree entry updates. After all batches: one `tree.update_batch` WASM call and one `putRoot`. |
-| **PullEngine** | `pull.ts` | A top-level async `pull()` function. Gets `FileDelta[]` from the server's `getDiff` endpoint. Groups them by type (rename, delete, modify, add). For add/modify: runs `applyContentDelta` in parallel batches of 6, using the 3-tier resolution strategy. Saves `ObsetyncSyncBase` and returns the new root hash. |
-| **ObsetyncApi** | `api.ts` | `class ObsetyncApi`. One method per server endpoint: `ping`, `getDiff`, `getRoot`, `putRoot`, `getContent`, `putBlob`, `getContentChunk`, `putChunk`, `getManifest`, `checkContent`, `checkChunks`, `checkManifests`. Normalises `https://` URLs to `http://` for legacy compat. Lazily initialises `ObsetyncSecureChannel` on first encrypted request. |
-| **ObsetyncSecureChannel** | `secure.ts` | `class ObsetyncSecureChannel`. `encrypt(method, path, plaintext)` → ciphertext header. `decrypt(ciphertext)` → plaintext. Per-call flow: generate ephemeral X25519 keypair → ECDH with server pubkey → HKDF-SHA256 with nonce salt to derive request key and response key → AES-256-GCM encrypt with AAD `"obsetync/v1" ‖ method ‖ path`. Uses `@noble/curves` (no SubtleCrypto dependency, iOS compatible). |
-| **ObsetyncSyncBase** | `sync-base.ts` | `class ObsetyncSyncBase`. In-memory map `path → {hash, mtime, size}` plus `lastSyncTimestamp`. Loaded from `.obsidian/plugins/obsetync/sync-base.json` on startup. `dirty` flag prevents unnecessary writes. `allPaths()` is the source of truth for reconcile and conflict detection. |
-| **ObsetyncJournal** | `journal.ts` | Append-only log of `JournalEntry` records (path, action, timestamp). Loaded on startup; unprocessed entries are replayed before the mtime scan. Entries are removed once their content has been successfully pushed. Prevents data loss across app restarts. |
-| **PlatformIO** | `platform.ts` | `class PlatformIO` with a `createPlatformIO(app)` factory. Uniform interface over `app.vault.adapter`. Key difference handled: on iOS, `adapter.readBinary()` must be used instead of `adapter.read()`; streaming is implemented manually in 64 KB slices to keep WASM heap bounded. `statBulk()` uses Obsidian's `getFiles()` cache — no filesystem traversal. |
+| **ObsetyncSyncEngine** | `sync.ts` | The orchestrator. Separates last-observed server root from the verified tree merge base, coalesces dirty paths in `DirtyPathSet`, and serializes mutation of the WASM tree. Startup sequence: `attachVaultListeners → pullRemote → recoverFromJournal → metadataScan`; `forceSync` runs `pull → reconcileContent → pushPending`. The scan compares every current stat with sync-base instead of trusting wall-clock direction, so copied-in files with old mtimes, backwards mtimes, and offline deletions are found. |
+| **PushEngine** | `push.ts` | Processes small paths in batches of 50 and each large file alone. Unknown small hashes use `wasm_hash_batch`; large manifests use incremental `WasmChunker` feeds so WASM retains only a bounded window. Missing chunks upload sequentially per large file, index uploads use bounded concurrency, and one `putRoot` commits the result. |
+| **PullEngine** | `pull.ts` | Gets a validated `FileDelta[]`, safely crosses ignore boundaries, and applies rename/delete/upsert changes while rechecking the live local-edit guard immediately before mutation. A remote delete is deferred unless disk is absent or still matches the known base, protecting offline edits before startup metadata scan. Unknown overwrite targets move to a visible `(... conflict local-before-pull ...).ext` path. Large restores use per-chunk staging checkpoints; renames write a small intent marker; only proved-complete operations advance sync-base. |
+| **ObsetyncApi** | `api.ts` | One method per server endpoint (`get/putContent`, content chunks/manifests, index chunks, root/diff/history/rollback). Every protected call reserves a durable sequence, uses wire POST with an authenticated semantic method, decrypts the semantic status, refreshes a stale rotating key once, and recovers once from a replay ceiling. Diff responses are shape-, size-, action-, hash-, and vault-path-validated before they can reach adapter I/O. |
+| **ObsetyncSecureChannel** | `secure.ts` | Wire-v2 client. Combines DH against the pinned static server key and rotating memory-only server key, derives per-message AES-GCM keys with HKDF-SHA256, binds method/path and request nonce in AAD, carries durable sequences, and decrypts the encrypted semantic status. Uses `@noble/curves` for X25519 and SubtleCrypto for HKDF/AES-GCM; see `transport.md`. |
+| **ObsetyncSyncBase** | `sync-base.ts` | In-memory `path → {hash, local mtime, size, optional server tree mtime}` plus timestamp and verified `treeBaseRoot`. Batch mutations first append to `sync-base.wal.ndjson`; `save()` rotates `.next → main` with `.bak` recovery and only then clears the idempotent WAL. |
+| **ObsetyncJournal** | `journal.ts` | Append-only NDJSON event/ack WAL with monotonic ids. A successful push appends exact per-path acknowledgement watermarks, so a later edit on the same path survives. Parseable records before a torn final append recover on startup; periodic compaction keeps only pending final states. |
+| **PlatformIO** | `platform.ts` | Uniform adapter I/O including `appendFile` and recoverable `replaceFile`. Desktop can expose an absolute path for true 64 KiB streaming hashes. Mobile has no ranged DataAdapter read, so source files are whole-buffer and capped at 128 MiB; chunked restore remains bounded. |
+| **OperationCheckpoint** | `operation-checkpoint.ts` | Persists the current phase and rate-limited progress. Normal completion removes the active marker; startup promotes an orphan to `last-interruption.json`, making otherwise silent iOS renderer kills diagnosable. |
 | **ObsetyncConflictModal** | `conflict-ui.ts` | `class ObsetyncConflictModal extends Modal`. `findConflicts(syncBase)` scans for `*.conflict` files (created by the server's merge engine when both sides changed the same file). The modal renders a diff and offers "Keep mine", "Keep server", or "Keep both" per conflict. |
 | **ObsetyncSettingTab** | `settings.ts` | `class ObsetyncSettingTab extends PluginSettingTab`. Four tabs: Connection (server URL, vault ID, device name, bearer token), Sync (interval, priority, `.obsidian/` toggle), Reconcile (manual trigger + status), Debug (last errors, debug log viewer). Calls `ObsetyncSyncEngine.reconcileContent()` when the user hits the reconcile button. |
 | **ObsetyncDebugLog + ObsetyncDebugModal** | `debug-log.ts` · `debug-modal.ts` | `debugLog.install()` monkey-patches `console.log` and `console.warn` to also push matching lines into a fixed-size ring buffer. `ObsetyncDebugModal` renders the buffer in a scrollable modal. Critical on iOS where there is no accessible developer console and log lines would otherwise be invisible. |
@@ -90,10 +93,10 @@ ObsetyncPlugin.onload
   → initWasm(wasmBytes)               # WASM boot
   → ObsetyncSyncBase.load() + ObsetyncJournal.load()  # read disk state
   → ObsetyncSyncEngine.start()
+      → attachVaultListeners()        # before the first network await
       → pullRemote()                  # pull.ts → ObsetyncApi → ObsetyncSecureChannel → server
       → recoverFromJournal()          # replay journal → push.ts
-      → partialMtimeScan()            # scan vault → push.ts
-      → attachVaultListeners()        # Obsidian vault events → journal + pendingChanges
+      → metadataScan()                 # all metadata drift + offline deletes → push.ts
       → setInterval(pullRemote, 30s)  # periodic pull
 ```
 
@@ -105,16 +108,18 @@ ObsetyncSyncEngine.forceSync
       → wasm_tree_chunk_hashes  → ObsetyncApi.checkChunks
       → ObsetyncApi.checkContent    (small files, 1000/batch)
       → ObsetyncApi.checkManifests  (large files, 1000/batch)
-      → ObsetyncApi.putChunk / putBlob for anything missing
+      → ObsetyncApi.putChunk / putContent / putContentChunk for anything missing
   → pushPending()           # push.ts for any dirty local changes
 ```
 
 ### Pull (applyDeltas — three tiers)
 ```
 PullEngine: for each added/modified file delta:
+  guard   → recheck journal/in-flight edits; preserve unknown local bytes as conflict copy
   tier-1  → ObsetyncSyncBase.getEntry()           → matches? zero work
-  tier-2  → PlatformIO.readFile(64KB)     → wasm.Hasher → matches? repair ObsetyncSyncBase, skip download
-  tier-3  → ObsetyncApi.getContent / getManifest + getContentChunk → PlatformIO.writeFile
+  tier-2  → desktop fs stream / bounded mobile read → wasm.Hasher → matches? repair sync-base
+  tier-3  → small: getContent + hash verify + write
+          → large: manifest + verified chunks/full fresh stream → staging checkpoint → replace
 ```
 
 ---

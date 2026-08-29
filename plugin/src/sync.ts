@@ -13,30 +13,39 @@ function formatBytes(n: number): string {
 
 /** Files above this size skip WASM hashing during scan — push.ts hashes them
  *  during upload via FastCDC (wasm_chunk_file returns file_hash). This keeps
- *  WASM linear memory bounded to ~1 MB per file regardless of vault content. */
+ *  WASM linear memory bounded to the ~4 MiB FastCDC window rather than the
+ *  complete file. */
 const LARGE_FILE_THRESHOLD = 1_048_576; // 1 MB
 import { ObsetyncApi, PushConflict } from "./api";
-import { conflictCopyPath } from "./conflict-ui";
+import { conflictCopyPath } from "./conflict-path";
 import { ObsetyncWsChannel, PresenceUpdate, WsState } from "./ws";
 import { PlatformIO } from "./platform";
 import { ObsetyncSyncBase } from "./sync-base";
-import { ObsetyncJournal } from "./journal";
+import { ObsetyncJournal, type NewJournalEntry } from "./journal";
 import { perfSpan } from "./debug-log";
 import { pull } from "./pull";
-import { push, hashFileStreaming, streamingHash, FileChange, WasmModule, WasmTree } from "./push";
+import { push, hashFileStreaming, streamingHash, chunkFileStreaming, FileChange, WasmModule, WasmTree } from "./push";
 import { SyncPriority } from "./settings";
 import { compileIgnore, type CompiledIgnore } from "./ignore";
+import { PullEchoTracker } from "./pull-echo";
+import { DirtyPathSet, type DirtyFileChange } from "./dirty-set";
+import { OperationCheckpoint } from "./operation-checkpoint";
+import { exactArrayBuffer } from "./binary";
+import { planMetadataScan } from "./scan-planner";
+import { isSafeVaultPath } from "./delta-validation";
 
 export type SyncState = "idle" | "pulling" | "pushing" | "scanning" | "error";
 
 /**
  * Core sync orchestrator. Coordinates pull, push, journal recovery,
- * mtime scanning, and live vault event tracking (D-005 4-layer system).
+ * metadata auditing, and live vault event tracking (D-005 4-layer system).
  */
 export class ObsetyncSyncEngine {
     private state: SyncState = "idle";
     private localRootHash: string | null;
-    private pendingChanges: FileChange[] = [];
+    /** One metadata-only record per dirty path. File bytes are read only when
+     *  its push snapshot is actually processed. */
+    private pendingChanges = new DirtyPathSet();
     private syncing = false;
     private syncTimer: number | null = null;
     private eventRefs: any[] = [];
@@ -55,12 +64,17 @@ export class ObsetyncSyncEngine {
      *  root from an untrusted tree is how vaults get reverted. Cleared by a
      *  verified pull-rebase or a full rescan. */
     private pushBlocked = false;
-    /** Paths the in-flight pull is writing — vault events for them are our
-     *  own echoes, not user edits, and must not be queued for push-back. */
-    private expectedPullWrites = new Set<string>();
+    /** Content-authenticated expectations for adapter writes made by pull.
+     *  Kept briefly after pull completion because Obsidian can emit the
+     *  corresponding vault events asynchronously. */
+    private pullEchoes = new PullEchoTracker();
     /** debouncedPush from attachVaultListeners, kept so sync completion can
      *  drain user edits that arrived mid-sync. */
     private debouncedPush: (() => void) | null = null;
+    /** Paths whose vault callbacks have started but whose durable journal
+     *  append/hash classification has not finished yet. Pull consults this
+     *  live set immediately before replacing remote content. */
+    private localEventsInFlight = new Set<string>();
 
     constructor(
         private app: App,
@@ -86,6 +100,8 @@ export class ObsetyncSyncEngine {
         private sharePresence: boolean = true,
         /** Slice 2: gitignore-style patterns for paths that never sync. */
         ignorePatterns: string[] = [],
+        private operationCheckpoint?: OperationCheckpoint,
+        private autoSync: boolean = true,
     ) {
         this.localRootHash = initialRootHash;
         this.ignore = compileIgnore(ignorePatterns);
@@ -190,32 +206,38 @@ export class ObsetyncSyncEngine {
             console.log(`[obsetync] tree base root: ${this.treeBaseRoot.slice(0, 16)}`);
         }
 
-        // Step 0: Verify connectivity. /health is the only plaintext route.
+        // Attach before the first network await. A first sync can run for
+        // minutes on an old iPad; edits made during it must enter the journal
+        // and the pull's live overwrite guard, not disappear in the startup
+        // gap. Pull-generated adapter events are authenticated by pullEchoes.
+        console.log("[obsetync] step 1: attach vault listeners");
+        this.attachVaultListeners();
+
+        // Start the public health probe for diagnostics without delaying the
+        // guarded startup pull.
+        const connectivity = this.api.ping();
+
+        // Startup sequence (D-005):
+        // 2. Pull remote changes.
+        console.log("[obsetync] step 2: pull remote");
+        await this.pullRemote();
+
+        // 3. Recover from journal (Layer 2).
+        console.log("[obsetync] step 3: recover from journal");
+        await this.recoverFromJournal();
+
+        // 4. Partial metadata scan (Layer 3).
+        console.log("[obsetync] step 4: metadata scan");
+        await this.partialMtimeScan();
+
         try {
-            const conn = await this.api.ping();
+            const conn = await connectivity;
             console.log(
                 `[obsetync] ${conn.ok ? "✓ reachable" : "✗ unreachable"} at ${conn.serverUrl} | ${conn.transport}`
             );
         } catch (e) {
             console.warn("[obsetync] ✗ server unreachable:", e);
         }
-
-        // Startup sequence (D-005):
-        // 1. Pull remote changes.
-        console.log("[obsetync] step 1: pull remote");
-        await this.pullRemote();
-
-        // 2. Recover from journal (Layer 2).
-        console.log("[obsetync] step 2: recover from journal");
-        await this.recoverFromJournal();
-
-        // 3. Partial mtime scan (Layer 3).
-        console.log("[obsetync] step 3: mtime scan");
-        await this.partialMtimeScan();
-
-        // 4. Start live event listeners (Layer 1).
-        console.log("[obsetync] step 4: attach vault listeners");
-        this.attachVaultListeners();
 
         // 5. Start periodic pull timer. While the WS notify channel is live,
         // frames trigger pulls within seconds and the timer degrades to a
@@ -330,6 +352,7 @@ export class ObsetyncSyncEngine {
             this.app.vault.offref(ref);
         }
         this.eventRefs = [];
+        this.pullEchoes.clear();
     }
 
     /** WS notify-channel state for the debug panel / status box. */
@@ -364,7 +387,7 @@ export class ObsetyncSyncEngine {
         }
         const t0 = Date.now();
         console.log(
-            `[obsetync] forceSync start: pending=${this.pendingChanges.length} ` +
+            `[obsetync] forceSync start: pending=${this.pendingChanges.size} ` +
             `localRoot=${this.localRootHash?.slice(0, 16) ?? "(none)"}`
         );
         await this.pullRemote();
@@ -372,7 +395,7 @@ export class ObsetyncSyncEngine {
         console.log(
             `[obsetync] forceSync: pull done in ${t1 - t0}ms, ` +
             `localRoot=${this.localRootHash?.slice(0, 16) ?? "(none)"}, ` +
-            `pending=${this.pendingChanges.length}`
+            `pending=${this.pendingChanges.size}`
         );
         try {
             await this.reconcileContent();
@@ -387,12 +410,12 @@ export class ObsetyncSyncEngine {
         const t2 = Date.now();
         console.log(
             `[obsetync] forceSync: reconcile done in ${t2 - t1}ms, ` +
-            `pending=${this.pendingChanges.length}`
+            `pending=${this.pendingChanges.size}`
         );
         await this.pushPending();
         console.log(
             `[obsetync] forceSync end in ${Date.now() - t0}ms, ` +
-            `pending=${this.pendingChanges.length}, ` +
+            `pending=${this.pendingChanges.size}, ` +
             `localRoot=${this.localRootHash?.slice(0, 16) ?? "(none)"}`
         );
     }
@@ -424,9 +447,17 @@ export class ObsetyncSyncEngine {
         }
         this.syncing = true;
         const endSpan = perfSpan("sync.reconcile");
+        const operationId = await this.operationCheckpoint?.begin(
+            "reconcile",
+            `${this.syncBase.entryCount()} tracked files`,
+        );
         try {
-            return await this._reconcileInner(progress);
+            return await this._reconcileInner((message) => {
+                progress(message);
+                if (operationId) this.operationCheckpoint?.progress(operationId, message);
+            });
         } finally {
+            if (operationId) await this.operationCheckpoint?.complete(operationId);
             endSpan();
             this.syncing = false;
         }
@@ -583,9 +614,8 @@ export class ObsetyncSyncEngine {
             notice?.setMessage(`Re-uploading large file ${largeIdx}/${missingLargeManifests.length}`);
             try {
                 const data = await this.io.readFile(path);
-                const actual = streamingHash(this.wasm, data);
-                if (actual !== hash) continue; // drifted — scan will pick up
-                const info = this.wasm.wasm_chunk_file(data);
+                const info = await chunkFileStreaming(this.wasm, data);
+                if (info.file_hash !== hash) continue; // drifted — scan will pick up
                 const chunkHashes = (info.chunks as any[]).map(c => c.hash);
                 const missingChunks = chunkHashes.length > 0
                     ? await this.api.checkContentChunks(chunkHashes)
@@ -593,7 +623,7 @@ export class ObsetyncSyncEngine {
                 const missingSet = new Set(missingChunks);
                 for (const c of info.chunks as any[]) {
                     if (missingSet.has(c.hash)) {
-                        const chunkData = this.wasm.wasm_get_file_chunk(data, c.offset, c.size);
+                        const chunkData = data.subarray(c.offset, c.offset + c.size);
                         await this.api.putContentChunk(c.hash, chunkData);
                         bytes += chunkData.length;
                     }
@@ -626,30 +656,39 @@ export class ObsetyncSyncEngine {
      *  in-memory drift caused a push block is discarded, the block lifted,
      *  and local differences re-queued from disk truth. */
     async fullScan(): Promise<void> {
+        if (this.syncing) {
+            console.log(`[obsetync] full scan skipped: another sync is in progress (state=${this.state})`);
+            new Notice("Obsetync: sync already in progress — retry the rescan when it finishes.");
+            return;
+        }
+        // Own the tree for the complete scan. WS pulls and debounced pushes
+        // must not mutate the same WASM handle between hash batches.
+        this.syncing = true;
         this.state = "scanning";
         this.onStatusUpdate("sync ⟳");
         const notice = new Notice("Scanning vault...", 0);
         console.log("[obsetync] full scan started");
         const endSpan = perfSpan("scan.full");
+        const operationId = await this.operationCheckpoint?.begin(
+            "full-scan",
+            `${this.getVaultFileCount()} cached vault files`,
+        );
+        let scanFailed = false;
 
         try {
-            try {
-                const entries = this.syncBase.allPaths().map((p) => {
-                    const e = this.syncBase.getEntry(p)!;
-                    return {
-                        path: p,
-                        hash: e.hash,
-                        mtime_ms: this.syncBase.getTreeMtime(p) ?? e.mtime,
-                        size: e.size,
-                    };
-                });
-                this.tree.build_from_entries(JSON.stringify(entries));
-                if (this.pushBlocked) {
-                    console.log("[obsetync] full scan rebuilt the tree — push unblocked");
-                    this.pushBlocked = false;
-                }
-            } catch (e) {
-                console.error("[obsetync] full scan tree rebuild failed:", e);
+            const entries = this.syncBase.allPaths().map((p) => {
+                const e = this.syncBase.getEntry(p)!;
+                return {
+                    path: p,
+                    hash: e.hash,
+                    mtime_ms: this.syncBase.getTreeMtime(p) ?? e.mtime,
+                    size: e.size,
+                };
+            });
+            this.tree.build_from_entries(JSON.stringify(entries));
+            if (this.pushBlocked) {
+                console.log("[obsetync] full scan rebuilt the tree — push unblocked");
+                this.pushBlocked = false;
             }
 
             // statBulk() reads all file stats from Obsidian's in-memory cache —
@@ -672,7 +711,8 @@ export class ObsetyncSyncEngine {
             }
             console.log(`[obsetync] full scan: ${toHash.length} files need hashing`);
 
-            // Phase 2: read + hash + push in streaming batches.
+            // Phase 2: read + hash in streaming batches. Only compact path
+            // records accumulate; file bytes are released after each group.
             //
             // Key constraints:
             //   - Large files (≥ 1 MB) skip WASM hash entirely here. push.ts reads
@@ -680,8 +720,8 @@ export class ObsetyncSyncEngine {
             //     WASM linear memory bounded regardless of PDF/image sizes.
             //   - READ_CONCURRENCY=4 limits concurrent IPC reads. 8 concurrent 200 MB
             //     PDFs = 1.6 GB peak; 4 = 800 MB — and hash is serial anyway.
-            //   - FLUSH_BATCH=500 means ~20 putRoot calls for a 10k vault instead of
-            //     200. Each flush holds syncing=true; fewer flushes = smoother UX.
+            //   - FLUSH_BATCH=500 periodically moves local arrays into the
+            //     coalescing DirtyPathSet without touching the network/tree.
             //   - yieldToUI() every group lets Electron's audio/render callbacks run.
             const READ_CONCURRENCY = 4;
             const FLUSH_BATCH = 500;
@@ -690,9 +730,8 @@ export class ObsetyncSyncEngine {
 
             const flushPending = async () => {
                 if (pending.length === 0) return;
-                this.pendingChanges.push(...pending);
+                this.pendingChanges.addMany(pending);
                 pending = [];
-                await this.pushPending();
             };
 
             for (let i = 0; i < toHash.length; i += READ_CONCURRENCY) {
@@ -736,6 +775,12 @@ export class ObsetyncSyncEngine {
                 );
                 this.onStatusUpdate(`⟳ ${done}/${toHash.length}`);
                 this.progressHeartbeat("fullScan", `${done}/${toHash.length} hashed, ${totalChanges} changed`);
+                if (operationId) {
+                    this.operationCheckpoint?.progress(
+                        operationId,
+                        `${done}/${toHash.length} hashed; ${totalChanges} changed`,
+                    );
+                }
 
                 if (pending.length >= FLUSH_BATCH) {
                     await flushPending();
@@ -753,12 +798,27 @@ export class ObsetyncSyncEngine {
             await flushPending();
 
             console.log(`[obsetync] full scan complete: ${totalChanges} changes`);
+        } catch (error: any) {
+            scanFailed = true;
+            this.lastError = {
+                ts: Date.now(),
+                origin: "full-scan",
+                message: String(error?.message ?? error),
+            };
+            console.error("[obsetync] full scan failed:", error);
+            throw error;
         } finally {
+            if (operationId) await this.operationCheckpoint?.complete(operationId);
             endSpan();
             notice.hide();
-            this.state = "idle";
-            this.onStatusUpdate("sync ✓");
+            this.syncing = false;
+            this.state = scanFailed ? "error" : "idle";
+            this.onStatusUpdate(scanFailed ? "sync ✗" : "sync ✓");
         }
+
+        // Publish once the scan has released exclusive ownership. push()
+        // itself streams these path records in bounded file batches.
+        if (this.pendingChanges.size > 0) await this.pushPending();
     }
 
     // --- Private ---
@@ -769,6 +829,10 @@ export class ObsetyncSyncEngine {
         this.state = "pulling";
         this.onStatusUpdate("sync ↓");
         const endSpan = perfSpan("sync.pull");
+        const operationId = await this.operationCheckpoint?.begin(
+            "pull",
+            `base=${(this.treeBaseRoot ?? this.localRootHash)?.slice(0, 16) ?? "none"}`,
+        );
 
         // Live progress: every tick lands in the status bar; a persistent
         // Notice appears only once REAL work is detected (first-sync or a
@@ -786,6 +850,7 @@ export class ObsetyncSyncEngine {
                 noticeRef.n = new Notice(`Obsetync ↓ ${msg}`, 0);
             }
             this.progressHeartbeat("pull", msg);
+            if (operationId) this.operationCheckpoint?.progress(operationId, msg);
         };
 
         try {
@@ -802,9 +867,7 @@ export class ObsetyncSyncEngine {
                 progress,
                 // Vault events for paths the pull itself writes are echoes,
                 // not user edits — register them before apply starts.
-                (paths) => {
-                    for (const p of paths) this.expectedPullWrites.add(p);
-                },
+                (writes) => this.pullEchoes.register(writes),
                 // Editor safety: paths with UNSYNCED local edits keep their
                 // disk bytes — the queued push + server merge reconcile them.
                 // Without this, the startup order (pull → journal recovery)
@@ -812,7 +875,7 @@ export class ObsetyncSyncEngine {
                 // them.
                 this.unsyncedLocalPaths(),
                 // Slice 2: never fetch ignored paths; untrack them if purged.
-                (p) => this.isIgnored(p),
+                (p) => this.isExcluded(p),
             );
             if (result.newRootHash) {
                 this.localRootHash = result.newRootHash;
@@ -825,9 +888,9 @@ export class ObsetyncSyncEngine {
             this.state = "error";
             this.onStatusUpdate("sync ✗");
         } finally {
+            if (operationId) await this.operationCheckpoint?.complete(operationId);
             endSpan();
             noticeRef.n?.hide();
-            this.expectedPullWrites.clear();
             this.syncing = false;
             if (this.state !== "error") {
                 this.state = "idle";
@@ -835,21 +898,28 @@ export class ObsetyncSyncEngine {
                 this.lastPullDoneMs = Date.now();
             }
             // Drain user edits that arrived while we were syncing.
-            if (this.pendingChanges.length > 0) this.debouncedPush?.();
+            if (this.pendingChanges.size > 0) this.debouncedPush?.();
         }
     }
 
     /** Every path whose newest bytes exist only locally: queued-but-unpushed
      *  changes plus unsynced journal entries. Pull must not overwrite these. */
-    private unsyncedLocalPaths(): Set<string> {
-        const paths = new Set<string>();
-        for (const c of this.pendingChanges) paths.add(c.path);
+    private unsyncedLocalPaths(): { has(path: string): boolean } {
+        const durableAtPullStart = new Set<string>();
         try {
-            for (const e of this.journal.unsynced()) paths.add(e.path);
+            for (const entry of this.journal.unsynced()) {
+                durableAtPullStart.add(entry.path);
+                if (entry.oldPath) durableAtPullStart.add(entry.oldPath);
+            }
         } catch {
-            // Journal unavailable — pending queue alone still protects live edits.
+            // The live pending/in-flight sets still protect current-session edits.
         }
-        return paths;
+        return {
+            has: (path: string) =>
+                durableAtPullStart.has(path) ||
+                this.pendingChanges.has(path) ||
+                this.localEventsInFlight.has(path),
+        };
     }
 
     /** Rate-limited progress line into the console/debug ring buffer, so
@@ -885,7 +955,8 @@ export class ObsetyncSyncEngine {
         applied: number;
         treeParity: boolean | null;
         deltasHadMtime: boolean;
-        failedCount: number;
+        deferredCount: number;
+        localDeferredCount: number;
         downloaded: number;
     }): Promise<void> {
         // Files this pull couldn't fetch leave the tree missing content the
@@ -894,10 +965,12 @@ export class ObsetyncSyncEngine {
         // (the 2026-07-13 failure mode). Hold the base where it is — merges
         // from an older base always preserve the other side's changes — and
         // let the deferred files retry on the next pull.
-        if (result.failedCount > 0) {
+        if (result.deferredCount > 0) {
+            const fetchDeferred = result.deferredCount - result.localDeferredCount;
             console.warn(
-                `[obsetync] pull deferred ${result.failedCount} unfetched file(s) — ` +
-                `base root NOT advanced; retrying next pull`,
+                `[obsetync] pull deferred ${result.deferredCount} file(s) ` +
+                `(${result.localDeferredCount} locally edited, ${fetchDeferred} unfetched) — ` +
+                `base root NOT advanced`,
             );
             return;
         }
@@ -917,7 +990,7 @@ export class ObsetyncSyncEngine {
                     const path = ".obsidian/plugins/obsetync/cached-root.bin";
                     await this.app.vault.adapter.writeBinary(
                         path,
-                        result.newRootBytes.buffer as ArrayBuffer,
+                        exactArrayBuffer(result.newRootBytes),
                     );
                 } catch (e) {
                     console.warn("[obsetync] failed to save cached root after pull:", e);
@@ -933,8 +1006,7 @@ export class ObsetyncSyncEngine {
         if (result.treeParity === false && result.newRootHash) {
             const treeCount = this.getTreeFileCount();
             const baseCount = this.syncBase.entryCount();
-            const epsilon = Math.max(8, Math.ceil(baseCount * 0.005));
-            const countsAgree = treeCount >= 0 && Math.abs(treeCount - baseCount) <= epsilon;
+            const countsAgree = treeCount >= 0 && treeCount === baseCount;
 
             // A tree that still doesn't match the server AFTER the pull
             // actually DOWNLOADED content is a genuine content divergence —
@@ -984,7 +1056,7 @@ export class ObsetyncSyncEngine {
             this.pushBlocked = true;
             console.error(
                 `[obsetync] tree/sync-base divergence: tree=${treeCount} files, ` +
-                `sync-base=${baseCount} (epsilon=${epsilon}) — pushes blocked`,
+                `sync-base=${baseCount} — pushes blocked`,
             );
             new Notice(
                 "Obsetync: local index inconsistent — sync paused. " +
@@ -995,10 +1067,10 @@ export class ObsetyncSyncEngine {
     }
 
     private async pushPending(): Promise<void> {
-        if (this.syncing || this.pendingChanges.length === 0) {
+        if (this.syncing || this.pendingChanges.size === 0) {
             console.log(
                 `[obsetync] pushPending early-return: syncing=${this.syncing}, ` +
-                `pending=${this.pendingChanges.length}`
+                `pending=${this.pendingChanges.size}`
             );
             return;
         }
@@ -1008,7 +1080,7 @@ export class ObsetyncSyncEngine {
         if (this.pushBlocked) {
             console.warn(
                 `[obsetync] push refused: tree diverged from server ` +
-                `(${this.pendingChanges.length} changes queued) — run Full Rescan`,
+                `(${this.pendingChanges.size} changes queued) — run Full Rescan`,
             );
             return;
         }
@@ -1034,12 +1106,11 @@ export class ObsetyncSyncEngine {
         const treeCount = this.getTreeFileCount();
         if (treeCount >= 0) {
             const baseCount = this.syncBase.entryCount();
-            const epsilon = Math.max(8, Math.ceil(baseCount * 0.005));
-            if (Math.abs(treeCount - baseCount) > epsilon) {
+            if (treeCount !== baseCount) {
                 this.pushBlocked = true;
                 console.error(
                     `[obsetync] push refused: tree=${treeCount} files vs ` +
-                    `sync-base=${baseCount} (epsilon=${epsilon}) — run Full Rescan`,
+                    `sync-base=${baseCount} — run Full Rescan`,
                 );
                 new Notice(
                     "Obsetync: local index inconsistent — sync paused. " +
@@ -1054,17 +1125,33 @@ export class ObsetyncSyncEngine {
         this.state = "pushing";
         const endSpan = perfSpan("sync.push");
 
-        const batch = sortByPriority(this.pendingChanges.splice(0), this.syncPriority);
-        console.log(
-            `[obsetync] pushPending: ${batch.length} changes — ` +
-            `first 3 paths: ${batch.slice(0, 3).map(c => `${c.action}:${c.path}`).join(", ")}`
+        // Atomically detach one coalesced snapshot. Files are materialized
+        // from their CURRENT disk state now, so a modify→delete or
+        // delete→create burst cannot upload an obsolete intermediate version.
+        const queued = this.pendingChanges.take();
+        const operationId = await this.operationCheckpoint?.begin(
+            "push",
+            `${queued.length} dirty paths awaiting materialization`,
         );
-        this.onStatusUpdate(`↑ 0/${batch.length}`);
-
-        // Show a persistent notice for batches large enough to care about.
-        const notice = batch.length >= 5 ? new Notice(`↑ 0/${batch.length}`, 0) : null;
+        let notice: Notice | null = null;
 
         try {
+            const batch = sortByPriority(
+                await this.materializeDirtyChanges(queued),
+                this.syncPriority,
+            );
+            this.operationCheckpoint?.progress(
+                operationId ?? "",
+                `${batch.length} coalesced paths materialized`,
+            );
+            console.log(
+                `[obsetync] pushPending: ${batch.length} final path states — ` +
+                `first 3 paths: ${batch.slice(0, 3).map(c => `${c.action}:${c.path}`).join(", ")}`
+            );
+            this.onStatusUpdate(`↑ 0/${batch.length}`);
+
+            // Show a persistent notice for batches large enough to care about.
+            notice = batch.length >= 5 ? new Notice(`↑ 0/${batch.length}`, 0) : null;
             const result = await push(
                 this.api,
                 this.io,
@@ -1079,6 +1166,7 @@ export class ObsetyncSyncEngine {
                 (text) => {
                     this.onStatusUpdate(text);
                     notice?.setMessage(text);
+                    if (operationId) this.operationCheckpoint?.progress(operationId, text);
                 }
             );
             if (result.newRootHash) {
@@ -1108,18 +1196,20 @@ export class ObsetyncSyncEngine {
             // Persist the new root so the WASM tree can be restored on restart.
             await this.saveCachedRoot();
 
-            // Mark journal entries as synced.
-            for (const change of batch) {
-                this.journal.markSynced(change.path);
-            }
+            await this.journal.acknowledge(
+                queued
+                    .filter((change) => change.journalId !== undefined)
+                    .map((change) => ({ path: change.path, throughId: change.journalId! })),
+            );
         } catch (e: any) {
             console.error("[obsetync] push error:", e);
             this.lastError = { ts: Date.now(), origin: "push", message: String(e?.message ?? e) };
-            this.pendingChanges.unshift(...batch);
+            this.pendingChanges.restore(queued);
             this.state = "error";
             this.onStatusUpdate("sync ✗");
             notice?.setMessage("sync ✗ error");
         } finally {
+            if (operationId) await this.operationCheckpoint?.complete(operationId);
             endSpan();
             notice?.hide();
             this.syncing = false;
@@ -1128,8 +1218,39 @@ export class ObsetyncSyncEngine {
                 this.onStatusUpdate("sync ✓");
             }
             // Drain user edits that arrived while we were pushing.
-            if (this.pendingChanges.length > 0) this.debouncedPush?.();
+            if (this.pendingChanges.size > 0) this.debouncedPush?.();
         }
+    }
+
+    /** Resolve a dirty hint to the path's final on-disk state. Metadata from
+     *  an event is reused only if stat still agrees; bytes are never retained
+     *  in the queue. */
+    private async materializeDirtyChanges(changes: DirtyFileChange[]): Promise<FileChange[]> {
+        const materialized: FileChange[] = [];
+        for (const change of changes) {
+            if (this.isExcluded(change.path)) continue;
+            const stat = await this.io.stat(change.path);
+            if (!stat) {
+                materialized.push({ action: "deleted", path: change.path });
+                continue;
+            }
+
+            const current: FileChange = {
+                action: this.syncBase.getEntry(change.path) ? "modified" : "created",
+                path: change.path,
+                mtime: stat.mtime,
+                size: stat.size,
+            };
+            if (
+                change.hash !== undefined &&
+                change.mtime === stat.mtime &&
+                change.size === stat.size
+            ) {
+                current.hash = change.hash;
+            }
+            materialized.push(current);
+        }
+        return materialized;
     }
 
     /** Preserve OUR losing side of unmergeable conflicts as sibling copies
@@ -1140,6 +1261,7 @@ export class ObsetyncSyncEngine {
      *  files, which never text-merge and aren't blob-addressable). */
     private async preserveConflictCopies(conflicts: PushConflict[]): Promise<void> {
         let preserved = 0;
+        let failed = 0;
         const now = new Date();
         for (const c of conflicts) {
             if (!c.path || !c.side_b_hash) continue;
@@ -1161,6 +1283,7 @@ export class ObsetyncSyncEngine {
                     `[obsetync] conflict on ${c.path} — our version preserved as ${copyPath}`,
                 );
             } catch (e) {
+                failed++;
                 console.error(`[obsetync] failed to preserve conflict copy for ${c.path}:`, e);
             }
         }
@@ -1172,6 +1295,12 @@ export class ObsetyncSyncEngine {
                     preserved > 1 ? "s" : ""
                 }. Use the "Show sync conflicts" command to resolve.`,
                 12000,
+            );
+        }
+        if (failed > 0) {
+            throw new Error(
+                `could not preserve ${failed} conflict cop${failed === 1 ? "y" : "ies"}; ` +
+                "original push remains journaled for retry",
             );
         }
     }
@@ -1191,19 +1320,19 @@ export class ObsetyncSyncEngine {
 
         let processed = 0;
         for (const entry of unsynced) {
-            if (entry.action === "deleted") {
-                this.pendingChanges.push({ action: "deleted", path: entry.path });
-            } else {
-                try {
-                    const hash = await hashFileStreaming(entry.path, this.io, this.wasm);
-                    this.pendingChanges.push({
-                        action: entry.action === "created" ? "created" : "modified",
-                        path: entry.path,
-                        hash,
-                    });
-                } catch {
-                    // File might have been deleted since journal entry.
-                }
+            // No reads or hashes during recovery: one final-state stat happens
+            // immediately before push. This makes replay O(unique paths) in
+            // memory and safe even after a very large offline edit burst.
+            this.pendingChanges.add(
+                {
+                    action: entry.action === "created" ? "created" :
+                        entry.action === "deleted" ? "deleted" : "modified",
+                    path: entry.path,
+                },
+                entry.id,
+            );
+            if (entry.action === "renamed" && entry.oldPath) {
+                this.pendingChanges.add({ action: "deleted", path: entry.oldPath }, entry.id);
             }
             processed++;
             this.onStatusUpdate(`⟳ journal ${processed}/${unsynced.length}`);
@@ -1212,13 +1341,12 @@ export class ObsetyncSyncEngine {
         }
         notice?.hide();
 
-        if (this.pendingChanges.length > 0) {
+        if (this.pendingChanges.size > 0) {
             await this.pushPending();
         }
-        await this.journal.truncate();
     }
 
-    /** Layer 3: partial mtime scan — check files modified since last sync. */
+    /** Layer 3: metadata audit — detect any stat drift and offline deletion. */
     private async partialMtimeScan(): Promise<void> {
         const lastSync = this.syncBase.lastSyncTimestamp;
         if (lastSync === 0) return; // First ever sync — skip, let pull handle it.
@@ -1229,23 +1357,28 @@ export class ObsetyncSyncEngine {
             const obsidianFiles = await this.io.listObsidianConfig();
             for (const [p, s] of obsidianFiles) allStats.set(p, s);
         }
-        const toHash: Array<{ path: string; stat: { mtime: number; size: number } }> = [];
-        for (const [path, stat] of allStats) {
-            if (this.isExcluded(path)) continue;
-            if (stat.mtime <= lastSync) continue;
-            const base = this.syncBase.getEntry(path);
-            if (base && stat.mtime === base.mtime && stat.size === base.size) continue;
-            toHash.push({ path, stat });
+        const plan = planMetadataScan(
+            allStats,
+            this.syncBase.allPaths(),
+            (path) => this.syncBase.getEntry(path),
+            (path) => this.isExcluded(path),
+        );
+        const toHash = plan.toHash;
+        for (const path of plan.deleted) {
+            this.pendingChanges.add({ action: "deleted", path });
         }
 
-        if (toHash.length === 0) return;
+        if (toHash.length === 0) {
+            if (plan.deleted.length > 0) await this.pushPending();
+            return;
+        }
 
         const READ_CONCURRENCY = 4;
         const notice =
             toHash.length >= 20
                 ? new Notice(`Obsetync: checking ${toHash.length} recently-touched files…`, 0)
                 : null;
-        let found = 0;
+        let found = plan.deleted.length;
         for (let i = 0; i < toHash.length; i += READ_CONCURRENCY) {
             const batch = toHash.slice(i, i + READ_CONCURRENCY);
             const results = await Promise.all(
@@ -1269,18 +1402,18 @@ export class ObsetyncSyncEngine {
                     size: r.stat.size,
                 };
                 if (r.hash !== undefined) change.hash = r.hash;
-                this.pendingChanges.push(change);
+                this.pendingChanges.add(change);
             }
             await yieldToUI();
             const done = Math.min(i + READ_CONCURRENCY, toHash.length);
             this.onStatusUpdate(`⟳ scan ${done}/${toHash.length}`);
-            notice?.setMessage(`Obsetync: mtime scan ${done}/${toHash.length} · ${found} changed`);
+            notice?.setMessage(`Obsetync: metadata scan ${done}/${toHash.length} · ${found} changed`);
             this.progressHeartbeat("mtimeScan", `${done}/${toHash.length}, ${found} changed`);
         }
         notice?.hide();
 
         if (found > 0) {
-            console.log(`[obsetync] mtime scan found ${found} unsynced changes`);
+            console.log(`[obsetync] metadata scan found ${found} unsynced changes`);
             await this.pushPending();
         }
     }
@@ -1290,120 +1423,230 @@ export class ObsetyncSyncEngine {
      *  Events are journaled + queued even while a sync is in flight — the old
      *  `if (this.syncing) return` dropped genuine user edits made during a
      *  long pull. The one thing we must NOT queue is the pull's own disk
-     *  writes echoing back as vault events; those are recognized via
-     *  `expectedPullWrites` (registered before applyDeltas touches disk). */
+     *  writes echoing back as vault events; those are recognized only when
+     *  the event's actual content matches PullEchoTracker's expected hash. */
+    private async appendLocalJournal(entry: NewJournalEntry): Promise<number | undefined> {
+        try {
+            return await this.journal.append(entry);
+        } catch (error) {
+            // Keep the current-session dirty hint even when durable storage is
+            // unavailable. The error is visible in diagnostics; a full scan
+            // remains the recovery path after a crash.
+            console.error(`[obsetync] change journal append failed for ${entry.path}:`, error);
+            return undefined;
+        }
+    }
+
+    /** Hash an expected pull echo without materializing a large file twice on
+     *  mobile. Desktop streams from fs. Mobile large-file writes use the
+     *  just-recorded sync-base hash only when event stat exactly matches the
+     *  post-write stat; otherwise the event stays dirty conservatively. */
+    private async pullEchoHash(file: TFile): Promise<string | null> {
+        if (
+            file.stat.size >= LARGE_FILE_THRESHOLD &&
+            this.io.getAbsolutePath(file.path) === null
+        ) {
+            // Adapter events can arrive just before applyContentDelta records
+            // its post-write stat. Give that continuation one event-loop turn.
+            await yieldToUI();
+            const base = this.syncBase.getEntry(file.path);
+            return base && base.mtime === file.stat.mtime && base.size === file.stat.size
+                ? base.hash
+                : null;
+        }
+        try {
+            return await hashFileStreaming(file.path, this.io, this.wasm);
+        } catch (error) {
+            console.warn(`[obsetync] pull-echo verification failed for ${file.path}:`, error);
+            return null;
+        }
+    }
+
     private attachVaultListeners(): void {
         this.debouncedPush = debounce(
-            () => this.pushPending(),
+            () => {
+                if (this.autoSync) void this.pushPending();
+            },
             3000,
             true
         );
         const debouncedPush = () => this.debouncedPush?.();
 
-        /** True → this event is our own pull writing to disk; consume it. */
-        const isPullEcho = (path: string): boolean => {
-            if (!this.syncing || !this.expectedPullWrites.has(path)) return false;
-            this.expectedPullWrites.delete(path);
-            return true;
-        };
-
         this.eventRefs.push(
             this.app.vault.on("modify", async (file: TAbstractFile) => {
                 if (!(file instanceof TFile)) return;
-                if (this.isExcluded(file.path) || isPullEcho(file.path)) return;
-                await this.journal.append({
-                    action: "modified",
-                    path: file.path,
-                    ts: Date.now(),
-                    synced: false,
-                });
-                const data = await this.io.readFile(file.path);
-                const hash = streamingHash(this.wasm, data);
-                this.pendingChanges.push({
-                    action: "modified",
-                    path: file.path,
-                    hash,
-                    data,
-                    mtime: file.stat.mtime,
-                    size: file.stat.size,
-                });
-                debouncedPush();
+                if (this.isExcluded(file.path)) return;
+                this.localEventsInFlight.add(file.path);
+                try {
+                    const expectedEcho = this.pullEchoes.expectsUpsert(file.path);
+                    const journalId = await this.appendLocalJournal({
+                        action: "modified",
+                        path: file.path,
+                        ts: Date.now(),
+                        synced: false,
+                    });
+                    const actualHash = expectedEcho ? await this.pullEchoHash(file) : null;
+                    if (
+                        actualHash !== null &&
+                        this.pullEchoes.consumeUpsert(file.path, actualHash)
+                    ) {
+                        if (journalId !== undefined) {
+                            await this.journal.acknowledge([
+                                { path: file.path, throughId: journalId },
+                            ]);
+                        }
+                        return;
+                    }
+                    const change: FileChange = {
+                        action: "modified",
+                        path: file.path,
+                        mtime: file.stat.mtime,
+                        size: file.stat.size,
+                    };
+                    if (actualHash !== null) change.hash = actualHash;
+                    this.pendingChanges.add(change, journalId);
+                    debouncedPush();
+                } finally {
+                    this.localEventsInFlight.delete(file.path);
+                }
             })
         );
 
         this.eventRefs.push(
             this.app.vault.on("create", async (file: TAbstractFile) => {
                 if (!(file instanceof TFile)) return;
-                if (this.isExcluded(file.path) || isPullEcho(file.path)) return;
-                await this.journal.append({
-                    action: "created",
-                    path: file.path,
-                    ts: Date.now(),
-                    synced: false,
-                });
-                const data = await this.io.readFile(file.path);
-                const hash = streamingHash(this.wasm, data);
-                this.pendingChanges.push({
-                    action: "created",
-                    path: file.path,
-                    hash,
-                    data,
-                    mtime: file.stat.mtime,
-                    size: file.stat.size,
-                });
-                debouncedPush();
+                if (this.isExcluded(file.path)) return;
+                this.localEventsInFlight.add(file.path);
+                try {
+                    const expectedEcho = this.pullEchoes.expectsUpsert(file.path);
+                    const journalId = await this.appendLocalJournal({
+                        action: "created",
+                        path: file.path,
+                        ts: Date.now(),
+                        synced: false,
+                    });
+                    const actualHash = expectedEcho ? await this.pullEchoHash(file) : null;
+                    if (
+                        actualHash !== null &&
+                        this.pullEchoes.consumeUpsert(file.path, actualHash)
+                    ) {
+                        if (journalId !== undefined) {
+                            await this.journal.acknowledge([
+                                { path: file.path, throughId: journalId },
+                            ]);
+                        }
+                        return;
+                    }
+                    const change: FileChange = {
+                        action: "created",
+                        path: file.path,
+                        mtime: file.stat.mtime,
+                        size: file.stat.size,
+                    };
+                    if (actualHash !== null) change.hash = actualHash;
+                    this.pendingChanges.add(change, journalId);
+                    debouncedPush();
+                } finally {
+                    this.localEventsInFlight.delete(file.path);
+                }
             })
         );
 
         this.eventRefs.push(
             this.app.vault.on("delete", async (file: TAbstractFile) => {
-                if (this.isExcluded(file.path) || isPullEcho(file.path)) return;
-                await this.journal.append({
-                    action: "deleted",
-                    path: file.path,
-                    ts: Date.now(),
-                    synced: false,
-                });
-                this.pendingChanges.push({
-                    action: "deleted",
-                    path: file.path,
-                });
-                debouncedPush();
+                if (this.isExcluded(file.path) || this.pullEchoes.consumeDelete(file.path)) return;
+                this.localEventsInFlight.add(file.path);
+                try {
+                    const journalId = await this.appendLocalJournal({
+                        action: "deleted",
+                        path: file.path,
+                        ts: Date.now(),
+                        synced: false,
+                    });
+                    this.pendingChanges.add({
+                        action: "deleted",
+                        path: file.path,
+                    }, journalId);
+                    debouncedPush();
+                } finally {
+                    this.localEventsInFlight.delete(file.path);
+                }
             })
         );
 
         this.eventRefs.push(
             this.app.vault.on("rename", async (file: TAbstractFile, oldPath: string) => {
                 if (!(file instanceof TFile)) return;
-                if (this.isExcluded(file.path)) return;
-                // A pull-applied rename echoes as one event with both paths.
-                const echoNew = isPullEcho(file.path);
-                const echoOld = isPullEcho(oldPath);
-                if (echoNew || echoOld) return;
-                await this.journal.append({
-                    action: "deleted",
-                    path: oldPath,
-                    ts: Date.now(),
-                    synced: false,
-                });
-                await this.journal.append({
-                    action: "created",
-                    path: file.path,
-                    ts: Date.now(),
-                    synced: false,
-                });
-                const data = await this.io.readFile(file.path);
-                const hash = streamingHash(this.wasm, data);
-                this.pendingChanges.push({ action: "deleted", path: oldPath });
-                this.pendingChanges.push({
-                    action: "created",
-                    path: file.path,
-                    hash,
-                    data,
-                    mtime: file.stat.mtime,
-                    size: file.stat.size,
-                });
-                debouncedPush();
+                const oldExcluded = this.isExcluded(oldPath);
+                const newExcluded = this.isExcluded(file.path);
+                if (oldExcluded && newExcluded) return;
+                this.localEventsInFlight.add(oldPath);
+                this.localEventsInFlight.add(file.path);
+                try {
+                    // A rename crossing out of sync scope is only a deletion;
+                    // crossing in is only a creation. Never publish the ignored
+                    // half of the move.
+                    if (newExcluded) {
+                        const journalId = await this.appendLocalJournal({
+                            action: "deleted",
+                            path: oldPath,
+                            ts: Date.now(),
+                            synced: false,
+                        });
+                        this.pendingChanges.add({ action: "deleted", path: oldPath }, journalId);
+                        debouncedPush();
+                        return;
+                    }
+
+                    const expectedEcho = !oldExcluded &&
+                        this.pullEchoes.expectsRename(oldPath, file.path);
+                    const oldJournalId = oldExcluded ? undefined : await this.appendLocalJournal({
+                        action: "deleted",
+                        path: oldPath,
+                        ts: Date.now(),
+                        synced: false,
+                    });
+                    const newJournalId = await this.appendLocalJournal({
+                        action: "created",
+                        path: file.path,
+                        ts: Date.now(),
+                        synced: false,
+                    });
+                    const actualHash = expectedEcho ? await this.pullEchoHash(file) : null;
+                    if (
+                        expectedEcho &&
+                        actualHash !== null &&
+                        this.pullEchoes.consumeRename(oldPath, file.path, actualHash)
+                    ) {
+                        const watermarks: Array<{ path: string; throughId: number }> = [];
+                        if (oldJournalId !== undefined) {
+                            watermarks.push({ path: oldPath, throughId: oldJournalId });
+                        }
+                        if (newJournalId !== undefined) {
+                            watermarks.push({ path: file.path, throughId: newJournalId });
+                        }
+                        await this.journal.acknowledge(watermarks);
+                        return;
+                    }
+                    if (!oldExcluded) {
+                        this.pendingChanges.add(
+                            { action: "deleted", path: oldPath },
+                            oldJournalId,
+                        );
+                    }
+                    const change: FileChange = {
+                        action: "created",
+                        path: file.path,
+                        mtime: file.stat.mtime,
+                        size: file.stat.size,
+                    };
+                    if (actualHash !== null) change.hash = actualHash;
+                    this.pendingChanges.add(change, newJournalId);
+                    debouncedPush();
+                } finally {
+                    this.localEventsInFlight.delete(oldPath);
+                    this.localEventsInFlight.delete(file.path);
+                }
             })
         );
     }
@@ -1413,7 +1656,7 @@ export class ObsetyncSyncEngine {
         if (!rootBytes) return;
         const path = ".obsidian/plugins/obsetync/cached-root.bin";
         try {
-            await this.app.vault.adapter.writeBinary(path, rootBytes.buffer as ArrayBuffer);
+            await this.app.vault.adapter.writeBinary(path, exactArrayBuffer(rootBytes));
             console.log("[obsetync] cached root saved");
         } catch (e) {
             console.warn("[obsetync] failed to save cached root:", e);
@@ -1422,8 +1665,9 @@ export class ObsetyncSyncEngine {
 
     private isSyncInternal(path: string): boolean {
         return (
+            !isSafeVaultPath(path) ||
             path.startsWith(".obsidian/plugins/obsetync/") ||
-            path.includes("chunk-cache/")
+            path === ".obsetync-crash.log"
         );
     }
 
@@ -1434,7 +1678,7 @@ export class ObsetyncSyncEngine {
 
     /** A path that must never enter sync from THIS device: the plugin's own
      *  internal files, or a user-ignored path. Used at every write-detection
-     *  chokepoint (vault events, full scan, mtime scan). Applying it in the
+     *  chokepoint (vault events, full scan, metadata scan). Applying it in the
      *  full-scan delete-detection is what stops a local `cargo clean` from
      *  propagating target/ DELETIONS to the fleet — ignored paths that vanish
      *  from disk are simply not tracked, never deleted. */

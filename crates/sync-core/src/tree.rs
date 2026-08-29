@@ -239,26 +239,50 @@ pub async fn load_all_entries<S: ChunkStore>(
     store: &S,
     hash: &FileHash,
 ) -> Result<Vec<FileEntry>, ChunkError> {
-    let bytes = store.get(hash).await?;
+    const MAX_VISITED_NODES: usize = 1_000_000;
+    const MAX_LOADED_ENTRIES: usize = 10_000_000;
 
-    // Try as leaf chunk first.
-    if let Ok(leaf) = LeafChunk::deserialize(&bytes) {
-        return Ok(leaf.entries);
-    }
-
-    // Try as internal node — recurse into children.
-    if let Ok(node) = InternalNode::deserialize(&bytes) {
-        let mut all_entries = Vec::new();
-        for (_prefix, child_hash) in &node.children {
-            let child_entries = Box::pin(load_all_entries(store, child_hash)).await?;
-            all_entries.extend(child_entries);
+    // Iterative traversal avoids an attacker-controlled internal-node depth
+    // overflowing the server stack before uploaded roots are validated.
+    let mut pending = vec![*hash];
+    let mut all_entries = Vec::new();
+    let mut visited = 0usize;
+    while let Some(next_hash) = pending.pop() {
+        visited += 1;
+        if visited > MAX_VISITED_NODES {
+            return Err(ChunkError::Deserialize("tree has too many nodes".into()));
         }
-        return Ok(all_entries);
+        let bytes = store.get(&next_hash).await?;
+        if let Ok(leaf) = LeafChunk::deserialize(&bytes) {
+            if all_entries.len().saturating_add(leaf.entries.len()) > MAX_LOADED_ENTRIES {
+                return Err(ChunkError::Deserialize("tree has too many entries".into()));
+            }
+            all_entries.extend(leaf.entries);
+            continue;
+        }
+        if let Ok(node) = InternalNode::deserialize(&bytes) {
+            // Order does not matter here because the flattened boundary is
+            // explicitly path-sorted below. Reverse keeps the common small
+            // case intuitive while using a LIFO work stack.
+            pending.extend(
+                node.children
+                    .iter()
+                    .rev()
+                    .map(|(_, child_hash)| *child_hash),
+            );
+            continue;
+        }
+        return Err(ChunkError::Deserialize(
+            "could not parse as LeafChunk or InternalNode".into(),
+        ));
     }
 
-    Err(ChunkError::Deserialize(
-        "could not parse as LeafChunk or InternalNode".into(),
-    ))
+    // Internal-node labels contain decimal chunk indexes. Their stable
+    // lexical order is `0, 1, 10, 11, 2, ...`, which is not necessarily
+    // FileEntry path order once a directory spans more than ten leaves.
+    // diff/merge both use a two-pointer walk and require this invariant.
+    all_entries.sort();
+    Ok(all_entries)
 }
 
 #[cfg(test)]
@@ -269,6 +293,34 @@ mod tests {
 
     fn make_entry(path: &str) -> FileEntry {
         FileEntry::new(path.to_string(), hash_bytes(path.as_bytes()), 1000, 100)
+    }
+
+    #[tokio::test]
+    async fn loading_wide_internal_node_returns_entries_in_path_order() {
+        let store = MemoryChunkStore::new();
+        let mut children = Vec::new();
+        let mut expected = Vec::new();
+
+        // InternalNode sorts child labels lexicographically, so labels 10/11
+        // precede label 2. Consumers such as diff/merge still require the
+        // flattened FileEntry stream itself to be path-sorted.
+        for index in 0..12 {
+            let path = format!("dir/{index:02}.md");
+            expected.push(path.clone());
+            let leaf = LeafChunk::new(vec![make_entry(&path)]);
+            let bytes = leaf.serialize();
+            let hash = hash_bytes(&bytes);
+            store.put(hash, bytes).await.unwrap();
+            children.push((format!("dir/{index}"), hash));
+        }
+        let internal = InternalNode::new(children);
+        let bytes = internal.serialize();
+        let hash = hash_bytes(&bytes);
+        store.put(hash, bytes).await.unwrap();
+
+        let loaded = load_all_entries(&store, &hash).await.unwrap();
+        let paths: Vec<_> = loaded.into_iter().map(|entry| entry.path).collect();
+        assert_eq!(paths, expected);
     }
 
     #[tokio::test]

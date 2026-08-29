@@ -2,11 +2,12 @@
 //! envelope transport. See `../../../docs/transport.md`.
 //!
 //! Clients learn the public key at enrollment time and use it as the remote
-//! static key in per-request ECDH. Compromise of this key does NOT reveal past
-//! session content (each session uses a fresh ephemeral keypair on the client
-//! side, so forward secrecy holds), but does let an attacker impersonate the
-//! server going forward — treat `box.key` the same as `server.key` used to be
-//! under the old TLS setup.
+//! static key in per-channel ECDH. Wire v2 combines it with a rotating
+//! memory-only server key: compromise of `box.key` alone cannot open captured
+//! ordinary traffic after the applicable rotating current/previous slot has
+//! been dropped. It can still impersonate the server going forward, and it
+//! opens captured single-DH bootstrap responses, so protect it like any other
+//! long-term server identity key. See the precise limits in transport.md.
 //!
 //! On-disk layout under `data/server/`:
 //!   - box.key : raw 32 bytes (mode 0600), the X25519 private key
@@ -16,6 +17,7 @@ use crate::storage::StorageLayout;
 use base64::prelude::*;
 use std::fs;
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroizing;
 
 const PRIV_FILE: &str = "box.key";
 const PUB_FILE: &str = "box.pub";
@@ -40,11 +42,11 @@ pub fn init_box_keypair(
     // x25519-dalek 2.0 uses rand_core 0.6, but our workspace already pulls rand 0.9.
     // Avoid the version mismatch by sourcing entropy directly from the OS.
     use rand::TryRngCore;
-    let mut seed = [0u8; KEY_LEN];
+    let mut seed = Zeroizing::new([0u8; KEY_LEN]);
     rand::rngs::OsRng
-        .try_fill_bytes(&mut seed)
+        .try_fill_bytes(&mut *seed)
         .map_err(|e| format!("OS RNG failed: {}", e))?;
-    let priv_key = StaticSecret::from(seed);
+    let priv_key = StaticSecret::from(*seed);
     let pub_key = PublicKey::from(&priv_key);
 
     fs::write(&priv_path, priv_key.as_bytes())?;
@@ -63,14 +65,15 @@ pub fn load_box_keypair(
     layout: &StorageLayout,
 ) -> Result<(StaticSecret, PublicKey), Box<dyn std::error::Error>> {
     let priv_path = layout.base.join("server").join(PRIV_FILE);
-    let bytes =
-        fs::read(&priv_path).map_err(|e| format!("reading {}: {}", priv_path.display(), e))?;
+    let bytes = Zeroizing::new(
+        fs::read(&priv_path).map_err(|e| format!("reading {}: {}", priv_path.display(), e))?,
+    );
     if bytes.len() != KEY_LEN {
         return Err(format!("box.key is {} bytes, expected {}", bytes.len(), KEY_LEN).into());
     }
-    let mut arr = [0u8; KEY_LEN];
+    let mut arr = Zeroizing::new([0u8; KEY_LEN]);
     arr.copy_from_slice(&bytes);
-    let priv_key = StaticSecret::from(arr);
+    let priv_key = StaticSecret::from(*arr);
     let pub_key = PublicKey::from(&priv_key);
     Ok((priv_key, pub_key))
 }

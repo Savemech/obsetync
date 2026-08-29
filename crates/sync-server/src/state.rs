@@ -1,9 +1,11 @@
 use crate::box_key;
 use crate::config::ServerConfig;
+use crate::eph_rotation::{self, EphState};
 use crate::secure::KEY_LEN;
+use crate::seq_tracker::SequenceTracker;
 use crate::storage::{StorageLayout, VaultStore};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Instant;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -18,6 +20,10 @@ pub struct AppState {
     /// worrying about Clone or thread-safety. 32 bytes copy per request is
     /// microseconds.
     pub server_priv_bytes: [u8; KEY_LEN],
+    /// Current and grace-period server DH keys for HTTP wire v2.
+    pub eph: Arc<RwLock<EphState>>,
+    /// Durable sliding anti-replay window per enrolled device.
+    pub sequences: SequenceTracker,
     /// Wall-clock monotonic start time — used by the admin dashboard to show
     /// uptime. Instant is Copy, so reading from Arc<AppState> needs no lock.
     pub started_at: Instant,
@@ -52,12 +58,16 @@ impl AppState {
             .expect("box keypair missing — run `sync-server init --data-dir …` first");
         let mut priv_bytes = [0u8; KEY_LEN];
         priv_bytes.copy_from_slice(priv_key.as_bytes());
+        let eph = eph_rotation::init_eph_keys().expect("transport-v2 ephemeral key unavailable");
+        let sequences = SequenceTracker::new(layout.clone());
 
         Self {
             config,
             layout,
             vaults,
             server_priv_bytes: priv_bytes,
+            eph: Arc::new(RwLock::new(eph)),
+            sequences,
             started_at: Instant::now(),
             vault_locks: StdMutex::new(HashMap::new()),
             notifiers: StdMutex::new(HashMap::new()),

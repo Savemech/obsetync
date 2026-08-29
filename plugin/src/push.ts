@@ -5,7 +5,14 @@ import { ObsetyncSyncBase } from "./sync-base";
 /** Streaming Blake3 hasher — feed in 64 KB chunks, call finalize(), then free(). */
 export interface WasmHasher {
     update(chunk: Uint8Array): void;
+    update_and_hash(chunk: Uint8Array): string;
     finalize(): string;
+    free(): void;
+}
+
+export interface WasmChunker {
+    update(chunk: Uint8Array): void;
+    finish(): any;
     free(): void;
 }
 
@@ -19,6 +26,7 @@ export interface WasmModule {
     wasm_root_hash_from_bytes(bytes: Uint8Array): string | undefined;
     /** Streaming Blake3 hasher. Peak WASM heap = chunk size (64 KB), not file size. */
     Hasher: new () => WasmHasher;
+    WasmChunker: new () => WasmChunker;
     /**
      * Hash N files in one WASM call. data = concatenated bytes of all files.
      * offsets[i] = byte offset where file i starts. sizes[i] = byte length of file i.
@@ -162,11 +170,26 @@ export async function push(
     // Collected here; applied in ONE update_batch call after all content batches.
     const allTreeUpdates: { path: string; hash: string; mtime_ms: number; size: number }[] = [];
 
-    // Stream through non-deleted files in batches.
-    for (let batchStart = 0; batchStart < nonDeleted.length; batchStart += STREAM_BATCH) {
+    // Stream through non-deleted files in batches. A large (or size-unknown)
+    // file always gets a singleton batch: retaining up to 50 full PDFs/videos
+    // until phase C was the dominant old-iPad Jetsam failure mode.
+    for (let batchStart = 0; batchStart < nonDeleted.length;) {
         // Yield before each batch so Electron's audio/render callbacks can run.
         await yieldToUI();
-        const batchChanges = nonDeleted.slice(batchStart, batchStart + STREAM_BATCH);
+        let batchEnd = batchStart + 1;
+        const firstSize = nonDeleted[batchStart].size;
+        if (firstSize !== undefined && !wasm.wasm_should_chunk(firstSize)) {
+            while (
+                batchEnd < nonDeleted.length &&
+                batchEnd - batchStart < STREAM_BATCH &&
+                nonDeleted[batchEnd].size !== undefined &&
+                !wasm.wasm_should_chunk(nonDeleted[batchEnd].size!)
+            ) {
+                batchEnd++;
+            }
+        }
+        const batchChanges = nonDeleted.slice(batchStart, batchEnd);
+        batchStart = batchEnd;
 
         // ------------------------------------------------------------------
         // A. Hash resolution — parallel reads, wasm_hash_batch per group.
@@ -210,7 +233,7 @@ export async function push(
 
             // Large files — wasm_chunk_file hashes internally.
             for (const { change, data } of reads.filter(r => wasm.wasm_should_chunk(r.data.length))) {
-                const chunkInfo = wasm.wasm_chunk_file(data);
+                const chunkInfo = await chunkFileStreaming(wasm, data);
                 change.hash = chunkInfo.file_hash;
                 batchFiles.push(new ObsetyncBatchFile(
                     change,
@@ -285,7 +308,10 @@ export async function push(
                 let fileBytesUploaded = 0;
                 for (const chunk of chunkInfo.chunks as any[]) {
                     if (neededChunksSet.has(chunk.hash)) {
-                        const chunkData = wasm.wasm_get_file_chunk(largeData, chunk.offset, chunk.size);
+                        const chunkData = largeData.subarray(
+                            chunk.offset,
+                            chunk.offset + chunk.size,
+                        );
                         await api.putContentChunk(chunk.hash, chunkData);
                         fileBytesUploaded += chunkData.length;
                     }
@@ -349,10 +375,18 @@ export async function push(
         const neededChunks = await api.checkChunks(chunkHashes);
         if (neededChunks.length > 0) {
             onProgress?.(`↑ uploading ${neededChunks.length} index chunks...`);
-            await Promise.all(neededChunks.map(hash => {
-                const bytes = wasm.wasm_tree_get_chunk(tree, hash);
-                return bytes ? api.putChunk(hash, bytes) : Promise.resolve();
-            }));
+            // Thousands of simultaneous encrypted requests retain thousands
+            // of request/response buffers and can terminate an old iOS
+            // renderer. Keep network parallelism useful but strictly bounded.
+            const INDEX_UPLOAD_CONCURRENCY = 8;
+            for (let i = 0; i < neededChunks.length; i += INDEX_UPLOAD_CONCURRENCY) {
+                const batch = neededChunks.slice(i, i + INDEX_UPLOAD_CONCURRENCY);
+                await Promise.all(batch.map(hash => {
+                    const bytes = wasm.wasm_tree_get_chunk(tree, hash);
+                    return bytes ? api.putChunk(hash, bytes) : Promise.resolve();
+                }));
+                await yieldToUI();
+            }
         }
     }
 
@@ -401,6 +435,24 @@ export function streamingHash(wasm: WasmModule, data: Uint8Array): string {
         return hasher.finalize();
     } finally {
         hasher.free();
+    }
+}
+
+/** Plan FastCDC chunks through small WASM bridge slices. The source buffer is
+ *  necessarily whole-file on Obsidian mobile, but WASM never receives a
+ *  second whole-file copy and retains a bounded ~4 MiB window. */
+export async function chunkFileStreaming(wasm: WasmModule, data: Uint8Array): Promise<any> {
+    const FEED = 64 * 1024;
+    const YIELD_EVERY = 4 * 1024 * 1024;
+    const chunker = new wasm.WasmChunker();
+    try {
+        for (let offset = 0; offset < data.length; offset += FEED) {
+            chunker.update(data.subarray(offset, offset + FEED));
+            if (offset > 0 && offset % YIELD_EVERY === 0) await yieldToUI();
+        }
+        return chunker.finish();
+    } finally {
+        chunker.free();
     }
 }
 

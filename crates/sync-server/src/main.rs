@@ -6,10 +6,12 @@ mod config;
 mod crdt;
 mod devices;
 mod enrollment;
+mod eph_rotation;
 mod error;
 mod guard;
 mod ignore_match;
 mod secure;
+mod seq_tracker;
 mod state;
 mod storage;
 mod ws;
@@ -147,7 +149,6 @@ fn cmd_init(data_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     layout.init_directories()?;
 
     let (_priv, pub_key) = box_key::init_box_keypair(&layout)?;
-
     let config = config::ServerConfig::new(data_dir.clone());
     config.save()?;
 
@@ -184,6 +185,7 @@ async fn cmd_run(
     config.admin_port = admin_port;
 
     let state = Arc::new(state::AppState::new(config));
+    eph_rotation::spawn_rotation_task(state.eph.clone());
 
     let sync_app = api::sync_router(state.clone());
     let admin_app = admin::admin_router(state.clone());

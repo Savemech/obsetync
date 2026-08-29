@@ -7,8 +7,8 @@
 //!   new root hash promptly after another device pushes.
 //! - Tickets are single-use (replay → 401) and garbage tickets are rejected.
 //!
-//! Frames carry no secrets — data still travels over the sealed HTTP pull;
-//! this suite only exercises the wake-up path.
+//! Wire-v2 frames are separately sealed. File bytes still travel over sealed
+//! HTTP pull; this suite exercises only the root-change wake-up path.
 
 use e2e_tests::*;
 use futures_util::{SinkExt, StreamExt};

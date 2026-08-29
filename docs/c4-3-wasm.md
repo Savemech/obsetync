@@ -16,19 +16,19 @@ C4Component
     Container_Ext(server_bridge, "SyncCoreBridge (in Sync Server)", "bridge.rs · native Rust build", "Uses the native (non-WASM) build of sync-core. Calls compute_deltas and merge_trees with a DiskChunkStore backed by the index/ directory.")
 
     Container_Boundary(b_wasm, "sync-core WASM · Rust → wasm32-unknown-unknown · base64-inlined in plugin/main.js") {
-        Component(wasm_bindings, "WASM Bindings + WasmTree + Hasher", "wasm.rs · #[wasm_bindgen]", "The sole public surface of the WASM module. Exports: wasm_hash, wasm_hash_batch, wasm_chunk_file, wasm_get_file_chunk, wasm_root_hash_from_bytes, wasm_should_chunk, wasm_tree_get_chunk, wasm_tree_chunk_hashes. WasmTree class: load_root, root_hash_hex, root_bytes, update_entry, delete_entry, update_batch, delete_batch, build_from_entries. Hasher class: streaming Blake3 in 64 KB slices (keeps WASM heap bounded). run_local() is a handwritten single-poll executor for driving MemoryChunkStore's async ops synchronously.")
+        Component(wasm_bindings, "WASM Bindings + WasmTree + streaming helpers", "wasm.rs · #[wasm_bindgen]", "Public surface includes WasmTree, streaming Blake3 Hasher, incremental WasmChunker, batch/single hashes, root decoding, and tree chunk access. run_local() single-polls synchronous MemoryChunkStore futures.")
 
-        Component(tree_builder, "TreeBuilder", "tree.rs", "build_tree(store, entries, vault_id, device_id): groups entries by top-level prefix (BTreeMap), splits each group into LeafChunks of up to TARGET_CHUNK_ENTRIES=1000, creates an InternalNode when a prefix has multiple leaf chunks, stores all nodes in ChunkStore, returns RootNode. update_tree(store, root, upserts, deletes): two-pointer O(N+prefix) incremental update — loads only changed prefix groups, re-chunks their entries, replaces nodes in store. Operates only on the prefixes actually touched by the batch.")
+        Component(tree_builder, "TreeBuilder", "tree.rs", "Builds and incrementally updates prefix-partitioned trees. The shared loader traverses iteratively with node/entry bounds and path-sorts the flattened result, so wide internal-node labels such as 1, 10, 2 cannot violate diff/merge ordering assumptions.")
 
-        Component(diff_engine, "DiffEngine", "diff.rs · native build only", "compute_deltas(store, from_root, to_root): two-pointer merge over both roots' sorted child prefix lists. Same prefix, different hash: materialize both entry lists via load_all_entries and diff them inline. Prefix only in from: emit Deleted for every entry. Prefix only in to: emit Added for every entry. After raw deltas: detect_renames pairs every Deleted+Added that share the same content hash. Returns Vec<FileDelta>. Not exposed via WASM bindings — called only by SyncCoreBridge in the native server build.")
+        Component(diff_engine, "DiffEngine", "diff.rs · native build only", "Two-pointer tree/entry diff compares content hash, mtime, and size. It emits metadata-complete deltas and converts only unambiguous one-delete/one-add hash matches into Renamed. Called by the native server bridge, not JavaScript.")
 
         Component(merge_engine, "MergeEngine", "merge.rs · native build only", "merge_trees(store, base, side_a, side_b): union of all three roots' prefixes. For each prefix: both same as base → keep base; only A changed → take A (auto-resolve); only B changed → take B (auto-resolve); both changed → diff file-level entries, call merge_file_entries for per-file resolution, collect FileConflict for unresolvable cases. Calls build_tree on the merged entry list to produce the new RootNode. Returns MergeResult{new_root, file_conflicts, auto_resolved_count}. Not exposed via WASM bindings — called only by SyncCoreBridge in the native server build.")
 
-        Component(fastcdc_chunker, "FastCDC Chunker", "fastcdc_chunker.rs · fastcdc v2020", "chunk_file(data): runs FastCDC::new(data, 64KB, 256KB, 1MB) over the full file bytes. For each chunk: hash_bytes(chunk_bytes) → ChunkRef{hash, offset, size}. Returns ChunkedFile{manifest: FileManifest{file_hash, total_size, chunks}, chunk_data: Vec<(FileHash, Vec<u8>)>}. reassemble_file: inverse, verifies per-chunk hash and final file hash. should_chunk: returns true if size ≥ 1 MB. Content-defined boundaries mean a one-byte edit to a 200 MB file changes at most 2–3 adjacent chunks.")
+        Component(fastcdc_chunker, "FastCDC Chunker", "fastcdc_chunker.rs · fastcdc v2020", "Uses 256 KiB minimum, 1 MiB target, 4 MiB maximum chunks for files ≥1 MiB. StreamingChunker incrementally hashes the file and retains a bounded window; one-shot chunk_file/reassemble_file remain for native/tests.")
 
         Component(blake3_hasher, "Blake3Hasher", "hash.rs · blake3 crate", "hash_bytes(data) → FileHash ([u8; 32]). Used for file content, chunk bytes, tree node serialisations — every identity in the system. IncrementalHasher: update/update_str/update_u64/finalize, used inside chunk.rs to compute node hashes from structured fields. hash_to_hex / hex_to_hash for wire-format conversion. ZERO_HASH sentinel for empty state. The Hasher WASM class (wasm.rs) wraps blake3::Hasher for streaming 64 KB slices from the plugin.")
 
-        Component(flatbuf_codec, "FlatBuffers Codec", "chunk.rs · sync_schema crate", "Rust structs: FileEntry{path, hash, mtime_ms, size_bytes}, LeafChunk{entries: Vec<FileEntry>}, InternalNode{children: Vec<(prefix, FileHash)>}, RootNode{vault_id, created_ms, version, children, total_files, parent_hash, device_id}. Each struct: serialize() → Vec<u8> via FlatBufferBuilder, deserialize(&[u8]) → Result. RootNode.hash() and LeafChunk.hash() compute Blake3(serialize()) — the content hash IS the hash of the canonical serialisation. FileEntry is Ord by path (alphabetic, stable sort for determinism).")
+        Component(flatbuf_codec, "FlatBuffers Codec", "chunk.rs · sync_schema crate", "Rust structs: FileEntry, LeafChunk, InternalNode, and RootNode with deterministic FlatBuffers encoding. Leaf/internal addresses hash serialized node bytes; RootNode.hash() is the semantic commitment to its ordered prefix/child-hash pairs, excluding history metadata. FileEntry is ordered by path.")
 
         Component(chunk_store, "ChunkStore trait + MemoryChunkStore", "store.rs", "ChunkStore trait: async has/get/put/delete over FileHash keys. ?Send bound (WASM is single-threaded). MemoryChunkStore: RefCell<HashMap<FileHash, Vec<u8>>> — the WasmTree's backing store. insert_chunk / get_chunk / all_chunk_hashes are extra synchronous methods used directly by wasm.rs. DiskChunkStore: std::fs-backed, sharded by hash[0:2] — used only in the native server build via SyncCoreBridge. MemoryChunkStore never returns Pending, making run_local() safe to use as a single-poll executor.")
     }
@@ -38,7 +38,7 @@ C4Component
     Rel(server_bridge, merge_engine, "merge_trees() — native build only", "via DiskChunkStore reading index/ directory")
 
     Rel(wasm_bindings, tree_builder, "WasmTree.build_from_entries → build_tree · WasmTree.update_batch / delete_batch → update_tree")
-    Rel(wasm_bindings, fastcdc_chunker, "wasm_chunk_file → chunk_file · wasm_should_chunk → should_chunk")
+    Rel(wasm_bindings, fastcdc_chunker, "WasmChunker → StreamingChunker · wasm_chunk_file → one-shot chunk_file · wasm_should_chunk → should_chunk")
     Rel(wasm_bindings, blake3_hasher, "wasm_hash / wasm_hash_batch → hash_bytes · Hasher class wraps blake3::Hasher")
     Rel(wasm_bindings, chunk_store, "WasmTree holds MemoryChunkStore · wasm_tree_get_chunk / wasm_tree_chunk_hashes query it directly")
     Rel(wasm_bindings, flatbuf_codec, "wasm_root_hash_from_bytes → RootNode::deserialize")
@@ -67,12 +67,12 @@ C4Component
 | Component | Source | Role |
 |-----------|--------|------|
 | **WASM Bindings + WasmTree + Hasher** | `wasm.rs` | The only module compiled with `#[cfg(feature = "wasm")]`. Everything the plugin can call lives here. `WasmTree` is a stateful WASM class that owns both the current `RootNode` and the `MemoryChunkStore` that backs it. `run_local()` is a minimal single-poll executor: it creates a no-op `Waker`, pins the future, calls `poll()` once, and panics on `Pending` (which `MemoryChunkStore` never returns). This avoids pulling in a full async runtime for WASM. |
-| **TreeBuilder** | `tree.rs` | Pure tree manipulation — no I/O except through the `ChunkStore` trait. `build_tree` does a full construction from a flat `Vec<FileEntry>`: group by top-level prefix via `BTreeMap`, split each group into `LeafChunk` segments of ≤1000 entries, promote to `InternalNode` if a prefix overflows one leaf, store all node bytes in the store, return the `RootNode`. `update_tree` is the incremental path: it only touches prefixes that contain a changed file, re-chunks those prefixes from their current on-store entries plus the new/deleted entries, and writes the replacement nodes. Unchanged prefixes are referenced by existing hashes with no I/O. |
-| **DiffEngine** | `diff.rs` | Two-pointer merge over `from_root.children` and `to_root.children` (both sorted by prefix, guaranteed by `BTreeMap` insertion order). Only loads entries for prefixes whose hash changed. After collecting raw `Added/Modified/Deleted` deltas: `detect_renames` scans for `Deleted+Added` pairs sharing a content hash and converts them to `Renamed`. The whole algorithm is O(changed subtrees × entries-per-chunk), not O(total files). **Not reachable from the plugin via WASM** — the plugin calls `ObsetyncApi.getDiff` instead. |
-| **MergeEngine** | `merge.rs` | Three-way merge at the prefix level. Takes `base` (common ancestor — the `parent_hash` from the incoming push), `side_a` (current server root), `side_b` (incoming push). Single-side changes are auto-resolved without touching the file level. Both-sides changes go to `merge_file_entries`, which merges per-path: auto-resolves if only one side changed the file, emits `FileConflict` if both sides changed the same file differently. The conflict resolution strategy (from `sync_rules.rs`) determines whether to keep-both, keep-latest, or error. After all prefixes: calls `build_tree` to materialise the merged entries into a new `RootNode`. **Not reachable from the plugin via WASM.** |
-| **FastCDC Chunker** | `fastcdc_chunker.rs` | Wraps the `fastcdc` v2020 crate. The key property is content-defined cut points: boundaries are determined by a rolling hash of the content bytes, not by fixed offsets. A one-byte change to a 200 MB PDF shifts at most 2–3 chunk boundaries — all other chunks are byte-identical and deduplicate across versions. `reassemble_file` reconstructs by concatenating chunks in manifest order and verifying the final Blake3 hash matches `manifest.file_hash`. |
-| **Blake3Hasher** | `hash.rs` | `FileHash = [u8; 32]` is used as the identity type everywhere: file content, chunk bytes, tree nodes. All equality comparisons in the tree (diff, merge, chunk lookup) reduce to `[u8; 32] == [u8; 32]`. `IncrementalHasher` is used inside `chunk.rs` to compute node hashes from structured fields in a deterministic order. The streaming `Hasher` WASM class is the memory-safe path for large files: each `update(64KB)` call keeps the WASM linear memory flat, avoiding the growth-to-full-file-size that a single `wasm_hash(entireFile)` call would cause. |
-| **FlatBuffers Codec** | `chunk.rs` + `crates/sync-schema` | The canonical on-wire and on-disk format for all tree nodes. FlatBuffers was chosen over JSON or bincode because it allows zero-copy reads on the server side and produces byte-identical output for the same logical tree (determinism is required for content-addressed hashing). `RootNode.hash()` is `blake3(self.serialize())` — the hash is a commitment to the exact bytes. `FileEntry` implements `Ord` by `path` so leaf chunks are always sorted the same way regardless of insertion order. |
+| **TreeBuilder** | `tree.rs` | Pure tree manipulation — no I/O except through the `ChunkStore` trait. `build_tree` groups by top-level prefix, splits groups into leaves of ≤1000 entries, and promotes wide groups to internal nodes. `update_tree` only re-chunks touched prefixes. `load_all_entries` is iterative rather than attacker-depth recursive, bounds visited nodes/entries, and path-sorts its final stream because lexicographic child labels (`1`, `10`, `2`) do not themselves guarantee `FileEntry` order. |
+| **DiffEngine** | `diff.rs` | Two-pointer merge over sorted roots and entries. A path is modified when hash, mtime, or size changes, preventing distinct roots from yielding a false empty delta. Only an unambiguous unique deleted/added hash pair becomes `Renamed`; duplicate-content ambiguity stays delete+add. **Not reachable from the plugin via WASM**. |
+| **MergeEngine** | `merge.rs` | Three-way merge at the prefix and path levels. Single-side changes auto-resolve. A two-sided same-path change provisionally keeps side A, then eligible small strict-UTF-8 files get a deterministic line-merge post-pass; overlap, binary, large, missing, or invalid content emits `FileConflict`. The returned root stays outside the byte-addressed chunk store and is persisted by the server in per-vault history. **Not reachable from the plugin via WASM.** |
+| **FastCDC Chunker** | `fastcdc_chunker.rs` | Content-defined 256 KiB / 1 MiB / 4 MiB min/target/max cuts. `StreamingChunker` accepts small feeds, incrementally computes full-file and chunk hashes, avoids per-chunk `Vec::drain` memmoves, and returns only the manifest. `reassemble_file` verifies both chunks and final Blake3 address. |
+| **Blake3Hasher** | `hash.rs` | `FileHash = [u8; 32]` identifies file content, chunks, and tree references. `IncrementalHasher` computes deterministic structured hashes. The streaming WASM `Hasher` keeps bridge memory bounded; `update_and_hash(slice)` updates the ordered whole-file digest and returns that slice's independent address in one JS→WASM copy, which lets pull verify both manifest chunks and the fresh assembled stream without duplicating plaintext. |
+| **FlatBuffers Codec** | `chunk.rs` + `crates/sync-schema` | The canonical on-wire and on-disk format for tree nodes. Leaf and internal node addresses commit to their serialized bytes. A root hash deliberately commits only to its ordered `(prefix, child_hash)` pairs, so identical vault state has the same identity despite `created_ms`, device, parent, or other history metadata. `FileEntry` implements `Ord` by path and loaders reassert that order before two-pointer algorithms. |
 | **ChunkStore / MemoryChunkStore** | `store.rs` | The `ChunkStore` trait is the single seam between the tree algorithms and their storage backends. `?Send` trait bound (required because WASM is single-threaded and futures must not be `Send`). In WASM: `MemoryChunkStore` — an in-memory `RefCell<HashMap>` that the `WasmTree` instance owns. All reads and writes complete synchronously, enabling `run_local()` to safely poll once. In the server native build: `DiskChunkStore` — reads from and writes to `index/<hash[0:2]>/<hash[2:]>` files. The same tree/diff/merge code runs against both stores without modification. |
 
 ---
@@ -86,7 +86,7 @@ The same `sync-core` source compiles to two different targets that are used in t
 | `wasm32-unknown-unknown` (WASM feature) | `wasm-pack build --target web` | ObsetyNC Plugin (base64-inlined in main.js) | `MemoryChunkStore` | All `#[wasm_bindgen]` exports in `wasm.rs` |
 | Native (`x86_64-linux` or similar) | `cargo build --release` | Sync Server (linked into binary) | `DiskChunkStore` | Direct Rust function calls via `bridge.rs` |
 
-The WASM build exposes: `WasmTree`, `Hasher`, `wasm_hash`, `wasm_hash_batch`, `wasm_chunk_file`, `wasm_get_file_chunk`, `wasm_root_hash_from_bytes`, `wasm_should_chunk`, `wasm_tree_get_chunk`, `wasm_tree_chunk_hashes`.
+The WASM build exposes: `WasmTree`, `Hasher`, `WasmChunker`, `wasm_hash`, `wasm_hash_batch`, the compatibility one-shot chunk helpers, `wasm_root_hash_from_bytes`, `wasm_should_chunk`, and tree-chunk accessors.
 
 The native build exposes (to `bridge.rs`): `sync_core::diff::compute_deltas`, `sync_core::merge::merge_trees`, `sync_core::store::DiskChunkStore`.
 
@@ -106,17 +106,14 @@ plugin: wasm_hash_batch(concatBytes, offsets, sizes)
 
 ### Push: chunk a large file (≥ 1 MB)
 ```
-plugin: wasm_chunk_file(fileBytes)
-  → WasmBindings.wasm_chunk_file
-      → FastCDCChunker.chunk_file(fileBytes)
-          → FastCDC rolling hash → chunk boundaries
-          → Blake3Hasher.hash_bytes(chunkBytes) for each chunk
-          → Blake3Hasher.hash_bytes(fileBytes) for file_hash
+plugin: new WasmChunker(); update(fileBytes[64 KiB slices]); finish()
+  → FastCDCChunker.StreamingChunker
+      → retain only the unresolved bounded FastCDC window
+      → incrementally Blake3-hash each emitted chunk and the complete stream
   ← JS object: { file_hash, total_size, chunks: [{hash, offset, size}] }
 
-plugin: wasm_get_file_chunk(fileBytes, offset, size)
-  → slice data[offset..offset+size]  # one chunk's bytes, no re-chunking
-  ← Uint8Array
+plugin: fileBytes.subarray(offset, offset + size)
+  → upload only hashes reported missing by the server
 ```
 
 ### Push: update tree after all file uploads
@@ -133,7 +130,7 @@ plugin: wasmTree.update_batch(entriesJSON)
   ← () [root updated in WasmTree.root field]
 
 plugin: wasmTree.root_bytes() → Uint8Array  # serialized RootNode for upload
-plugin: wasm_tree_chunk_hashes(tree)         # all node hashes for checkChunks
+plugin: wasm_tree_chunk_hashes(tree)         # byte-addressed leaf/internal hashes
 plugin: wasm_tree_get_chunk(tree, hash)      # get individual node bytes for upload
 ```
 
@@ -145,7 +142,7 @@ SyncCoreBridge.run_diff(index_base, from_root, to_root)
       → diff::compute_deltas(disk_store, from_root, to_root)
           → two-pointer over sorted prefix children
           → for changed prefix: DiskChunkStore.get(hash) → FlatBuffersCodec.deserialize → diff entries
-          → detect_renames: pair Deleted+Added with same hash
+          → detect_renames: pair only unique one-delete/one-add matches per hash
   ← Vec<FileDelta>
 ```
 

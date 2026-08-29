@@ -130,6 +130,7 @@ async fn v2_entry(state: SharedState, socket: WebSocket) {
 }
 
 /// Decoded session keys + directional counters for a v2 session.
+#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 struct SealCtx {
     c2s: [u8; 32],
     s2c: [u8; 32],
@@ -168,7 +169,7 @@ async fn session_v2(
     state: SharedState,
     mut sink: SplitSink<WebSocket, Message>,
     mut stream: SplitStream<WebSocket>,
-    ticket: ws_ticket::WsTicket,
+    mut ticket: ws_ticket::WsTicket,
 ) {
     let device_short = ticket.device_id[..ticket.device_id.len().min(12)].to_string();
     let Some(mut seal) = SealCtx::from_ticket(&ticket) else {
@@ -177,6 +178,8 @@ async fn session_v2(
             .await;
         return;
     };
+    zeroize::Zeroize::zeroize(&mut ticket.c2s_key_hex);
+    zeroize::Zeroize::zeroize(&mut ticket.s2c_key_hex);
 
     // Sealed handshake ack — also proves to the client that both sides
     // derived the same keys before it sends anything sensitive.

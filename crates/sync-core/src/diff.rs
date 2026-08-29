@@ -25,11 +25,16 @@ pub enum FileDelta {
     },
     Deleted {
         path: String,
+        /// Kept inside the core delta so delete+add pairs can be recognized
+        /// as renames. The HTTP wire intentionally omits it for plain deletes.
+        hash: FileHash,
     },
     Renamed {
         path: String,
         old_path: String,
         hash: FileHash,
+        size: u64,
+        mtime_ms: u64,
     },
 }
 
@@ -72,7 +77,10 @@ pub async fn compute_deltas<S: ChunkStore>(
                 // prefix exists only in from — entire directory deleted
                 let entries = load_all_entries(store, from_hash).await?;
                 for e in entries {
-                    raw_deltas.push(FileDelta::Deleted { path: e.path });
+                    raw_deltas.push(FileDelta::Deleted {
+                        path: e.path,
+                        hash: e.hash,
+                    });
                 }
                 i += 1;
             }
@@ -96,7 +104,10 @@ pub async fn compute_deltas<S: ChunkStore>(
     for (_, hash) in &from_children[i..] {
         let entries = load_all_entries(store, hash).await?;
         for e in entries {
-            raw_deltas.push(FileDelta::Deleted { path: e.path });
+            raw_deltas.push(FileDelta::Deleted {
+                path: e.path,
+                hash: e.hash,
+            });
         }
     }
 
@@ -132,7 +143,10 @@ fn diff_entries(
         let ord = from[i].path.cmp(&to[j].path);
         match ord {
             std::cmp::Ordering::Equal => {
-                if from[i].hash != to[j].hash {
+                if from[i].hash != to[j].hash
+                    || from[i].mtime_ms != to[j].mtime_ms
+                    || from[i].size_bytes != to[j].size_bytes
+                {
                     deltas.push(FileDelta::Modified {
                         path: to[j].path.clone(),
                         hash: to[j].hash,
@@ -146,6 +160,7 @@ fn diff_entries(
             std::cmp::Ordering::Less => {
                 deltas.push(FileDelta::Deleted {
                     path: from[i].path.clone(),
+                    hash: from[i].hash,
                 });
                 i += 1;
             }
@@ -163,6 +178,7 @@ fn diff_entries(
     for entry in &from[i..] {
         deltas.push(FileDelta::Deleted {
             path: entry.path.clone(),
+            hash: entry.hash,
         });
     }
     for entry in &to[j..] {
@@ -175,10 +191,69 @@ fn diff_entries(
     }
 }
 
-/// Detect renames by matching content hashes between Deleted and Added entries.
-/// TODO: requires adding hash to FileDelta::Deleted or a separate store pass.
+/// Detect the unambiguous rename case: exactly one deletion and one addition
+/// share a content hash. Ambiguous duplicate-content sets remain delete+add;
+/// guessing which identical source moved would make ignore-boundary handling
+/// and diagnostics misleading even though the final bytes happen to match.
 fn detect_renames(deltas: Vec<FileDelta>) -> Vec<FileDelta> {
+    use std::collections::{HashMap, HashSet};
+
+    let mut deleted: HashMap<FileHash, Vec<usize>> = HashMap::new();
+    let mut added: HashMap<FileHash, Vec<usize>> = HashMap::new();
+    for (index, delta) in deltas.iter().enumerate() {
+        match delta {
+            FileDelta::Deleted { hash, .. } => deleted.entry(*hash).or_default().push(index),
+            FileDelta::Added { hash, .. } => added.entry(*hash).or_default().push(index),
+            _ => {}
+        }
+    }
+
+    let mut replacements = HashMap::new();
+    let mut consumed_additions = HashSet::new();
+    for (hash, deleted_indices) in deleted {
+        let Some(added_indices) = added.get(&hash) else {
+            continue;
+        };
+        if deleted_indices.len() != 1 || added_indices.len() != 1 {
+            continue;
+        }
+        let delete_index = deleted_indices[0];
+        let add_index = added_indices[0];
+        let old_path = match &deltas[delete_index] {
+            FileDelta::Deleted { path, .. } => path.clone(),
+            _ => unreachable!(),
+        };
+        let (path, size, mtime_ms) = match &deltas[add_index] {
+            FileDelta::Added {
+                path,
+                size,
+                mtime_ms,
+                ..
+            } => (path.clone(), *size, *mtime_ms),
+            _ => unreachable!(),
+        };
+        replacements.insert(
+            delete_index,
+            FileDelta::Renamed {
+                path,
+                old_path,
+                hash,
+                size,
+                mtime_ms,
+            },
+        );
+        consumed_additions.insert(add_index);
+    }
+
     deltas
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, delta)| {
+            replacements
+                .remove(&index)
+                .or_else(|| (!consumed_additions.contains(&index)).then_some(delta))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -234,7 +309,7 @@ mod tests {
 
         let deltas = compute_deltas(&store, &root1, &root2).await.unwrap();
         assert_eq!(deltas.len(), 1);
-        assert!(matches!(&deltas[0], FileDelta::Deleted { path } if path == "notes/b.md"));
+        assert!(matches!(&deltas[0], FileDelta::Deleted { path, .. } if path == "notes/b.md"));
     }
 
     #[tokio::test]
@@ -282,7 +357,50 @@ mod tests {
 
         let deltas = compute_deltas(&store, &root1, &root2).await.unwrap();
         assert_eq!(deltas.len(), 1);
-        assert!(matches!(&deltas[0], FileDelta::Deleted { path } if path == "photos/p.png"));
+        assert!(matches!(&deltas[0], FileDelta::Deleted { path, .. } if path == "photos/p.png"));
+    }
+
+    #[tokio::test]
+    async fn metadata_only_change_is_not_silently_dropped() {
+        let store = MemoryChunkStore::new();
+        let hash = hash_bytes(b"same");
+        let before = FileEntry::new("a.md".into(), hash, 1000, 4);
+        let after = FileEntry::new("a.md".into(), hash, 2000, 4);
+        let r1 = build_tree(&store, vec![before], "v", "d").await.unwrap();
+        let r2 = build_tree(&store, vec![after], "v", "d").await.unwrap();
+
+        let deltas = compute_deltas(&store, &r1, &r2).await.unwrap();
+        assert!(matches!(
+            deltas.as_slice(),
+            [FileDelta::Modified {
+                path,
+                hash: actual_hash,
+                size: 4,
+                mtime_ms: 2000,
+            }] if path == "a.md" && actual_hash == &hash
+        ));
+    }
+
+    #[tokio::test]
+    async fn unique_delete_add_pair_becomes_metadata_complete_rename() {
+        let store = MemoryChunkStore::new();
+        let hash = hash_bytes(b"same");
+        let before = FileEntry::new("old.md".into(), hash, 1000, 4);
+        let after = FileEntry::new("new.md".into(), hash, 2000, 4);
+        let r1 = build_tree(&store, vec![before], "v", "d").await.unwrap();
+        let r2 = build_tree(&store, vec![after], "v", "d").await.unwrap();
+
+        let deltas = compute_deltas(&store, &r1, &r2).await.unwrap();
+        assert!(matches!(
+            deltas.as_slice(),
+            [FileDelta::Renamed {
+                path,
+                old_path,
+                hash: actual_hash,
+                size: 4,
+                mtime_ms: 2000,
+            }] if path == "new.md" && old_path == "old.md" && actual_hash == &hash
+        ));
     }
 
     #[tokio::test]
@@ -393,7 +511,10 @@ mod tests {
 
     #[test]
     fn file_delta_deleted_serde() {
-        let d = FileDelta::Deleted { path: "x".into() };
+        let d = FileDelta::Deleted {
+            path: "x".into(),
+            hash: crate::hash::hash_bytes(b"x"),
+        };
         let json = serde_json::to_string(&d).unwrap();
         assert!(json.contains("deleted"));
         let _back: FileDelta = serde_json::from_str(&json).unwrap();

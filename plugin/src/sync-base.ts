@@ -1,62 +1,132 @@
-import { App } from "obsidian";
+import type { App } from "obsidian";
 
 interface BaseEntry {
     hash: string;
-    /** Local on-disk mtime — used by the mtime scan to detect edits. */
+    /** Local on-disk mtime — compared during the metadata audit. */
     mtime: number;
     size: number;
-    /** mtime the file carries in the SERVER's Merkle tree, when it differs
-     *  from the local one (files written by pull get the puller's own disk
-     *  mtime locally, but must mirror the server's leaf mtime in the tree —
-     *  leaf hashes cover mtime, so rebuilding the tree from sync-base can
-     *  only reproduce the server root if this is preserved). Absent means
-     *  "same as `mtime`" (files this device pushed itself). */
+    /** Server-tree mtime when it differs from the local filesystem mtime. */
     treeMtime?: number;
 }
 
 interface SyncBaseData {
     lastSyncTimestamp: number;
     entries: Record<string, BaseEntry>;
-    /** The server root hash this device's Merkle tree was last reconciled
-     *  with — the HONEST parent for putRoot (merge base), as opposed to the
-     *  last root merely *observed* on the server. Persisted in lockstep with
-     *  the entries it corresponds to. Null until the first verified
-     *  pull-rebase or push. */
+    /** Last server root this exact local tree was verifiably based on. */
     treeBaseRoot?: string | null;
 }
 
+type SyncBaseOperation =
+    | { op: "set"; path: string; entry: BaseEntry }
+    | { op: "remove"; path: string }
+    | { op: "timestamp"; value: number }
+    | { op: "tree-root"; value: string | null };
+
 const SYNC_BASE_PATH = ".obsidian/plugins/obsetync/sync-base.json";
+const SYNC_BASE_NEXT_PATH = `${SYNC_BASE_PATH}.next`;
+const SYNC_BASE_BACKUP_PATH = `${SYNC_BASE_PATH}.bak`;
+const SYNC_BASE_WAL_PATH = ".obsidian/plugins/obsetync/sync-base.wal.ndjson";
 
 /**
- * Tracks the last-synced hash for every file — the "common ancestor" for conflict detection.
- * Persisted as a JSON file in the plugin data directory.
+ * Last-synced state with a small append-only checkpoint log.
+ *
+ * A 68k-file pull no longer has to choose between rewriting a huge JSON file
+ * after every batch and losing all progress on an iOS process kill. Mutations
+ * are appended to the WAL at batch boundaries; save() periodically compacts
+ * them into an atomically rotated snapshot. WAL operations are idempotent.
  */
 export class ObsetyncSyncBase {
     private data: SyncBaseData = { lastSyncTimestamp: 0, entries: {} };
     private dirty = false;
+    private pendingOperations: SyncBaseOperation[] = [];
+    private directoryEnsured = false;
+    private walNeedsLeadingNewline = false;
+    private writeChain: Promise<void> = Promise.resolve();
+    private mutationVersion = 0;
 
     constructor(private app: App) {}
 
     async load(): Promise<void> {
+        const loaded = await this.readFirstValidSnapshot([
+            SYNC_BASE_NEXT_PATH,
+            SYNC_BASE_PATH,
+            SYNC_BASE_BACKUP_PATH,
+        ]);
+        this.data = loaded ?? { lastSyncTimestamp: 0, entries: {} };
+        this.pendingOperations = [];
+        this.dirty = false;
+
         try {
-            const raw = await this.app.vault.adapter.read(SYNC_BASE_PATH);
-            this.data = JSON.parse(raw);
+            const wal = await this.app.vault.adapter.read(SYNC_BASE_WAL_PATH);
+            this.walNeedsLeadingNewline = wal.length > 0 && !wal.endsWith("\n");
+            let applied = 0;
+            for (const line of wal.split("\n")) {
+                if (!line.trim()) continue;
+                try {
+                    this.applyOperation(JSON.parse(line) as SyncBaseOperation);
+                    applied++;
+                } catch {
+                    // Preserve all parseable checkpoints after a torn final append.
+                }
+            }
+            if (applied > 0) this.dirty = true;
         } catch {
-            this.data = { lastSyncTimestamp: 0, entries: {} };
+            // No WAL yet.
+            this.walNeedsLeadingNewline = false;
         }
     }
 
+    /** Durably append mutations since the previous batch without rewriting
+     *  the full sync-base snapshot. */
+    async checkpoint(): Promise<void> {
+        await this.enqueue(async () => {
+            if (this.pendingOperations.length === 0) return;
+            await this.ensureDirectory();
+            await this.flushPendingInsideQueue();
+        });
+    }
+
+    /** Compact current state into a recoverable rotated snapshot, then clear
+     *  the idempotent WAL. */
     async save(): Promise<void> {
-        if (!this.dirty) return;
-        const dir = SYNC_BASE_PATH.substring(0, SYNC_BASE_PATH.lastIndexOf("/"));
-        if (!(await this.app.vault.adapter.exists(dir))) {
-            await this.app.vault.adapter.mkdir(dir);
-        }
-        await this.app.vault.adapter.write(
-            SYNC_BASE_PATH,
-            JSON.stringify(this.data)
-        );
-        this.dirty = false;
+        await this.enqueue(async () => {
+            if (!this.dirty && this.pendingOperations.length === 0) return;
+            await this.ensureDirectory();
+            await this.flushPendingInsideQueue();
+
+            const snapshotVersion = this.mutationVersion;
+            const encoded = JSON.stringify(this.data);
+            const adapter = this.app.vault.adapter;
+            await adapter.write(SYNC_BASE_NEXT_PATH, encoded);
+
+            if (await adapter.exists(SYNC_BASE_BACKUP_PATH)) {
+                await adapter.remove(SYNC_BASE_BACKUP_PATH);
+            }
+            if (await adapter.exists(SYNC_BASE_PATH)) {
+                await adapter.rename(SYNC_BASE_PATH, SYNC_BASE_BACKUP_PATH);
+            }
+            try {
+                await adapter.rename(SYNC_BASE_NEXT_PATH, SYNC_BASE_PATH);
+            } catch (error) {
+                if (!(await adapter.exists(SYNC_BASE_PATH)) && await adapter.exists(SYNC_BASE_BACKUP_PATH)) {
+                    try { await adapter.rename(SYNC_BASE_BACKUP_PATH, SYNC_BASE_PATH); } catch { /* original error */ }
+                }
+                throw error;
+            }
+
+            // Replaying pre-snapshot WAL rows is harmless, so clear it only
+            // after the new main snapshot is in place.
+            await adapter.write(SYNC_BASE_WAL_PATH, "");
+            this.walNeedsLeadingNewline = false;
+            if (await adapter.exists(SYNC_BASE_BACKUP_PATH)) {
+                await adapter.remove(SYNC_BASE_BACKUP_PATH);
+            }
+
+            // Mutations can arrive while adapter promises yield. Persist any
+            // post-snapshot operations immediately after clearing the WAL.
+            await this.flushPendingInsideQueue();
+            this.dirty = this.mutationVersion !== snapshotVersion;
+        });
     }
 
     getHash(path: string): string | null {
@@ -67,33 +137,21 @@ export class ObsetyncSyncBase {
         return this.data.entries[path] ?? null;
     }
 
-    setEntry(
-        path: string,
-        hash: string,
-        mtime: number,
-        size: number,
-        treeMtime?: number,
-    ): void {
+    setEntry(path: string, hash: string, mtime: number, size: number, treeMtime?: number): void {
         const entry: BaseEntry = { hash, mtime, size };
-        // Only store treeMtime when it genuinely differs — keeps the JSON
-        // compact and "absent = same as mtime" unambiguous.
-        if (treeMtime !== undefined && treeMtime !== mtime) {
-            entry.treeMtime = treeMtime;
-        }
+        if (treeMtime !== undefined && treeMtime !== mtime) entry.treeMtime = treeMtime;
         this.data.entries[path] = entry;
-        this.dirty = true;
+        this.record({ op: "set", path, entry });
     }
 
     removeEntry(path: string): void {
         delete this.data.entries[path];
-        this.dirty = true;
+        this.record({ op: "remove", path });
     }
 
-    /** The mtime this path must carry in the Merkle tree (server parity). */
     getTreeMtime(path: string): number | null {
-        const e = this.data.entries[path];
-        if (!e) return null;
-        return e.treeMtime ?? e.mtime;
+        const entry = this.data.entries[path];
+        return entry ? entry.treeMtime ?? entry.mtime : null;
     }
 
     get treeBaseRoot(): string | null {
@@ -103,7 +161,7 @@ export class ObsetyncSyncBase {
     setTreeBaseRoot(hash: string | null): void {
         if ((this.data.treeBaseRoot ?? null) === hash) return;
         this.data.treeBaseRoot = hash;
-        this.dirty = true;
+        this.record({ op: "tree-root", value: hash });
     }
 
     get lastSyncTimestamp(): number {
@@ -112,7 +170,7 @@ export class ObsetyncSyncBase {
 
     setLastSyncTimestamp(ts: number): void {
         this.data.lastSyncTimestamp = ts;
-        this.dirty = true;
+        this.record({ op: "timestamp", value: ts });
     }
 
     allPaths(): string[] {
@@ -121,5 +179,82 @@ export class ObsetyncSyncBase {
 
     entryCount(): number {
         return Object.keys(this.data.entries).length;
+    }
+
+    private record(operation: SyncBaseOperation): void {
+        this.pendingOperations.push(operation);
+        this.dirty = true;
+        this.mutationVersion++;
+    }
+
+    private applyOperation(operation: SyncBaseOperation): void {
+        if (!operation || typeof operation !== "object") throw new Error("invalid sync-base WAL row");
+        switch (operation.op) {
+            case "set":
+                if (typeof operation.path !== "string" || !operation.entry) throw new Error("invalid set");
+                this.data.entries[operation.path] = operation.entry;
+                break;
+            case "remove":
+                if (typeof operation.path !== "string") throw new Error("invalid remove");
+                delete this.data.entries[operation.path];
+                break;
+            case "timestamp":
+                if (typeof operation.value !== "number") throw new Error("invalid timestamp");
+                this.data.lastSyncTimestamp = operation.value;
+                break;
+            case "tree-root":
+                if (operation.value !== null && typeof operation.value !== "string") {
+                    throw new Error("invalid tree root");
+                }
+                this.data.treeBaseRoot = operation.value;
+                break;
+            default:
+                throw new Error("unknown sync-base WAL operation");
+        }
+    }
+
+    private async readFirstValidSnapshot(paths: string[]): Promise<SyncBaseData | null> {
+        for (const path of paths) {
+            try {
+                const parsed = JSON.parse(await this.app.vault.adapter.read(path)) as SyncBaseData;
+                if (parsed && typeof parsed.lastSyncTimestamp === "number" && parsed.entries) {
+                    return parsed;
+                }
+            } catch {
+                // Try the staged snapshot or previous backup.
+            }
+        }
+        return null;
+    }
+
+    private async flushPendingInsideQueue(): Promise<void> {
+        // A vault callback can mutate sync-base while adapter.append() yields.
+        // Drain until stable so save()/checkpoint() never resolve with a
+        // mutation that happened during their final write still memory-only.
+        while (this.pendingOperations.length > 0) {
+            const operations = this.pendingOperations.splice(0);
+            try {
+                const lines = operations.map((operation) => JSON.stringify(operation)).join("\n");
+                const prefix = this.walNeedsLeadingNewline ? "\n" : "";
+                await this.app.vault.adapter.append(SYNC_BASE_WAL_PATH, `${prefix}${lines}\n`);
+                this.walNeedsLeadingNewline = false;
+            } catch (error) {
+                this.pendingOperations = operations.concat(this.pendingOperations);
+                throw error;
+            }
+        }
+    }
+
+    private async ensureDirectory(): Promise<void> {
+        if (this.directoryEnsured) return;
+        const dir = SYNC_BASE_PATH.substring(0, SYNC_BASE_PATH.lastIndexOf("/"));
+        if (!(await this.app.vault.adapter.exists(dir))) await this.app.vault.adapter.mkdir(dir);
+        this.directoryEnsured = true;
+    }
+
+    private enqueue<T>(operation: () => Promise<T>): Promise<T> {
+        const result = this.writeChain.then(operation, operation);
+        this.writeChain = result.then(() => undefined, () => undefined);
+        return result;
     }
 }

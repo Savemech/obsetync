@@ -1,5 +1,6 @@
 use crate::chunk::ChunkError;
-use crate::hash::{hash_to_hex, FileHash};
+use crate::hash::{hash_bytes, hash_to_hex, FileHash};
+use crate::store::atomic_write;
 
 /// Store for actual file content (the bytes of vault files).
 /// Separate from ChunkStore which handles index data.
@@ -77,43 +78,62 @@ impl DiskContentStore {
 #[async_trait::async_trait(?Send)]
 impl ContentStore for DiskContentStore {
     async fn has(&self, hash: &FileHash) -> bool {
-        self.blob_path(hash).exists()
+        self.get(hash).await.is_ok()
     }
 
     async fn get(&self, hash: &FileHash) -> Result<Vec<u8>, ChunkError> {
         let path = self.blob_path(hash);
-        std::fs::read(&path).map_err(|_| ChunkError::NotFound(hash_to_hex(hash)))
+        let data = match std::fs::read(&path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ChunkError::NotFound(hash_to_hex(hash)));
+            }
+            Err(error) => return Err(ChunkError::Io(error)),
+        };
+        if hash_bytes(&data) != *hash {
+            return Err(ChunkError::Deserialize(format!(
+                "content object {} failed content-address validation",
+                hash_to_hex(hash),
+            )));
+        }
+        Ok(data)
     }
 
     async fn put(&self, hash: FileHash, data: Vec<u8>) -> Result<(), ChunkError> {
-        let path = self.blob_path(&hash);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        if hash_bytes(&data) != hash {
+            return Err(ChunkError::Deserialize(format!(
+                "refusing content bytes that do not match {}",
+                hash_to_hex(&hash),
+            )));
         }
-        std::fs::write(&path, &data)?;
+        let path = self.blob_path(&hash);
+        atomic_write(&path, &data)?;
         Ok(())
     }
 
     async fn has_manifest(&self, file_hash: &FileHash) -> bool {
-        self.manifest_path(file_hash).exists()
+        self.get_manifest(file_hash).await.is_ok()
     }
 
     async fn get_manifest(&self, file_hash: &FileHash) -> Result<FileManifest, ChunkError> {
         let path = self.manifest_path(file_hash);
         let data =
             std::fs::read(&path).map_err(|_| ChunkError::NotFound(hash_to_hex(file_hash)))?;
-        serde_json::from_slice(&data)
-            .map_err(|e| ChunkError::Deserialize(format!("manifest: {}", e)))
+        let manifest: FileManifest = serde_json::from_slice(&data)
+            .map_err(|e| ChunkError::Deserialize(format!("manifest: {}", e)))?;
+        if manifest.file_hash != *file_hash {
+            return Err(ChunkError::Deserialize(
+                "manifest file_hash does not match its storage address".into(),
+            ));
+        }
+        Ok(manifest)
     }
 
     async fn put_manifest(&self, manifest: FileManifest) -> Result<(), ChunkError> {
         let path = self.manifest_path(&manifest.file_hash);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let data = serde_json::to_vec(&manifest)
             .map_err(|e| ChunkError::Deserialize(format!("manifest serialize: {}", e)))?;
-        std::fs::write(&path, &data)?;
+        atomic_write(&path, &data)?;
         Ok(())
     }
 }
@@ -226,11 +246,29 @@ mod tests {
     async fn disk_content_store_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let store = DiskContentStore::new(dir.path());
-        let hash = hash_bytes(b"disk content");
         let data = b"disk content bytes".to_vec();
+        let hash = hash_bytes(&data);
 
         store.put(hash, data.clone()).await.unwrap();
         assert!(store.has(&hash).await);
+        assert_eq!(store.get(&hash).await.unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn disk_content_store_rejects_and_repairs_corrupt_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DiskContentStore::new(dir.path());
+        let data = b"merged note bytes".to_vec();
+        let hash = hash_bytes(&data);
+        store.put(hash, data.clone()).await.unwrap();
+        std::fs::write(store.blob_path(&hash), b"corrupt").unwrap();
+
+        assert!(!store.has(&hash).await);
+        assert!(matches!(
+            store.get(&hash).await.unwrap_err(),
+            ChunkError::Deserialize(_)
+        ));
+        store.put(hash, data.clone()).await.unwrap();
         assert_eq!(store.get(&hash).await.unwrap(), data);
     }
 

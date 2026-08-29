@@ -5,6 +5,9 @@ use sync_core::diff::FileDelta;
 use sync_core::merge::MergeResult;
 use sync_core::store::DiskChunkStore;
 
+const MAX_ROOT_FILES: u64 = 5_000_000;
+const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
 /// Run sync-core's `merge_trees` in a blocking task with a LocalSet
 /// to handle the `!Send` futures from `ChunkStore` trait.
 ///
@@ -51,7 +54,10 @@ pub async fn run_list_entries(
             .map_err(|e| e.to_string())?;
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async {
-            let mut entries = Vec::with_capacity(root.total_files as usize);
+            // Stored roots are normally trusted, but never turn a corrupt
+            // total_files field into a giant eager allocation.
+            let mut entries =
+                Vec::with_capacity(usize::try_from(root.total_files).unwrap_or(0).min(100_000));
             for (_prefix, child_hash) in &root.children {
                 let mut child = sync_core::tree::load_all_entries(&store, child_hash)
                     .await
@@ -64,6 +70,124 @@ pub async fn run_list_entries(
     })
     .await
     .map_err(|e| format!("join error: {}", e))?
+}
+
+/// Validate and flatten an untrusted uploaded root before it can become the
+/// current vault state. The first implementation is deliberately routed
+/// through the same loader as admin export; structural checks are layered in
+/// by the root-validation regression tests below.
+pub async fn run_validate_root(
+    index_base: PathBuf,
+    root: RootNode,
+) -> Result<Vec<sync_core::chunk::FileEntry>, String> {
+    tokio::task::spawn_blocking(move || {
+        if root.version != 1 {
+            return Err(format!("unsupported root version {}", root.version));
+        }
+        if root.total_files > MAX_ROOT_FILES {
+            return Err(format!(
+                "root declares too many files: {}",
+                root.total_files
+            ));
+        }
+        if root.children.len() as u64 > root.total_files && root.total_files != 0 {
+            return Err("root has more top-level children than files".to_string());
+        }
+        if root.total_files == 0 && !root.children.is_empty() {
+            return Err("empty root has child nodes".to_string());
+        }
+
+        let store = DiskChunkStore::new(&index_base);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let mut entries =
+                Vec::with_capacity(usize::try_from(root.total_files).unwrap_or(0).min(100_000));
+            let mut previous_prefix: Option<&str> = None;
+            let mut previous_path: Option<String> = None;
+            for (prefix, child_hash) in &root.children {
+                if previous_prefix.is_some_and(|previous| previous >= prefix.as_str()) {
+                    return Err("root child prefixes are not strictly sorted".to_string());
+                }
+                if !valid_top_level_prefix(prefix) {
+                    return Err(format!("invalid root child prefix {prefix:?}"));
+                }
+                previous_prefix = Some(prefix);
+
+                let child = sync_core::tree::load_all_entries(&store, child_hash)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                for entry in child {
+                    if !valid_vault_path(&entry.path) {
+                        return Err(format!("unsafe vault path {:?}", entry.path));
+                    }
+                    if top_level_prefix(&entry.path) != prefix {
+                        return Err(format!(
+                            "entry {:?} is stored under wrong root prefix {:?}",
+                            entry.path, prefix
+                        ));
+                    }
+                    if previous_path
+                        .as_ref()
+                        .is_some_and(|previous| previous >= &entry.path)
+                    {
+                        return Err("root entries are not strictly path-sorted".to_string());
+                    }
+                    if entry.size_bytes > JS_MAX_SAFE_INTEGER
+                        || entry.mtime_ms > JS_MAX_SAFE_INTEGER
+                    {
+                        return Err(format!(
+                            "entry {:?} exceeds client integer range",
+                            entry.path
+                        ));
+                    }
+                    previous_path = Some(entry.path.clone());
+                    entries.push(entry);
+                    if entries.len() as u64 > root.total_files {
+                        return Err("root contains more entries than declared".to_string());
+                    }
+                }
+            }
+            if entries.len() as u64 != root.total_files {
+                return Err(format!(
+                    "root declares {} files but contains {}",
+                    root.total_files,
+                    entries.len()
+                ));
+            }
+            Ok(entries)
+        })
+    })
+    .await
+    .map_err(|e| format!("join error: {}", e))?
+}
+
+fn valid_vault_path(path: &str) -> bool {
+    if path.is_empty() || path.len() > 4096 || path.starts_with('/') || path.contains('\\') {
+        return false;
+    }
+    if path.chars().any(|ch| ch.is_control()) {
+        return false;
+    }
+    path.split('/')
+        .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+}
+
+fn top_level_prefix(path: &str) -> &str {
+    path.find('/').map_or("", |index| &path[..=index])
+}
+
+fn valid_top_level_prefix(prefix: &str) -> bool {
+    if prefix.is_empty() {
+        return true;
+    }
+    let Some(segment) = prefix.strip_suffix('/') else {
+        return false;
+    };
+    !segment.contains('/') && valid_vault_path(segment)
 }
 
 /// Rebuild `root` with every entry matching one of `patterns` removed — the
@@ -188,6 +312,30 @@ mod tests {
             &deltas[0],
             sync_core::diff::FileDelta::Added { path, .. } if path == "b.md"
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn root_validation_rejects_false_file_count() {
+        let dir = tempdir().unwrap();
+        let mut root =
+            build_tree_on_disk(dir.path().to_path_buf(), vec![make_entry("a.md", "x")]).await;
+        root.total_files = 999;
+        assert!(run_validate_root(dir.path().to_path_buf(), root)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn root_validation_rejects_unsafe_entry_path() {
+        let dir = tempdir().unwrap();
+        let root = build_tree_on_disk(
+            dir.path().to_path_buf(),
+            vec![make_entry("../outside.md", "x")],
+        )
+        .await;
+        assert!(run_validate_root(dir.path().to_path_buf(), root)
+            .await
+            .is_err());
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -3,7 +3,7 @@ use crate::devices;
 use crate::error::ServerError;
 use crate::secure;
 use crate::state::SharedState;
-use crate::storage::{blob_exists, read_blob, write_blob};
+use crate::storage::{blob_exists, blob_matches_hash, read_blob, write_blob, StorageLayout};
 use axum::{
     body::Body,
     extract::{Path, Request, State},
@@ -13,28 +13,23 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use sync_core::hash::{hash_bytes, hash_to_hex, hex_to_hash};
+use sync_core::hash::{hash_bytes, hash_to_hex, hex_to_hash, FileHash};
 use x25519_dalek::StaticSecret;
 
 /// Max body size we'll consume in one shot. Generous to accommodate the
-/// occasional large-file blob upload (FastCDC caps chunks at ~1 MB each,
-/// but the full-file manifest path can push a megabyte or two).
-const MAX_BODY_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB
+/// occasional large-file blob upload (FastCDC caps chunks at 4 MiB each,
+/// while large manifests and root batches can also exceed small defaults).
+const MAX_BODY_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 
 /// Authenticated device id, inserted into request extensions by
 /// `secure_envelope` after bearer validation.
 #[derive(Clone)]
 pub struct DeviceIdExt(pub String);
 
-/// Secure-envelope middleware. Every protected route body is a sealed
-/// blob: `[ver | nonce | client_eph_pub | ciphertext+tag]`. We decrypt
-/// the request using the server's long-term X25519 private key, validate
-/// the bearer token found inside the plaintext, run the inner handler,
-/// then encrypt its response back to the same client using the shared
-/// secret from the request's ECDH.
-///
-/// Protocol specification: ../../../docs/transport.md
-async fn secure_envelope(
+/// Historical wire-v1 implementation kept temporarily as migration context;
+/// cfg(false) guarantees wire v2 is the sole compiled middleware.
+#[cfg(any())]
+async fn secure_envelope_v1_retired(
     State(state): State<SharedState>,
     request: Request,
     next: Next,
@@ -210,6 +205,200 @@ async fn secure_envelope(
     out
 }
 
+/// Transport-v2 middleware. Every post-decrypt outcome is returned as an
+/// encrypted semantic status over wire HTTP 200; failures that prevent opening
+/// the request collapse to one constant 256-byte decoy.
+async fn secure_envelope(
+    State(state): State<SharedState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path().to_owned();
+    let started = std::time::Instant::now();
+    if request.method() != Method::POST {
+        tracing::warn!(path = %path, "transport-v2 request used a non-POST wire method");
+        return decrypt_failure_decoy();
+    }
+    let Some(method) = request
+        .headers()
+        .get("X-Obsetync-Method")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<Method>().ok())
+    else {
+        tracing::warn!(path = %path, "transport-v2 request omitted/invalidated semantic method");
+        return decrypt_failure_decoy();
+    };
+
+    let (mut parts, body) = request.into_parts();
+    let body_bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            tracing::warn!(method = %method, path = %path, "transport-v2 request body unavailable");
+            return decrypt_failure_decoy();
+        }
+    };
+    let server_private = StaticSecret::from(state.server_priv_bytes);
+    let decrypted_result = {
+        let eph = state.eph.read().expect("eph state poisoned");
+        secure::decrypt_request(&body_bytes, &server_private, &eph, method.as_str(), &path)
+    };
+    let mut decrypted = match decrypted_result {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(method = %method, path = %path, reason = %error, "transport-v2 envelope rejected");
+            return decrypt_failure_decoy();
+        }
+    };
+
+    let device_short = if decrypted.mode == secure::TransportMode::Bootstrap {
+        // This read-only endpoint intentionally carries no bearer or sequence:
+        // putting a credential inside the single-DH bootstrap would expose it
+        // to a future compromise of the long-term server key.
+        "bootstrap".to_owned()
+    } else {
+        let device_id = match devices::lookup_token(&state.layout, &decrypted.bearer_token) {
+            Some(device_id) => device_id,
+            None => {
+                tracing::warn!(method = %method, path = %path, "transport-v2 unknown bearer");
+                return encrypted_semantic_response(
+                    &decrypted,
+                    StatusCode::UNAUTHORIZED,
+                    br#"{"error":"unknown_bearer"}"#,
+                    &method,
+                    &path,
+                );
+            }
+        };
+        let device_short = device_id[..device_id.len().min(12)].to_owned();
+        if devices::is_revoked(&state.layout, &device_id) {
+            tracing::warn!(device = %device_short, method = %method, path = %path, "revoked device attempted request");
+            return encrypted_semantic_response(
+                &decrypted,
+                StatusCode::FORBIDDEN,
+                br#"{"error":"revoked"}"#,
+                &method,
+                &path,
+            );
+        }
+
+        match state
+            .sequences
+            .check_and_record(&device_id, decrypted.sequence)
+        {
+            Ok(crate::seq_tracker::ReplayDecision::Accepted) => {}
+            Ok(crate::seq_tracker::ReplayDecision::Replay { greatest_seen }) => {
+                let body = serde_json::json!({
+                    "error": "replay",
+                    "last_seen_seq": greatest_seen,
+                })
+                .to_string();
+                tracing::warn!(device = %device_short, sequence = decrypted.sequence, greatest_seen, "transport-v2 replay rejected");
+                return encrypted_semantic_response(
+                    &decrypted,
+                    StatusCode::UNAUTHORIZED,
+                    body.as_bytes(),
+                    &method,
+                    &path,
+                );
+            }
+            Err(error) => {
+                tracing::error!(device = %device_short, reason = %error, "anti-replay state persistence failed");
+                return encrypted_semantic_response(
+                    &decrypted,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    br#"{"error":"anti_replay_unavailable"}"#,
+                    &method,
+                    &path,
+                );
+            }
+        }
+        let _ = devices::touch_last_seen(&state.layout, &device_id);
+        parts.extensions.insert(DeviceIdExt(device_id));
+        device_short
+    };
+
+    parts.method = method.clone();
+    let inner_body_len = decrypted.inner_body.len();
+    let inner_body = std::mem::take(&mut decrypted.inner_body);
+    let mut inner_request = Request::from_parts(parts, Body::from(inner_body));
+    inner_request
+        .headers_mut()
+        .remove(axum::http::header::CONTENT_LENGTH);
+    let inner_response = next.run(inner_request).await;
+    let semantic_status = inner_response.status();
+    let (_, response_body) = inner_response.into_parts();
+    let response_bytes = if semantic_status == StatusCode::NO_CONTENT
+        || semantic_status == StatusCode::NOT_MODIFIED
+    {
+        axum::body::Bytes::new()
+    } else {
+        match axum::body::to_bytes(response_body, MAX_BODY_BYTES).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                tracing::error!(device = %device_short, method = %method, path = %path, "handler response body unavailable");
+                return encrypted_semantic_response(
+                    &decrypted,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    br#"{"error":"internal"}"#,
+                    &method,
+                    &path,
+                );
+            }
+        }
+    };
+
+    tracing::debug!(
+        device = %device_short,
+        method = %method,
+        path = %path,
+        sequence = decrypted.sequence,
+        status = semantic_status.as_u16(),
+        in_body = inner_body_len,
+        out_body = response_bytes.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "transport-v2 sync request"
+    );
+    encrypted_semantic_response(&decrypted, semantic_status, &response_bytes, &method, &path)
+}
+
+fn encrypted_semantic_response(
+    request: &secure::DecryptedRequest,
+    status: StatusCode,
+    body: &[u8],
+    method: &Method,
+    path: &str,
+) -> Response {
+    match secure::encrypt_response(
+        status.as_u16(),
+        body,
+        &request.key_material,
+        request.mode,
+        method.as_str(),
+        path,
+        &request.nonce_req,
+    ) {
+        Ok(encrypted) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+            encrypted,
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(reason = %error, "transport-v2 response encryption failed");
+            decrypt_failure_decoy()
+        }
+    }
+}
+
+fn decrypt_failure_decoy() -> Response {
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        vec![0u8; 256],
+    )
+        .into_response()
+}
+
 pub fn sync_router(state: SharedState) -> Router {
     // Why every per-method path also has a `.post(...)` dispatcher:
     //
@@ -222,6 +411,7 @@ pub fn sync_router(state: SharedState) -> Router {
     // register an explicit POST handler on each per-method path that reads
     // `X-Obsetync-Method` and delegates to the right semantic handler.
     let protected = Router::new()
+        .route("/api/v1/server-eph", post(get_server_eph))
         .route(
             "/api/v1/root/{vault_id}",
             get(get_root).put(put_root).post(root_dispatcher),
@@ -280,18 +470,30 @@ pub fn sync_router(state: SharedState) -> Router {
         // The notify WebSocket is a sibling of the sealed routes: it
         // self-authenticates with a single-use ticket (minted over the
         // sealed /api/v1/ws-ticket) because secure_envelope buffers whole
-        // responses and cannot wrap a stream. Frames carry no secrets.
+        // responses and cannot wrap a stream. Wire-v2 frames are separately
+        // sealed; root notifications carry hashes and presence carries paths.
         .route("/api/v1/ws", get(crate::ws::ws_route))
         .merge(protected)
         .with_state(state)
+}
+
+async fn get_server_eph(State(state): State<SharedState>) -> impl IntoResponse {
+    let (public, valid_until) = crate::eph_rotation::current_bundle(&state.eph);
+    axum::Json(serde_json::json!({
+        "Es_pub": public,
+        "rotation_timestamp": valid_until.saturating_sub(crate::eph_rotation::ROTATION_PERIOD_SECONDS),
+        "valid_until": valid_until,
+        "rotation_period_seconds": crate::eph_rotation::ROTATION_PERIOD_SECONDS,
+        "grace_seconds": crate::eph_rotation::GRACE_SECONDS,
+    }))
 }
 
 // --- Semantic-method dispatchers ---
 //
 // These handlers are registered for `POST /api/v1/<path>` and read the
 // semantic method from `X-Obsetync-Method` to delegate to the real handler.
-// They keep the plaintext-verb API (direct GET/PUT via curl still works),
-// while letting the plugin tunnel everything as wire-POST for iOS.
+// They let the authenticated middleware tunnel semantic verbs through the
+// wire-POST route selected before middleware dispatch on iOS.
 
 fn semantic_method(headers: &HeaderMap) -> Option<Method> {
     headers
@@ -576,17 +778,17 @@ async fn post_ws_ticket(
         }
     };
 
-    let outcome = crate::ws_ticket::mint(&state.layout, &device.0, client_eph_pub)
+    let mut outcome = crate::ws_ticket::mint(&state.layout, &device.0, client_eph_pub)
         .map_err(|e| ServerError::Internal(format!("ticket mint failed: {}", e)))?;
-    Ok((
-        StatusCode::OK,
-        serde_json::json!({
-            "ticket": outcome.ticket.ticket,
-            "expires_at": outcome.ticket.expires_at,
-            "server_eph_pub": outcome.server_eph_pub_b64,
-        })
-        .to_string(),
-    ))
+    let response = serde_json::json!({
+        "ticket": outcome.ticket.ticket,
+        "expires_at": outcome.ticket.expires_at,
+        "server_eph_pub": outcome.server_eph_pub_b64,
+    })
+    .to_string();
+    zeroize::Zeroize::zeroize(&mut outcome.ticket.c2s_key_hex);
+    zeroize::Zeroize::zeroize(&mut outcome.ticket.s2c_key_hex);
+    Ok((StatusCode::OK, response))
 }
 
 /// POST /api/v1/crdt/{vault_id} — body is the note path (UTF-8). Returns the
@@ -747,18 +949,38 @@ async fn put_root(
         .to_owned();
     let root_bytes = &body[64..];
 
-    let incoming_root = sync_core::chunk::RootNode::deserialize(root_bytes)
+    let mut incoming_root = sync_core::chunk::RootNode::deserialize(root_bytes)
         .map_err(|e| ServerError::BadRequest(format!("invalid root: {}", e)))?;
 
+    if incoming_root.vault_id != vault_id {
+        return Err(ServerError::BadRequest(
+            "root vault_id does not match request path".into(),
+        ));
+    }
+
+    // Root bytes and every referenced index/content object are untrusted
+    // until this walk succeeds. Besides blocking traversal-shaped paths, the
+    // count check prevents a false total_files field from weakening the
+    // blast-radius guard. The walk reads compact index nodes, not file data.
+    let entries = bridge::run_validate_root(state.layout.base.join("index"), incoming_root.clone())
+        .await
+        .map_err(|e| ServerError::BadRequest(format!("invalid root structure: {}", e)))?;
+    for entry in &entries {
+        let present = if sync_core::fastcdc_chunker::should_chunk(entry.size_bytes) {
+            blob_exists(&state.layout.content_manifest_path(&entry.hash))
+        } else {
+            blob_exists(&state.layout.content_blob_path(&entry.hash))
+        };
+        if !present {
+            return Err(ServerError::BadRequest(format!(
+                "root references missing content for {:?}",
+                entry.path
+            )));
+        }
+    }
+    drop(entries);
+
     let incoming_hash = incoming_root.hash();
-    let incoming_bytes = root_bytes.to_vec();
-
-    state
-        .vaults
-        .store_root(&vault_id, &incoming_hash, &incoming_bytes)?;
-
-    let idx_path = state.layout.index_path(&incoming_hash);
-    write_blob(&idx_path, &incoming_bytes)?;
 
     // Serialize the read-modify-write on `current` per vault. Without this,
     // two concurrent pushes both observe the same current, both pass the
@@ -771,10 +993,20 @@ async fn put_root(
     let _vault_guard = vault_lock.lock().await;
 
     let current_root_hash = state.vaults.get_current_root(&vault_id);
+    // History metadata is server-authored. It is not part of the semantic
+    // root hash, so trusting client values would let a replay rewrite the
+    // displayed author, timestamp, or parent of an existing state.
+    incoming_root.created_ms = unix_time_ms();
+    incoming_root.device_id = device.0.clone();
 
     match current_root_hash {
         None => {
             // First push — accept directly.
+            incoming_root.parent_hash = None;
+            let incoming_bytes = incoming_root.serialize();
+            state
+                .vaults
+                .store_root(&vault_id, &incoming_hash, &incoming_bytes)?;
             state.vaults.set_current_root(&vault_id, &incoming_hash)?;
             state.notify_root_changed(&vault_id, &hash_to_hex(&incoming_hash));
             tracing::info!(
@@ -795,6 +1027,8 @@ async fn put_root(
         Some(current_hash) => {
             let parent_hash = hex_to_hash(&parent_hex)
                 .map_err(|_| ServerError::BadRequest("invalid X-Parent-Root header".into()))?;
+            incoming_root.parent_hash = Some(parent_hash);
+            let incoming_bytes = incoming_root.serialize();
 
             if current_hash == parent_hash {
                 // Fast-forward — parent matches current. The parent claim is
@@ -817,6 +1051,9 @@ async fn put_root(
                 )
                 .await?;
 
+                state
+                    .vaults
+                    .store_root(&vault_id, &incoming_hash, &incoming_bytes)?;
                 state.vaults.set_current_root(&vault_id, &incoming_hash)?;
                 state.notify_root_changed(&vault_id, &hash_to_hex(&incoming_hash));
                 tracing::info!(
@@ -865,25 +1102,19 @@ async fn put_root(
                 // the merged blob where pullers fetch content by hash.
                 let index_base = state.layout.base.join("index");
                 let content_base = state.layout.base.join("content");
+                let incoming_for_merge = incoming_root;
                 let merge_result = bridge::run_merge(
                     index_base,
                     content_base,
                     base_root,
                     current_root,
-                    incoming_root,
+                    incoming_for_merge,
                 )
                 .await
                 .map_err(|e| ServerError::Internal(format!("merge failed: {}", e)))?;
 
                 let merged_hash = merge_result.new_root.hash();
                 let merged_bytes = merge_result.new_root.serialize();
-
-                // Store merged root.
-                state
-                    .vaults
-                    .store_root(&vault_id, &merged_hash, &merged_bytes)?;
-                let idx_path = state.layout.index_path(&merged_hash);
-                write_blob(&idx_path, &merged_bytes)?;
 
                 // A merge with a poisoned base (claimed parent newer than the
                 // pusher's real tree epoch) silently reverts every file the
@@ -900,6 +1131,16 @@ async fn put_root(
                     "merge",
                 )
                 .await?;
+
+                // Only accepted states enter history. Root nodes are kept in
+                // per-vault history, not the global byte-addressed index:
+                // their hash excludes history metadata by design.
+                state
+                    .vaults
+                    .store_root(&vault_id, &incoming_hash, &incoming_bytes)?;
+                state
+                    .vaults
+                    .store_root(&vault_id, &merged_hash, &merged_bytes)?;
 
                 // Update current.
                 state.vaults.set_current_root(&vault_id, &merged_hash)?;
@@ -943,6 +1184,13 @@ async fn put_root(
             }
         }
     }
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 // --- Diff ---
@@ -1065,6 +1313,8 @@ enum WireDelta {
         path: String,
         old_path: String,
         hash: String,
+        size: u64,
+        mtime_ms: u64,
     },
 }
 
@@ -1094,15 +1344,19 @@ impl From<&sync_core::diff::FileDelta> for WireDelta {
                 size: *size,
                 mtime_ms: *mtime_ms,
             },
-            F::Deleted { path } => WireDelta::Deleted { path: path.clone() },
+            F::Deleted { path, .. } => WireDelta::Deleted { path: path.clone() },
             F::Renamed {
                 path,
                 old_path,
                 hash,
+                size,
+                mtime_ms,
             } => WireDelta::Renamed {
                 path: path.clone(),
                 old_path: old_path.clone(),
                 hash: hash_to_hex(hash),
+                size: *size,
+                mtime_ms: *mtime_ms,
             },
         }
     }
@@ -1119,6 +1373,12 @@ async fn get_chunk(
     let path = state.layout.index_path(&hash);
     let data = read_blob(&path)
         .ok_or_else(|| ServerError::NotFound(format!("chunk {} not found", hash_hex)))?;
+    if hash_bytes(&data) != hash {
+        return Err(ServerError::Internal(format!(
+            "index chunk {} failed content-address validation",
+            hash_hex
+        )));
+    }
     Ok((StatusCode::OK, data))
 }
 
@@ -1157,7 +1417,7 @@ async fn post_chunks_check(
         .into_iter()
         .filter(|h| {
             hex_to_hash(h)
-                .map(|hash| !blob_exists(&state.layout.index_path(&hash)))
+                .map(|hash| !blob_matches_hash(&state.layout.index_path(&hash), &hash))
                 .unwrap_or(false)
         })
         .collect();
@@ -1175,6 +1435,12 @@ async fn get_content(
     let path = state.layout.content_blob_path(&hash);
     let data = read_blob(&path)
         .ok_or_else(|| ServerError::NotFound(format!("content {} not found", hash_hex)))?;
+    if hash_bytes(&data) != hash {
+        return Err(ServerError::Internal(format!(
+            "content {} failed content-address validation",
+            hash_hex
+        )));
+    }
     Ok((StatusCode::OK, data))
 }
 
@@ -1209,7 +1475,7 @@ async fn post_content_check(
         .into_iter()
         .filter(|h| {
             hex_to_hash(h)
-                .map(|hash| !blob_exists(&state.layout.content_blob_path(&hash)))
+                .map(|hash| !blob_matches_hash(&state.layout.content_blob_path(&hash), &hash))
                 .unwrap_or(false)
         })
         .collect();
@@ -1217,6 +1483,104 @@ async fn post_content_check(
 }
 
 // --- Content Manifests ---
+
+const MAX_CONTENT_CHUNK_BYTES: u32 = 4 * 1024 * 1024;
+const MAX_MANIFEST_CHUNKS: usize = 1_000_000;
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct WireContentManifest {
+    file_hash: String,
+    total_size: u64,
+    chunks: Vec<WireContentChunkRef>,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct WireContentChunkRef {
+    hash: String,
+    offset: u64,
+    size: u32,
+}
+
+/// Validate the manifest itself without reading chunk contents. This cheap
+/// pass is used by GET/check so malformed JSON or a missing referenced object
+/// becomes repairable without re-hashing every large file on every sync.
+fn validate_content_manifest_structure(
+    expected_file_hash: &FileHash,
+    manifest: &WireContentManifest,
+) -> Result<Vec<FileHash>, String> {
+    let declared_hash =
+        hex_to_hash(&manifest.file_hash).map_err(|_| "invalid manifest file_hash".to_string())?;
+    if &declared_hash != expected_file_hash {
+        return Err("manifest file_hash does not match request path".into());
+    }
+    if manifest.chunks.len() > MAX_MANIFEST_CHUNKS {
+        return Err("manifest has too many chunks".into());
+    }
+    if manifest.total_size > 0 && manifest.chunks.is_empty() {
+        return Err("non-empty manifest has no chunks".into());
+    }
+
+    let mut expected_offset = 0u64;
+    let mut chunk_hashes = Vec::with_capacity(manifest.chunks.len());
+    for (index, chunk) in manifest.chunks.iter().enumerate() {
+        if chunk.offset != expected_offset
+            || chunk.size == 0
+            || chunk.size > MAX_CONTENT_CHUNK_BYTES
+        {
+            return Err(format!("invalid manifest chunk layout at index {index}"));
+        }
+        expected_offset = expected_offset
+            .checked_add(u64::from(chunk.size))
+            .ok_or_else(|| "manifest size overflow".to_string())?;
+        if expected_offset > manifest.total_size {
+            return Err("manifest chunks exceed total_size".into());
+        }
+        chunk_hashes.push(
+            hex_to_hash(&chunk.hash).map_err(|_| format!("invalid chunk hash at index {index}"))?,
+        );
+    }
+    if expected_offset != manifest.total_size {
+        return Err("manifest chunks do not cover total_size".into());
+    }
+    if manifest.total_size == 0 && *expected_file_hash != hash_bytes(&[]) {
+        return Err("empty manifest does not match file_hash".into());
+    }
+    Ok(chunk_hashes)
+}
+
+/// Validate both manifest structure and the content it names. Chunk PUTs
+/// already verify their individual addresses; rechecking here also detects
+/// disk corruption and proves the ordered concatenation hashes to the
+/// manifest/file-tree hash without ever holding the whole file in memory.
+fn validate_content_manifest(
+    layout: &StorageLayout,
+    expected_file_hash: &FileHash,
+    manifest: &WireContentManifest,
+) -> Result<(), ServerError> {
+    let chunk_hashes = validate_content_manifest_structure(expected_file_hash, manifest)
+        .map_err(ServerError::BadRequest)?;
+    let mut full_hasher = blake3::Hasher::new();
+    for (index, (chunk, chunk_hash)) in manifest.chunks.iter().zip(chunk_hashes.iter()).enumerate()
+    {
+        let bytes = read_blob(&layout.content_chunk_path(chunk_hash)).ok_or_else(|| {
+            ServerError::BadRequest(format!("manifest chunk {} is missing", index))
+        })?;
+        if bytes.len() != chunk.size as usize || hash_bytes(&bytes) != *chunk_hash {
+            return Err(ServerError::BadRequest(format!(
+                "manifest chunk {} failed size/hash validation",
+                index
+            )));
+        }
+        full_hasher.update(&bytes);
+    }
+
+    if full_hasher.finalize().as_bytes() != expected_file_hash {
+        return Err(ServerError::BadRequest(
+            "manifest chunks do not hash to file_hash".into(),
+        ));
+    }
+    Ok(())
+}
 
 async fn get_manifest(
     State(state): State<SharedState>,
@@ -1227,6 +1591,19 @@ async fn get_manifest(
     let path = state.layout.content_manifest_path(&hash);
     let data = read_blob(&path)
         .ok_or_else(|| ServerError::NotFound(format!("manifest {} not found", hash_hex)))?;
+    let manifest: WireContentManifest = serde_json::from_slice(&data)
+        .map_err(|e| ServerError::Internal(format!("corrupt manifest {}: {}", hash_hex, e)))?;
+    let chunk_hashes = validate_content_manifest_structure(&hash, &manifest)
+        .map_err(|e| ServerError::Internal(format!("corrupt manifest {}: {}", hash_hex, e)))?;
+    if chunk_hashes
+        .iter()
+        .any(|chunk| !blob_exists(&state.layout.content_chunk_path(chunk)))
+    {
+        return Err(ServerError::Internal(format!(
+            "manifest {} references a missing chunk",
+            hash_hex,
+        )));
+    }
     Ok((
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -1241,13 +1618,16 @@ async fn put_manifest(
 ) -> Result<impl IntoResponse, ServerError> {
     let hash =
         hex_to_hash(&hash_hex).map_err(|_| ServerError::BadRequest("invalid hash".into()))?;
-    // Validate it's valid JSON (stored as-is; hashes are hex strings from the plugin).
-    let _: serde_json::Value = serde_json::from_slice(&body)?;
+    let manifest: WireContentManifest = serde_json::from_slice(&body)?;
+    validate_content_manifest(&state.layout, &hash, &manifest)?;
+    // Store a canonical representation only after all referenced bytes and
+    // the full-file content address have been verified.
+    let encoded = serde_json::to_vec(&manifest)?;
     let path = state.layout.content_manifest_path(&hash);
-    write_blob(&path, &body)?;
+    write_blob(&path, &encoded)?;
     tracing::debug!(
         hash = %&hash_hex[..hash_hex.len().min(16)],
-        bytes = body.len(),
+        bytes = encoded.len(),
         "put_manifest: large-file manifest stored"
     );
     Ok(StatusCode::NO_CONTENT)
@@ -1264,6 +1644,12 @@ async fn get_content_chunk(
     let path = state.layout.content_chunk_path(&hash);
     let data = read_blob(&path)
         .ok_or_else(|| ServerError::NotFound(format!("content chunk {} not found", hash_hex)))?;
+    if hash_bytes(&data) != hash {
+        return Err(ServerError::Internal(format!(
+            "content chunk {} failed content-address validation",
+            hash_hex
+        )));
+    }
     Ok((StatusCode::OK, data))
 }
 
@@ -1298,11 +1684,25 @@ async fn post_manifests_check(
         .into_iter()
         .filter(|h| {
             hex_to_hash(h)
-                .map(|hash| !blob_exists(&state.layout.content_manifest_path(&hash)))
+                .map(|hash| !stored_manifest_is_usable(&state.layout, &hash))
                 .unwrap_or(false)
         })
         .collect();
     Ok(axum::Json(serde_json::json!({ "needed": needed })))
+}
+
+fn stored_manifest_is_usable(layout: &StorageLayout, file_hash: &FileHash) -> bool {
+    let Some(data) = read_blob(&layout.content_manifest_path(file_hash)) else {
+        return false;
+    };
+    let Ok(manifest) = serde_json::from_slice::<WireContentManifest>(&data) else {
+        return false;
+    };
+    validate_content_manifest_structure(file_hash, &manifest).is_ok_and(|chunk_hashes| {
+        chunk_hashes
+            .iter()
+            .all(|chunk| blob_exists(&layout.content_chunk_path(chunk)))
+    })
 }
 
 async fn post_content_chunks_check(
@@ -1315,7 +1715,7 @@ async fn post_content_chunks_check(
         .into_iter()
         .filter(|h| {
             hex_to_hash(h)
-                .map(|hash| !blob_exists(&state.layout.content_chunk_path(&hash)))
+                .map(|hash| !blob_matches_hash(&state.layout.content_chunk_path(&hash), &hash))
                 .unwrap_or(false)
         })
         .collect();
@@ -1335,11 +1735,15 @@ mod integration_tests {
     use crate::box_key;
     use crate::config::ServerConfig;
     use crate::devices;
-    use crate::secure::{encrypt_request_for_tests, RESPONSE_HEADER_LEN, TAG_LEN, WIRE_VERSION};
+    use crate::secure::{
+        decrypt_response_for_tests, encrypt_request_for_tests, DecryptedRequest,
+        RESPONSE_HEADER_LEN, TAG_LEN, WIRE_VERSION,
+    };
     use crate::state::AppState;
     use crate::storage::StorageLayout;
     use axum::http::Request as HttpRequest;
     use http_body_util::BodyExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use sync_core::hash::{hash_bytes, hash_to_hex};
     use tempfile::TempDir;
@@ -1354,6 +1758,7 @@ mod integration_tests {
         server_pub: PublicKey,
         client_priv: StaticSecret,
         bearer: String,
+        sequence: AtomicU64,
     }
 
     fn setup() -> Env {
@@ -1383,24 +1788,44 @@ mod integration_tests {
             server_pub,
             client_priv,
             bearer,
+            sequence: AtomicU64::new(1),
         }
     }
 
-    async fn send(
+    fn seal(
         env: &Env,
         semantic_method: &str,
         path: &str,
         inner_body: &[u8],
-    ) -> (StatusCode, Vec<u8>) {
-        let wire_body = encrypt_request_for_tests(
-            &env.client_priv,
-            &env.server_pub,
-            &env.bearer,
-            semantic_method,
-            path,
-            inner_body,
-        );
+    ) -> (Vec<u8>, DecryptedRequest) {
+        let wire_body = {
+            let eph = env.state.eph.read().unwrap();
+            encrypt_request_for_tests(
+                &env.client_priv,
+                &env.server_pub,
+                Some(&PublicKey::from(eph.current.public)),
+                &env.bearer,
+                env.sequence.fetch_add(1, Ordering::Relaxed),
+                semantic_method,
+                path,
+                inner_body,
+            )
+        };
+        let server_private = StaticSecret::from(env.state.server_priv_bytes);
+        let opened = {
+            let eph = env.state.eph.read().unwrap();
+            secure::decrypt_request(&wire_body, &server_private, &eph, semantic_method, path)
+                .unwrap()
+        };
+        (wire_body, opened)
+    }
 
+    async fn dispatch_wire(
+        env: &Env,
+        semantic_method: &str,
+        path: &str,
+        wire_body: Vec<u8>,
+    ) -> (StatusCode, Vec<u8>) {
         let req = HttpRequest::builder()
             .method("POST")
             .uri(path)
@@ -1422,10 +1847,19 @@ mod integration_tests {
         (status, body)
     }
 
-    /// Regression guard for the 204-strip bug. put_chunk used to return 204
-    /// No Content → hyper dropped the AEAD envelope → client's
-    /// decryptResponse saw 0 bytes and threw. Middleware now promotes 204→200
-    /// before encryption so the envelope reaches the wire.
+    async fn send(
+        env: &Env,
+        semantic_method: &str,
+        path: &str,
+        inner_body: &[u8],
+    ) -> (StatusCode, Vec<u8>) {
+        let (wire_body, _) = seal(env, semantic_method, path, inner_body);
+        dispatch_wire(env, semantic_method, path, wire_body).await
+    }
+
+    /// Regression guard for the 204-strip bug. The semantic 204 now lives
+    /// inside ciphertext while the actual wire response is HTTP 200, so hyper
+    /// cannot discard the encrypted envelope as a no-content response.
     #[tokio::test]
     async fn put_chunk_response_carries_aead_envelope() {
         let env = setup();
@@ -1470,6 +1904,76 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn content_chunk_above_axum_default_body_limit_is_accepted() {
+        let env = setup();
+        // FastCDC permits chunks up to 4 MiB. Axum's Bytes extractor defaults
+        // to 2 MiB, so the decrypted inner request must explicitly inherit the
+        // transport's larger bounded limit.
+        let payload = vec![0x5a; 3 * 1024 * 1024];
+        let hash = hash_bytes(&payload);
+        let path = format!("/api/v1/content/chunk/{}", hash_to_hex(&hash));
+        let (wire_body, opened_request) = seal(&env, "PUT", &path, &payload);
+
+        let (wire_status, wire_response) = dispatch_wire(&env, "PUT", &path, wire_body).await;
+        let (semantic_status, _) = decrypt_response_for_tests(
+            &wire_response,
+            &opened_request.key_material,
+            opened_request.mode,
+            "PUT",
+            &path,
+            &opened_request.nonce_req,
+        );
+
+        assert_eq!(wire_status, StatusCode::OK);
+        assert_eq!(semantic_status, StatusCode::NO_CONTENT.as_u16());
+        assert!(env.state.layout.content_chunk_path(&hash).exists());
+    }
+
+    #[tokio::test]
+    async fn accepted_root_uses_server_history_metadata_not_global_index_cas() {
+        let env = setup();
+        let vault = "root-metadata";
+        let submitted = sync_core::chunk::RootNode {
+            vault_id: vault.into(),
+            created_ms: 1,
+            version: 1,
+            children: vec![],
+            total_files: 0,
+            parent_hash: Some(hash_bytes(b"forged-parent")),
+            device_id: "forged-device".into(),
+        };
+        let root_hash = submitted.hash();
+        let mut payload = "0".repeat(64).into_bytes();
+        payload.extend_from_slice(&submitted.serialize());
+        let path = format!("/api/v1/root/{vault}");
+        let (wire_body, opened_request) = seal(&env, "PUT", &path, &payload);
+
+        let (wire_status, wire_response) = dispatch_wire(&env, "PUT", &path, wire_body).await;
+        let (semantic_status, _) = decrypt_response_for_tests(
+            &wire_response,
+            &opened_request.key_material,
+            opened_request.mode,
+            "PUT",
+            &path,
+            &opened_request.nonce_req,
+        );
+        assert_eq!(wire_status, StatusCode::OK);
+        assert_eq!(semantic_status, StatusCode::OK.as_u16());
+
+        let stored = sync_core::chunk::RootNode::deserialize(
+            &env.state.vaults.get_root(vault, &root_hash).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored.device_id, "c0ffeec0ffeec0ffeec0ffeec0ffeedeadbeef");
+        assert!(stored.created_ms > 1);
+        assert_eq!(stored.parent_hash, None);
+        assert!(
+            !env.state.layout.index_path(&root_hash).exists(),
+            "semantic root bytes must not pollute the global byte-addressed index",
+        );
+    }
+
+    #[tokio::test]
     async fn wire_post_dispatches_to_semantic_get() {
         let env = setup();
 
@@ -1489,6 +1993,96 @@ mod integration_tests {
         assert!(body.len() >= RESPONSE_HEADER_LEN + TAG_LEN);
     }
 
+    #[tokio::test]
+    async fn manifest_is_accepted_only_after_full_content_validation() {
+        let env = setup();
+        let first = b"verified ".to_vec();
+        let second = b"chunks".to_vec();
+        let all = [first.as_slice(), second.as_slice()].concat();
+        let first_hash = hash_bytes(&first);
+        let second_hash = hash_bytes(&second);
+        let file_hash = hash_bytes(&all);
+
+        for (hash, bytes) in [(first_hash, first), (second_hash, second)] {
+            let path = format!("/api/v1/content/chunk/{}", hash_to_hex(&hash));
+            let (status, _) = send(&env, "PUT", &path, &bytes).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "file_hash": hash_to_hex(&file_hash),
+            "total_size": all.len(),
+            "chunks": [
+                { "hash": hash_to_hex(&first_hash), "offset": 0, "size": 9 },
+                { "hash": hash_to_hex(&second_hash), "offset": 9, "size": 6 }
+            ]
+        }))
+        .unwrap();
+        let path = format!("/api/v1/content/manifest/{}", hash_to_hex(&file_hash));
+        let (status, _) = send(&env, "PUT", &path, &body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(env.state.layout.content_manifest_path(&file_hash).exists());
+    }
+
+    #[tokio::test]
+    async fn manifest_with_a_hole_is_rejected() {
+        let env = setup();
+        let bytes = b"chunk".to_vec();
+        let chunk_hash = hash_bytes(&bytes);
+        let file_hash = hash_bytes(&bytes);
+        let chunk_path = format!("/api/v1/content/chunk/{}", hash_to_hex(&chunk_hash));
+        assert_eq!(
+            send(&env, "PUT", &chunk_path, &bytes).await.0,
+            StatusCode::OK
+        );
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "file_hash": hash_to_hex(&file_hash),
+            "total_size": bytes.len() + 1,
+            "chunks": [{
+                "hash": hash_to_hex(&chunk_hash),
+                "offset": 1,
+                "size": bytes.len()
+            }]
+        }))
+        .unwrap();
+        let path = format!("/api/v1/content/manifest/{}", hash_to_hex(&file_hash));
+        let (status, _) = send(&env, "PUT", &path, &body).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "semantic errors stay inside the envelope"
+        );
+        assert!(!env.state.layout.content_manifest_path(&file_hash).exists());
+    }
+
+    #[tokio::test]
+    async fn manifest_check_requests_reupload_for_corrupt_json() {
+        let env = setup();
+        let file_hash = hash_bytes(b"large file identity");
+        let manifest_path = env.state.layout.content_manifest_path(&file_hash);
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(&manifest_path, b"{not-json").unwrap();
+
+        let path = "/api/v1/content/manifests/check";
+        let request_body = serde_json::to_vec(&vec![hash_to_hex(&file_hash)]).unwrap();
+        let (wire_body, opened_request) = seal(&env, "POST", path, &request_body);
+        let (wire_status, wire_response) = dispatch_wire(&env, "POST", path, wire_body).await;
+        let (semantic_status, body) = decrypt_response_for_tests(
+            &wire_response,
+            &opened_request.key_material,
+            opened_request.mode,
+            "POST",
+            path,
+            &opened_request.nonce_req,
+        );
+
+        assert_eq!(wire_status, StatusCode::OK);
+        assert_eq!(semantic_status, StatusCode::OK.as_u16());
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response["needed"][0], hash_to_hex(&file_hash));
+    }
+
     /// An envelope encrypted against the wrong server pubkey must 401 (AEAD
     /// decrypt failure), not panic and not leak routing info.
     #[tokio::test]
@@ -1503,7 +2097,11 @@ mod integration_tests {
         let wire_body = encrypt_request_for_tests(
             &env.client_priv,
             &other_pub,
+            Some(&PublicKey::from(
+                env.state.eph.read().unwrap().current.public,
+            )),
             &env.bearer,
+            env.sequence.fetch_add(1, Ordering::Relaxed),
             "PUT",
             "/api/v1/chunk/aa",
             b"hi",
@@ -1517,11 +2115,86 @@ mod integration_tests {
 
         let router = sync_router(env.state.clone());
         let resp = router.oneshot(req).await.unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::UNAUTHORIZED,
-            "envelope encrypted against wrong server key must 401"
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.len(), 256);
+        assert!(body.iter().all(|byte| *byte == 0));
+    }
+
+    #[tokio::test]
+    async fn exact_same_endpoint_replay_is_rejected_inside_the_envelope() {
+        let env = setup();
+        let path = "/api/v1/root/replay-vault";
+        let (wire_body, opened_request) = seal(&env, "GET", path, &[]);
+
+        let (first_wire_status, first_wire_body) =
+            dispatch_wire(&env, "GET", path, wire_body.clone()).await;
+        let (first_status, _) = decrypt_response_for_tests(
+            &first_wire_body,
+            &opened_request.key_material,
+            opened_request.mode,
+            "GET",
+            path,
+            &opened_request.nonce_req,
         );
+        assert_eq!(first_wire_status, StatusCode::OK);
+        assert_eq!(first_status, StatusCode::NOT_FOUND.as_u16());
+
+        let (replay_wire_status, replay_wire_body) =
+            dispatch_wire(&env, "GET", path, wire_body).await;
+        let (replay_status, replay_body) = decrypt_response_for_tests(
+            &replay_wire_body,
+            &opened_request.key_material,
+            opened_request.mode,
+            "GET",
+            path,
+            &opened_request.nonce_req,
+        );
+        assert_eq!(replay_wire_status, StatusCode::OK);
+        assert_eq!(replay_status, StatusCode::UNAUTHORIZED.as_u16());
+        let replay_json: serde_json::Value = serde_json::from_slice(&replay_body).unwrap();
+        assert_eq!(replay_json["error"], "replay");
+        assert_eq!(replay_json["last_seen_seq"], 4096);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_is_credential_free_and_bypasses_replay_state() {
+        let env = setup();
+        let path = secure::BOOTSTRAP_PATH;
+        let wire_body = encrypt_request_for_tests(
+            &env.client_priv,
+            &env.server_pub,
+            None,
+            &env.bearer,
+            999,
+            "POST",
+            path,
+            b"",
+        );
+        let server_private = StaticSecret::from(env.state.server_priv_bytes);
+        let opened_request = {
+            let eph = env.state.eph.read().unwrap();
+            secure::decrypt_request(&wire_body, &server_private, &eph, "POST", path).unwrap()
+        };
+        assert!(opened_request.bearer_token.is_empty());
+        assert_eq!(opened_request.sequence, 0);
+
+        let (wire_status, wire_response) = dispatch_wire(&env, "POST", path, wire_body).await;
+        let (semantic_status, body) = decrypt_response_for_tests(
+            &wire_response,
+            &opened_request.key_material,
+            opened_request.mode,
+            "POST",
+            path,
+            &opened_request.nonce_req,
+        );
+        assert_eq!(wire_status, StatusCode::OK);
+        assert_eq!(semantic_status, StatusCode::OK.as_u16());
+        let bundle: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(bundle["Es_pub"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+        assert!(bundle["valid_until"].as_u64().is_some());
     }
 
     /// /health stays plaintext — must survive without the envelope machinery.

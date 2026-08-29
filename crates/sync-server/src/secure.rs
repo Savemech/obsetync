@@ -2,24 +2,24 @@
 //!
 //! Full wire-format + threat model: `../../../docs/transport.md`.
 //!
-//! Replaces the old self-signed CA + mTLS stack. iOS `requestUrl` can reach
-//! the server over plain HTTP; the payload is encrypted end-to-end using the
-//! server's long-term X25519 keypair (see [`crate::box_key`]) and a fresh
-//! client-ephemeral X25519 keypair for every request.
+//! iOS `requestUrl` reaches the server over plain HTTP; the payload is
+//! encrypted end-to-end using the pinned long-term server key, a rotating
+//! memory-only server key, and a client-ephemeral key.
 //!
 //! ## Wire format
 //!
 //! Request body (client → server):
 //! ```text
-//! [ 1B version = 0x01 ]
+//! [ 1B version = 0x02 ]
 //! [ 12B AEAD nonce   ]
 //! [ 32B client ephemeral X25519 pubkey ]
+//! [ 8B rotating-server-key fingerprint ]
 //! [ AES-256-GCM ciphertext || 16B tag ]
 //! ```
 //!
 //! Response body (server → client):
 //! ```text
-//! [ 1B version = 0x01 ]
+//! [ 1B version = 0x02 ]
 //! [ 12B AEAD nonce   ]
 //! [ AES-256-GCM ciphertext || 16B tag ]
 //! ```
@@ -27,15 +27,15 @@
 //! ## Key schedule
 //!
 //! ```text
-//! shared          = X25519(our_priv, their_pub)
-//! request_key     = HKDF-SHA256(salt = req_nonce,  ikm = shared, info = "obsetync/v1/c2s")
-//! response_key    = HKDF-SHA256(salt = resp_nonce, ikm = shared, info = "obsetync/v1/s2c")
+//! ikm             = X25519(S_priv, Ec_pub) || X25519(Es_priv, Ec_pub)
+//! request_key     = HKDF-SHA256(salt = req_nonce,  ikm, info = "obsetync/v2/c2s")
+//! response_key    = HKDF-SHA256(salt = resp_nonce, ikm, info = "obsetync/v2/s2c")
 //! ```
 //!
 //! ## AAD
 //!
-//! Request:  `"obsetync/v1 <METHOD> <PATH>"`.
-//! Response: `"obsetync/v1 <METHOD> <PATH>" || nonce_req` — the response AAD
+//! Request:  `"obsetync/v2 <METHOD> <PATH>"`.
+//! Response: `"obsetync/v2 <METHOD> <PATH>" || nonce_req` — the response AAD
 //! additionally binds the 12-byte nonce of the request it answers, so an
 //! in-session MITM can't substitute the response of one request for another
 //! that shares the same method + path (e.g. replaying a stale `GET /root`
@@ -52,21 +52,30 @@ use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-pub const WIRE_VERSION: u8 = 0x01;
+use crate::eph_rotation::{EphState, BOOTSTRAP_FINGERPRINT, FINGERPRINT_LEN};
+
+pub const WIRE_VERSION: u8 = 0x02;
 pub const NONCE_LEN: usize = 12; // AES-GCM-96
 pub const PUBKEY_LEN: usize = 32;
 pub const KEY_LEN: usize = 32;
 pub const TAG_LEN: usize = 16;
 pub const BEARER_LEN: usize = 64; // 32 random bytes, hex-encoded ASCII
 
-pub const REQUEST_HEADER_LEN: usize = 1 + NONCE_LEN + PUBKEY_LEN; // 45
+pub const REQUEST_HEADER_LEN: usize = 1 + NONCE_LEN + PUBKEY_LEN + FINGERPRINT_LEN; // 53
 pub const RESPONSE_HEADER_LEN: usize = 1 + NONCE_LEN; // 13
-pub const MIN_REQUEST_LEN: usize = REQUEST_HEADER_LEN + BEARER_LEN + TAG_LEN;
+pub const SEQUENCE_LEN: usize = 8;
+/// Bootstrap carries an empty plaintext; authenticated requests add the
+/// bearer + sequence prefix after decryption.
+pub const MIN_REQUEST_LEN: usize = REQUEST_HEADER_LEN + TAG_LEN;
 
-const INFO_C2S: &[u8] = b"obsetync/v1/c2s";
-const INFO_S2C: &[u8] = b"obsetync/v1/s2c";
-const AAD_PREFIX: &[u8] = b"obsetync/v1";
+const INFO_C2S: &[u8] = b"obsetync/v2/c2s";
+const INFO_S2C: &[u8] = b"obsetync/v2/s2c";
+const INFO_C2S_BOOT: &[u8] = b"obsetync/v2/c2s-boot";
+const INFO_S2C_BOOT: &[u8] = b"obsetync/v2/s2c-boot";
+const AAD_PREFIX: &[u8] = b"obsetync/v2";
+pub const BOOTSTRAP_PATH: &str = "/api/v1/server-eph";
 
 #[derive(Debug, thiserror::Error)]
 pub enum SecureError {
@@ -84,6 +93,24 @@ pub enum SecureError {
     MissingBearer,
     #[error("bearer token in plaintext is not valid UTF-8")]
     BadBearer,
+    #[error("bearer token is not 64 hexadecimal ASCII characters")]
+    BadBearerFormat,
+    #[error("plaintext too short to contain sequence number")]
+    MissingSequence,
+    #[error("server ephemeral fingerprint is unknown")]
+    UnknownFingerprint,
+    #[error("X25519 peer key produced a non-contributory shared secret")]
+    NonContributoryKey,
+    #[error("bootstrap fingerprint is not valid for this endpoint")]
+    InvalidBootstrapPath,
+    #[error("bootstrap request plaintext must be empty")]
+    InvalidBootstrapBody,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportMode {
+    Default,
+    Bootstrap,
 }
 
 /// A request the server has decrypted successfully. The caller validates
@@ -92,11 +119,22 @@ pub enum SecureError {
 /// reuses the same ECDH result — no second key exchange needed.
 pub struct DecryptedRequest {
     pub bearer_token: String,
+    pub sequence: u64,
     pub inner_body: Vec<u8>,
-    pub shared_secret: [u8; KEY_LEN],
+    /// Double-DH IKM is 64 bytes; bootstrap IKM is 32 bytes.
+    pub key_material: Zeroizing<Vec<u8>>,
+    pub mode: TransportMode,
     /// Nonce of the request envelope — [`encrypt_response`] folds it into the
     /// response AAD so the answer is bound to exactly this request.
     pub nonce_req: [u8; NONCE_LEN],
+}
+
+impl Drop for DecryptedRequest {
+    fn drop(&mut self) {
+        self.bearer_token.zeroize();
+        self.inner_body.zeroize();
+        self.key_material.zeroize();
+    }
 }
 
 fn build_aad(method: &str, path: &str) -> Vec<u8> {
@@ -135,6 +173,7 @@ fn hkdf_key(shared: &[u8], nonce: &[u8], info: &[u8]) -> [u8; KEY_LEN] {
 pub fn decrypt_request(
     body: &[u8],
     our_priv: &StaticSecret,
+    eph_state: &EphState,
     method: &str,
     path: &str,
 ) -> Result<DecryptedRequest, SecureError> {
@@ -146,39 +185,106 @@ pub fn decrypt_request(
     }
 
     let nonce_bytes: [u8; NONCE_LEN] = body[1..1 + NONCE_LEN].try_into().unwrap();
-    let pubkey_bytes: [u8; PUBKEY_LEN] = body[1 + NONCE_LEN..REQUEST_HEADER_LEN]
+    let pubkey_end = 1 + NONCE_LEN + PUBKEY_LEN;
+    let pubkey_bytes: [u8; PUBKEY_LEN] = body[1 + NONCE_LEN..pubkey_end]
         .try_into()
         .map_err(|_| SecureError::BadPubkey)?;
+    let request_fingerprint: [u8; FINGERPRINT_LEN] = body[pubkey_end..REQUEST_HEADER_LEN]
+        .try_into()
+        .expect("fixed fingerprint slice");
     let ct = &body[REQUEST_HEADER_LEN..];
 
     let their_pub = PublicKey::from(pubkey_bytes);
-    let shared = our_priv.diffie_hellman(&their_pub);
-    let shared_bytes: [u8; KEY_LEN] = *shared.as_bytes();
+    let static_shared = our_priv.diffie_hellman(&their_pub);
+    if !static_shared.was_contributory() {
+        return Err(SecureError::NonContributoryKey);
+    }
+    let (mode, key_material, request_info) = if request_fingerprint == BOOTSTRAP_FINGERPRINT {
+        if path != BOOTSTRAP_PATH {
+            return Err(SecureError::InvalidBootstrapPath);
+        }
+        (
+            TransportMode::Bootstrap,
+            Zeroizing::new(static_shared.as_bytes().to_vec()),
+            INFO_C2S_BOOT,
+        )
+    } else {
+        let slot = if request_fingerprint == eph_state.current.fingerprint {
+            &eph_state.current
+        } else if let Some(previous) = eph_state
+            .previous
+            .as_ref()
+            .filter(|slot| request_fingerprint == slot.fingerprint)
+        {
+            previous
+        } else {
+            return Err(SecureError::UnknownFingerprint);
+        };
+        let eph_private = StaticSecret::from(slot.private);
+        let ephemeral_shared = eph_private.diffie_hellman(&their_pub);
+        if !ephemeral_shared.was_contributory() {
+            return Err(SecureError::NonContributoryKey);
+        }
+        let mut ikm = Vec::with_capacity(KEY_LEN * 2);
+        ikm.extend_from_slice(static_shared.as_bytes());
+        ikm.extend_from_slice(ephemeral_shared.as_bytes());
+        (TransportMode::Default, Zeroizing::new(ikm), INFO_C2S)
+    };
 
-    let key_bytes = hkdf_key(&shared_bytes, &nonce_bytes, INFO_C2S);
+    let mut key_bytes = hkdf_key(&key_material, &nonce_bytes, request_info);
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
+    key_bytes.zeroize();
     let aad = build_aad(method, path);
 
-    let plaintext = cipher
-        .decrypt(
-            Nonce::from_slice(&nonce_bytes),
-            Payload { msg: ct, aad: &aad },
-        )
-        .map_err(|_| SecureError::AeadOpen)?;
+    let plaintext = Zeroizing::new(
+        cipher
+            .decrypt(
+                Nonce::from_slice(&nonce_bytes),
+                Payload { msg: ct, aad: &aad },
+            )
+            .map_err(|_| SecureError::AeadOpen)?,
+    );
 
-    if plaintext.len() < BEARER_LEN {
-        return Err(SecureError::MissingBearer);
-    }
-    let bearer_bytes = &plaintext[..BEARER_LEN];
-    let bearer_token = std::str::from_utf8(bearer_bytes)
-        .map_err(|_| SecureError::BadBearer)?
-        .to_owned();
-    let inner_body = plaintext[BEARER_LEN..].to_vec();
+    let (bearer_token, sequence, inner_body) = match mode {
+        TransportMode::Bootstrap => {
+            if !plaintext.is_empty() {
+                return Err(SecureError::InvalidBootstrapBody);
+            }
+            (String::new(), 0, Vec::new())
+        }
+        TransportMode::Default => {
+            if plaintext.len() < BEARER_LEN {
+                return Err(SecureError::MissingBearer);
+            }
+            if plaintext.len() < BEARER_LEN + SEQUENCE_LEN {
+                return Err(SecureError::MissingSequence);
+            }
+            let bearer_bytes = &plaintext[..BEARER_LEN];
+            if !bearer_bytes.iter().all(u8::is_ascii_hexdigit) {
+                return Err(SecureError::BadBearerFormat);
+            }
+            let bearer_token = std::str::from_utf8(bearer_bytes)
+                .map_err(|_| SecureError::BadBearer)?
+                .to_owned();
+            let sequence = u64::from_be_bytes(
+                plaintext[BEARER_LEN..BEARER_LEN + SEQUENCE_LEN]
+                    .try_into()
+                    .expect("fixed sequence slice"),
+            );
+            (
+                bearer_token,
+                sequence,
+                plaintext[BEARER_LEN + SEQUENCE_LEN..].to_vec(),
+            )
+        }
+    };
 
     Ok(DecryptedRequest {
         bearer_token,
+        sequence,
         inner_body,
-        shared_secret: shared_bytes,
+        key_material,
+        mode,
         nonce_req: nonce_bytes,
     })
 }
@@ -188,8 +294,10 @@ pub fn decrypt_request(
 /// tricked into accepting a response minted for a different endpoint — or for
 /// a different request to the same endpoint within the session.
 pub fn encrypt_response(
+    status: u16,
     body: &[u8],
-    shared_secret: &[u8; KEY_LEN],
+    key_material: &[u8],
+    mode: TransportMode,
     method: &str,
     path: &str,
     nonce_req: &[u8; NONCE_LEN],
@@ -205,19 +313,27 @@ pub fn encrypt_response(
         .try_fill_bytes(&mut nonce_bytes)
         .map_err(|e| SecureError::AeadSeal(format!("OS RNG: {}", e)))?;
 
-    let key_bytes = hkdf_key(shared_secret, &nonce_bytes, INFO_S2C);
+    let response_info = match mode {
+        TransportMode::Default => INFO_S2C,
+        TransportMode::Bootstrap => INFO_S2C_BOOT,
+    };
+    let mut key_bytes = hkdf_key(key_material, &nonce_bytes, response_info);
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
+    key_bytes.zeroize();
     let aad = build_response_aad(method, path, nonce_req);
 
-    let ct = cipher
-        .encrypt(
-            Nonce::from_slice(&nonce_bytes),
-            Payload {
-                msg: body,
-                aad: &aad,
-            },
-        )
-        .map_err(|e| SecureError::AeadSeal(e.to_string()))?;
+    let mut plaintext = Vec::with_capacity(2 + body.len());
+    plaintext.extend_from_slice(&status.to_be_bytes());
+    plaintext.extend_from_slice(body);
+    let encrypted = cipher.encrypt(
+        Nonce::from_slice(&nonce_bytes),
+        Payload {
+            msg: &plaintext,
+            aad: &aad,
+        },
+    );
+    plaintext.zeroize();
+    let ct = encrypted.map_err(|e| SecureError::AeadSeal(e.to_string()))?;
 
     let mut out = Vec::with_capacity(RESPONSE_HEADER_LEN + ct.len());
     out.push(WIRE_VERSION);
@@ -229,30 +345,60 @@ pub fn encrypt_response(
 /// Helper used by tests to build a client-side request envelope. Lives in the
 /// server crate so the wire-format tests don't drift from the decrypt path.
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub fn encrypt_request_for_tests(
     our_priv: &StaticSecret,
     server_pub: &PublicKey,
+    server_eph_pub: Option<&PublicKey>,
     bearer_token: &str,
+    sequence: u64,
     method: &str,
     path: &str,
     body: &[u8],
 ) -> Vec<u8> {
     assert_eq!(bearer_token.len(), BEARER_LEN);
 
-    let shared = our_priv.diffie_hellman(server_pub);
-    let shared_bytes: [u8; KEY_LEN] = *shared.as_bytes();
+    let static_shared = our_priv.diffie_hellman(server_pub);
+    let (key_material, fingerprint, request_info) = match server_eph_pub {
+        Some(eph_pub) => {
+            let eph_shared = our_priv.diffie_hellman(eph_pub);
+            let mut ikm = Vec::with_capacity(KEY_LEN * 2);
+            ikm.extend_from_slice(static_shared.as_bytes());
+            ikm.extend_from_slice(eph_shared.as_bytes());
+            (
+                ikm,
+                crate::eph_rotation::fingerprint(eph_pub.as_bytes()),
+                INFO_C2S,
+            )
+        }
+        None => (
+            static_shared.as_bytes().to_vec(),
+            BOOTSTRAP_FINGERPRINT,
+            INFO_C2S_BOOT,
+        ),
+    };
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
     use rand::TryRngCore;
     rand::rngs::OsRng.try_fill_bytes(&mut nonce_bytes).unwrap();
 
-    let key_bytes = hkdf_key(&shared_bytes, &nonce_bytes, INFO_C2S);
+    let key_bytes = hkdf_key(&key_material, &nonce_bytes, request_info);
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
     let aad = build_aad(method, path);
 
-    let mut plaintext = Vec::with_capacity(BEARER_LEN + body.len());
-    plaintext.extend_from_slice(bearer_token.as_bytes());
-    plaintext.extend_from_slice(body);
+    let plaintext = if server_eph_pub.is_some() {
+        let mut authenticated = Vec::with_capacity(BEARER_LEN + SEQUENCE_LEN + body.len());
+        authenticated.extend_from_slice(bearer_token.as_bytes());
+        authenticated.extend_from_slice(&sequence.to_be_bytes());
+        authenticated.extend_from_slice(body);
+        authenticated
+    } else {
+        assert!(
+            body.is_empty(),
+            "bootstrap test requests have an empty plaintext"
+        );
+        Vec::new()
+    };
 
     let ct = cipher
         .encrypt(
@@ -270,11 +416,48 @@ pub fn encrypt_request_for_tests(
     out.push(WIRE_VERSION);
     out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(our_pub.as_bytes());
+    out.extend_from_slice(&fingerprint);
     out.extend_from_slice(&ct);
     out
 }
 
+/// Open a transport-v2 response in integration tests. Keeping this next to
+/// the production KDF/AAD builders prevents full-stack tests from silently
+/// validating only the outer HTTP 200 while ignoring the encrypted semantic
+/// status.
 #[cfg(test)]
+pub fn decrypt_response_for_tests(
+    wire: &[u8],
+    key_material: &[u8],
+    mode: TransportMode,
+    method: &str,
+    path: &str,
+    request_nonce: &[u8; NONCE_LEN],
+) -> (u16, Vec<u8>) {
+    assert!(wire.len() >= RESPONSE_HEADER_LEN + TAG_LEN + 2);
+    assert_eq!(wire[0], WIRE_VERSION);
+    let nonce: [u8; NONCE_LEN] = wire[1..RESPONSE_HEADER_LEN].try_into().unwrap();
+    let info = match mode {
+        TransportMode::Default => INFO_S2C,
+        TransportMode::Bootstrap => INFO_S2C_BOOT,
+    };
+    let key = hkdf_key(key_material, &nonce, info);
+    let plaintext = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key))
+        .decrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &wire[RESPONSE_HEADER_LEN..],
+                aad: &build_response_aad(method, path, request_nonce),
+            },
+        )
+        .unwrap();
+    let status = u16::from_be_bytes(plaintext[..2].try_into().unwrap());
+    (status, plaintext[2..].to_vec())
+}
+
+// Historical v1 unit cases are retained as source context only; the v2 cases
+// below exercise the active signatures and wire format.
+#[cfg(any())]
 mod tests {
     use super::*;
     use rand::TryRngCore;
@@ -516,6 +699,143 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod http_v2_tests {
+    use super::*;
+    use crate::eph_rotation::{fingerprint, EphKeyMaterial};
+    use rand::TryRngCore;
+
+    fn keypair() -> (StaticSecret, PublicKey) {
+        let mut bytes = [0u8; KEY_LEN];
+        rand::rngs::OsRng.try_fill_bytes(&mut bytes).unwrap();
+        let private = StaticSecret::from(bytes);
+        let public = PublicKey::from(&private);
+        (private, public)
+    }
+
+    fn eph_state(private: &StaticSecret, public: &PublicKey) -> EphState {
+        EphState {
+            current: EphKeyMaterial {
+                private: *private.as_bytes(),
+                public: *public.as_bytes(),
+                fingerprint: fingerprint(public.as_bytes()),
+                rotated_at: 1,
+                valid_until: u64::MAX,
+            },
+            previous: None,
+        }
+    }
+
+    #[test]
+    fn double_dh_round_trip_carries_sequence_and_encrypted_status() {
+        let (static_private, static_public) = keypair();
+        let (eph_private, eph_public) = keypair();
+        let state = eph_state(&eph_private, &eph_public);
+        let (client_private, _) = keypair();
+        let path = "/api/v1/root/vault";
+        let wire = encrypt_request_for_tests(
+            &client_private,
+            &static_public,
+            Some(&eph_public),
+            &"a".repeat(BEARER_LEN),
+            42,
+            "PUT",
+            path,
+            b"root",
+        );
+        let decrypted = decrypt_request(&wire, &static_private, &state, "PUT", path).unwrap();
+        assert_eq!(decrypted.sequence, 42);
+        assert_eq!(decrypted.inner_body, b"root");
+        assert_eq!(decrypted.mode, TransportMode::Default);
+
+        let response = encrypt_response(
+            409,
+            b"conflict",
+            &decrypted.key_material,
+            decrypted.mode,
+            "PUT",
+            path,
+            &decrypted.nonce_req,
+        )
+        .unwrap();
+        let (status, plain) = decrypt_response_for_tests(
+            &response,
+            &decrypted.key_material,
+            decrypted.mode,
+            "PUT",
+            path,
+            &decrypted.nonce_req,
+        );
+        assert_eq!(status, 409);
+        assert_eq!(plain, b"conflict");
+    }
+
+    #[test]
+    fn bootstrap_is_single_dh_and_endpoint_scoped() {
+        let (static_private, static_public) = keypair();
+        let (eph_private, eph_public) = keypair();
+        let state = eph_state(&eph_private, &eph_public);
+        let (client_private, _) = keypair();
+        let wire = encrypt_request_for_tests(
+            &client_private,
+            &static_public,
+            None,
+            &"b".repeat(BEARER_LEN),
+            7,
+            "POST",
+            BOOTSTRAP_PATH,
+            b"",
+        );
+        let decrypted =
+            decrypt_request(&wire, &static_private, &state, "POST", BOOTSTRAP_PATH).unwrap();
+        assert_eq!(decrypted.mode, TransportMode::Bootstrap);
+        assert_eq!(decrypted.sequence, 0);
+        assert!(decrypted.bearer_token.is_empty());
+        assert!(matches!(
+            decrypt_request(&wire, &static_private, &state, "POST", "/api/v1/root/x"),
+            Err(SecureError::InvalidBootstrapPath) | Err(SecureError::AeadOpen)
+        ));
+    }
+
+    #[test]
+    fn wrong_ephemeral_fingerprint_is_rejected_before_open() {
+        let (static_private, static_public) = keypair();
+        let (eph_private, eph_public) = keypair();
+        let state = eph_state(&eph_private, &eph_public);
+        let (client_private, _) = keypair();
+        let mut wire = encrypt_request_for_tests(
+            &client_private,
+            &static_public,
+            Some(&eph_public),
+            &"c".repeat(BEARER_LEN),
+            1,
+            "GET",
+            "/x",
+            b"",
+        );
+        wire[REQUEST_HEADER_LEN - 1] ^= 1;
+        assert!(matches!(
+            decrypt_request(&wire, &static_private, &state, "GET", "/x"),
+            Err(SecureError::UnknownFingerprint)
+        ));
+    }
+
+    #[test]
+    fn low_order_client_public_key_is_rejected() {
+        let (static_private, _) = keypair();
+        let (eph_private, eph_public) = keypair();
+        let state = eph_state(&eph_private, &eph_public);
+        let mut wire = vec![0u8; MIN_REQUEST_LEN];
+        wire[0] = WIRE_VERSION;
+        wire[1 + NONCE_LEN + PUBKEY_LEN..REQUEST_HEADER_LEN]
+            .copy_from_slice(&state.current.fingerprint);
+        assert!(matches!(
+            decrypt_request(&wire, &static_private, &state, "GET", "/x"),
+            Err(SecureError::NonContributoryKey)
+        ));
+    }
+}
+
 // --- WebSocket sealed frames (Ph3, wire v2) ----------------------------------
 //
 // The notify channel's v1 frames were plaintext JSON — fine while they only
@@ -537,6 +857,7 @@ const WS_INFO_S2C: &[u8] = b"obsetync/ws/v2/s2c";
 const WS_AAD_PREFIX: &[u8] = b"obsetync/ws/v2";
 
 /// Directional key pair for one WS session.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct WsSessionKeys {
     pub c2s: [u8; KEY_LEN],
     pub s2c: [u8; KEY_LEN],

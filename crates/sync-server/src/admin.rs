@@ -665,9 +665,6 @@ async fn purge_vault(
         .vaults
         .store_root(&vault_id, &new_hash, &new_bytes)
         .map_err(|e| ServerErrorHtml(format!("store root failed: {}", e)))?;
-    let idx_path = state.layout.index_path(&new_hash);
-    crate::storage::write_blob(&idx_path, &new_bytes)
-        .map_err(|e| ServerErrorHtml(format!("write index failed: {}", e)))?;
 
     state
         .vaults
@@ -849,6 +846,7 @@ async fn claim_enrollment(
 
     match enrollment::claim_enrollment(&state.layout, &code) {
         Ok(info) => {
+            let (eph_public, eph_valid_until) = crate::eph_rotation::current_bundle(&state.eph);
             tracing::info!(
                 device_name = %info.device_name,
                 device = %&info.device_id[..info.device_id.len().min(12)],
@@ -860,6 +858,10 @@ async fn claim_enrollment(
                 "device_id":       info.device_id,
                 "bearer_token":    info.bearer_token,
                 "server_box_pub":  box_pub,
+                "wire_version":    "0x02",
+                "eph_endpoint":    "/api/v1/server-eph",
+                "Es_pub_initial":  eph_public,
+                "Es_pub_valid_until": eph_valid_until,
             });
             (
                 StatusCode::OK,

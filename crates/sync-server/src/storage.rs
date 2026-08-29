@@ -1,4 +1,6 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use sync_core::chunk::RootNode;
 use sync_core::hash::{hash_to_hex, hex_to_hash, FileHash};
 
 /// Manages the filesystem layout for the server's data directory.
@@ -62,10 +64,18 @@ impl StorageLayout {
             .join(&hex[2..])
     }
 
+    /// Durable HTTP-v2 anti-replay window for one enrolled device.
+    pub fn device_sequence_path(&self, device_id: &str) -> PathBuf {
+        self.base
+            .join("devices")
+            .join(storage_component(device_id))
+            .join("seq-window")
+    }
+
     // --- Vaults ---
 
     pub fn vault_dir(&self, vault_id: &str) -> PathBuf {
-        self.base.join("vaults").join(vault_id)
+        self.base.join("vaults").join(storage_component(vault_id))
     }
 
     pub fn vault_current_path(&self, vault_id: &str) -> PathBuf {
@@ -93,25 +103,57 @@ impl StorageLayout {
     pub fn crdt_log_path(&self, vault_id: &str, note_hash_hex: &str) -> PathBuf {
         self.base
             .join("crdt")
-            .join(vault_id)
-            .join(format!("{}.log", note_hash_hex))
+            .join(storage_component(vault_id))
+            .join(format!("{}.log", storage_component(note_hash_hex)))
     }
 
     // --- Devices ---
 
     pub fn device_dir(&self, fingerprint: &str) -> PathBuf {
-        self.base.join("devices").join(fingerprint)
+        self.base
+            .join("devices")
+            .join(storage_component(fingerprint))
     }
 
     /// Path for the bearer-token → fingerprint index entry.
     pub fn token_path(&self, token: &str) -> PathBuf {
-        self.base.join("devices").join("tokens").join(token)
+        self.base
+            .join("devices")
+            .join("tokens")
+            .join(storage_component(token))
     }
 
     // --- Enrollments ---
 
     pub fn enrollment_path(&self, code: &str) -> PathBuf {
-        self.base.join("enrollments").join(format!("{}.json", code))
+        self.base
+            .join("enrollments")
+            .join(format!("{}.json", storage_component(code)))
+    }
+}
+
+/// Keep normal human/hex identifiers readable, while mapping every unsafe
+/// path component (slashes, `..`, control bytes, excessive length) to a stable
+/// content-derived name inside the intended namespace. This is defense in
+/// depth for every route/admin parameter that eventually reaches storage.
+fn storage_component(value: &str) -> String {
+    let safe = !value.is_empty()
+        && value.len() <= 128
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    if safe {
+        value.to_owned()
+    } else {
+        // `~` is deliberately outside the accepted safe alphabet. Therefore
+        // no literal identifier can equal the encoded name of another value;
+        // the mapping is collision-resistant up to the content hash itself.
+        format!(
+            "~{}",
+            hash_to_hex(&sync_core::hash::hash_bytes(value.as_bytes()))
+        )
     }
 }
 
@@ -137,8 +179,11 @@ impl VaultStore {
         self.layout.ensure_vault(vault_id)?;
         let path = self.layout.vault_current_path(vault_id);
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, hash_to_hex(hash))?;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(hash_to_hex(hash).as_bytes())?;
+        file.sync_all()?;
         std::fs::rename(&tmp, &path)?;
+        std::fs::File::open(path.parent().expect("current root has parent"))?.sync_all()?;
         Ok(())
     }
 
@@ -151,8 +196,18 @@ impl VaultStore {
     ) -> Result<(), std::io::Error> {
         self.layout.ensure_vault(vault_id)?;
         let path = self.layout.vault_root_path(vault_id, hash);
-        std::fs::write(&path, data)?;
-        Ok(())
+
+        // Root identity deliberately commits only to the ordered child-hash
+        // set, not created_ms/device/parent metadata. History is therefore a
+        // set of unique states: once valid metadata has been recorded for a
+        // semantic root, a replay of the same state must not rewrite it.
+        if std::fs::read(&path).is_ok_and(|existing| {
+            RootNode::deserialize(&existing)
+                .is_ok_and(|root| root.vault_id == vault_id && root.hash() == *hash)
+        }) {
+            return Ok(());
+        }
+        write_blob(&path, data)
     }
 
     /// Load a root node's bytes from history.
@@ -173,18 +228,85 @@ pub fn read_blob(path: &Path) -> Option<Vec<u8>> {
     std::fs::read(path).ok()
 }
 
-/// Helper: write a content-addressed blob to a path, creating parent dirs.
+/// Write an immutable/content-addressed object without ever exposing a partial
+/// final file. The temp file lives in the same directory so rename is an
+/// atomic namespace operation; file and directory are synced before success.
 pub fn write_blob(path: &Path, data: &[u8]) -> Result<(), std::io::Error> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "blob path has no parent")
+    })?;
+    std::fs::create_dir_all(parent)?;
+
+    // Concurrent writers of the same address are common and harmless. Avoid
+    // replacing a complete identical object (especially on Windows, where
+    // rename-over-existing is not portable).
+    if std::fs::read(path).is_ok_and(|existing| existing == data) {
+        return Ok(());
     }
-    std::fs::write(path, data)?;
+
+    let tmp = path.with_extension(format!(
+        "tmp-{}-{:016x}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp)?;
+    if let Err(error) = file.write_all(data).and_then(|_| file.sync_all()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    drop(file);
+
+    if let Err(rename_error) = std::fs::rename(&tmp, path) {
+        // Another writer may have won while our temp was being synced.
+        if std::fs::read(path).is_ok_and(|existing| existing == data) {
+            let _ = std::fs::remove_file(&tmp);
+            return Ok(());
+        }
+
+        // Windows cannot replace an existing destination with rename(). Use a
+        // recoverable old→backup, temp→final sequence for the rare corrupt or
+        // different existing object.
+        let backup = path.with_extension(format!(
+            "backup-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let had_existing = path.exists();
+        if had_existing {
+            std::fs::rename(path, &backup)?;
+        }
+        if let Err(error) = std::fs::rename(&tmp, path) {
+            if had_existing {
+                let _ = std::fs::rename(&backup, path);
+            }
+            let _ = std::fs::remove_file(&tmp);
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!("blob promotion failed after rename error {rename_error}: {error}"),
+            ));
+        }
+        if had_existing {
+            let _ = std::fs::remove_file(&backup);
+        }
+    }
+    std::fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
 /// Helper: check if a content-addressed blob exists.
 pub fn blob_exists(path: &Path) -> bool {
     path.exists()
+}
+
+/// Verify that an object still matches the content address encoded by its
+/// path. Check endpoints use this for the small set of objects a changed
+/// batch wants to reuse, allowing pre-atomic-write partials or disk damage to
+/// be repaired by a normal re-upload instead of becoming permanently stuck.
+pub fn blob_matches_hash(path: &Path, expected: &FileHash) -> bool {
+    std::fs::read(path).is_ok_and(|bytes| sync_core::hash::hash_bytes(&bytes) == *expected)
 }
 
 #[cfg(test)]
@@ -291,6 +413,33 @@ mod tests {
     }
 
     #[test]
+    fn untrusted_identifiers_cannot_escape_their_storage_namespaces() {
+        let layout = StorageLayout::new("/data");
+        assert!(layout.vault_dir("../../server").starts_with("/data/vaults"));
+        assert!(layout
+            .token_path("/etc/passwd")
+            .starts_with("/data/devices/tokens"));
+        assert!(layout.device_dir("..").starts_with("/data/devices"));
+        assert!(layout
+            .enrollment_path("../secret")
+            .starts_with("/data/enrollments"));
+        for path in [
+            layout.vault_dir("../../server"),
+            layout.token_path("/etc/passwd"),
+            layout.device_dir(".."),
+        ] {
+            assert!(!path.components().any(|part| part.as_os_str() == ".."));
+        }
+
+        let encoded_unsafe = storage_component("../collision");
+        assert_ne!(
+            storage_component(&encoded_unsafe),
+            encoded_unsafe,
+            "a literal safe identifier must not alias an escaped unsafe one",
+        );
+    }
+
+    #[test]
     fn ensure_vault_creates_roots_dir() {
         let dir = tempdir().unwrap();
         let layout = StorageLayout::new(dir.path());
@@ -343,6 +492,38 @@ mod tests {
     }
 
     #[test]
+    fn vault_store_does_not_rewrite_metadata_for_the_same_semantic_root() {
+        let dir = tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        let store = VaultStore::new(layout);
+        let first = RootNode {
+            vault_id: "v".into(),
+            created_ms: 1,
+            version: 1,
+            children: vec![],
+            total_files: 0,
+            parent_hash: None,
+            device_id: "first-device".into(),
+        };
+        let second = RootNode {
+            created_ms: 2,
+            parent_hash: Some(hash_bytes(b"forged-parent")),
+            device_id: "second-device".into(),
+            ..first.clone()
+        };
+        let hash = first.hash();
+        assert_eq!(hash, second.hash());
+
+        store.store_root("v", &hash, &first.serialize()).unwrap();
+        store.store_root("v", &hash, &second.serialize()).unwrap();
+
+        let stored = RootNode::deserialize(&store.get_root("v", &hash).unwrap()).unwrap();
+        assert_eq!(stored.created_ms, 1);
+        assert_eq!(stored.device_id, "first-device");
+        assert_eq!(stored.parent_hash, None);
+    }
+
+    #[test]
     fn vault_store_get_root_missing_returns_none() {
         let dir = tempdir().unwrap();
         let layout = StorageLayout::new(dir.path());
@@ -367,6 +548,22 @@ mod tests {
         write_blob(&path, b"hello").unwrap();
         assert!(blob_exists(&path));
         assert_eq!(read_blob(&path).unwrap(), b"hello".to_vec());
+    }
+
+    #[test]
+    fn write_blob_replaces_an_incomplete_existing_object() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("objects/blob");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"partial").unwrap();
+        write_blob(&path, b"complete payload").unwrap();
+        assert_eq!(read_blob(&path).unwrap(), b"complete payload".to_vec());
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+        assert!(blob_matches_hash(&path, &hash_bytes(b"complete payload")));
+        assert!(!blob_matches_hash(&path, &hash_bytes(b"other")));
     }
 
     #[test]

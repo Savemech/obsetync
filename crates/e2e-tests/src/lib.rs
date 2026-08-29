@@ -28,8 +28,9 @@ use hkdf::Hkdf;
 use rand::TryRngCore;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use sync_core::chunk::{FileEntry, InternalNode, LeafChunk, RootNode};
 use sync_core::hash::{hash_bytes, hash_to_hex, hex_to_hash, FileHash};
@@ -37,18 +38,20 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 // --- wire constants (mirror sync_server::secure) -----------------------------
 
-pub const WIRE_VERSION: u8 = 0x01;
+pub const WIRE_VERSION: u8 = 0x02;
 pub const NONCE_LEN: usize = 12;
 pub const PUBKEY_LEN: usize = 32;
 pub const KEY_LEN: usize = 32;
 pub const TAG_LEN: usize = 16;
 pub const BEARER_LEN: usize = 64;
-pub const REQUEST_HEADER_LEN: usize = 1 + NONCE_LEN + PUBKEY_LEN;
+pub const FINGERPRINT_LEN: usize = 8;
+pub const SEQUENCE_LEN: usize = 8;
+pub const REQUEST_HEADER_LEN: usize = 1 + NONCE_LEN + PUBKEY_LEN + FINGERPRINT_LEN;
 pub const RESPONSE_HEADER_LEN: usize = 1 + NONCE_LEN;
 
-const INFO_C2S: &[u8] = b"obsetync/v1/c2s";
-const INFO_S2C: &[u8] = b"obsetync/v1/s2c";
-const AAD_PREFIX: &[u8] = b"obsetync/v1";
+const INFO_C2S: &[u8] = b"obsetync/v2/c2s";
+const INFO_S2C: &[u8] = b"obsetync/v2/s2c";
+const AAD_PREFIX: &[u8] = b"obsetync/v2";
 
 /// Hex string for a 32-byte hash of all zeros — the "fresh client / no parent"
 /// sentinel the server recognises when prepended to PUT /root and POST /diff.
@@ -143,12 +146,25 @@ impl E2eEnv {
         }
         let mut arr = [0u8; PUBKEY_LEN];
         arr.copy_from_slice(&pub_bytes);
+        if bundle.wire_version != "0x02" {
+            bail!(
+                "server enrollment returned unsupported wire version {}",
+                bundle.wire_version
+            );
+        }
+        let eph_bytes = BASE64_STANDARD
+            .decode(&bundle.es_pub_initial)
+            .context("decoding Es_pub_initial base64")?;
+        let eph_arr: [u8; PUBKEY_LEN] = eph_bytes
+            .try_into()
+            .map_err(|bytes: Vec<u8>| anyhow!("Es_pub_initial is {} bytes", bytes.len()))?;
         Ok(DeviceCreds {
             code,
             device_id: bundle.device_id,
             device_name: bundle.device_name,
             bearer: bundle.bearer_token,
             server_box_pub: PublicKey::from(arr),
+            server_eph_pub: PublicKey::from(eph_arr),
         })
     }
 
@@ -180,6 +196,7 @@ pub struct DeviceCreds {
     pub device_name: String,
     pub bearer: String,
     pub server_box_pub: PublicKey,
+    pub server_eph_pub: PublicKey,
 }
 
 #[derive(Deserialize)]
@@ -188,6 +205,9 @@ struct EnrollmentBundle {
     device_id: String,
     bearer_token: String,
     server_box_pub: String,
+    wire_version: String,
+    #[serde(rename = "Es_pub_initial")]
+    es_pub_initial: String,
 }
 
 fn parse_enrollment_code(html: &str) -> Option<String> {
@@ -216,6 +236,22 @@ pub struct WireClient {
     base_url: String,
     creds: DeviceCreds,
     http: reqwest::Client,
+    sequence: AtomicU64,
+}
+
+/// Captured transport-v2 request used by replay/tamper end-to-end tests.
+pub struct SealedRequest {
+    wire_body: Vec<u8>,
+    client_eph: StaticSecret,
+    nonce_req: [u8; NONCE_LEN],
+}
+
+impl SealedRequest {
+    pub fn corrupt_last_byte(&mut self) {
+        if let Some(last) = self.wire_body.last_mut() {
+            *last ^= 1;
+        }
+    }
 }
 
 impl WireClient {
@@ -224,6 +260,7 @@ impl WireClient {
             base_url: env.base_url.clone(),
             creds,
             http: env.http.clone(),
+            sequence: AtomicU64::new(1),
         }
     }
 
@@ -234,8 +271,17 @@ impl WireClient {
     /// Send a sealed envelope. `semantic_method` is what the server sees after
     /// envelope decryption (PUT/GET/POST/etc); the wire method is always POST.
     pub async fn raw(&self, semantic_method: &str, path: &str, body: &[u8]) -> Result<RawResponse> {
-        // Per-request ephemeral keypair. Forward secrecy: an attacker who later
-        // compromises the server's box.key cannot decrypt this exchange.
+        let sealed = self.seal_for_test(semantic_method, path, body)?;
+        self.send_sealed_for_test(&sealed, semantic_method, path)
+            .await
+    }
+
+    pub fn seal_for_test(
+        &self,
+        semantic_method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> Result<SealedRequest> {
         let mut seed = [0u8; KEY_LEN];
         rand::rngs::OsRng.try_fill_bytes(&mut seed).unwrap();
         let client_eph = StaticSecret::from(seed);
@@ -243,22 +289,34 @@ impl WireClient {
         let envelope = encrypt_request(
             &client_eph,
             &self.creds.server_box_pub,
+            &self.creds.server_eph_pub,
             &self.creds.bearer,
+            self.sequence.fetch_add(1, Ordering::Relaxed),
             semantic_method,
             path,
             body,
         )?;
-        // Response AAD binds the request nonce (bytes 1..13 of the envelope) —
-        // keep it to verify the answer belongs to exactly this request.
         let nonce_req: [u8; NONCE_LEN] = envelope[1..1 + NONCE_LEN].try_into().unwrap();
+        Ok(SealedRequest {
+            wire_body: envelope,
+            client_eph,
+            nonce_req,
+        })
+    }
 
+    pub async fn send_sealed_for_test(
+        &self,
+        sealed: &SealedRequest,
+        semantic_method: &str,
+        path: &str,
+    ) -> Result<RawResponse> {
         let url = format!("{}{}", self.base_url, path);
         let resp = self
             .http
             .post(&url)
             .header("X-Obsetync-Method", semantic_method)
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .body(envelope)
+            .body(sealed.wire_body.clone())
             .send()
             .await
             .context("HTTP send")?;
@@ -266,26 +324,29 @@ impl WireClient {
         let status = resp.status();
         let body = resp.bytes().await?.to_vec();
 
-        // Errors from the middleware (401/403/400) are returned as plaintext —
-        // they never reach the secure-envelope wrapping path. Successful and
-        // handler-error responses (4xx/5xx generated by inner handlers) are
-        // both encrypted.
-        let plaintext = if status.is_success() {
-            decrypt_response(
-                &client_eph,
-                &self.creds.server_box_pub,
-                semantic_method,
-                path,
-                &nonce_req,
-                &body,
-            )
-            .context("decrypt response")?
-        } else {
-            body
-        };
+        if status != StatusCode::OK {
+            return Ok(RawResponse { status, body });
+        }
+        if body.len() == 256 && body.iter().all(|byte| *byte == 0) {
+            return Ok(RawResponse {
+                status: StatusCode::UNAUTHORIZED,
+                body: b"transport decrypt decoy".to_vec(),
+            });
+        }
+        let (semantic_status, plaintext) = decrypt_response(
+            &sealed.client_eph,
+            &self.creds.server_box_pub,
+            &self.creds.server_eph_pub,
+            semantic_method,
+            path,
+            &sealed.nonce_req,
+            &body,
+        )
+        .context("decrypt response")?;
 
         Ok(RawResponse {
-            status,
+            status: StatusCode::from_u16(semantic_status)
+                .context("invalid encrypted semantic status")?,
             body: plaintext,
         })
     }
@@ -509,10 +570,13 @@ fn hkdf_key(shared: &[u8], nonce: &[u8], info: &[u8]) -> [u8; KEY_LEN] {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encrypt_request(
     eph_priv: &StaticSecret,
     server_pub: &PublicKey,
+    server_eph_pub: &PublicKey,
     bearer: &str,
+    sequence: u64,
     method: &str,
     path: &str,
     body: &[u8],
@@ -520,18 +584,22 @@ fn encrypt_request(
     if bearer.len() != BEARER_LEN {
         bail!("bearer must be {} chars, got {}", BEARER_LEN, bearer.len());
     }
-    let shared = eph_priv.diffie_hellman(server_pub);
-    let shared_bytes: [u8; KEY_LEN] = *shared.as_bytes();
+    let static_shared = eph_priv.diffie_hellman(server_pub);
+    let ephemeral_shared = eph_priv.diffie_hellman(server_eph_pub);
+    let mut key_material = Vec::with_capacity(KEY_LEN * 2);
+    key_material.extend_from_slice(static_shared.as_bytes());
+    key_material.extend_from_slice(ephemeral_shared.as_bytes());
 
     let mut nonce = [0u8; NONCE_LEN];
     rand::rngs::OsRng.try_fill_bytes(&mut nonce).unwrap();
 
-    let key = hkdf_key(&shared_bytes, &nonce, INFO_C2S);
+    let key = hkdf_key(&key_material, &nonce, INFO_C2S);
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
     let aad = build_aad(method, path);
 
-    let mut plaintext = Vec::with_capacity(BEARER_LEN + body.len());
+    let mut plaintext = Vec::with_capacity(BEARER_LEN + SEQUENCE_LEN + body.len());
     plaintext.extend_from_slice(bearer.as_bytes());
+    plaintext.extend_from_slice(&sequence.to_be_bytes());
     plaintext.extend_from_slice(body);
 
     let ct = cipher
@@ -549,6 +617,7 @@ fn encrypt_request(
     out.push(WIRE_VERSION);
     out.extend_from_slice(&nonce);
     out.extend_from_slice(our_pub.as_bytes());
+    out.extend_from_slice(&Sha256::digest(server_eph_pub.as_bytes())[..FINGERPRINT_LEN]);
     out.extend_from_slice(&ct);
     Ok(out)
 }
@@ -556,11 +625,12 @@ fn encrypt_request(
 fn decrypt_response(
     eph_priv: &StaticSecret,
     server_pub: &PublicKey,
+    server_eph_pub: &PublicKey,
     method: &str,
     path: &str,
     nonce_req: &[u8; NONCE_LEN],
     body: &[u8],
-) -> Result<Vec<u8>> {
+) -> Result<(u16, Vec<u8>)> {
     if body.len() < RESPONSE_HEADER_LEN + TAG_LEN {
         bail!("response too short: {} bytes", body.len());
     }
@@ -570,16 +640,27 @@ fn decrypt_response(
     let nonce: [u8; NONCE_LEN] = body[1..1 + NONCE_LEN].try_into().unwrap();
     let ct = &body[RESPONSE_HEADER_LEN..];
 
-    let shared = eph_priv.diffie_hellman(server_pub);
-    let key = hkdf_key(shared.as_bytes(), &nonce, INFO_S2C);
+    let static_shared = eph_priv.diffie_hellman(server_pub);
+    let ephemeral_shared = eph_priv.diffie_hellman(server_eph_pub);
+    let mut key_material = Vec::with_capacity(KEY_LEN * 2);
+    key_material.extend_from_slice(static_shared.as_bytes());
+    key_material.extend_from_slice(ephemeral_shared.as_bytes());
+    let key = hkdf_key(&key_material, &nonce, INFO_S2C);
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
     // Response AAD = request AAD || nonce_req (replay binding, see secure.rs).
     let mut aad = build_aad(method, path);
     aad.extend_from_slice(nonce_req);
 
-    cipher
+    let plaintext = cipher
         .decrypt(Nonce::from_slice(&nonce), Payload { msg: ct, aad: &aad })
-        .map_err(|_| anyhow!("response AEAD open failed"))
+        .map_err(|_| anyhow!("response AEAD open failed"))?;
+    if plaintext.len() < 2 {
+        bail!("encrypted response omitted semantic status");
+    }
+    Ok((
+        u16::from_be_bytes(plaintext[..2].try_into().unwrap()),
+        plaintext[2..].to_vec(),
+    ))
 }
 
 // --- High-level vault helpers ------------------------------------------------

@@ -2,8 +2,12 @@ import { requestUrl, RequestUrlParam } from "obsidian";
 import {
     ObsetyncSecureChannel,
     ObsetyncSecureTransportError,
+    ObsetyncSessionStaleError,
     extractRequestNonce,
 } from "./secure";
+import { DurableSequenceAllocator } from "./transport-sequence";
+import { validateFileDeltas } from "./delta-validation";
+import { exactArrayBuffer } from "./binary";
 
 export interface FileDelta {
     action: "added" | "modified" | "deleted" | "renamed";
@@ -62,6 +66,23 @@ export interface EnrollmentBundle {
     device_id: string;
     bearer_token: string;
     server_box_pub: string;
+    wire_version: "0x02";
+    eph_endpoint: string;
+    Es_pub_initial: string;
+    Es_pub_valid_until: number;
+}
+
+export interface TransportPersistentState {
+    wireVersion: string;
+    esPub: string;
+    esPubValidUntil: number;
+    /** Highest sequence durably reserved, not merely the last one sent. */
+    lastOutgoingSeq: number;
+}
+
+export interface TransportPersistence {
+    get(): TransportPersistentState;
+    update(patch: Partial<TransportPersistentState>): Promise<void>;
 }
 
 interface FetchLike {
@@ -84,11 +105,15 @@ interface FetchLike {
  */
 export class ObsetyncApi {
     private channel: ObsetyncSecureChannel | null = null;
+    private channelPromise: Promise<ObsetyncSecureChannel> | null = null;
+    private refreshPromise: Promise<void> | null = null;
+    private readonly sequences: DurableSequenceAllocator;
 
     constructor(
         private readonly serverUrl: string,
         private readonly serverBoxPubBase64: string,
         private readonly bearerTokenHex: string,
+        private readonly transportPersistence?: TransportPersistence,
     ) {
         // The sync port speaks plain HTTP — the AEAD envelope is the trust
         // boundary. Fold legacy https:// URLs down to http:// transparently
@@ -103,6 +128,13 @@ export class ObsetyncApi {
             );
         }
         this.serverUrl = u;
+        this.sequences = new DurableSequenceAllocator({
+            readReservedThrough: () =>
+                this.requireTransportPersistence().get().lastOutgoingSeq,
+            persistReservedThrough: async (value) => {
+                await this.requireTransportPersistence().update({ lastOutgoingSeq: value });
+            },
+        });
     }
 
     /** Normalized server base URL — the WS channel derives ws:// from it. */
@@ -130,15 +162,39 @@ export class ObsetyncApi {
     /** Lazily establish the ObsetyncSecureChannel. Called before the first encrypted
      *  request; subsequent requests reuse the same shared secret. */
     private async getChannel(): Promise<ObsetyncSecureChannel> {
-        if (this.channel) return this.channel;
+        if (this.channel && !this.channel.isStale()) return this.channel;
+        if (this.channelPromise) return this.channelPromise;
+        if (this.refreshPromise) await this.refreshPromise;
+        if (this.channel && !this.channel.isStale()) return this.channel;
         if (!this.serverBoxPubBase64) {
             throw new Error("ObsetyncApi: server box pubkey missing — re-enroll the device");
         }
         if (!this.bearerTokenHex) {
             throw new Error("ObsetyncApi: bearer token missing — re-enroll the device");
         }
-        this.channel = await ObsetyncSecureChannel.create(this.serverBoxPubBase64, this.bearerTokenHex);
-        return this.channel;
+        const persistence = this.requireTransportPersistence();
+        this.channelPromise = (async () => {
+            let state = persistence.get();
+            if (state.wireVersion !== "0x02") {
+                throw new Error("server transport upgraded to wire 0x02 — re-enroll this device");
+            }
+            if (!state.esPub || Date.now() / 1000 >= state.esPubValidUntil - 3600) {
+                await this.refreshServerEphemeral();
+                state = persistence.get();
+            }
+            this.channel = await ObsetyncSecureChannel.create(
+                this.serverBoxPubBase64,
+                this.bearerTokenHex,
+                state.esPub,
+                state.esPubValidUntil,
+            );
+            return this.channel;
+        })();
+        try {
+            return await this.channelPromise;
+        } finally {
+            this.channelPromise = null;
+        }
     }
 
     // --- Root ---
@@ -201,7 +257,7 @@ export class ObsetyncApi {
         // path seed the vault.
         if (res.status === 404) return null;
         if (!res.ok) throw new Error(`getDiff failed: ${res.status}`);
-        return res.json();
+        return validateFileDeltas(await res.json());
     }
 
     // --- Index chunks ---
@@ -337,12 +393,50 @@ export class ObsetyncApi {
      * issues with iOS's requestUrl not sending a body on GET.
      */
     private async sealed(method: string, path: string, body: Uint8Array): Promise<FetchLike> {
-        const channel = await this.getChannel();
-        const wireBody = await channel.encryptRequest(method, path, body);
-        // The response AAD binds this request's nonce — keep it so the
-        // answer can't be swapped with one minted for another request.
-        const nonceReq = extractRequestNonce(wireBody);
+        let refreshed = false;
+        let replayRecovered = false;
+        for (;;) {
+            const channel = await this.getChannel();
+            const sequence = await this.nextSequence();
+            let response: FetchLike;
+            try {
+                response = await this.sendEncrypted(channel, method, path, body, sequence);
+            } catch (error) {
+                if (error instanceof ObsetyncSessionStaleError && !refreshed) {
+                    refreshed = true;
+                    if (this.channel === channel || this.channel === null) {
+                        this.channel = null;
+                        await this.refreshServerEphemeral();
+                    }
+                    continue;
+                }
+                if (error instanceof ObsetyncSecureTransportError) {
+                    throw new Error(`decrypt ${method} ${path}: ${error.message}`);
+                }
+                throw error;
+            }
 
+            if (response.status === 401 && !replayRecovered) {
+                const error = await response.json().catch(() => null);
+                if (error?.error === "replay" && Number.isSafeInteger(error.last_seen_seq)) {
+                    replayRecovered = true;
+                    await this.recoverSequence(error.last_seen_seq);
+                    continue;
+                }
+            }
+            return response;
+        }
+    }
+
+    private async sendEncrypted(
+        channel: ObsetyncSecureChannel,
+        method: string,
+        path: string,
+        body: Uint8Array,
+        sequence: number,
+    ): Promise<FetchLike> {
+        const wireBody = await channel.encryptRequest(method, path, body, sequence);
+        const nonceReq = extractRequestNonce(wireBody);
         const params: RequestUrlParam = {
             url: `${this.serverUrl}${path}`,
             method: "POST",
@@ -350,53 +444,95 @@ export class ObsetyncApi {
                 "Content-Type": "application/octet-stream",
                 "X-Obsetync-Method": method,
             },
-            body: (wireBody.buffer as ArrayBuffer).slice(
-                wireBody.byteOffset,
-                wireBody.byteOffset + wireBody.byteLength,
-            ),
+            body: exactArrayBuffer(wireBody),
             throw: false,
         };
-
-        const res = await requestUrl(params);
-
-        // Non-2xx responses are never decrypted. Middleware-generated errors
-        // (401 / 403 / 400) are plaintext strings; handler-generated errors
-        // (e.g. 404 from get_root) arrive as encrypted envelopes — but no
-        // caller reads a non-2xx body, only the status, so neither needs
-        // opening here.
-        const isOk = res.status >= 200 && res.status < 300;
-        if (!isOk) {
+        const wireResponse = await requestUrl(params);
+        if (wireResponse.status !== 200) {
+            // Reverse proxies can still emit their own plaintext failures;
+            // the application server itself always responds with wire 200.
             return {
-                status: res.status,
+                status: wireResponse.status,
                 ok: false,
-                arrayBuffer: async () => res.arrayBuffer,
-                json: async () => res.json,
+                arrayBuffer: async () => wireResponse.arrayBuffer,
+                json: async () => wireResponse.json,
             };
         }
 
-        const wireResp = new Uint8Array(res.arrayBuffer);
-        let plaintext: Uint8Array;
-        try {
-            plaintext = await channel.decryptResponse(method, path, nonceReq, wireResp);
-        } catch (e) {
-            if (e instanceof ObsetyncSecureTransportError) {
-                throw new Error(`decrypt ${method} ${path}: ${e.message}`);
-            }
-            throw e;
-        }
-
-        const ptBuffer = (plaintext.buffer as ArrayBuffer).slice(
-            plaintext.byteOffset,
-            plaintext.byteOffset + plaintext.byteLength,
+        const opened = await channel.decryptResponse(
+            method,
+            path,
+            nonceReq,
+            new Uint8Array(wireResponse.arrayBuffer),
         );
+        const plaintext = opened.body;
         return {
-            status: res.status,
-            ok: true,
-            arrayBuffer: async () => ptBuffer,
+            status: opened.status,
+            ok: opened.status >= 200 && opened.status < 300,
+            arrayBuffer: async () => exactArrayBuffer(plaintext),
             json: async () => {
                 const text = new TextDecoder().decode(plaintext);
                 return text.length ? JSON.parse(text) : null;
             },
         };
+    }
+
+    private async refreshServerEphemeral(): Promise<void> {
+        if (this.refreshPromise) return this.refreshPromise;
+        this.refreshPromise = this.refreshServerEphemeralOnce();
+        try {
+            await this.refreshPromise;
+        } finally {
+            this.refreshPromise = null;
+        }
+    }
+
+    private async refreshServerEphemeralOnce(): Promise<void> {
+        const persistence = this.requireTransportPersistence();
+        const bootstrap = await ObsetyncSecureChannel.createBootstrap(
+            this.serverBoxPubBase64,
+        );
+        const response = await this.sendEncrypted(
+            bootstrap,
+            "POST",
+            "/api/v1/server-eph",
+            new Uint8Array(),
+            0,
+        );
+        if (!response.ok) {
+            throw new Error(
+                `server ephemeral refresh failed: ${response.status}; ` +
+                "re-enroll device",
+            );
+        }
+        const bundle = await response.json();
+        if (
+            typeof bundle?.Es_pub !== "string" ||
+            !Number.isSafeInteger(bundle?.valid_until) ||
+            bundle.valid_until <= Date.now() / 1000
+        ) {
+            throw new Error("server returned an invalid transport-v2 ephemeral bundle");
+        }
+        await persistence.update({
+            esPub: bundle.Es_pub,
+            esPubValidUntil: bundle.valid_until,
+            wireVersion: "0x02",
+        });
+        this.channel = null;
+    }
+
+    private async nextSequence(): Promise<number> {
+        return this.sequences.next();
+    }
+
+    private async recoverSequence(greatestSeen: number): Promise<void> {
+        await this.sequences.recover(greatestSeen);
+    }
+
+    private requireTransportPersistence(): TransportPersistence {
+        if (!this.transportPersistence) {
+            throw new Error("transport-v2 state unavailable — re-enroll device");
+        }
+        return this.transportPersistence;
     }
 }

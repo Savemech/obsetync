@@ -12,6 +12,7 @@ use crate::storage::StorageLayout;
 use rand::Rng;
 use std::fs;
 use std::path::PathBuf;
+use zeroize::{Zeroize, Zeroizing};
 
 const TICKET_TTL_MS: u64 = 10 * 60 * 1000;
 
@@ -61,8 +62,8 @@ pub fn mint(
     client_eph_pub: Option<[u8; 32]>,
 ) -> Result<MintOutcome, std::io::Error> {
     let mut rng = rand::rng();
-    let bytes: Vec<u8> = (0..32).map(|_| rng.random::<u8>()).collect();
-    let ticket = hex::encode(bytes);
+    let bytes = Zeroizing::new((0..32).map(|_| rng.random::<u8>()).collect::<Vec<u8>>());
+    let ticket = hex::encode(&*bytes);
 
     let (c2s_hex, s2c_hex, server_eph_pub_b64) = match client_eph_pub {
         Some(client_pub_bytes) => {
@@ -72,9 +73,16 @@ pub fn mint(
                 .try_fill_bytes(&mut seed)
                 .map_err(|e| std::io::Error::other(format!("OS RNG failed: {}", e)))?;
             let server_eph = x25519_dalek::StaticSecret::from(seed);
+            seed.zeroize();
             let server_pub = x25519_dalek::PublicKey::from(&server_eph);
             let client_pub = x25519_dalek::PublicKey::from(client_pub_bytes);
             let shared = server_eph.diffie_hellman(&client_pub);
+            if !shared.was_contributory() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "client_eph_pub is a low-order X25519 point",
+                ));
+            }
             let keys = crate::secure::derive_ws_keys(shared.as_bytes(), &ticket);
             use base64::prelude::*;
             (
@@ -99,7 +107,8 @@ pub fn mint(
     let dir = tickets_dir(layout);
     fs::create_dir_all(&dir)?;
     let path = ticket_path(layout, &ticket).expect("hex ticket is always a valid path");
-    fs::write(&path, serde_json::to_string(&info)?)?;
+    let encoded = Zeroizing::new(serde_json::to_string(&info)?);
+    fs::write(&path, encoded.as_bytes())?;
 
     // Opportunistic sweep so abandoned tickets don't accumulate forever.
     sweep_expired(layout);
@@ -114,9 +123,14 @@ pub fn mint(
 /// (device + session keys), or None for unknown/expired/reused tickets.
 pub fn claim(layout: &StorageLayout, ticket: &str) -> Option<WsTicket> {
     let path = ticket_path(layout, ticket)?;
-    let data = fs::read_to_string(&path).ok()?;
-    // Single use: remove before validating so a parallel claim loses.
-    let _ = fs::remove_file(&path);
+    // Atomically take ownership before reading. A read-then-remove sequence
+    // lets two parallel handshakes read the same ticket before either unlink
+    // wins. Exactly one rename can consume the source path.
+    let claimed_path = path.with_extension(format!("claim-{:016x}", rand::random::<u64>()));
+    fs::rename(&path, &claimed_path).ok()?;
+    let data = fs::read_to_string(&claimed_path).map(Zeroizing::new);
+    let _ = fs::remove_file(&claimed_path);
+    let data = data.ok()?;
     let info: WsTicket = serde_json::from_str(&data).ok()?;
     if now_ms() > info.expires_at {
         return None;
@@ -130,7 +144,7 @@ fn sweep_expired(layout: &StorageLayout) {
         return;
     };
     for entry in entries.filter_map(|e| e.ok()) {
-        let Ok(data) = fs::read_to_string(entry.path()) else {
+        let Ok(data) = fs::read_to_string(entry.path()).map(Zeroizing::new) else {
             continue;
         };
         if let Ok(info) = serde_json::from_str::<WsTicket>(&data) {
@@ -199,6 +213,30 @@ mod tests {
         let keys = crate::secure::derive_ws_keys(shared.as_bytes(), &m.ticket.ticket);
         assert_eq!(hex::encode(keys.c2s), m.ticket.c2s_key_hex);
         assert_eq!(hex::encode(keys.s2c), m.ticket.s2c_key_hex);
+    }
+
+    #[test]
+    fn parallel_claim_has_exactly_one_winner() {
+        let (_d, layout) = fresh_layout();
+        let ticket = mint(&layout, "device-race", None).unwrap().ticket.ticket;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let layout = layout.clone();
+            let ticket = ticket.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                claim(&layout, &ticket).is_some()
+            }));
+        }
+        barrier.wait();
+        let winners = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(winners, 1);
     }
 
     #[test]

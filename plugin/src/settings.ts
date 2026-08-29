@@ -36,6 +36,12 @@ export interface SyncSettings {
     deviceId: string;
     bearerToken: string;
     serverBoxPub: string;
+    /** HTTP envelope protocol and rotating-key cache (wire v2). */
+    wireVersion: string;
+    esPub: string;
+    esPubValidUntil: number;
+    /** Durable high-water mark of pre-reserved outgoing sequence blocks. */
+    lastOutgoingSeq: number;
 }
 
 export const DEFAULT_SETTINGS: SyncSettings = {
@@ -53,6 +59,10 @@ export const DEFAULT_SETTINGS: SyncSettings = {
     deviceId: "",
     bearerToken: "",
     serverBoxPub: "",
+    wireVersion: "",
+    esPub: "",
+    esPubValidUntil: 0,
+    lastOutgoingSeq: 0,
 };
 
 export class ObsetyncSettingTab extends PluginSettingTab {
@@ -105,7 +115,10 @@ export class ObsetyncSettingTab extends PluginSettingTab {
         // Vault ID.
         new Setting(containerEl)
             .setName("Vault ID")
-            .setDesc("Unique identifier for this vault on the server.")
+            .setDesc(
+                "Unique identifier shared by this vault's devices. Use 1–128 ASCII " +
+                "letters, digits, dots, underscores, or hyphens; start with a letter or digit.",
+            )
             .addText((text) =>
                 text
                     .setPlaceholder("my-vault")
@@ -180,6 +193,10 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                             this.plugin.settings.deviceId     = "";
                             this.plugin.settings.bearerToken  = "";
                             this.plugin.settings.serverBoxPub = "";
+                            this.plugin.settings.wireVersion = "";
+                            this.plugin.settings.esPub = "";
+                            this.plugin.settings.esPubValidUntil = 0;
+                            this.plugin.settings.lastOutgoingSeq = 0;
                             await this.plugin.saveSettings();
                             new Notice("Enrollment reset. Enter a new code to re-enroll.");
                             this.display(); // Refresh UI — enrollment input reappears.

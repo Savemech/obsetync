@@ -120,13 +120,12 @@ export function perfSpan(name: string): () => void {
 }
 
 // ---------------------------------------------------------------------------
-// Crash log — window-level error capture that survives a renderer kill.
+// Crash log — window-level JavaScript error capture persisted across sessions.
 //
-// DevTools die with the renderer, so console evidence is lost exactly when
-// the process OOMs. This logger appends window "error" / "unhandledrejection"
-// events — from the WHOLE renderer, not only obsetync; the point is to
-// identify what killed it — to a dotfile in the vault root. Dotfiles are
-// invisible to Obsidian's indexer and to obsetync's own sync.
+// This catches window "error" / "unhandledrejection" events from the whole
+// renderer. It cannot catch iOS Jetsam or an OS-level OOM kill because no
+// JavaScript callback runs in that case; operation-checkpoint.ts provides the
+// durable phase breadcrumb for those terminations.
 //
 // Storm-safe: entries are buffered and flushed at most once per second in a
 // single read+write, consecutive duplicates are collapsed into a repeat

@@ -12,43 +12,46 @@
  * bytes out as SubtleCrypto. HKDF-SHA256 + AES-256-GCM stay on SubtleCrypto
  * (ubiquitous since 2014).
  *
- * Wire format (matches `crates/sync-server/src/secure.rs`):
+ * HTTP wire v2 (matches `crates/sync-server/src/secure.rs`):
  *
- *   request:   [1B ver=0x01] [12B nonce] [32B eph_pub] [AES-GCM ct || 16B tag]
- *   response:  [1B ver=0x01] [12B nonce]               [AES-GCM ct || 16B tag]
+ *   request:  [0x02] [12B nonce] [32B client pub] [8B server-eph fp] [ciphertext]
+ *   response: [0x02] [12B nonce] [ciphertext]
  *
  * Inner request plaintext:
  *
- *   [64B bearer_token_hex_ASCII] [actual body bytes]
+ *   [64B bearer_token_hex_ASCII] [8B sequence BE] [actual body bytes]
  *
  * AAD (authenticated, never on the wire):
  *
- *   request:   "obsetync/v1 <METHOD> <PATH>"
- *   response:  "obsetync/v1 <METHOD> <PATH>" || nonce_req
+ *   request:   "obsetync/v2 <METHOD> <PATH>"
+ *   response:  "obsetync/v2 <METHOD> <PATH>" || nonce_req
  *
  * The response AAD binds the 12-byte nonce of the request it answers, so an
  * in-session MITM can't substitute the response of one request for another
  * with the same method + path (e.g. feeding us a stale GET /root answer).
  *
- * A single `ObsetyncSecureChannel` instance caches the ECDH shared secret for its
- * lifetime, so per-request work is just HKDF + AES-GCM (microseconds).
- * Forward secrecy is per-session (per plugin load), same as TLS with session
- * tickets.
+ * The default key material combines DH against the pinned long-term server
+ * key and a rotating, memory-only server key. The latter bounds exposure if
+ * the long-term key is compromised in the future.
  */
 
 import { x25519 } from "@noble/curves/ed25519";
 
-const WIRE_VERSION = 0x01;
+export const HTTP_WIRE_VERSION = 0x02;
 const NONCE_LEN = 12;
 const PUBKEY_LEN = 32;
 const TAG_LEN = 16;
 const BEARER_LEN = 64;
-const REQUEST_HEADER_LEN = 1 + NONCE_LEN + PUBKEY_LEN; // 45
+const FINGERPRINT_LEN = 8;
+const SEQUENCE_LEN = 8;
+const REQUEST_HEADER_LEN = 1 + NONCE_LEN + PUBKEY_LEN + FINGERPRINT_LEN; // 53
 const RESPONSE_HEADER_LEN = 1 + NONCE_LEN;             // 13
 
-const AAD_PREFIX = "obsetync/v1";
-const INFO_C2S = "obsetync/v1/c2s";
-const INFO_S2C = "obsetync/v1/s2c";
+const AAD_PREFIX = "obsetync/v2";
+const INFO_C2S = "obsetync/v2/c2s";
+const INFO_S2C = "obsetync/v2/s2c";
+const INFO_C2S_BOOT = "obsetync/v2/c2s-boot";
+const INFO_S2C_BOOT = "obsetync/v2/s2c-boot";
 
 const WS_AAD_PREFIX = "obsetync/ws/v2";
 const WS_INFO_C2S = "obsetync/ws/v2/c2s";
@@ -59,6 +62,20 @@ export class ObsetyncSecureTransportError extends Error {
         super(msg);
         this.name = "ObsetyncSecureTransportError";
     }
+}
+
+/** The server returned the constant decrypt-failure shape. API orchestration
+ *  refreshes the rotating key once, then asks the user to re-enroll. */
+export class ObsetyncSessionStaleError extends ObsetyncSecureTransportError {
+    constructor() {
+        super("server could not open the transport-v2 envelope");
+        this.name = "ObsetyncSessionStaleError";
+    }
+}
+
+export interface DecryptedResponse {
+    status: number;
+    body: Uint8Array;
 }
 
 function decodeBase64(b64: string): Uint8Array {
@@ -132,15 +149,24 @@ export class ObsetyncSecureChannel {
     private readonly ephPubRaw: Uint8Array;
     private readonly hkdfKey: CryptoKey;
     private readonly bearerBytes: Uint8Array;
+    private readonly fingerprint: Uint8Array;
+    private readonly bootstrap: boolean;
+    private readonly validUntilSeconds: number;
 
     private constructor(
         ephPubRaw: Uint8Array,
         hkdfKey: CryptoKey,
         bearerBytes: Uint8Array,
+        fingerprint: Uint8Array,
+        bootstrap: boolean,
+        validUntilSeconds: number,
     ) {
         this.ephPubRaw = ephPubRaw;
         this.hkdfKey = hkdfKey;
         this.bearerBytes = bearerBytes;
+        this.fingerprint = fingerprint;
+        this.bootstrap = bootstrap;
+        this.validUntilSeconds = validUntilSeconds;
     }
 
     /**
@@ -154,8 +180,42 @@ export class ObsetyncSecureChannel {
     static async create(
         serverBoxPubBase64: string,
         bearerTokenHex: string,
+        serverEphPubBase64: string,
+        validUntilSeconds: number,
     ): Promise<ObsetyncSecureChannel> {
-        if (bearerTokenHex.length !== BEARER_LEN || !/^[0-9a-fA-F]+$/.test(bearerTokenHex)) {
+        return this.createInternal(
+            serverBoxPubBase64,
+            bearerTokenHex,
+            serverEphPubBase64,
+            validUntilSeconds,
+            false,
+        );
+    }
+
+    /** Single-DH channel used only to fetch the current rotating public key. */
+    static async createBootstrap(
+        serverBoxPubBase64: string,
+    ): Promise<ObsetyncSecureChannel> {
+        return this.createInternal(
+            serverBoxPubBase64,
+            "",
+            null,
+            Number.POSITIVE_INFINITY,
+            true,
+        );
+    }
+
+    private static async createInternal(
+        serverBoxPubBase64: string,
+        bearerTokenHex: string,
+        serverEphPubBase64: string | null,
+        validUntilSeconds: number,
+        bootstrap: boolean,
+    ): Promise<ObsetyncSecureChannel> {
+        if (
+            !bootstrap &&
+            (bearerTokenHex.length !== BEARER_LEN || !/^[0-9a-fA-F]+$/.test(bearerTokenHex))
+        ) {
             throw new ObsetyncSecureTransportError("bearer token is not 64 hex chars");
         }
 
@@ -173,24 +233,78 @@ export class ObsetyncSecureChannel {
         // way — TLS session keys have the same property.
         const ephPrivBytes = new Uint8Array(PUBKEY_LEN);
         crypto.getRandomValues(ephPrivBytes);
-        const ephPubRaw = x25519.getPublicKey(ephPrivBytes);
-        const shared = x25519.getSharedSecret(ephPrivBytes, serverPubBytes);
-        // Zero the private key — we've already derived the shared secret,
-        // everything from here on uses HKDF-derived per-request AES keys.
-        ephPrivBytes.fill(0);
+        let staticShared: Uint8Array | null = null;
+        try {
+            const ephPubRaw = x25519.getPublicKey(ephPrivBytes);
+            staticShared = x25519.getSharedSecret(ephPrivBytes, serverPubBytes);
+            if (staticShared.every((byte) => byte === 0)) {
+                throw new ObsetyncSecureTransportError(
+                    "server box public key is a non-contributory X25519 point",
+                );
+            }
+            let fingerprint = new Uint8Array(FINGERPRINT_LEN);
+            let keyMaterial: Uint8Array;
+            if (bootstrap) {
+                keyMaterial = staticShared.slice();
+            } else {
+                const serverEphBytes = decodeBase64(serverEphPubBase64 ?? "");
+                if (serverEphBytes.length !== PUBKEY_LEN) {
+                    throw new ObsetyncSecureTransportError(
+                        `server ephemeral pubkey must be ${PUBKEY_LEN} bytes`,
+                    );
+                }
+                const ephemeralShared = x25519.getSharedSecret(ephPrivBytes, serverEphBytes);
+                try {
+                    if (ephemeralShared.every((byte) => byte === 0)) {
+                        throw new ObsetyncSecureTransportError(
+                            "server ephemeral public key is a non-contributory X25519 point",
+                        );
+                    }
+                    keyMaterial = concat(staticShared, ephemeralShared);
+                    const digest = new Uint8Array(
+                        await crypto.subtle.digest("SHA-256", bs(serverEphBytes)),
+                    );
+                    fingerprint = digest.slice(0, FINGERPRINT_LEN);
+                } finally {
+                    ephemeralShared.fill(0);
+                }
+            }
 
-        // Import shared as HKDF key material so we can deriveBits per request.
-        const hkdfKey = await crypto.subtle.importKey(
-            "raw",
-            bs(shared),
-            "HKDF",
-            false,
-            ["deriveBits"],
-        );
+            // Import shared as HKDF key material so we can deriveBits per
+            // request. Always clear the extractable copy, including failures.
+            let hkdfKey: CryptoKey;
+            try {
+                hkdfKey = await crypto.subtle.importKey(
+                    "raw",
+                    bs(keyMaterial),
+                    "HKDF",
+                    false,
+                    ["deriveBits"],
+                );
+            } finally {
+                keyMaterial.fill(0);
+            }
 
-        const bearerBytes = new TextEncoder().encode(bearerTokenHex);
+            const bearerBytes = bootstrap
+                ? new Uint8Array()
+                : new TextEncoder().encode(bearerTokenHex);
 
-        return new ObsetyncSecureChannel(ephPubRaw, hkdfKey, bearerBytes);
+            return new ObsetyncSecureChannel(
+                ephPubRaw,
+                hkdfKey,
+                bearerBytes,
+                fingerprint,
+                bootstrap,
+                validUntilSeconds,
+            );
+        } finally {
+            ephPrivBytes.fill(0);
+            staticShared?.fill(0);
+        }
+    }
+
+    isStale(nowSeconds = Date.now() / 1000, refreshMarginSeconds = 3600): boolean {
+        return !this.bootstrap && nowSeconds >= this.validUntilSeconds - refreshMarginSeconds;
     }
 
     /** Derive an AES-256-GCM key for the given direction + nonce. */
@@ -209,13 +323,17 @@ export class ObsetyncSecureChannel {
             this.hkdfKey,
             256,
         );
-        return crypto.subtle.importKey(
-            "raw",
-            keyBytes,
-            { name: "AES-GCM", length: 256 },
-            false,
-            [usage],
-        );
+        try {
+            return await crypto.subtle.importKey(
+                "raw",
+                keyBytes,
+                { name: "AES-GCM", length: 256 },
+                false,
+                [usage],
+            );
+        } finally {
+            new Uint8Array(keyBytes).fill(0);
+        }
     }
 
     /**
@@ -226,24 +344,48 @@ export class ObsetyncSecureChannel {
         method: string,
         path: string,
         body: Uint8Array,
+        sequence: number,
     ): Promise<Uint8Array> {
+        if (!this.bootstrap && (!Number.isSafeInteger(sequence) || sequence <= 0)) {
+            throw new ObsetyncSecureTransportError("request sequence must be a positive safe integer");
+        }
+        if (this.bootstrap && body.length !== 0) {
+            throw new ObsetyncSecureTransportError("bootstrap request plaintext must be empty");
+        }
         const nonce = randomNonce();
         const aad = buildAad(method, path);
-        const key = await this.deriveAesKey(nonce, INFO_C2S, "encrypt");
-
-        const plaintext = concat(this.bearerBytes, body);
-        const ct = new Uint8Array(
-            await crypto.subtle.encrypt(
-                { name: "AES-GCM", iv: bs(nonce), additionalData: bs(aad) },
-                key,
-                bs(plaintext),
-            ),
+        const key = await this.deriveAesKey(
+            nonce,
+            this.bootstrap ? INFO_C2S_BOOT : INFO_C2S,
+            "encrypt",
         );
 
+        let plaintext = body;
+        if (!this.bootstrap) {
+            const sequenceBytes = new Uint8Array(SEQUENCE_LEN);
+            new DataView(sequenceBytes.buffer).setBigUint64(0, BigInt(sequence), false);
+            plaintext = concat(this.bearerBytes, sequenceBytes, body);
+        }
+        let ct: Uint8Array;
+        try {
+            ct = new Uint8Array(
+                await crypto.subtle.encrypt(
+                    { name: "AES-GCM", iv: bs(nonce), additionalData: bs(aad) },
+                    key,
+                    bs(plaintext),
+                ),
+            );
+        } finally {
+            // Default-mode plaintext is our own bearer+sequence+body copy.
+            // Do not clear the caller-owned bootstrap/body view.
+            if (!this.bootstrap) plaintext.fill(0);
+        }
+
         const out = new Uint8Array(REQUEST_HEADER_LEN + ct.length);
-        out[0] = WIRE_VERSION;
+        out[0] = HTTP_WIRE_VERSION;
         out.set(nonce, 1);
         out.set(this.ephPubRaw, 1 + NONCE_LEN);
+        out.set(this.fingerprint, 1 + NONCE_LEN + PUBKEY_LEN);
         out.set(ct, REQUEST_HEADER_LEN);
         return out;
     }
@@ -262,13 +404,16 @@ export class ObsetyncSecureChannel {
         path: string,
         nonceReq: Uint8Array,
         wireBody: Uint8Array,
-    ): Promise<Uint8Array> {
+    ): Promise<DecryptedResponse> {
+        if (wireBody.length === 256 && wireBody.every((byte) => byte === 0)) {
+            throw new ObsetyncSessionStaleError();
+        }
         if (wireBody.length < RESPONSE_HEADER_LEN + TAG_LEN) {
             throw new ObsetyncSecureTransportError(
                 `response too short: ${wireBody.length} bytes, need at least ${RESPONSE_HEADER_LEN + TAG_LEN}`,
             );
         }
-        if (wireBody[0] !== WIRE_VERSION) {
+        if (wireBody[0] !== HTTP_WIRE_VERSION) {
             throw new ObsetyncSecureTransportError(`unsupported response wire version ${wireBody[0]}`);
         }
         // slice() returns a fresh ArrayBuffer-backed view — subarray() would
@@ -282,7 +427,11 @@ export class ObsetyncSecureChannel {
         const nonce = wireBody.slice(1, 1 + NONCE_LEN);
         const ct = wireBody.slice(RESPONSE_HEADER_LEN);
         const aad = buildResponseAad(method, path, nonceReq);
-        const key = await this.deriveAesKey(nonce, INFO_S2C, "decrypt");
+        const key = await this.deriveAesKey(
+            nonce,
+            this.bootstrap ? INFO_S2C_BOOT : INFO_S2C,
+            "decrypt",
+        );
 
         try {
             const plaintext = new Uint8Array(
@@ -292,7 +441,20 @@ export class ObsetyncSecureChannel {
                     bs(ct),
                 ),
             );
-            return plaintext;
+            if (plaintext.length < 2) {
+                throw new ObsetyncSecureTransportError("response has no semantic status");
+            }
+            return {
+                status: new DataView(
+                    plaintext.buffer,
+                    plaintext.byteOffset,
+                    plaintext.byteLength,
+                ).getUint16(0, false),
+                // Share the decrypted allocation here. The API boundary makes
+                // one exact ArrayBuffer only for binary consumers; JSON
+                // responses avoid an otherwise unconditional extra copy.
+                body: plaintext.subarray(2),
+            };
         } catch {
             throw new ObsetyncSecureTransportError(
                 "response decryption failed (tampered, wrong server key, mismatched AAD, " +
@@ -352,16 +514,36 @@ export class ObsetyncWsSession {
         serverEphPubB64: string,
         ticketHex: string,
     ): Promise<ObsetyncWsSession> {
+        if (clientEphPriv.length !== PUBKEY_LEN || !/^[0-9a-f]{64}$/i.test(ticketHex)) {
+            clientEphPriv.fill(0);
+            throw new ObsetyncSecureTransportError("invalid WS key exchange inputs");
+        }
         const serverPub = decodeBase64(serverEphPubB64);
         if (serverPub.length !== PUBKEY_LEN) {
+            clientEphPriv.fill(0);
             throw new ObsetyncSecureTransportError("server_eph_pub must be 32 bytes");
         }
-        const shared = x25519.getSharedSecret(clientEphPriv, serverPub);
-        clientEphPriv.fill(0);
+        let shared: Uint8Array;
+        try {
+            shared = x25519.getSharedSecret(clientEphPriv, serverPub);
+        } finally {
+            clientEphPriv.fill(0);
+        }
+        if (shared.every((byte) => byte === 0)) {
+            shared.fill(0);
+            throw new ObsetyncSecureTransportError(
+                "server WS public key is a non-contributory X25519 point",
+            );
+        }
 
-        const hkdfKey = await crypto.subtle.importKey("raw", bs(shared), "HKDF", false, [
-            "deriveBits",
-        ]);
+        let hkdfKey: CryptoKey;
+        try {
+            hkdfKey = await crypto.subtle.importKey("raw", bs(shared), "HKDF", false, [
+                "deriveBits",
+            ]);
+        } finally {
+            shared.fill(0);
+        }
         const salt = new TextEncoder().encode(ticketHex);
         const derive = async (info: string, usage: KeyUsage): Promise<CryptoKey> => {
             const bits = await crypto.subtle.deriveBits(
@@ -374,9 +556,17 @@ export class ObsetyncWsSession {
                 hkdfKey,
                 256,
             );
-            return crypto.subtle.importKey("raw", bits, { name: "AES-GCM", length: 256 }, false, [
-                usage,
-            ]);
+            try {
+                return await crypto.subtle.importKey(
+                    "raw",
+                    bits,
+                    { name: "AES-GCM", length: 256 },
+                    false,
+                    [usage],
+                );
+            } finally {
+                new Uint8Array(bits).fill(0);
+            }
         };
         return new ObsetyncWsSession(
             await derive(WS_INFO_C2S, "encrypt"),

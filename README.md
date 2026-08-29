@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Savemech/obsetync/actions/workflows/ci.yml/badge.svg)](https://github.com/Savemech/obsetync/actions/workflows/ci.yml)
 
-Self-hosted, end-to-end sync for [Obsidian](https://obsidian.md) vaults.
+Self-hosted sync for [Obsidian](https://obsidian.md) vaults with an authenticated, encrypted client/server transport.
 
 Your notes stay on your infrastructure. Desktop and iOS sync through your own server — no third-party cloud, no vendor lock-in.
 
@@ -11,9 +11,9 @@ Your notes stay on your infrastructure. Desktop and iOS sync through your own se
 - **Self-hosted** — the only server involved is yours
 - **Cross-platform** — desktop (Windows, macOS, Linux) and iOS
 - **Content-addressed storage** — blake3-hashed blobs, automatic deduplication
-- **Incremental sync** — FastCDC chunking means a 1-byte edit to a 200 MB PDF uploads ~64 KB, not the whole file
+- **Incremental sync** — FastCDC chunking means a small edit to a 200 MB binary usually uploads about one content-defined chunk, not the whole file
 - **Merkle tree index** — O(log n) diff, constant-time cached roots on reconnect
-- **End-to-end encrypted transport** — X25519 ECDH + HKDF-SHA256 + AES-256-GCM wrap every request body. No TLS, no CA, no cert install ceremony. The server's X25519 public key is pinned at enrollment; every request is sealed end-to-end with a fresh ephemeral client keypair and a bearer token buried inside the AEAD envelope. Full protocol at [`docs/transport.md`](docs/transport.md)
+- **Application-layer encrypted transport** — X25519 ECDH + HKDF-SHA256 + AES-256-GCM wrap every request body. No TLS, no CA, no cert install ceremony. The server's long-term key is pinned at enrollment; each plugin channel combines it with a rotating memory-only server key, and the bearer stays inside the AEAD envelope. Full protocol at [`docs/transport.md`](docs/transport.md)
 - **Three-way merge** — server reconciles concurrent edits; conflicts preserved as copies instead of clobbered
 
 ## Architecture
@@ -25,7 +25,7 @@ Your notes stay on your infrastructure. Desktop and iOS sync through your own se
 | `plugin/`          | TypeScript    | Obsidian plugin — orchestrates scan/hash/push/pull through WASM |
 | `sync-schema`      | flatbuffers   | On-wire format for tree nodes                                   |
 
-The plugin runs WASM in the Obsidian renderer. Blake3 hashing, FastCDC chunking, and tree operations happen in WASM; the TypeScript side handles I/O, HTTP, the Obsidian API, and X25519 ECDH via [`@noble/curves`](https://github.com/paulmillr/noble-curves) (so iOS and older Chromium, which don't ship X25519 in WebCrypto yet, still work). Peak memory during a 10k-file scan stays bounded because files are streamed in 64 KB slices — the WASM heap never grows past one slice.
+The plugin runs WASM in the Obsidian renderer. Blake3 hashing, FastCDC chunking, and tree operations happen in WASM; the TypeScript side handles I/O, HTTP, the Obsidian API, and X25519 ECDH via [`@noble/curves`](https://github.com/paulmillr/noble-curves). Desktop hashing streams from disk in 64 KB slices. Obsidian's mobile adapter has no ranged reads, so large local uploads require one whole-file JS buffer (capped at 128 MiB to fail visibly instead of inviting an iOS Jetsam restart); large downloads/restores are staged and verified one chunk at a time.
 
 ## Prerequisites
 
@@ -225,7 +225,7 @@ On **iOS**, the same flow works via the Files app:
 1. Open the server admin UI (`http://<server>:27183/admin`), click **Add device**, name it, copy the enrollment code.
 2. In Obsidian → **Settings → ObsetyNC**, fill in:
    - **Server URL** — `http://your-server:27182` (plain HTTP; the AEAD envelope encrypts the payload itself, so HTTPS is unnecessary and actively wrong)
-   - **Vault ID** — any name you like; use the same ID on every device that syncs the same vault
+   - **Vault ID** — a simple ASCII ID such as `personal-notes`; use the same ID on every device that syncs the vault
    - **Enrollment code** — paste it from the admin UI
 3. Hit **Enroll**. First device bulk-pushes its vault; every later device does a first-sync pull (downloads the vault from the server) — progress shown in the status bar + notices.
 
@@ -235,13 +235,13 @@ Repeat on each desktop + phone + tablet you want in the sync.
 
 Sync traffic is sealed inside an **AEAD envelope** carried in plain HTTP bodies: X25519 ECDH + HKDF-SHA256 + AES-256-GCM. No TLS, no CA, no client certs. Clients pin the server's long-term X25519 public key at enrollment (`data/server/box.pub`, base64). Each plugin session generates a fresh ephemeral X25519 keypair; each request carries its own 12-byte nonce + AAD-bound HTTP method and path.
 
-The **bearer token** lives inside the encrypted plaintext (first 64 ASCII hex chars), not in a header — so packet captures can't even tell which device is talking. Revoking a device drops its bearer token from the server index; the next request 401s immediately.
+The **bearer token** lives inside the encrypted plaintext, not in a header — so packet captures can't tell which device is talking from credentials. Revocation is checked immediately after decryption; the next opened request receives an encrypted semantic 403.
 
 **Full protocol specification**: [`docs/transport.md`](docs/transport.md) — byte-level wire format, key schedule, threat model, code map, and a worked example of a request/response round-trip.
 
 ## Reconcile with server
 
-The client maintains a local `sync-base.json` that caches "what hashes the server has". If the server storage is wiped or restored from an older backup, that cache lies — sync would silently say "in sync" while the server is actually missing content. **Settings → ObsetyNC → Reconcile with server** runs a `checkContent` / `checkContentChunks` sweep across every entry in sync-base and re-uploads anything the server is missing. Cheap when the server is in parity (one batched request); corrective when it isn't. This also runs automatically on every **Sync Now**.
+The client maintains a local `sync-base.json` that caches "what hashes the server has". If server storage is wiped, partially restored, or corrupted, that cache can lie. **Settings → ObsetyNC → Reconcile with server** checks Merkle index nodes, small blobs, and large-file manifests in bounded batches; malformed manifests or missing referenced chunks are treated as absent, then local bytes are re-chunked and only missing/corrupt content is uploaded. The parity path transfers metadata only. This also runs automatically on every **Sync Now**.
 
 ## Optional: sync your `.obsidian/` folder
 
@@ -263,7 +263,7 @@ The plugin settings include a toggle to sync your `.obsidian/` directory alongsi
     └── chunks/     FastCDC chunks (large files)
 ```
 
-Small files (< 1 MB) go to `content/<hash>` whole. Large files are chunked via FastCDC; the manifest records chunk hashes and offsets. All storage is content-addressed — identical files across multiple paths use one physical blob. Compromise of `box.key` lets an attacker impersonate the server going forward but does **not** reveal past session content (forward secrecy via per-session ephemeral client keys).
+Small files (< 1 MB) go to `content/<hash>` whole. Large files are chunked via FastCDC; the manifest records chunk hashes and offsets. All storage is content-addressed — identical files across multiple paths use one physical blob. Ordinary wire-v2 traffic has window-bounded forward secrecy from the rotating in-memory server key: after the applicable current/previous slot is gone, theft of `box.key` alone cannot open that captured traffic. Bootstrap traffic and the other limits are spelled out in [`docs/transport.md`](docs/transport.md).
 
 ## Development
 
@@ -296,6 +296,8 @@ just nuke           # remove all ObsetyNC images + volumes (fresh start)
 **`ERR_SSL_PROTOCOL_ERROR` from the plugin** — you saved the Server URL as `https://…`. The sync port is plaintext HTTP; the plugin auto-migrates stored URLs on load, but if you typed a fresh one manually, use `http://`. The AEAD envelope is the trust boundary — TLS would be double-encryption of the same bytes.
 
 **iPhone loops on `GET /api/v1/root/...` forever** — the plugin WASM module failed to load (check *Show debug info* → recent logs for `WASM load failed`). That drops the plugin to a stub that can't hash. Usually caused by an older iOS/WebKit missing a WASM feature; upgrade iOS first.
+
+**Obsidian disappears or restarts during a long iPad sync** — reopen it, then use **Settings → ObsetyNC → Show debug info**. “Previous interruption” reports the last durable phase/file-count/byte checkpoint even when iOS Jetsam killed the renderer before JavaScript could log an exception. Large downloads resume from their verified staging checkpoint; repeated interruption at a local upload above 128 MiB means that file must be uploaded from desktop or excluded.
 
 **`getContent ...: 400` on first sync** — was a real bug in ≤1.1.10 (delta hashes serialized as JSON number arrays instead of hex strings). Upgrade to 1.1.11+ on BOTH the server and every plugin.
 
@@ -396,5 +398,3 @@ ObsetyNC's own source code is licensed under the **[PolyForm Noncommercial Licen
 - **Commercial use is reserved to the author.** Using ObsetyNC for a commercial purpose requires a separate commercial license. Contact **Anton Strukov (Savemech)** — savemech@gmail.com.
 
 The plugin and server bundle third-party open-source components under their own permissive licenses (MIT / Apache-2.0 / ISC / BSD / 0BSD); see **[THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md)**. There are no ads and no in-app payments — the plugin is free to use noncommercially and requires only a server you host yourself.
-
-

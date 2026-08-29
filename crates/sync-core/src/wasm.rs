@@ -53,10 +53,9 @@ impl WasmTree {
         let root =
             RootNode::deserialize(root_bytes).map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-        // Store the root bytes in the memory store so tree operations can find it.
-        let hash = root.hash();
-        self.store.insert_chunk(hash, root_bytes.to_vec());
-
+        // Root bytes live separately from the byte-addressed leaf/internal
+        // store: RootNode::hash() is semantic and intentionally excludes its
+        // history metadata, so it is not a Blake3 address for root_bytes.
         self.root = Some(root);
         Ok(())
     }
@@ -224,7 +223,7 @@ pub fn wasm_tree_get_chunk(tree: &WasmTree, hash_hex: &str) -> Option<Vec<u8>> {
     tree.store.get_chunk(&hash)
 }
 
-/// Return hex hashes of all index chunks (LeafChunk, InternalNode, RootNode)
+/// Return hex hashes of all byte-addressed index chunks (LeafChunk/InternalNode)
 /// held in the WASM tree's in-memory store.
 /// The plugin calls this before putRoot to upload any chunks the server is missing.
 #[wasm_bindgen]
@@ -265,6 +264,44 @@ pub fn wasm_chunk_file(data: &[u8]) -> JsValue {
         }).collect::<Vec<_>>(),
     });
     to_js(&result)
+}
+
+/// Streaming FastCDC planner for memory-constrained clients. Feed small JS
+/// views with update(); WASM retains a bounded ~4 MiB window and finish() returns only
+/// the manifest, avoiding a second whole-file copy in WASM linear memory.
+#[wasm_bindgen]
+pub struct WasmChunker {
+    inner: crate::fastcdc_chunker::StreamingChunker,
+}
+
+#[wasm_bindgen]
+impl WasmChunker {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self {
+            inner: crate::fastcdc_chunker::StreamingChunker::new(),
+        }
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) -> Result<(), JsValue> {
+        self.inner.update(bytes).map_err(JsValue::from_str)
+    }
+
+    pub fn finish(&mut self) -> Result<JsValue, JsValue> {
+        let manifest = self.inner.finish().map_err(JsValue::from_str)?;
+        let result = serde_json::json!({
+            "file_hash": hash_to_hex(&manifest.file_hash),
+            "total_size": manifest.total_size,
+            "chunks": manifest.chunks.iter().map(|chunk| {
+                serde_json::json!({
+                    "hash": hash_to_hex(&chunk.hash),
+                    "offset": chunk.offset,
+                    "size": chunk.size,
+                })
+            }).collect::<Vec<_>>(),
+        });
+        Ok(to_js(&result))
+    }
 }
 
 /// Get a specific sub-file chunk's bytes after calling wasm_chunk_file.
@@ -339,6 +376,14 @@ impl Hasher {
     /// Feed the next chunk of file bytes. Call repeatedly until all bytes fed.
     pub fn update(&mut self, chunk: &[u8]) {
         self.inner.update(chunk);
+    }
+
+    /// Feed bytes into the running whole-file hash and return this slice's
+    /// independent Blake3 address in the same JS→WASM copy. Pull uses this to
+    /// validate a manifest chunk and the ordered full stream simultaneously.
+    pub fn update_and_hash(&mut self, chunk: &[u8]) -> String {
+        self.inner.update(chunk);
+        hash_to_hex(&hash_bytes(chunk))
     }
 
     /// Return the final Blake3 hex hash. Non-consuming — safe to call once.

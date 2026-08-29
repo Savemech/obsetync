@@ -1,10 +1,14 @@
-import { ObsetyncApi, FileDelta } from "./api";
+import { ObsetyncApi, FileDelta, type FileManifest } from "./api";
 import { PlatformIO } from "./platform";
 import { ObsetyncSyncBase } from "./sync-base";
 import { hashFileStreaming, type WasmModule, type WasmTree } from "./push";
+import type { PullWriteExpectation } from "./pull-echo";
+import { conflictCopyPath } from "./conflict-path";
 
 const CHUNK_THRESHOLD = 1_048_576; // 1MB
 const DOWNLOAD_CONCURRENCY = 6;
+const MAX_CONTENT_CHUNK = 4 * 1_048_576;
+const TRANSFER_DIR = ".obsidian/plugins/obsetync/transfers";
 
 /** Sentinel device-root that tells the server "I'm fresh, give me every
  *  file as an addition." Matches the all-zero branch in `post_diff`. */
@@ -25,18 +29,24 @@ export interface PullResult {
      *  mtime_ms (server ≥ 1.4.0). Without it exact parity is unreachable
      *  because leaf hashes cover mtime. */
     deltasHadMtime: boolean;
-    /** Files this pull could not fetch (after one retry) and DEFERRED —
-     *  left untouched on disk, excluded from the tree rebase, retried next
-     *  pull. Non-zero means the tree is knowingly missing content the server
-     *  has, so the caller must NOT advance treeBaseRoot (a later fast-forward
-     *  would read those gaps as deletions — the 2026-07-13 failure mode). */
-    failedCount: number;
-    /** Bytes-worth of files this pull actually fetched from the server. Zero
+    /** Server deltas deliberately or involuntarily deferred: fetch failures
+     *  plus paths with an unsynced local edit. They stay out of BOTH disk and
+     *  the tree rebase, so treeBaseRoot remains the older honest merge base. */
+    deferredCount: number;
+    /** Subset of deferredCount caused by unsynced local edits. */
+    localDeferredCount: number;
+    /** Number of files this pull actually fetched from the server. Zero
      *  means every applied delta verified against local disk — the content is
      *  provably identical to the server, so a tree-hash mismatch is metadata
      *  (mtime) only, not a real divergence, and is safe to adopt rather than
      *  pause. */
     downloaded: number;
+}
+
+/** Set-like live guard. A real Set is accepted, while the sync engine can
+ *  provide a dynamic view that also sees editor events arriving mid-pull. */
+export interface PullPathGuard {
+    has(path: string): boolean;
 }
 
 /**
@@ -55,18 +65,18 @@ export async function pull(
     wasm: WasmModule | null,
     tree: WasmTree | null,
     onProgress?: (msg: string) => void,
-    /** Called with every path this pull is about to touch (targets, rename
-     *  old_paths, deletions) BEFORE any disk write, so the engine can tell
-     *  its own write-echo vault events apart from real user edits. */
-    onDeltasKnown?: (paths: string[]) => void,
+    /** Called with the exact writes this pull will perform, after ignored and
+     *  locally-edited paths have been removed. Upserts carry their expected
+     *  content hash so delayed vault-event echoes can be authenticated. */
+    onWritesKnown?: (writes: PullWriteExpectation[]) => void,
     /** Paths with UNSYNCED local edits (pending queue / journal). Their disk
      *  state is newer than anything the server can send — applying the
      *  server's version would overwrite bytes that exist nowhere else (the
      *  startup order is pull → journal recovery, so a journaled edit from
      *  last session would be clobbered before recovery ever reads it).
-     *  These paths are skipped on DISK but still applied to the tree: the
-     *  local edit pushes right after, and the server merge reconciles. */
-    skipPaths?: Set<string>,
+     *  These paths are skipped on disk AND in the tree. Keeping the previous
+     *  treeBaseRoot forces a real server-side three-way merge. */
+    skipPaths?: PullPathGuard,
     /** Slice 2 ignore predicate. Ignored UPSERTS are dropped (never fetched —
      *  this is what stops a stale device choking on a target/ binary — never
      *  tracked, never in the tree). Ignored DELETES untrack the path (sync-base
@@ -84,17 +94,35 @@ export async function pull(
         onProgress?.("first sync: downloading all files from server...");
         const deltas = await api.getDiff(vaultId, ZERO_ROOT);
         if (!deltas || deltas.length === 0) {
+            // An existing server can legitimately have a committed empty
+            // root. Fetch and reproduce it instead of treating [] as "no
+            // server": otherwise the first later local edit would push with
+            // an empty parent and be rejected because a current root exists.
+            const deltasHadMtime = rebaseTree(tree, syncBase, []);
+            let newRootHash: string | null = null;
+            let newRootBytes: Uint8Array | null = null;
+            try {
+                newRootBytes = await api.getRoot(vaultId);
+                if (newRootBytes && wasm) {
+                    newRootHash = wasm.wasm_root_hash_from_bytes(newRootBytes) ?? null;
+                }
+            } catch (e) {
+                console.warn("[obsetync] empty first-sync root fetch failed:", e);
+            }
+            syncBase.setLastSyncTimestamp(Date.now());
+            await syncBase.save();
+            onProgress?.("first sync: applied 0 files");
             return {
-                newRootHash: null,
-                newRootBytes: null,
+                newRootHash,
+                newRootBytes,
                 applied: 0,
-                treeParity: null,
-                deltasHadMtime: false,
-                failedCount: 0,
+                treeParity: parity(tree, newRootHash),
+                deltasHadMtime,
+                deferredCount: 0,
+                localDeferredCount: 0,
                 downloaded: 0,
             };
         }
-        onDeltasKnown?.(deltaPaths(deltas));
         const { kept, ignoredDeletes, ignoredUpserts } = splitIgnored(deltas, isIgnored);
         for (const d of ignoredDeletes) syncBase.removeEntry(d.path);
         if (ignoredUpserts > 0 || ignoredDeletes.length > 0) {
@@ -103,7 +131,7 @@ export async function pull(
                 `untracked ${ignoredDeletes.length} ignored deletion(s)`,
             );
         }
-        const { deferred: failed, downloaded } = await applyDeltas(
+        const { deferred, downloaded, localDeferredCount } = await applyDeltas(
             api,
             io,
             syncBase,
@@ -111,13 +139,14 @@ export async function pull(
             kept,
             onProgress,
             skipPaths,
+            onWritesKnown,
         );
 
         // Rebase: sync-base was just seeded with the full server state, so a
         // fresh bootstrap from it materializes the server's tree locally.
         // Deferred files never got a sync-base entry, so the bootstrap already
         // excludes them; filter the delta list too for the incremental branch.
-        const appliedDeltas = excludeDeltas(kept, failed).concat(ignoredDeletes);
+        const appliedDeltas = excludeDeltas(kept, deferred).concat(ignoredDeletes);
         const deltasHadMtime = rebaseTree(tree, syncBase, appliedDeltas);
 
         // Establish newRootHash + raw root bytes from the server's current
@@ -136,14 +165,15 @@ export async function pull(
 
         syncBase.setLastSyncTimestamp(Date.now());
         await syncBase.save();
-        onProgress?.(`first sync: applied ${kept.length - failed.length} files`);
+        onProgress?.(`first sync: applied ${kept.length - deferred.length} files`);
         return {
             newRootHash,
             newRootBytes,
-            applied: kept.length - failed.length,
+            applied: kept.length - deferred.length,
             treeParity: parity(tree, newRootHash),
             deltasHadMtime,
-            failedCount: failed.length,
+            deferredCount: deferred.length,
+            localDeferredCount,
             downloaded,
         };
     }
@@ -154,8 +184,8 @@ export async function pull(
     if (!deltas || deltas.length === 0) {
         // Empty delta list can mean one of two things:
         //
-        //   (a) Same root on both sides — server sends 304, middleware
-        //       promotes to 200 with empty body.
+        //   (a) Same root on both sides — the encrypted semantic status is
+        //       304 and the API wrapper returns null.
         //   (b) Different roots but identical content (only mtime/size
         //       differ between server and client trees). Server computed
         //       deltas and got [].
@@ -186,13 +216,13 @@ export async function pull(
             applied: 0,
             treeParity: parity(tree, newRootHash),
             deltasHadMtime: false,
-            failedCount: 0,
+            deferredCount: 0,
+            localDeferredCount: 0,
             downloaded: 0,
         };
     }
 
     onProgress?.(`${deltas.length} changes to apply`);
-    onDeltasKnown?.(deltaPaths(deltas));
     const { kept, ignoredDeletes, ignoredUpserts } = splitIgnored(deltas, isIgnored);
     // Untrack ignored paths the server dropped (a purge) WITHOUT touching disk.
     for (const d of ignoredDeletes) syncBase.removeEntry(d.path);
@@ -202,7 +232,7 @@ export async function pull(
             `untracked ${ignoredDeletes.length} ignored deletion(s)`,
         );
     }
-    const { deferred: failed, downloaded } = await applyDeltas(
+    const { deferred, downloaded, localDeferredCount } = await applyDeltas(
         api,
         io,
         syncBase,
@@ -210,6 +240,7 @@ export async function pull(
         kept,
         onProgress,
         skipPaths,
+        onWritesKnown,
     );
 
     // Rebase the Merkle tree with the exact deltas just applied to disk +
@@ -218,7 +249,7 @@ export async function pull(
     // excluded here, or the tree would claim content that never hit disk.
     // Ignored deletions ARE included: they drop the leaf so the tree converges
     // with a server that purged them.
-    const appliedDeltas = excludeDeltas(kept, failed).concat(ignoredDeletes);
+    const appliedDeltas = excludeDeltas(kept, deferred).concat(ignoredDeletes);
     const deltasHadMtime = rebaseTree(tree, syncBase, appliedDeltas);
 
     // Extract the new root hash from the server's current root bytes so
@@ -240,10 +271,11 @@ export async function pull(
     return {
         newRootHash,
         newRootBytes,
-        applied: kept.length - failed.length,
+        applied: kept.length - deferred.length,
         treeParity: parity(tree, newRootHash),
         deltasHadMtime,
-        failedCount: failed.length,
+        deferredCount: deferred.length,
+        localDeferredCount,
         downloaded,
     };
 }
@@ -271,6 +303,29 @@ function splitIgnored(
     const ignoredDeletes: FileDelta[] = [];
     let ignoredUpserts = 0;
     for (const d of deltas) {
+        if (d.action === "renamed" && d.old_path) {
+            const oldIgnored = isIgnored(d.old_path);
+            const targetIgnored = isIgnored(d.path);
+            if (oldIgnored && !targetIgnored) {
+                // Crossing into sync scope is an addition. Never rename the
+                // user's ignored local source out from under them.
+                kept.push({
+                    action: "added",
+                    path: d.path,
+                    hash: d.hash,
+                    size: d.size,
+                    mtime_ms: d.mtime_ms,
+                });
+                continue;
+            }
+            if (targetIgnored) {
+                // Crossing out of sync scope removes the formerly tracked
+                // source but deliberately leaves all ignored disk paths alone.
+                ignoredDeletes.push({ action: "deleted", path: d.old_path });
+                ignoredUpserts++;
+                continue;
+            }
+        }
         if (isIgnored(d.path)) {
             if (d.action === "deleted") ignoredDeletes.push(d);
             else ignoredUpserts++;
@@ -279,16 +334,6 @@ function splitIgnored(
         kept.push(d);
     }
     return { kept, ignoredDeletes, ignoredUpserts };
-}
-
-/** Every vault path a delta set will touch (targets + rename sources). */
-function deltaPaths(deltas: FileDelta[]): string[] {
-    const paths: string[] = [];
-    for (const d of deltas) {
-        paths.push(d.path);
-        if (d.old_path) paths.push(d.old_path);
-    }
-    return paths;
 }
 
 /** Compare the tree's actual root to the server's. Null when either side
@@ -409,22 +454,31 @@ async function applyDeltas(
     wasm: WasmModule | null,
     deltas: FileDelta[],
     onProgress?: (msg: string) => void,
-    skipPaths?: Set<string>,
-): Promise<{ deferred: FileDelta[]; downloaded: number }> {
+    skipPaths?: PullPathGuard,
+    onWritesKnown?: (writes: PullWriteExpectation[]) => void,
+): Promise<{ deferred: FileDelta[]; downloaded: number; localDeferredCount: number }> {
     const renames: FileDelta[] = [];
     const deletions: FileDelta[] = [];
     const modifications: FileDelta[] = [];
     const additions: FileDelta[] = [];
-    const deferred: string[] = [];
+    const locallyDeferred: FileDelta[] = [];
+    const locallyDeferredSet = new Set<FileDelta>();
+    const shouldSkip = (delta: FileDelta): boolean =>
+        !!skipPaths && (
+            skipPaths.has(delta.path) ||
+            (delta.old_path !== undefined && skipPaths.has(delta.old_path))
+        );
+    const deferLocal = (delta: FileDelta): void => {
+        if (locallyDeferredSet.has(delta)) return;
+        locallyDeferredSet.add(delta);
+        locallyDeferred.push(delta);
+    };
     for (const d of deltas) {
         // Locally-edited paths keep their disk bytes; the pending push +
         // server merge reconcile them. (Renames are included when either
         // end touches an edited path.)
-        if (
-            skipPaths &&
-            (skipPaths.has(d.path) || (d.old_path !== undefined && skipPaths.has(d.old_path)))
-        ) {
-            deferred.push(d.path);
+        if (shouldSkip(d)) {
+            deferLocal(d);
             continue;
         }
         if (d.action === "renamed") renames.push(d);
@@ -432,17 +486,139 @@ async function applyDeltas(
         else if (d.action === "modified") modifications.push(d);
         else additions.push(d);
     }
-    if (deferred.length > 0) {
+    if (locallyDeferred.length > 0) {
         console.log(
-            `[obsetync] pull deferred ${deferred.length} locally-edited file(s): ` +
-            `${deferred.slice(0, 3).join(", ")}${deferred.length > 3 ? ", …" : ""} — ` +
-            `local bytes win until the pending push merges them`,
+            `[obsetync] pull deferred ${locallyDeferred.length} locally-edited file(s): ` +
+            `${locallyDeferred.slice(0, 3).map((d) => d.path).join(", ")}` +
+            `${locallyDeferred.length > 3 ? ", …" : ""} — ` +
+            `honest base retained for server-side merge`,
         );
     }
 
+    const writes: PullWriteExpectation[] = [];
     for (const delta of renames) {
-        if (delta.old_path) {
-            await io.renameFile(delta.old_path, delta.path);
+        if (delta.old_path) writes.push({ path: delta.old_path, action: "delete" });
+        if (delta.hash) writes.push({ path: delta.path, action: "upsert", hash: delta.hash });
+    }
+    // Deletions are registered immediately before the adapter mutation, only
+    // after proving the disk still holds the known base. Unlike an upsert,
+    // a delete echo has no content hash with which to authenticate an early
+    // expectation.
+    for (const delta of [...modifications, ...additions]) {
+        if (delta.hash) writes.push({ path: delta.path, action: "upsert", hash: delta.hash });
+    }
+    if (writes.length > 0) onWritesKnown?.(writes);
+
+    for (const delta of renames) {
+        // Re-check immediately before touching disk: this guard is live and
+        // can observe an editor event that arrived after delta partitioning.
+        if (shouldSkip(delta)) {
+            deferLocal(delta);
+            continue;
+        }
+        if (delta.old_path && delta.hash) {
+            const oldBase = syncBase.getEntry(delta.old_path);
+            const targetBase = syncBase.getEntry(delta.path);
+            const markerPath = renameCheckpointPath(wasm, delta.old_path, delta.path, delta.hash);
+            if (await io.exists(delta.old_path)) {
+                // A rename target should be absent in the source tree. Never
+                // overwrite an unexpected local file just to apply the delta.
+                if (await io.exists(delta.path)) {
+                    deferLocal(delta);
+                    continue;
+                }
+                const sourceStat = await io.stat(delta.old_path);
+                const metadataStillMatches = !!oldBase && !!sourceStat &&
+                    oldBase.hash === delta.hash &&
+                    oldBase.mtime === sourceStat.mtime && oldBase.size === sourceStat.size;
+                if (!metadataStillMatches) {
+                    const canVerifyWithoutLargeMobileRead = !!wasm && !!sourceStat && (
+                        sourceStat.size < CHUNK_THRESHOLD ||
+                        io.getAbsolutePath(delta.old_path) !== null
+                    );
+                    if (!canVerifyWithoutLargeMobileRead) {
+                        deferLocal(delta);
+                        continue;
+                    }
+                    try {
+                        if (await hashFileStreaming(delta.old_path, io, wasm!) !== delta.hash) {
+                            deferLocal(delta);
+                            continue;
+                        }
+                    } catch {
+                        deferLocal(delta);
+                        continue;
+                    }
+                }
+                // Persist intent after verifying source + target state but
+                // before the non-idempotent adapter rename. If the renderer
+                // dies after the move and before sync-base is checkpointed,
+                // the next run can distinguish our completed rename from an
+                // unrelated same-size file already at the target.
+                if (!markerPath) {
+                    deferLocal(delta);
+                    continue;
+                }
+                try {
+                    await writeRenameCheckpoint(io, markerPath, {
+                        version: 1,
+                        oldPath: delta.old_path,
+                        targetPath: delta.path,
+                        fileHash: delta.hash.toLowerCase(),
+                        size: delta.size ?? sourceStat?.size ?? oldBase?.size ?? 0,
+                    });
+                } catch {
+                    deferLocal(delta);
+                    continue;
+                }
+                if (shouldSkip(delta) || await io.exists(delta.path)) {
+                    await safeDelete(io, markerPath);
+                    deferLocal(delta);
+                    continue;
+                }
+                await io.renameFile(delta.old_path, delta.path);
+            } else {
+                // Crash recovery: adapter.rename() may have committed before
+                // the sync-base checkpoint. A target already present in the
+                // base is independently durable; otherwise require either a
+                // content hash or the exact pre-rename WAL marker plus the
+                // source's unchanged local metadata. Size alone is not proof.
+                const targetStat = await io.stat(delta.path);
+                let targetVerified = !!targetStat && !!targetBase &&
+                    targetBase.hash === delta.hash &&
+                    targetBase.mtime === targetStat.mtime &&
+                    targetBase.size === targetStat.size;
+                if (!targetVerified && targetStat) {
+                    const canHashTarget = !!wasm && (
+                        targetStat.size < CHUNK_THRESHOLD ||
+                        io.getAbsolutePath(delta.path) !== null
+                    );
+                    if (canHashTarget) {
+                        try {
+                            targetVerified =
+                                await hashFileStreaming(delta.path, io, wasm!) === delta.hash;
+                        } catch {
+                            targetVerified = false;
+                        }
+                    }
+                }
+                if (!targetVerified && targetStat && markerPath && oldBase) {
+                    const marker = await readRenameCheckpoint(io, markerPath);
+                    targetVerified = !!marker &&
+                        marker.version === 1 &&
+                        marker.oldPath === delta.old_path &&
+                        marker.targetPath === delta.path &&
+                        marker.fileHash === delta.hash.toLowerCase() &&
+                        marker.size === targetStat.size &&
+                        oldBase.hash === delta.hash &&
+                        oldBase.mtime === targetStat.mtime &&
+                        oldBase.size === targetStat.size;
+                }
+                if (!targetVerified) {
+                    deferLocal(delta);
+                    continue;
+                }
+            }
             syncBase.removeEntry(delta.old_path);
             if (delta.hash) {
                 const stat = await io.stat(delta.path);
@@ -454,12 +630,44 @@ async function applyDeltas(
                     delta.mtime_ms,
                 );
             }
+            // Rename is the only non-idempotent metadata operation. Persist it
+            // immediately so a renderer kill never asks the next run to rename
+            // an already-moved source again.
+            await syncBase.checkpoint();
+            if (markerPath) await safeDelete(io, markerPath);
+        } else {
+            deferLocal(delta);
         }
     }
 
+    let appliedDeletions = 0;
     for (const delta of deletions) {
+        if (shouldSkip(delta)) {
+            deferLocal(delta);
+            continue;
+        }
+        // Startup pull runs before the metadata audit. An edit made while the
+        // plugin was unloaded therefore has no journal row yet; compare disk
+        // with the honest sync base before honoring a remote delete. The
+        // later metadata audit will queue a deferred local version for merge.
+        if (!(await diskStillMatchesDeleteBase(io, syncBase, wasm, delta.path))) {
+            console.warn(
+                `[obsetync] deferred remote delete for locally changed ${delta.path}`,
+            );
+            deferLocal(delta);
+            continue;
+        }
+        if (shouldSkip(delta)) {
+            deferLocal(delta);
+            continue;
+        }
+        onWritesKnown?.([{ path: delta.path, action: "delete" }]);
         await io.deleteFile(delta.path);
         syncBase.removeEntry(delta.path);
+        appliedDeletions++;
+    }
+    if (appliedDeletions > 0) {
+        await syncBase.checkpoint();
     }
 
     const stats: ApplyStats = {
@@ -478,26 +686,50 @@ async function applyDeltas(
     // We collect them, retry once, and defer whatever still fails.
     const failed: FileDelta[] = [];
     const startedAt = Date.now();
-    for (let i = 0; i < toDownload.length; i += DOWNLOAD_CONCURRENCY) {
-        const batch = toDownload.slice(i, i + DOWNLOAD_CONCURRENCY);
+    let completed = 0;
+    const applyBatch = async (batch: FileDelta[]) => {
         const results = await Promise.allSettled(
-            batch.map((delta) => applyContentDelta(api, io, syncBase, wasm, delta, stats))
+            batch.map((delta) => applyContentDelta(
+                api,
+                io,
+                syncBase,
+                wasm,
+                delta,
+                stats,
+                () => shouldSkip(delta),
+            ))
         );
         results.forEach((r, j) => {
             if (r.status === "rejected") failed.push(batch[j]);
+            else if (!r.value) deferLocal(batch[j]);
         });
+        // Persist every completed batch as a tiny WAL append. A process kill
+        // resumes from here without re-hashing all already-applied files.
+        await syncBase.checkpoint();
+        completed += batch.length;
         // One tick per batch: position, what was verified-for-free vs actually
         // downloaded, bytes moved, deferred count, and the current rate —
         // everything a human needs to see that a big pull is alive and moving.
-        const done = Math.min(i + DOWNLOAD_CONCURRENCY, toDownload.length);
         const verified = stats.cacheHit + stats.localHit;
         const elapsed = (Date.now() - startedAt) / 1000;
-        const rate = elapsed > 0 ? ` · ${(done / elapsed).toFixed(0)} f/s` : "";
+        const rate = elapsed > 0 ? ` · ${(completed / elapsed).toFixed(0)} f/s` : "";
         const failMsg = failed.length > 0 ? ` · ✗${failed.length} deferred` : "";
         onProgress?.(
-            `${done}/${toDownload.length} files applied · ` +
+            `${completed}/${toDownload.length} files applied · ` +
             `✓${verified} verified · ↓${stats.downloaded} (${fmtBytes(stats.bytesDownloaded)})${failMsg}${rate}`
         );
+    };
+
+    // Small files retain bounded parallelism. Large files run strictly one at
+    // a time: six simultaneous encrypted/chunked transfers were enough to
+    // exceed the practical Jetsam limit on older 2 GB iPads.
+    const smallDownloads = toDownload.filter((delta) => (delta.size ?? 0) < CHUNK_THRESHOLD);
+    const largeDownloads = toDownload.filter((delta) => (delta.size ?? 0) >= CHUNK_THRESHOLD);
+    for (let i = 0; i < smallDownloads.length; i += DOWNLOAD_CONCURRENCY) {
+        await applyBatch(smallDownloads.slice(i, i + DOWNLOAD_CONCURRENCY));
+    }
+    for (const delta of largeDownloads) {
+        await applyBatch([delta]);
     }
 
     // One retry pass — most failures are transient. A file that STILL fails is
@@ -509,7 +741,20 @@ async function applyDeltas(
         console.warn(`[obsetync] pull: ${failed.length} file(s) failed first pass — retrying once`);
         for (const delta of failed) {
             try {
-                await applyContentDelta(api, io, syncBase, wasm, delta, stats);
+                const applied = await applyContentDelta(
+                    api,
+                    io,
+                    syncBase,
+                    wasm,
+                    delta,
+                    stats,
+                    () => shouldSkip(delta),
+                );
+                if (!applied) {
+                    deferLocal(delta);
+                    continue;
+                }
+                await syncBase.checkpoint();
             } catch (e) {
                 unfetched.push(delta);
                 console.warn(`[obsetync] pull: deferring ${delta.path}: ${String((e as any)?.message ?? e)}`);
@@ -525,14 +770,19 @@ async function applyDeltas(
     }
 
     if (toDownload.length > 0) {
+        const deferredTotal = locallyDeferred.length + unfetched.length;
         console.log(
             `[obsetync] applyDeltas: ${stats.cacheHit} cache-hit, ` +
             `${stats.localHit} local-hash-hit, ${stats.downloaded} downloaded, ` +
-            `${unfetched.length} deferred — ` +
+            `${deferredTotal} deferred — ` +
             `${fmtBytes(stats.bytesSkipped)} saved, ${fmtBytes(stats.bytesDownloaded)} transferred`
         );
     }
-    return { deferred: unfetched, downloaded: stats.downloaded };
+    return {
+        deferred: locallyDeferred.concat(unfetched),
+        downloaded: stats.downloaded,
+        localDeferredCount: locallyDeferred.length,
+    };
 }
 
 /** Human-readable byte count for progress messages. */
@@ -542,6 +792,33 @@ function fmtBytes(n: number): string {
     return `${n} B`;
 }
 
+/** A remote delete is safe only when the target is absent or is still the
+ * exact last-synced base. Stat equality is the zero-read fast path; changed
+ * metadata is resolved by a bounded small/mobile or streaming desktop hash.
+ * Large mobile files with changed metadata are deferred rather than read as
+ * one huge JS buffer immediately before deletion. */
+async function diskStillMatchesDeleteBase(
+    io: PlatformIO,
+    syncBase: ObsetyncSyncBase,
+    wasm: WasmModule | null,
+    path: string,
+): Promise<boolean> {
+    const stat = await io.stat(path);
+    if (!stat) return true;
+    const base = syncBase.getEntry(path);
+    if (!base) return false;
+    if (base.mtime === stat.mtime && base.size === stat.size) return true;
+
+    const canHashWithoutLargeMobileRead =
+        stat.size < CHUNK_THRESHOLD || io.getAbsolutePath(path) !== null;
+    if (!wasm || !canHashWithoutLargeMobileRead) return false;
+    try {
+        return await hashFileStreaming(path, io, wasm) === base.hash;
+    } catch {
+        return false;
+    }
+}
+
 async function applyContentDelta(
     api: ObsetyncApi,
     io: PlatformIO,
@@ -549,10 +826,13 @@ async function applyContentDelta(
     wasm: WasmModule | null,
     delta: FileDelta,
     stats: ApplyStats,
-): Promise<void> {
-    if (!delta.hash) return;
+    shouldDefer?: () => boolean,
+): Promise<boolean> {
+    if (!delta.hash) return true;
+    if (shouldDefer?.()) return false;
 
     const size = delta.size ?? 0;
+    let preserveExisting = false;
 
     // --- Tier 1: sync-base cache hit --------------------------------------
     // If sync-base already records this path at this exact hash AND the
@@ -561,15 +841,33 @@ async function applyContentDelta(
     const stat = await io.stat(delta.path);
     if (stat) {
         const base = syncBase.getEntry(delta.path);
+        const metadataMatchesBase = !!base &&
+            base.mtime === stat.mtime && base.size === stat.size;
         if (
             base &&
             base.hash === delta.hash &&
             base.mtime === stat.mtime &&
             base.size === stat.size
         ) {
+            if (shouldDefer?.()) return false;
+            // Content and local disk metadata are already right, but a
+            // metadata-only server delta can still change the tree mtime.
+            // Record it so the rebased Merkle root reproduces the server.
+            if (
+                delta.mtime_ms !== undefined &&
+                syncBase.getTreeMtime(delta.path) !== delta.mtime_ms
+            ) {
+                syncBase.setEntry(
+                    delta.path,
+                    delta.hash,
+                    stat.mtime,
+                    stat.size,
+                    delta.mtime_ms,
+                );
+            }
             stats.cacheHit++;
             stats.bytesSkipped += size || stat.size;
-            return;
+            return true;
         }
 
         // --- Tier 2: local hash matches target --------------------------
@@ -577,10 +875,17 @@ async function applyContentDelta(
         // to the exact value the server is offering. Common after a
         // rollback or stub-WASM recovery — the content is correct, only
         // our metadata was stale. Repair sync-base and skip the download.
-        if (wasm) {
+        // Desktop streams this check from Node fs. Obsidian mobile exposes no
+        // ranged read, so hashing an existing large file would allocate the
+        // whole file immediately before downloading its replacement — a bad
+        // peak-memory trade on older iPads.
+        const canHashLocallyWithoutLargeMobileRead =
+            stat.size < CHUNK_THRESHOLD || io.getAbsolutePath(delta.path) !== null;
+        if (wasm && canHashLocallyWithoutLargeMobileRead) {
             try {
                 const actualHash = await hashFileStreaming(delta.path, io, wasm);
                 if (actualHash === delta.hash) {
+                    if (shouldDefer?.()) return false;
                     syncBase.setEntry(
                         delta.path,
                         delta.hash,
@@ -590,21 +895,57 @@ async function applyContentDelta(
                     );
                     stats.localHit++;
                     stats.bytesSkipped += size || stat.size;
-                    return;
+                    return true;
                 }
+                // The target differs, but overwriting is safe when disk still
+                // holds the exact previously-synced base. Any third hash is an
+                // unjournaled/local collision and must be preserved first.
+                preserveExisting = !base || actualHash !== base.hash;
             } catch (e) {
                 // Hash failed (read error, permission issue, etc.) — fall
                 // through to the download path so we still end up correct.
                 console.warn(`[obsetync] local-hash check failed for ${delta.path}:`, e);
+                preserveExisting = !metadataMatchesBase;
             }
+        } else {
+            // Large mobile files cannot be reread without one huge JS
+            // allocation. Exact sync-base metadata is our safe fast path;
+            // anything else is moved aside without reading its bytes.
+            preserveExisting = !metadataMatchesBase;
         }
     }
 
     // --- Tier 3: actual download from server -----------------------------
+    if (shouldDefer?.()) return false;
     if (size >= CHUNK_THRESHOLD) {
-        await applyLargeFile(api, io, delta.path, delta.hash);
+        try {
+            await applyLargeFile(
+                api,
+                io,
+                delta.path,
+                delta.hash,
+                size,
+                wasm,
+                shouldDefer,
+                preserveExisting,
+            );
+        } catch (error) {
+            if (error instanceof LocalEditDuringPull) return false;
+            throw error;
+        }
     } else {
         const data = await api.getContent(delta.hash);
+        if (!wasm || wasm.wasm_hash(data).toLowerCase() !== delta.hash.toLowerCase()) {
+            throw new Error(`small-file content hash mismatch for ${delta.path}`);
+        }
+        if (shouldDefer?.()) return false;
+        if (preserveExisting && await io.exists(delta.path)) {
+            const conflictPath = await uniqueLocalConflictPath(io, delta.path);
+            await io.renameFile(delta.path, conflictPath);
+            console.warn(
+                `[obsetync] preserved unsynced local bytes as ${conflictPath} before pull`,
+            );
+        }
         await io.writeFile(delta.path, data);
     }
     stats.downloaded++;
@@ -618,34 +959,277 @@ async function applyContentDelta(
         postStat?.size ?? size,
         delta.mtime_ms,
     );
+    return true;
 }
 
-async function applyLargeFile(
+class LocalEditDuringPull extends Error {}
+
+interface RenameTransferCheckpoint {
+    version: 1;
+    oldPath: string;
+    targetPath: string;
+    fileHash: string;
+    size: number;
+}
+
+function renameCheckpointPath(
+    wasm: WasmModule | null,
+    oldPath: string,
+    targetPath: string,
+    fileHash: string,
+): string | null {
+    if (!wasm) return null;
+    try {
+        const identity = new TextEncoder().encode(`${oldPath}\0${targetPath}`);
+        const pathHash = wasm.wasm_hash(identity).slice(0, 16).toLowerCase();
+        if (!/^[0-9a-f]{16}$/.test(pathHash)) return null;
+        const address = /^[0-9a-f]{64}$/i.test(fileHash)
+            ? fileHash.slice(0, 16).toLowerCase()
+            : wasm.wasm_hash(new TextEncoder().encode(fileHash)).slice(0, 16).toLowerCase();
+        if (!/^[0-9a-f]{16}$/.test(address)) return null;
+        return `${TRANSFER_DIR}/${address}-${pathHash}.rename.json`;
+    } catch {
+        return null;
+    }
+}
+
+async function readRenameCheckpoint(
+    io: PlatformIO,
+    path: string,
+): Promise<RenameTransferCheckpoint | null> {
+    try {
+        const value = JSON.parse(
+            new TextDecoder().decode(await io.readFile(path)),
+        ) as Partial<RenameTransferCheckpoint>;
+        if (
+            value?.version !== 1 ||
+            typeof value.oldPath !== "string" ||
+            typeof value.targetPath !== "string" ||
+            typeof value.fileHash !== "string" ||
+            !Number.isSafeInteger(value.size) ||
+            value.size! < 0
+        ) {
+            return null;
+        }
+        return value as RenameTransferCheckpoint;
+    } catch {
+        return null;
+    }
+}
+
+async function writeRenameCheckpoint(
+    io: PlatformIO,
+    path: string,
+    checkpoint: RenameTransferCheckpoint,
+): Promise<void> {
+    await io.writeFile(path, new TextEncoder().encode(JSON.stringify(checkpoint)));
+}
+
+interface LargeTransferCheckpoint {
+    version: 1;
+    targetPath: string;
+    fileHash: string;
+    totalSize: number;
+    nextChunk: number;
+    bytesWritten: number;
+}
+
+/** Reject manifests that could overlap, leave holes, overrun allocations, or
+ *  point at a different content address. Returned values are safe JS ints. */
+export function validateManifest(
+    value: FileManifest,
+    expectedHash: string,
+    expectedSize?: number,
+): FileManifest {
+    const manifest = value as Partial<FileManifest> | null;
+    if (!manifest || typeof manifest !== "object") throw new Error("invalid large-file manifest");
+    const canonicalHash = expectedHash.toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(canonicalHash) || manifest.file_hash?.toLowerCase() !== canonicalHash) {
+        throw new Error("large-file manifest hash mismatch");
+    }
+    if (!Number.isSafeInteger(manifest.total_size) || manifest.total_size! < 0) {
+        throw new Error("invalid large-file total size");
+    }
+    if (expectedSize !== undefined && expectedSize > 0 && manifest.total_size !== expectedSize) {
+        throw new Error("large-file manifest size disagrees with tree entry");
+    }
+    if (!Array.isArray(manifest.chunks) || manifest.chunks.length > 1_000_000) {
+        throw new Error("invalid large-file chunk list");
+    }
+
+    let expectedOffset = 0;
+    for (const chunk of manifest.chunks) {
+        if (
+            !chunk ||
+            typeof chunk.hash !== "string" ||
+            !/^[0-9a-f]{64}$/i.test(chunk.hash) ||
+            !Number.isSafeInteger(chunk.offset) ||
+            !Number.isSafeInteger(chunk.size) ||
+            chunk.offset !== expectedOffset ||
+            chunk.size <= 0 ||
+            chunk.size > MAX_CONTENT_CHUNK
+        ) {
+            throw new Error("invalid large-file chunk layout");
+        }
+        expectedOffset += chunk.size;
+        if (!Number.isSafeInteger(expectedOffset) || expectedOffset > manifest.total_size!) {
+            throw new Error("large-file chunk layout exceeds total size");
+        }
+    }
+    if (expectedOffset !== manifest.total_size) {
+        throw new Error("large-file chunk layout does not cover the file");
+    }
+    if (manifest.total_size > 0 && manifest.chunks.length === 0) {
+        throw new Error("non-empty large file has no chunks");
+    }
+    return manifest as FileManifest;
+}
+
+/** Download a large file into an internal staging file. Each chunk is
+ *  length/hash checked, appended, and durably checkpointed before proceeding;
+ *  an iOS process kill resumes at the next chunk instead of starting over. */
+export async function applyLargeFile(
     api: ObsetyncApi,
     io: PlatformIO,
     path: string,
-    hash: string
+    hash: string,
+    expectedSize: number,
+    wasm: WasmModule | null,
+    shouldAbort?: () => boolean,
+    preserveExisting = false,
 ): Promise<void> {
-    const manifest = await api.getManifest(hash);
+    if (shouldAbort?.()) throw new LocalEditDuringPull();
+    if (!wasm) throw new Error("WASM hash verifier unavailable for large file");
+    const manifest = validateManifest(await api.getManifest(hash), hash, expectedSize);
+    const pathHash = wasm.wasm_hash(new TextEncoder().encode(path)).slice(0, 16);
+    const transferKey = `${hash.toLowerCase()}-${pathHash}`;
+    const stagingPath = `${TRANSFER_DIR}/${transferKey}.part`;
+    const checkpointPath = `${TRANSFER_DIR}/${transferKey}.checkpoint.json`;
 
-    // Fetch all chunks.
-    const chunkData: Uint8Array[] = [];
-    for (let i = 0; i < manifest.chunks.length; i += DOWNLOAD_CONCURRENCY) {
-        const batch = manifest.chunks.slice(i, i + DOWNLOAD_CONCURRENCY);
-        const results = await Promise.all(
-            batch.map((c) => api.getContentChunk(c.hash))
+    let checkpoint = await readLargeCheckpoint(io, checkpointPath);
+    const expectedBytes = (nextChunk: number): number =>
+        nextChunk === manifest.chunks.length
+            ? manifest.total_size
+            : manifest.chunks[nextChunk]?.offset ?? -1;
+    const stagingStat = await io.stat(stagingPath);
+    const resumable =
+        checkpoint?.version === 1 &&
+        checkpoint.targetPath === path &&
+        checkpoint.fileHash === hash.toLowerCase() &&
+        checkpoint.totalSize === manifest.total_size &&
+        Number.isInteger(checkpoint.nextChunk) &&
+        checkpoint.nextChunk >= 0 &&
+        checkpoint.nextChunk <= manifest.chunks.length &&
+        checkpoint.bytesWritten === expectedBytes(checkpoint.nextChunk) &&
+        stagingStat?.size === checkpoint.bytesWritten;
+
+    if (!resumable) {
+        await safeDelete(io, stagingPath);
+        await safeDelete(io, checkpointPath);
+        await io.writeFile(stagingPath, new Uint8Array());
+        checkpoint = {
+            version: 1,
+            targetPath: path,
+            fileHash: hash.toLowerCase(),
+            totalSize: manifest.total_size,
+            nextChunk: 0,
+            bytesWritten: 0,
+        };
+        await writeLargeCheckpoint(io, checkpointPath, checkpoint);
+    }
+
+    // A fresh transfer can prove the manifest's ordered concatenation while
+    // bytes are already crossing the WASM boundary. Resumed prefixes were
+    // individually verified before their checkpoint; mobile has no ranged
+    // read with which to replay them without a whole-file allocation.
+    const wholeHasher = checkpoint!.nextChunk === 0 ? new wasm.Hasher() : null;
+    let assembledHash: string | null = null;
+    try {
+        for (let index = checkpoint!.nextChunk; index < manifest.chunks.length; index++) {
+            if (shouldAbort?.()) throw new LocalEditDuringPull();
+            const chunk = manifest.chunks[index];
+            const data = await api.getContentChunk(chunk.hash);
+            if (data.length !== chunk.size) {
+                throw new Error(`large-file chunk ${index} length mismatch`);
+            }
+            const actualHash = wholeHasher
+                ? wholeHasher.update_and_hash(data)
+                : wasm.wasm_hash(data);
+            if (actualHash.toLowerCase() !== chunk.hash.toLowerCase()) {
+                throw new Error(`large-file chunk ${index} hash mismatch`);
+            }
+            await io.appendFile(stagingPath, data);
+            checkpoint = {
+                ...checkpoint!,
+                nextChunk: index + 1,
+                bytesWritten: chunk.offset + chunk.size,
+            };
+            await writeLargeCheckpoint(io, checkpointPath, checkpoint);
+            // One chunk at a time bounds live plaintext to ~4 MiB; yielding also
+            // keeps old WKWebView render/watchdog queues responsive.
+            await new Promise<void>((resolve) => globalThis.setTimeout(resolve, 0));
+        }
+        if (wholeHasher) assembledHash = wholeHasher.finalize().toLowerCase();
+    } finally {
+        wholeHasher?.free();
+    }
+
+    if (assembledHash !== null && assembledHash !== hash.toLowerCase()) {
+        // Do not leave a completed-looking checkpoint: the next retry must
+        // fetch from chunk zero rather than promoting known-wrong bytes.
+        await safeDelete(io, stagingPath);
+        await safeDelete(io, checkpointPath);
+        throw new Error("large-file assembled content hash mismatch");
+    }
+
+    const completed = await io.stat(stagingPath);
+    if (completed?.size !== manifest.total_size) {
+        throw new Error("large-file staging size mismatch after download");
+    }
+    if (shouldAbort?.()) throw new LocalEditDuringPull();
+    if (preserveExisting && await io.exists(path)) {
+        const conflictPath = await uniqueLocalConflictPath(io, path);
+        await io.renameFile(path, conflictPath);
+        console.warn(
+            `[obsetync] preserved unsynced local bytes as ${conflictPath} before pull`,
         );
-        chunkData.push(...results);
     }
+    await io.replaceFile(stagingPath, path);
+    await safeDelete(io, checkpointPath);
+}
 
-    // Reassemble.
-    const totalSize = manifest.total_size;
-    const assembled = new Uint8Array(totalSize);
-    let offset = 0;
-    for (const chunk of chunkData) {
-        assembled.set(chunk, offset);
-        offset += chunk.length;
+async function readLargeCheckpoint(
+    io: PlatformIO,
+    path: string,
+): Promise<LargeTransferCheckpoint | null> {
+    try {
+        return JSON.parse(new TextDecoder().decode(await io.readFile(path))) as LargeTransferCheckpoint;
+    } catch {
+        return null;
     }
+}
 
-    await io.writeFile(path, assembled);
+async function writeLargeCheckpoint(
+    io: PlatformIO,
+    path: string,
+    checkpoint: LargeTransferCheckpoint,
+): Promise<void> {
+    await io.writeFile(path, new TextEncoder().encode(JSON.stringify(checkpoint)));
+}
+
+async function safeDelete(io: PlatformIO, path: string): Promise<void> {
+    try { await io.deleteFile(path); } catch { /* absent/stale file */ }
+}
+
+async function uniqueLocalConflictPath(io: PlatformIO, path: string): Promise<string> {
+    const now = Date.now();
+    for (let attempt = 0; attempt < 1_000; attempt++) {
+        const candidate = conflictCopyPath(
+            path,
+            "local-before-pull",
+            new Date(now + attempt * 60_000),
+        );
+        if (!(await io.exists(candidate))) return candidate;
+    }
+    throw new Error(`could not allocate a conflict-copy path for ${path}`);
 }

@@ -228,11 +228,6 @@ pub async fn merge_trees<S: ChunkStore, C: ContentStore>(
         ..new_root
     };
 
-    // Store the merged root.
-    let root_bytes = merged_root.serialize();
-    let root_hash = merged_root.hash();
-    store.put(root_hash, root_bytes).await?;
-
     Ok(MergeResult {
         new_root: merged_root,
         file_conflicts,
@@ -684,8 +679,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn merge_result_root_is_persisted() {
-        // merge_trees stores the merged root in the chunk store before returning.
+    async fn merge_result_root_stays_out_of_the_byte_addressed_chunk_store() {
+        // Root hashes intentionally exclude history metadata, unlike leaf and
+        // internal-node addresses. The caller persists the returned root in
+        // its per-vault history rather than mixing it into the byte CAS.
         let store = MemoryChunkStore::new();
         let content = MemoryContentStore::new();
         let base = build_tree(&store, vec![make_entry("a.md", "x")], "v", "d")
@@ -698,10 +695,10 @@ mod tests {
             .await
             .unwrap();
         let merged_hash = result.new_root.hash();
-        // The merged root bytes must now be retrievable from the store.
-        let bytes = store.get(&merged_hash).await.unwrap();
-        let decoded = crate::chunk::RootNode::deserialize(&bytes).unwrap();
-        assert_eq!(decoded.hash(), merged_hash);
+        assert!(matches!(
+            store.get(&merged_hash).await.unwrap_err(),
+            crate::chunk::ChunkError::NotFound(_),
+        ));
     }
 
     #[tokio::test]
