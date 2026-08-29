@@ -140,7 +140,7 @@
           version = "1.10.1";
           src     = ./plugin;
 
-          npmDepsHash = "sha256-wg3PPj+hbVnNkC7/Tw1yExitOEsyEVBn3XP4mj7p4sw=";
+          npmDepsHash = "sha256-lyEMLmn/Gt42afsBhU30iUoQCIkMkXn2aQi/rOy52sg=";
 
           # Inject the WASM bindings before esbuild runs.
           preBuild = ''
