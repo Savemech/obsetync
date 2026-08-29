@@ -407,8 +407,13 @@ impl WireClient {
                 device_root_hex.as_bytes(),
             )
             .await?;
-        // 304 was promoted to 200 by the middleware before encryption (so the
-        // AEAD envelope reaches the wire) — but the body stays "[]".
+        // Wire v2 carries the semantic status inside the encrypted payload,
+        // so an in-sync response remains 304 after the outer HTTP 200 is
+        // opened. Accept an empty JSON array as the wire-v1 compatibility
+        // representation too.
+        if r.status == StatusCode::NOT_MODIFIED {
+            return Ok(DiffResponse::InSync);
+        }
         if !r.status.is_success() {
             bail!(
                 "post_diff: {} — {}",

@@ -107,7 +107,6 @@ pub async fn run_validate_root(
             let mut entries =
                 Vec::with_capacity(usize::try_from(root.total_files).unwrap_or(0).min(100_000));
             let mut previous_prefix: Option<&str> = None;
-            let mut previous_path: Option<String> = None;
             for (prefix, child_hash) in &root.children {
                 if previous_prefix.is_some_and(|previous| previous >= prefix.as_str()) {
                     return Err("root child prefixes are not strictly sorted".to_string());
@@ -120,6 +119,11 @@ pub async fn run_validate_root(
                 let child = sync_core::tree::load_all_entries(&store, child_hash)
                     .await
                     .map_err(|e| e.to_string())?;
+                // Each prefix is its own sorted namespace. The canonical root
+                // order puts the root-level prefix (`""`) first, but a root
+                // file such as `seed.md` can lexically follow `notes/x.md` in
+                // the next prefix, so ordering must not leak across children.
+                let mut previous_path: Option<String> = None;
                 for entry in child {
                     if !valid_vault_path(&entry.path) {
                         return Err(format!("unsafe vault path {:?}", entry.path));
@@ -336,6 +340,25 @@ mod tests {
         assert!(run_validate_root(dir.path().to_path_buf(), root)
             .await
             .is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn root_validation_accepts_root_files_with_directory_prefixes() {
+        let dir = tempdir().unwrap();
+        let root = build_tree_on_disk(
+            dir.path().to_path_buf(),
+            vec![
+                make_entry("seed.md", "seed"),
+                make_entry("notes/x.md", "x"),
+                make_entry("photos/y.png", "y"),
+            ],
+        )
+        .await;
+
+        let entries = run_validate_root(dir.path().to_path_buf(), root)
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 3);
     }
 
     #[tokio::test(flavor = "multi_thread")]
