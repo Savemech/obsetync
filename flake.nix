@@ -181,9 +181,18 @@
 
           contents = [
             pkgs.dockerTools.caCertificates  # /etc/ssl/certs for rustls
-            pkgs.dockerTools.fakeNss         # minimal /etc/passwd (for `User: nobody`)
             sync-server                       # the binary at /bin/sync-server
           ];
+
+          # Docker resolves passwd/group before every healthcheck exec. The
+          # fakeNss files are absolute nix-store symlinks, which recent runc
+          # rejects during that lookup as "path escapes from parent". Keep
+          # regular NSS files in the image's own layer instead.
+          extraCommands = ''
+            mkdir -p etc
+            printf 'root:x:0:0:root:/root:/sbin/nologin\nnobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n' > etc/passwd
+            printf 'root:x:0:\nnogroup:x:65534:\n' > etc/group
+          '';
 
           config = {
             Entrypoint   = [ "${sync-server}/bin/sync-server" ];
@@ -197,7 +206,7 @@
               "27183/tcp" = {};
             };
             Volumes    = { "/data" = {}; };
-            User       = "nobody";
+            User       = "65534:65534";
             WorkingDir = "/";
             Labels     = {
               "org.opencontainers.image.title"       = "obsetync-server";
