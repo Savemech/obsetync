@@ -201,7 +201,7 @@ export default class ObsetyncPlugin extends Plugin {
                 push(`In sync (tree):    ${inSync ? "yes ✓" : "no"}`);
                 push(`Push blocked:      ${this.syncEngine.isPushBlocked() ? "YES — run Full Rescan" : "no"}`);
                 push(`Re-enroll needed:  ${this.syncEngine.isReenrollmentRequired() ? "YES — automatic sync paused" : "no"}`);
-                push(`Bulk scan review:  ${this.syncEngine.isBulkScanReviewRequired() ? "YES — run Full Rescan to confirm" : "no"}`);
+                push(`Bulk change review: ${this.syncEngine.isBulkChangeReviewRequired() ? "YES — run Full Rescan to confirm" : "no"}`);
                 push(`Tree root hash:    ${trunc(treeRoot, 24)}`);
                 push(`Tree base root:    ${trunc(baseRoot, 24)}`);
                 push(`Last server root:  ${trunc(serverRoot, 24)}`);
@@ -486,8 +486,8 @@ export default class ObsetyncPlugin extends Plugin {
         await this.syncEngine.start();
         if (this.syncEngine.isReenrollmentRequired()) {
             this.updateStatusBar("sync ⚠ re-enroll");
-        } else if (this.syncEngine.isBulkScanReviewRequired()) {
-            this.updateStatusBar("sync ⚠ review scan");
+        } else if (this.syncEngine.isBulkChangeReviewRequired()) {
+            this.updateStatusBar("sync ⚠ review");
         } else {
             this.updateStatusBar("sync ✓");
         }

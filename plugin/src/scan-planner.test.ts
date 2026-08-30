@@ -1,4 +1,8 @@
-import { metadataScanNeedsReview, planMetadataScan } from "./scan-planner";
+import {
+    automaticChangeNeedsReview,
+    metadataScanNeedsReview,
+    planMetadataScan,
+} from "./scan-planner";
 
 const check = (condition: unknown, message: string) => {
     if (!condition) throw new Error(message);
@@ -49,5 +53,13 @@ check(
     ),
     "mass deletion was not blocked",
 );
+check(
+    automaticChangeNeedsReview(1_003, 636, 966),
+    "journal-sized mass deletion was not blocked",
+);
+check(
+    !automaticChangeNeedsReview(1_003, 20, 966),
+    "ordinary journal recovery was incorrectly blocked",
+);
 
-console.log("scan-planner.test: 8 assertions passed");
+console.log("scan-planner.test: 10 assertions passed");

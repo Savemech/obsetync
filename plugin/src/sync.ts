@@ -31,7 +31,11 @@ import { PullEchoTracker } from "./pull-echo";
 import { DirtyPathSet, type DirtyFileChange } from "./dirty-set";
 import { OperationCheckpoint } from "./operation-checkpoint";
 import { exactArrayBuffer } from "./binary";
-import { metadataScanNeedsReview, planMetadataScan } from "./scan-planner";
+import {
+    automaticChangeNeedsReview,
+    metadataScanNeedsReview,
+    planMetadataScan,
+} from "./scan-planner";
 import { isSafeVaultPath } from "./delta-validation";
 import { isReenrollmentRequiredError } from "./transport-errors";
 
@@ -69,8 +73,8 @@ export class ObsetyncSyncEngine {
      *  is reset, so startup scans and every automatic network loop pause. */
     private reenrollmentRequired = false;
     private reenrollmentNoticeShown = false;
-    /** Startup detected vault-sized drift and requires explicit Full Rescan. */
-    private bulkScanReviewRequired = false;
+    /** Automatic recovery found vault-sized or deletion-heavy work. */
+    private bulkChangeReviewRequired = false;
     /** Prevent late async completions from reviving an engine after reload. */
     private stopped = false;
     /** Content-authenticated expectations for adapter writes made by pull.
@@ -207,8 +211,8 @@ export class ObsetyncSyncEngine {
         return this.reenrollmentRequired;
     }
 
-    isBulkScanReviewRequired(): boolean {
-        return this.bulkScanReviewRequired;
+    isBulkChangeReviewRequired(): boolean {
+        return this.bulkChangeReviewRequired;
     }
 
     /** Start the sync engine: run startup sequence, attach listeners, start timer. */
@@ -400,6 +404,13 @@ export class ObsetyncSyncEngine {
     async forceSync(): Promise<void> {
         if (this.reenrollmentRequired || this.stopped) {
             new Notice("Obsetync: re-enroll this device before syncing.", 10000);
+            return;
+        }
+        if (this.bulkChangeReviewRequired) {
+            new Notice(
+                "Obsetync: automatic publishing is paused. Review ignores and run Full Rescan.",
+                10000,
+            );
             return;
         }
         // Another cycle already holds the engine (e.g. the startup
@@ -693,9 +704,10 @@ export class ObsetyncSyncEngine {
             new Notice("Obsetync: sync already in progress — retry the rescan when it finishes.");
             return;
         }
-        // Full Rescan is the user's explicit confirmation after a bulk-audit
-        // safety stop.
-        this.bulkScanReviewRequired = false;
+        // Full Rescan is the user's explicit confirmation after a bulk-change
+        // safety stop. Restore the stop if the confirming scan itself fails.
+        const bulkReviewWasRequired = this.bulkChangeReviewRequired;
+        this.bulkChangeReviewRequired = false;
         // Own the tree for the complete scan. WS pulls and debounced pushes
         // must not mutate the same WASM handle between hash batches.
         this.syncing = true;
@@ -835,6 +847,7 @@ export class ObsetyncSyncEngine {
             console.log(`[obsetync] full scan complete: ${totalChanges} changes`);
         } catch (error: any) {
             scanFailed = true;
+            if (bulkReviewWasRequired) this.bulkChangeReviewRequired = true;
             this.lastError = {
                 ts: Date.now(),
                 origin: "full-scan",
@@ -853,7 +866,7 @@ export class ObsetyncSyncEngine {
 
         // Publish once the scan has released exclusive ownership. push()
         // itself streams these path records in bounded file batches.
-        if (this.pendingChanges.size > 0) await this.pushPending();
+        if (this.pendingChanges.size > 0) await this.pushPending(true);
     }
 
     // --- Private ---
@@ -931,7 +944,7 @@ export class ObsetyncSyncEngine {
             if (!pullFailed && !this.stopped) {
                 this.state = "idle";
                 this.onStatusUpdate(
-                    this.bulkScanReviewRequired ? "sync ⚠ review scan" : "sync ✓",
+                    this.bulkChangeReviewRequired ? "sync ⚠ review" : "sync ✓",
                 );
                 this.lastPullDoneMs = Date.now();
             }
@@ -939,6 +952,7 @@ export class ObsetyncSyncEngine {
             if (
                 !this.reenrollmentRequired &&
                 !this.stopped &&
+                !this.bulkChangeReviewRequired &&
                 this.pendingChanges.size > 0
             ) {
                 this.debouncedPush?.();
@@ -998,6 +1012,27 @@ export class ObsetyncSyncEngine {
         }
 
         this.onStatusUpdate("sync ✗");
+    }
+
+    private requireBulkChangeReview(
+        source: string,
+        total: number,
+        trackedDeletions: number,
+    ): void {
+        this.bulkChangeReviewRequired = true;
+        this.onStatusUpdate("sync ⚠ review");
+        console.warn(
+            `[obsetync] automatic ${source} publish paused: ${total} changes, ` +
+            `${trackedDeletions} tracked deletions; review ignores and run Full Rescan`,
+        );
+        const deletionSummary = trackedDeletions > 0
+            ? `, including ${trackedDeletions.toLocaleString()} tracked deletions`
+            : "";
+        new Notice(
+            `Obsetync paused ${total.toLocaleString()} automatic changes${deletionSummary}. ` +
+            "Review ignore patterns, then run Full Rescan to confirm.",
+            15000,
+        );
     }
 
     /**
@@ -1132,8 +1167,14 @@ export class ObsetyncSyncEngine {
         }
     }
 
-    private async pushPending(): Promise<void> {
+    private async pushPending(allowBulkChange = false): Promise<void> {
         if (this.reenrollmentRequired || this.stopped) return;
+        if (this.bulkChangeReviewRequired && !allowBulkChange) {
+            console.warn(
+                `[obsetync] push deferred: ${this.pendingChanges.size} changes await Full Rescan review`,
+            );
+            return;
+        }
         if (this.syncing || this.pendingChanges.size === 0) {
             console.log(
                 `[obsetync] pushPending early-return: syncing=${this.syncing}, ` +
@@ -1212,6 +1253,23 @@ export class ObsetyncSyncEngine {
             );
             if (this.stopped) {
                 this.pendingChanges.restore(queued);
+                return;
+            }
+            const trackedDeletions = batch.filter(
+                (change) =>
+                    change.action === "deleted" &&
+                    this.syncBase.getEntry(change.path) !== null,
+            ).length;
+            if (
+                !allowBulkChange &&
+                automaticChangeNeedsReview(
+                    batch.length,
+                    trackedDeletions,
+                    this.syncBase.entryCount(),
+                )
+            ) {
+                this.pendingChanges.restore(queued);
+                this.requireBulkChangeReview("pending recovery", batch.length, trackedDeletions);
                 return;
             }
             this.operationCheckpoint?.progress(
@@ -1294,13 +1352,14 @@ export class ObsetyncSyncEngine {
             if (!pushFailed && !this.stopped) {
                 this.state = "idle";
                 this.onStatusUpdate(
-                    this.bulkScanReviewRequired ? "sync ⚠ review scan" : "sync ✓",
+                    this.bulkChangeReviewRequired ? "sync ⚠ review" : "sync ✓",
                 );
             }
             // Drain user edits that arrived while we were pushing.
             if (
                 !this.reenrollmentRequired &&
                 !this.stopped &&
+                !this.bulkChangeReviewRequired &&
                 this.pendingChanges.size > 0
             ) {
                 this.debouncedPush?.();
@@ -1436,6 +1495,10 @@ export class ObsetyncSyncEngine {
     private async partialMtimeScan(): Promise<void> {
         const lastSync = this.syncBase.lastSyncTimestamp;
         if (lastSync === 0) return; // First ever sync — skip, let pull handle it.
+        if (this.bulkChangeReviewRequired) {
+            console.warn("[obsetync] metadata scan skipped while bulk changes await review");
+            return;
+        }
 
         // Filter candidates from in-memory cache — no async stat calls.
         const allStats = this.io.statBulk();
@@ -1451,18 +1514,12 @@ export class ObsetyncSyncEngine {
         );
         if (metadataScanNeedsReview(plan, this.syncBase.entryCount())) {
             const total = plan.toHash.length + plan.deleted.length;
-            this.bulkScanReviewRequired = true;
-            this.onStatusUpdate("sync ⚠ review scan");
             console.warn(
-                `[obsetync] automatic metadata publish paused: ${plan.toHash.length} ` +
+                `[obsetync] metadata scan found ${plan.toHash.length} ` +
                 `files need hashing and ${plan.deleted.length} look deleted ` +
-                `(${total} total changes); review ignores and run Full Rescan`,
+                `(${total} total changes)`,
             );
-            new Notice(
-                `Obsetync paused an automatic ${total.toLocaleString()}-file change. ` +
-                "Review ignore patterns, then run Full Rescan to confirm it.",
-                15000,
-            );
+            this.requireBulkChangeReview("metadata scan", total, plan.deleted.length);
             return;
         }
         const toHash = plan.toHash;

@@ -8,8 +8,22 @@ export interface MetadataScanPlan {
     deleted: string[];
 }
 
-/** Automatic startup work above this size requires an explicit Full Rescan. */
-export const AUTOMATIC_METADATA_CHANGE_LIMIT = 10_000;
+/** Automatic work above this size requires an explicit Full Rescan. */
+export const AUTOMATIC_CHANGE_LIMIT = 10_000;
+
+/** Shared publish gate for metadata scans, journal recovery, and live queues. */
+export function automaticChangeNeedsReview(
+    total: number,
+    trackedDeletions: number,
+    baseCount: number,
+): boolean {
+    if (total >= AUTOMATIC_CHANGE_LIMIT) return true;
+    return (
+        baseCount >= 100 &&
+        trackedDeletions >= 100 &&
+        trackedDeletions * 4 >= baseCount
+    );
+}
 
 /**
  * A startup audit is recovery, not user intent. Refuse to automatically
@@ -21,12 +35,7 @@ export function metadataScanNeedsReview(
     baseCount: number,
 ): boolean {
     const total = plan.toHash.length + plan.deleted.length;
-    if (total >= AUTOMATIC_METADATA_CHANGE_LIMIT) return true;
-    return (
-        baseCount >= 100 &&
-        plan.deleted.length >= 100 &&
-        plan.deleted.length * 4 >= baseCount
-    );
+    return automaticChangeNeedsReview(total, plan.deleted.length, baseCount);
 }
 
 /** Pure metadata phase shared by startup scans and tests. */
