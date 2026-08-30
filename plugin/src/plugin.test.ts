@@ -13,3 +13,4 @@ import "./operation-checkpoint.test";
 import "./secure.test";
 import "./scan-planner.test";
 import "./delta-validation.test";
+import "./push-transaction.test";

@@ -9,6 +9,7 @@ import { ObsetyncConflictModal, findConflicts } from "./conflict-ui";
 import { debugLog, crashLog, perfSpan } from "./debug-log";
 import { OperationCheckpoint } from "./operation-checkpoint";
 import type { WasmModule, WasmTree } from "./push";
+import { migrateLegacyDefaultIgnorePatterns } from "./ignore";
 
 // Static import of the wasm-bindgen --target web glue. esbuild inlines this
 // ES module into main.js at build time — no runtime `new Function(...)` or
@@ -199,6 +200,8 @@ export default class ObsetyncPlugin extends Plugin {
                 push(`Engine state:      ${this.syncEngine.getState()}`);
                 push(`In sync (tree):    ${inSync ? "yes ✓" : "no"}`);
                 push(`Push blocked:      ${this.syncEngine.isPushBlocked() ? "YES — run Full Rescan" : "no"}`);
+                push(`Re-enroll needed:  ${this.syncEngine.isReenrollmentRequired() ? "YES — automatic sync paused" : "no"}`);
+                push(`Bulk scan review:  ${this.syncEngine.isBulkScanReviewRequired() ? "YES — run Full Rescan to confirm" : "no"}`);
                 push(`Tree root hash:    ${trunc(treeRoot, 24)}`);
                 push(`Tree base root:    ${trunc(baseRoot, 24)}`);
                 push(`Last server root:  ${trunc(serverRoot, 24)}`);
@@ -292,18 +295,28 @@ export default class ObsetyncPlugin extends Plugin {
             DEFAULT_SETTINGS,
             await this.loadData()
         );
+        let settingsChanged = false;
+
+        const migratedIgnores = migrateLegacyDefaultIgnorePatterns(this.settings.ignorePatterns);
+        if (migratedIgnores !== this.settings.ignorePatterns) {
+            this.settings.ignorePatterns = migratedIgnores;
+            settingsChanged = true;
+            console.log("[obsetync] added the atomic-save temp suffix to default ignores");
+        }
+
         // Migration 1.0.x → 1.1.x: server is plain HTTP now (the AEAD
         // envelope is the trust boundary). Persist the rewrite so the
         // settings UI reflects reality instead of showing a stale https URL.
         if (this.settings.serverUrl.startsWith("https://")) {
             this.settings.serverUrl =
                 "http://" + this.settings.serverUrl.slice("https://".length);
-            await this.saveSettings();
+            settingsChanged = true;
             console.warn(
                 "[obsetync] migrated server URL from https:// to http:// " +
                 "(transport is plaintext HTTP + AEAD envelope)"
             );
         }
+        if (settingsChanged) await this.saveSettings();
     }
 
     async saveSettings(): Promise<void> {
@@ -471,7 +484,13 @@ export default class ObsetyncPlugin extends Plugin {
         // Start.
         this.updateStatusBar("sync ↓");
         await this.syncEngine.start();
-        this.updateStatusBar("sync ✓");
+        if (this.syncEngine.isReenrollmentRequired()) {
+            this.updateStatusBar("sync ⚠ re-enroll");
+        } else if (this.syncEngine.isBulkScanReviewRequired()) {
+            this.updateStatusBar("sync ⚠ review scan");
+        } else {
+            this.updateStatusBar("sync ✓");
+        }
     }
 
     private async loadWasm(): Promise<WasmModule> {

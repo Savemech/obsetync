@@ -8,7 +8,11 @@
  * POSITIVE silently stops a real note — the second set of cases guards that.
  */
 import assert from "node:assert";
-import { compileIgnore, DEFAULT_IGNORE_PATTERNS } from "./ignore";
+import {
+    compileIgnore,
+    DEFAULT_IGNORE_PATTERNS,
+    migrateLegacyDefaultIgnorePatterns,
+} from "./ignore";
 
 let passed = 0;
 function ok(name: string, cond: boolean) {
@@ -26,8 +30,14 @@ ok(".git nested", def.test("proj/.git/objects/ab/cdef"));
 ok(".DS_Store basename", def.test("notes/.DS_Store"));
 ok(".DS_Store at root", def.test(".DS_Store"));
 ok("*.tmp basename", def.test("drafts/foo.tmp"));
+ok("atomic-save tmp suffix", def.test("drafts/foo.md.tmp.1234.abcdef"));
 ok("leading ./ normalized", def.test("./target/x"));
 ok("leading / normalized", def.test("/target/x"));
+
+const migrated = migrateLegacyDefaultIgnorePatterns(DEFAULT_IGNORE_PATTERNS.slice(0, -1));
+ok("legacy defaults gain atomic tmp suffix", migrated.includes("*.tmp.*"));
+const custom = ["target/", "keep-my-temp-files"];
+ok("custom ignores stay untouched", migrateLegacyDefaultIgnorePatterns(custom) === custom);
 
 // --- defaults MUST NOT ignore real notes (false-positive guards) -------------
 ok("plain note", !def.test("notes/projects/design.md"));

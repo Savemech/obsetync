@@ -122,31 +122,35 @@ export async function push(
         return { newRootHash: tree.root_hash_hex(), conflicts: [] };
     }
 
+    // Fail terminal enrollment/transport mismatches before hashing thousands
+    // of files or touching the candidate tree. Authentication is still
+    // checked by the first real request; this resolves the local v2 channel.
+    await api.ensureTransportReady();
+
+    // This immutable snapshot is both the bootstrap source and the rollback
+    // source. sync-base itself is not mutated until putRoot succeeds.
+    const baseEntries = syncBase.allPaths().map((path) => {
+        const entry = syncBase.getEntry(path)!;
+        return {
+            path,
+            hash: entry.hash,
+            mtime_ms: syncBase.getTreeMtime(path) ?? entry.mtime,
+            size: entry.size,
+        };
+    });
+    let treeMutated = false;
+    let rootAccepted = false;
+
+    try {
+
     const total = changes.length;
     console.log(`[obsetync] pushing ${total} changes`);
 
     // Bootstrap tree from sync-base on first push.
     // build_from_entries is O(n log n) in WASM — one call vs N×prefix with a loop.
     if (!tree.root_hash_hex()) {
-        const paths = syncBase.allPaths();
-        if (paths.length === 0) {
-            tree.build_from_entries("[]");
-        } else {
-            const entries = paths.map(p => {
-                const e = syncBase.getEntry(p)!;
-                // treeMtime (server-side mtime for pulled files) keeps the
-                // rebuilt leaf metadata identical to the server's — leaf
-                // hashes cover mtime, so this is what makes the rebuilt
-                // root reproducible.
-                return {
-                    path: p,
-                    hash: e.hash,
-                    mtime_ms: syncBase.getTreeMtime(p) ?? e.mtime,
-                    size: e.size,
-                };
-            });
-            tree.build_from_entries(JSON.stringify(entries));
-        }
+        // treeMtime keeps pulled leaf metadata byte-identical to the server.
+        tree.build_from_entries(JSON.stringify(baseEntries));
     }
 
     const deleted    = changes.filter(c => c.action === "deleted");
@@ -160,8 +164,8 @@ export async function push(
 
     // ONE delete_batch call for all deletions → O(N+prefix) not O(N×prefix).
     if (deleted.length > 0) {
+        treeMutated = true;
         tree.delete_batch(JSON.stringify(deleted.map(c => c.path)));
-        for (const change of deleted) syncBase.removeEntry(change.path);
     }
 
     let processed = deleted.length;
@@ -334,8 +338,6 @@ export async function push(
 
             // Queue tree update — applied in ONE update_batch after all batches.
             allTreeUpdates.push({ path: change.path, hash: change.hash!, mtime_ms: mtime, size });
-            // syncBase is fast in-memory — update per-file is fine.
-            syncBase.setEntry(change.path, change.hash!, mtime, size);
         }
 
         // batchFiles goes out of scope — large file blobs are GC-eligible now.
@@ -348,6 +350,7 @@ export async function push(
     const beforeRoot = tree.root_hash_hex();
     const beforeFiles = tree.total_files();
     if (allTreeUpdates.length > 0) {
+        treeMutated = true;
         tree.update_batch(JSON.stringify(allTreeUpdates));
     }
     const afterRoot = tree.root_hash_hex();
@@ -397,8 +400,7 @@ export async function push(
     const parentHash = baseRootHash ?? "";
     const rootBytes  = tree.root_bytes();
     if (!rootBytes) {
-        console.warn(`[obsetync] push: tree.root_bytes() returned null — tree uninitialised?`);
-        return { newRootHash: null, conflicts: [] };
+        throw new Error("push: tree.root_bytes() returned null — tree uninitialised");
     }
     console.log(
         `[obsetync] putRoot → parent=${parentHash ? parentHash.slice(0,16) : "(empty)"} ` +
@@ -407,6 +409,14 @@ export async function push(
 
     onProgress?.("↑ pushing root...");
     const result = await api.putRoot(vaultId, rootBytes, parentHash);
+    rootAccepted = true;
+
+    // Commit local metadata only after the server accepted this root. A
+    // failed check/upload/root request therefore leaves sync-base untouched.
+    for (const change of deleted) syncBase.removeEntry(change.path);
+    for (const update of allTreeUpdates) {
+        syncBase.setEntry(update.path, update.hash, update.mtime_ms, update.size);
+    }
 
     syncBase.setLastSyncTimestamp(Date.now());
     await syncBase.save();
@@ -415,6 +425,17 @@ export async function push(
         newRootHash: result.root_hash,
         conflicts:   result.conflicts ?? [],
     };
+    } catch (error) {
+        if (treeMutated && !rootAccepted) {
+            try {
+                tree.build_from_entries(JSON.stringify(baseEntries));
+                console.warn("[obsetync] failed push rolled candidate tree back to sync-base");
+            } catch (rollbackError) {
+                console.error("[obsetync] failed to roll candidate tree back:", rollbackError);
+            }
+        }
+        throw error;
+    }
 }
 
 /** Yield control back to the JS event loop so Obsidian stays responsive. */

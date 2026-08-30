@@ -189,6 +189,9 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                         .setButtonText("Reset enrollment")
                         .setWarning()
                         .onClick(async () => {
+                            // Stop timers, listeners, and late retry drains
+                            // before invalidating credentials.
+                            this.plugin.syncEngineOrNull()?.stop();
                             this.plugin.settings.enrolled    = false;
                             this.plugin.settings.deviceId     = "";
                             this.plugin.settings.bearerToken  = "";

@@ -8,6 +8,10 @@ import {
 import { DurableSequenceAllocator } from "./transport-sequence";
 import { validateFileDeltas } from "./delta-validation";
 import { exactArrayBuffer } from "./binary";
+import {
+    isReenrollmentRequiredError,
+    reenrollmentRequired,
+} from "./transport-errors";
 
 export interface FileDelta {
     action: "added" | "modified" | "deleted" | "renamed";
@@ -167,16 +171,18 @@ export class ObsetyncApi {
         if (this.refreshPromise) await this.refreshPromise;
         if (this.channel && !this.channel.isStale()) return this.channel;
         if (!this.serverBoxPubBase64) {
-            throw new Error("ObsetyncApi: server box pubkey missing — re-enroll the device");
+            throw reenrollmentRequired("ObsetyncApi: server box pubkey missing — re-enroll the device");
         }
         if (!this.bearerTokenHex) {
-            throw new Error("ObsetyncApi: bearer token missing — re-enroll the device");
+            throw reenrollmentRequired("ObsetyncApi: bearer token missing — re-enroll the device");
         }
         const persistence = this.requireTransportPersistence();
         this.channelPromise = (async () => {
             let state = persistence.get();
             if (state.wireVersion !== "0x02") {
-                throw new Error("server transport upgraded to wire 0x02 — re-enroll this device");
+                throw reenrollmentRequired(
+                    "server transport upgraded to wire 0x02 — re-enroll this device",
+                );
             }
             if (!state.esPub || Date.now() / 1000 >= state.esPubValidUntil - 3600) {
                 await this.refreshServerEphemeral();
@@ -195,6 +201,15 @@ export class ObsetyncApi {
         } finally {
             this.channelPromise = null;
         }
+    }
+
+    /**
+     * Resolve all local/rotating transport state before a push starts touching
+     * its candidate tree. This intentionally allocates no sequence and sends
+     * no vault request; the first real request still authenticates normally.
+     */
+    async ensureTransportReady(): Promise<void> {
+        await this.getChannel();
     }
 
     // --- Root ---
@@ -402,13 +417,19 @@ export class ObsetyncApi {
             try {
                 response = await this.sendEncrypted(channel, method, path, body, sequence);
             } catch (error) {
-                if (error instanceof ObsetyncSessionStaleError && !refreshed) {
-                    refreshed = true;
-                    if (this.channel === channel || this.channel === null) {
-                        this.channel = null;
-                        await this.refreshServerEphemeral();
+                if (error instanceof ObsetyncSessionStaleError) {
+                    if (!refreshed) {
+                        refreshed = true;
+                        if (this.channel === channel || this.channel === null) {
+                            this.channel = null;
+                            await this.refreshServerEphemeral();
+                        }
+                        continue;
                     }
-                    continue;
+                    throw reenrollmentRequired(
+                        `server rejected refreshed transport keys for ${method} ${path} — ` +
+                        "re-enroll device",
+                    );
                 }
                 if (error instanceof ObsetyncSecureTransportError) {
                     throw new Error(`decrypt ${method} ${path}: ${error.message}`);
@@ -423,6 +444,11 @@ export class ObsetyncApi {
                     await this.recoverSequence(error.last_seen_seq);
                     continue;
                 }
+            }
+            if (response.status === 401 || response.status === 403) {
+                throw reenrollmentRequired(
+                    `server rejected this device (${response.status}) — re-enroll device`,
+                );
             }
             return response;
         }
@@ -492,18 +518,27 @@ export class ObsetyncApi {
         const bootstrap = await ObsetyncSecureChannel.createBootstrap(
             this.serverBoxPubBase64,
         );
-        const response = await this.sendEncrypted(
-            bootstrap,
-            "POST",
-            "/api/v1/server-eph",
-            new Uint8Array(),
-            0,
-        );
-        if (!response.ok) {
-            throw new Error(
-                `server ephemeral refresh failed: ${response.status}; ` +
-                "re-enroll device",
+        let response: FetchLike;
+        try {
+            response = await this.sendEncrypted(
+                bootstrap,
+                "POST",
+                "/api/v1/server-eph",
+                new Uint8Array(),
+                0,
             );
+        } catch (error) {
+            if (error instanceof ObsetyncSecureTransportError) {
+                throw reenrollmentRequired(
+                    "server transport key no longer matches this enrollment — re-enroll device",
+                );
+            }
+            throw error;
+        }
+        if (!response.ok) {
+            // A proxy/server outage is retryable; re-enrollment cannot repair
+            // an HTTP 5xx (or a route temporarily missing during a rollout).
+            throw new Error(`server ephemeral refresh failed: ${response.status}`);
         }
         const bundle = await response.json();
         if (
@@ -522,7 +557,16 @@ export class ObsetyncApi {
     }
 
     private async nextSequence(): Promise<number> {
-        return this.sequences.next();
+        try {
+            return await this.sequences.next();
+        } catch (error) {
+            if (isReenrollmentRequiredError(error)) {
+                throw reenrollmentRequired(
+                    error instanceof Error ? error.message : String(error),
+                );
+            }
+            throw error;
+        }
     }
 
     private async recoverSequence(greatestSeen: number): Promise<void> {
@@ -531,7 +575,7 @@ export class ObsetyncApi {
 
     private requireTransportPersistence(): TransportPersistence {
         if (!this.transportPersistence) {
-            throw new Error("transport-v2 state unavailable — re-enroll device");
+            throw reenrollmentRequired("transport-v2 state unavailable — re-enroll device");
         }
         return this.transportPersistence;
     }

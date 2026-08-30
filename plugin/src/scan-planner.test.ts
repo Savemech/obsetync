@@ -1,4 +1,4 @@
-import { planMetadataScan } from "./scan-planner";
+import { metadataScanNeedsReview, planMetadataScan } from "./scan-planner";
 
 const check = (condition: unknown, message: string) => {
     if (!condition) throw new Error(message);
@@ -31,4 +31,23 @@ check(candidates.has("regressed.md"), "backwards mtime change was missed");
 check(!candidates.has("ignored.tmp"), "ignored local file entered the scan");
 check(result.deleted.length === 1 && result.deleted[0] === "gone.md", "offline deletion was missed");
 
-console.log("scan-planner.test: 5 assertions passed");
+check(
+    !metadataScanNeedsReview(result, bases.size),
+    "small metadata audit was incorrectly blocked",
+);
+check(
+    metadataScanNeedsReview(
+        { toHash: Array.from({ length: 10_000 }, (_, i) => ({ path: `${i}.md`, stat: { mtime: i, size: 1 } })), deleted: [] },
+        20_000,
+    ),
+    "vault-sized automatic audit was not blocked",
+);
+check(
+    metadataScanNeedsReview(
+        { toHash: [], deleted: Array.from({ length: 100 }, (_, i) => `${i}.md`) },
+        400,
+    ),
+    "mass deletion was not blocked",
+);
+
+console.log("scan-planner.test: 8 assertions passed");

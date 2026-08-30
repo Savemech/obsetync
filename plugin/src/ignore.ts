@@ -114,7 +114,7 @@ export function compileIgnore(patterns: string[]): CompiledIgnore {
 /** Sensible defaults: regenerated build output + VCS metadata + OS junk. These
  *  are never meaningful to sync and are the usual cause of a vault ballooning
  *  to tens of thousands of files. */
-export const DEFAULT_IGNORE_PATTERNS: string[] = [
+const LEGACY_DEFAULT_IGNORE_PATTERNS: string[] = [
     "target/",
     "node_modules/",
     ".git/",
@@ -122,3 +122,19 @@ export const DEFAULT_IGNORE_PATTERNS: string[] = [
     "Thumbs.db",
     "*.tmp",
 ];
+
+export const DEFAULT_IGNORE_PATTERNS: string[] = [
+    ...LEGACY_DEFAULT_IGNORE_PATTERNS,
+    "*.tmp.*",
+];
+
+/**
+ * Add newly introduced safety defaults only when the saved list is exactly
+ * the previous default. A customised list is user intent and stays untouched.
+ */
+export function migrateLegacyDefaultIgnorePatterns(patterns: string[]): string[] {
+    const isLegacyDefault =
+        patterns.length === LEGACY_DEFAULT_IGNORE_PATTERNS.length &&
+        patterns.every((pattern, index) => pattern === LEGACY_DEFAULT_IGNORE_PATTERNS[index]);
+    return isLegacyDefault ? [...DEFAULT_IGNORE_PATTERNS] : patterns;
+}

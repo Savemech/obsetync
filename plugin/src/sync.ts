@@ -31,8 +31,9 @@ import { PullEchoTracker } from "./pull-echo";
 import { DirtyPathSet, type DirtyFileChange } from "./dirty-set";
 import { OperationCheckpoint } from "./operation-checkpoint";
 import { exactArrayBuffer } from "./binary";
-import { planMetadataScan } from "./scan-planner";
+import { metadataScanNeedsReview, planMetadataScan } from "./scan-planner";
 import { isSafeVaultPath } from "./delta-validation";
+import { isReenrollmentRequiredError } from "./transport-errors";
 
 export type SyncState = "idle" | "pulling" | "pushing" | "scanning" | "error";
 
@@ -64,6 +65,14 @@ export class ObsetyncSyncEngine {
      *  root from an untrusted tree is how vaults get reverted. Cleared by a
      *  verified pull-rebase or a full rescan. */
     private pushBlocked = false;
+    /** Terminal transport mismatch: retries cannot succeed until enrollment
+     *  is reset, so startup scans and every automatic network loop pause. */
+    private reenrollmentRequired = false;
+    private reenrollmentNoticeShown = false;
+    /** Startup detected vault-sized drift and requires explicit Full Rescan. */
+    private bulkScanReviewRequired = false;
+    /** Prevent late async completions from reviving an engine after reload. */
+    private stopped = false;
     /** Content-authenticated expectations for adapter writes made by pull.
      *  Kept briefly after pull completion because Obsidian can emit the
      *  corresponding vault events asynchronously. */
@@ -194,8 +203,17 @@ export class ObsetyncSyncEngine {
         return this.pushBlocked;
     }
 
+    isReenrollmentRequired(): boolean {
+        return this.reenrollmentRequired;
+    }
+
+    isBulkScanReviewRequired(): boolean {
+        return this.bulkScanReviewRequired;
+    }
+
     /** Start the sync engine: run startup sequence, attach listeners, start timer. */
     async start(): Promise<void> {
+        this.stopped = false;
         console.log("[obsetync] starting sync engine");
 
         // Restore the verified base root persisted in lockstep with sync-base.
@@ -221,10 +239,15 @@ export class ObsetyncSyncEngine {
         // 2. Pull remote changes.
         console.log("[obsetync] step 2: pull remote");
         await this.pullRemote();
+        if (this.reenrollmentRequired || this.stopped) {
+            console.warn("[obsetync] startup paused until this device is re-enrolled");
+            return;
+        }
 
         // 3. Recover from journal (Layer 2).
         console.log("[obsetync] step 3: recover from journal");
         await this.recoverFromJournal();
+        if (this.reenrollmentRequired || this.stopped) return;
 
         // 4. Partial metadata scan (Layer 3).
         console.log("[obsetync] step 4: metadata scan");
@@ -334,6 +357,7 @@ export class ObsetyncSyncEngine {
 
     /** Stop the sync engine. */
     stop(): void {
+        this.stopped = true;
         if (this.syncTimer) {
             window.clearInterval(this.syncTimer);
             this.syncTimer = null;
@@ -374,6 +398,10 @@ export class ObsetyncSyncEngine {
      * anything missing. Cheap when the server is fully populated (one
      * checkContent call with N hashes), correct when it isn't. */
     async forceSync(): Promise<void> {
+        if (this.reenrollmentRequired || this.stopped) {
+            new Notice("Obsetync: re-enroll this device before syncing.", 10000);
+            return;
+        }
         // Another cycle already holds the engine (e.g. the startup
         // first-sync). Every sub-step below would silently yield to it and
         // forceSync would finish in ~1ms — reporting "complete" for work it
@@ -656,11 +684,18 @@ export class ObsetyncSyncEngine {
      *  in-memory drift caused a push block is discarded, the block lifted,
      *  and local differences re-queued from disk truth. */
     async fullScan(): Promise<void> {
+        if (this.reenrollmentRequired || this.stopped) {
+            new Notice("Obsetync: re-enroll this device before running a rescan.", 10000);
+            return;
+        }
         if (this.syncing) {
             console.log(`[obsetync] full scan skipped: another sync is in progress (state=${this.state})`);
             new Notice("Obsetync: sync already in progress — retry the rescan when it finishes.");
             return;
         }
+        // Full Rescan is the user's explicit confirmation after a bulk-audit
+        // safety stop.
+        this.bulkScanReviewRequired = false;
         // Own the tree for the complete scan. WS pulls and debounced pushes
         // must not mutate the same WASM handle between hash batches.
         this.syncing = true;
@@ -824,7 +859,7 @@ export class ObsetyncSyncEngine {
     // --- Private ---
 
     private async pullRemote(): Promise<void> {
-        if (this.syncing) return;
+        if (this.syncing || this.reenrollmentRequired || this.stopped) return;
         this.syncing = true;
         this.state = "pulling";
         this.onStatusUpdate("sync ↓");
@@ -841,7 +876,9 @@ export class ObsetyncSyncEngine {
         // simply never passed — pull's per-batch ticks all landed in void.
         // (ref-object because TS control-flow can't see the closure assign)
         const noticeRef: { n: Notice | null } = { n: null };
+        let pullFailed = false;
         const progress = (msg: string) => {
+            if (this.stopped) throw new Error("sync engine stopped");
             this.onStatusUpdate(`↓ ${msg}`);
             const isRealWork = /files applied|changes to apply|first sync/.test(msg);
             if (noticeRef.n) {
@@ -883,22 +920,29 @@ export class ObsetyncSyncEngine {
             }
             await this.adoptPullResult(result);
         } catch (e: any) {
+            pullFailed = true;
             console.error("[obsetync] pull error:", e);
-            this.lastError = { ts: Date.now(), origin: "pull", message: String(e?.message ?? e) };
-            this.state = "error";
-            this.onStatusUpdate("sync ✗");
+            if (!this.stopped) this.recordSyncFailure("pull", e);
         } finally {
             if (operationId) await this.operationCheckpoint?.complete(operationId);
             endSpan();
             noticeRef.n?.hide();
             this.syncing = false;
-            if (this.state !== "error") {
+            if (!pullFailed && !this.stopped) {
                 this.state = "idle";
-                this.onStatusUpdate("sync ✓");
+                this.onStatusUpdate(
+                    this.bulkScanReviewRequired ? "sync ⚠ review scan" : "sync ✓",
+                );
                 this.lastPullDoneMs = Date.now();
             }
             // Drain user edits that arrived while we were syncing.
-            if (this.pendingChanges.size > 0) this.debouncedPush?.();
+            if (
+                !this.reenrollmentRequired &&
+                !this.stopped &&
+                this.pendingChanges.size > 0
+            ) {
+                this.debouncedPush?.();
+            }
         }
     }
 
@@ -932,6 +976,28 @@ export class ObsetyncSyncEngine {
             this.lastHeartbeatMs = now;
             console.log(`[obsetync] ${op} progress: ${msg}`);
         }
+    }
+
+    private recordSyncFailure(origin: string, error: unknown): void {
+        const message = error instanceof Error ? error.message : String(error);
+        this.lastError = { ts: Date.now(), origin, message };
+        this.state = "error";
+
+        if (isReenrollmentRequiredError(error)) {
+            this.reenrollmentRequired = true;
+            this.onStatusUpdate("sync ⚠ re-enroll");
+            if (!this.reenrollmentNoticeShown) {
+                this.reenrollmentNoticeShown = true;
+                new Notice(
+                    "Obsetync: this server requires fresh enrollment. " +
+                    "Automatic sync is paused; reset enrollment and enter a new code.",
+                    15000,
+                );
+            }
+            return;
+        }
+
+        this.onStatusUpdate("sync ✗");
     }
 
     /**
@@ -1067,6 +1133,7 @@ export class ObsetyncSyncEngine {
     }
 
     private async pushPending(): Promise<void> {
+        if (this.reenrollmentRequired || this.stopped) return;
         if (this.syncing || this.pendingChanges.size === 0) {
             console.log(
                 `[obsetync] pushPending early-return: syncing=${this.syncing}, ` +
@@ -1134,12 +1201,19 @@ export class ObsetyncSyncEngine {
             `${queued.length} dirty paths awaiting materialization`,
         );
         let notice: Notice | null = null;
+        let pushFailed = false;
 
         try {
+            // Do this before materializing a potentially vault-sized queue.
+            await this.api.ensureTransportReady();
             const batch = sortByPriority(
                 await this.materializeDirtyChanges(queued),
                 this.syncPriority,
             );
+            if (this.stopped) {
+                this.pendingChanges.restore(queued);
+                return;
+            }
             this.operationCheckpoint?.progress(
                 operationId ?? "",
                 `${batch.length} coalesced paths materialized`,
@@ -1164,6 +1238,7 @@ export class ObsetyncSyncEngine {
                 // the last root merely observed on the server.
                 this.treeBaseRoot,
                 (text) => {
+                    if (this.stopped) throw new Error("sync engine stopped");
                     this.onStatusUpdate(text);
                     notice?.setMessage(text);
                     if (operationId) this.operationCheckpoint?.progress(operationId, text);
@@ -1202,23 +1277,34 @@ export class ObsetyncSyncEngine {
                     .map((change) => ({ path: change.path, throughId: change.journalId! })),
             );
         } catch (e: any) {
+            pushFailed = true;
             console.error("[obsetync] push error:", e);
-            this.lastError = { ts: Date.now(), origin: "push", message: String(e?.message ?? e) };
             this.pendingChanges.restore(queued);
-            this.state = "error";
-            this.onStatusUpdate("sync ✗");
-            notice?.setMessage("sync ✗ error");
+            if (!this.stopped) {
+                this.recordSyncFailure("push", e);
+                notice?.setMessage(
+                    this.reenrollmentRequired ? "Obsetync: re-enrollment required" : "sync ✗ error",
+                );
+            }
         } finally {
             if (operationId) await this.operationCheckpoint?.complete(operationId);
             endSpan();
             notice?.hide();
             this.syncing = false;
-            if (this.state !== "error") {
+            if (!pushFailed && !this.stopped) {
                 this.state = "idle";
-                this.onStatusUpdate("sync ✓");
+                this.onStatusUpdate(
+                    this.bulkScanReviewRequired ? "sync ⚠ review scan" : "sync ✓",
+                );
             }
             // Drain user edits that arrived while we were pushing.
-            if (this.pendingChanges.size > 0) this.debouncedPush?.();
+            if (
+                !this.reenrollmentRequired &&
+                !this.stopped &&
+                this.pendingChanges.size > 0
+            ) {
+                this.debouncedPush?.();
+            }
         }
     }
 
@@ -1363,6 +1449,22 @@ export class ObsetyncSyncEngine {
             (path) => this.syncBase.getEntry(path),
             (path) => this.isExcluded(path),
         );
+        if (metadataScanNeedsReview(plan, this.syncBase.entryCount())) {
+            const total = plan.toHash.length + plan.deleted.length;
+            this.bulkScanReviewRequired = true;
+            this.onStatusUpdate("sync ⚠ review scan");
+            console.warn(
+                `[obsetync] automatic metadata publish paused: ${plan.toHash.length} ` +
+                `files need hashing and ${plan.deleted.length} look deleted ` +
+                `(${total} total changes); review ignores and run Full Rescan`,
+            );
+            new Notice(
+                `Obsetync paused an automatic ${total.toLocaleString()}-file change. ` +
+                "Review ignore patterns, then run Full Rescan to confirm it.",
+                15000,
+            );
+            return;
+        }
         const toHash = plan.toHash;
         for (const path of plan.deleted) {
             this.pendingChanges.add({ action: "deleted", path });
