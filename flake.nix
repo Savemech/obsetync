@@ -48,7 +48,7 @@
           inherit src;
           strictDeps = true;
           pname = "obsetync";
-          version = "1.10.1";
+          version = "1.10.2";
 
           # aws-lc-sys (rustls backend) needs clang + cmake + perl to build.
           nativeBuildInputs = with pkgs; [
@@ -94,7 +94,7 @@
 
         sync-core-wasm = pkgs.stdenv.mkDerivation {
           pname   = "sync-core-wasm-bindings";
-          version = "1.10.1";
+          version = "1.10.2";
 
           src = sync-core-wasm-raw;
 
@@ -137,10 +137,10 @@
         # ------------------------------------------------------------------
         plugin = pkgs.buildNpmPackage {
           pname   = "obsetync-plugin";
-          version = "1.10.1";
+          version = "1.10.2";
           src     = ./plugin;
 
-          npmDepsHash = "sha256-lyEMLmn/Gt42afsBhU30iUoQCIkMkXn2aQi/rOy52sg=";
+          npmDepsHash = "sha256-jYva27KIFCPFDhnYL9gHzeL1tPyC7tJQtzONFoA2rug=";
 
           # Inject the WASM bindings before esbuild runs.
           preBuild = ''
