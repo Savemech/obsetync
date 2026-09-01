@@ -24,6 +24,9 @@ export interface WasmModule {
     wasm_get_file_chunk(data: Uint8Array, offset: number, size: number): Uint8Array;
     wasm_tree_get_chunk(tree: any, hash: string): Uint8Array | null;
     wasm_tree_chunk_hashes(tree: any): string[];
+    wasm_tree_committed_chunk_hashes(tree: any): string[];
+    wasm_tree_candidate_chunk_hashes(tree: any): string[];
+    wasm_tree_new_candidate_chunk_hashes(tree: any): string[];
     wasm_root_hash_from_bytes(bytes: Uint8Array): string | undefined;
     /** Streaming Blake3 hasher. Peak WASM heap = chunk size (64 KB), not file size. */
     Hasher: new () => WasmHasher;
@@ -44,6 +47,15 @@ export interface WasmTree {
     root_hash_hex(): string | null;
     root_bytes(): Uint8Array | null;
     total_files(): number;
+    begin_candidate(): void;
+    has_candidate(): boolean;
+    candidate_root_hash_hex(): string | null;
+    candidate_root_bytes(): Uint8Array | null;
+    candidate_total_files(): number;
+    candidate_update_batch(entriesJson: string): void;
+    candidate_delete_batch(pathsJson: string): void;
+    commit_candidate(): WasmTreeGcStats;
+    abort_candidate(): WasmTreeGcStats;
     update_entry(path: string, hash: string, mtime: number, size: number): void;
     delete_entry(path: string): void;
     build_from_entries(entriesJson: string): void;
@@ -51,6 +63,14 @@ export interface WasmTree {
     update_batch(entriesJson: string): void;
     /** Delete N paths in ONE update_tree call. JSON: ["path/a.md","path/b.md",...] */
     delete_batch(pathsJson: string): void;
+}
+
+export interface WasmTreeGcStats {
+    before: number;
+    reachable: number;
+    removed: number;
+    after: number;
+    bytes_removed: number;
 }
 
 export interface FileChange {
@@ -97,7 +117,7 @@ const READ_CONCURRENCY = 4;
  *   → data released at end of batch
  *
  * After all batches:
- *   D. tree.update_batch — ONE update_tree call for all N upserts → O(N+prefix)
+ *   D. tree.candidate_update_batch — one update_tree call for all N upserts
  *   E. Upload index chunks + push root
  *
  * Root push and sync-base save happen once after all batches.
@@ -140,58 +160,59 @@ export async function push(
         endPreflight?.();
     }
 
-    // This immutable snapshot is both the bootstrap source and the rollback
-    // source. sync-base itself is not mutated until putRoot succeeds.
-    const endEnumerate = perf?.phase("enumerate");
-    let baseEntries: Array<{ path: string; hash: string; mtime_ms: number; size: number }>;
-    try {
-        baseEntries = syncBase.allPaths().map((path) => {
-            const entry = syncBase.getEntry(path)!;
-            return {
-                path,
-                hash: entry.hash,
-                mtime_ms: syncBase.getTreeMtime(path) ?? entry.mtime,
-                size: entry.size,
-            };
-        });
-    } finally {
-        endEnumerate?.();
-    }
-    let treeMutated = false;
-    let rootAccepted = false;
-
-    try {
-
     const total = changes.length;
     console.log(`[obsetync] pushing ${total} changes`);
 
-    // Bootstrap tree from sync-base on first push.
-    // build_from_entries is O(n log n) in WASM — one call vs N×prefix with a loop.
+    // Bootstrap is the only push path allowed to enumerate the complete
+    // sync-base. Every normal incremental push starts from a cheap committed
+    // root pointer and never retains O(vault_size) JS rollback objects.
+    let bootstrapped = false;
     if (!tree.root_hash_hex()) {
-        // treeMtime keeps pulled leaf metadata byte-identical to the server.
+        const endEnumerate = perf?.phase("enumerate");
+        let baseEntries: Array<{ path: string; hash: string; mtime_ms: number; size: number }>;
+        try {
+            baseEntries = syncBase.allPaths().map((path) => {
+                const entry = syncBase.getEntry(path)!;
+                return {
+                    path,
+                    hash: entry.hash,
+                    mtime_ms: syncBase.getTreeMtime(path) ?? entry.mtime,
+                    size: entry.size,
+                };
+            });
+        } finally {
+            endEnumerate?.();
+        }
         const endTree = perf?.phase("tree_update");
         try {
             tree.build_from_entries(JSON.stringify(baseEntries));
+            bootstrapped = true;
         } finally {
             endTree?.();
         }
     }
+
+    const committedChunks = wasm.wasm_tree_committed_chunk_hashes(tree);
+    perf?.setWasmChunks({ before: committedChunks.length });
+    tree.begin_candidate();
+    let candidateOpen = true;
+
+    try {
 
     const deleted    = changes.filter(c => c.action === "deleted");
     const nonDeleted = changes.filter(c => c.action !== "deleted");
 
     console.log(
         `[obsetync] push: ${changes.length} changes (${nonDeleted.length} upsert, ` +
-        `${deleted.length} delete), tree bootstrapped=${!!tree.root_hash_hex()}, ` +
-        `sync-base size=${syncBase.allPaths().length}`
+        `${deleted.length} delete), bootstrap=${bootstrapped}, ` +
+        `sync-base size=${syncBase.entryCount()}`
     );
 
-    // ONE delete_batch call for all deletions → O(N+prefix) not O(N×prefix).
+    // One candidate delete call for all deletions: O(N+prefix), not O(N×prefix).
     if (deleted.length > 0) {
-        treeMutated = true;
         const endTree = perf?.phase("tree_update");
         try {
-            tree.delete_batch(JSON.stringify(deleted.map(c => c.path)));
+            tree.candidate_delete_batch(JSON.stringify(deleted.map(c => c.path)));
         } finally {
             endTree?.();
         }
@@ -450,16 +471,15 @@ export async function push(
     }
 
     // ------------------------------------------------------------------
-    // D. Apply ALL tree updates in ONE update_tree call.
+    // D. Apply all tree updates to the candidate in one update_tree call.
     //    O(N + prefix_size) vs O(N × prefix_size) with per-file update_entry.
     // ------------------------------------------------------------------
     const beforeRoot = tree.root_hash_hex();
     const beforeFiles = tree.total_files();
     if (allTreeUpdates.length > 0) {
-        treeMutated = true;
         const endTree = perf?.phase("tree_update");
         try {
-            tree.update_batch(JSON.stringify(allTreeUpdates));
+            tree.candidate_update_batch(JSON.stringify(allTreeUpdates));
         } finally {
             endTree?.();
         }
@@ -469,10 +489,10 @@ export async function push(
         filesNeeded: neededFiles,
         bytesNeeded: neededBytes,
     });
-    const afterRoot = tree.root_hash_hex();
-    const afterFiles = tree.total_files();
+    const afterRoot = tree.candidate_root_hash_hex();
+    const afterFiles = tree.candidate_total_files();
     // Diagnostic: if batch > 0 but root didn't move, or file count didn't grow
-    // by the expected delta, update_batch silently dropped entries and we want
+    // by the expected delta, candidate_update_batch silently dropped entries and we want
     // to know NOW instead of watching devices mysteriously fail to sync.
     console.log(
         `[obsetync] tree update: files ${beforeFiles} → ${afterFiles}, ` +
@@ -481,15 +501,19 @@ export async function push(
     );
     if (allTreeUpdates.length > 0 && beforeRoot === afterRoot) {
         console.warn(
-            `[obsetync] update_batch didn't move root despite ${allTreeUpdates.length} entries — ` +
+            `[obsetync] candidate_update_batch didn't move root despite ` +
+            `${allTreeUpdates.length} entries — ` +
             `first 3: ${JSON.stringify(allTreeUpdates.slice(0, 3))}`
         );
     }
 
     // Upload index chunks (LeafChunk, InternalNode) accumulated in MemoryChunkStore.
     // Server needs these to walk the tree during merge/diff.
-    const chunkHashes = wasm.wasm_tree_chunk_hashes(tree);
-    perf?.setWasmChunks({ after: chunkHashes.length });
+    const candidateChunkHashes = wasm.wasm_tree_candidate_chunk_hashes(tree);
+    const chunkHashes = bootstrapped
+        ? candidateChunkHashes
+        : wasm.wasm_tree_new_candidate_chunk_hashes(tree);
+    perf?.setWasmChunks({ reachable: candidateChunkHashes.length });
     if (chunkHashes.length > 0) {
         onProgress?.(`↑ checking ${chunkHashes.length} index chunks...`);
         const endCheck = perf?.phase("check");
@@ -526,9 +550,9 @@ export async function push(
     // lets the server fast-forward when we're truly current and pick the
     // correct three-way-merge base when we're not.
     const parentHash = baseRootHash ?? "";
-    const rootBytes  = tree.root_bytes();
+    const rootBytes  = tree.candidate_root_bytes();
     if (!rootBytes) {
-        throw new Error("push: tree.root_bytes() returned null — tree uninitialised");
+        throw new Error("push: candidate_root_bytes() returned null — candidate uninitialised");
     }
     console.log(
         `[obsetync] putRoot → parent=${parentHash ? parentHash.slice(0,16) : "(empty)"} ` +
@@ -543,7 +567,12 @@ export async function push(
     } finally {
         endRootCommit?.();
     }
-    rootAccepted = true;
+
+    // Server acceptance is the transaction boundary. Only now can the local
+    // committed pointer advance and old immutable chunks be swept.
+    const gcStats = tree.commit_candidate();
+    candidateOpen = false;
+    perf?.setWasmChunks({ after: gcStats.after });
 
     // Commit local metadata only after the server accepted this root. A
     // failed check/upload/root request therefore leaves sync-base untouched.
@@ -565,17 +594,18 @@ export async function push(
         conflicts:   result.conflicts ?? [],
     };
     } catch (error) {
-        if (treeMutated && !rootAccepted) {
+        if (candidateOpen && tree.has_candidate()) {
             try {
                 const endTree = perf?.phase("tree_update");
                 try {
-                    tree.build_from_entries(JSON.stringify(baseEntries));
+                    const gcStats = tree.abort_candidate();
+                    perf?.setWasmChunks({ after: gcStats.after });
                 } finally {
                     endTree?.();
                 }
-                console.warn("[obsetync] failed push rolled candidate tree back to sync-base");
-            } catch (rollbackError) {
-                console.error("[obsetync] failed to roll candidate tree back:", rollbackError);
+                console.warn("[obsetync] failed push aborted candidate tree");
+            } catch (abortError) {
+                console.error("[obsetync] failed to abort candidate tree:", abortError);
             }
         }
         throw error;

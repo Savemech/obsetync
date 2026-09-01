@@ -7,6 +7,7 @@ pub mod hash;
 pub mod merge;
 pub mod store;
 pub mod sync_rules;
+pub mod transactional_tree;
 pub mod tree;
 
 #[cfg(feature = "wasm")]

@@ -6,6 +6,34 @@ const check = (condition: unknown, message: string) => {
     if (!condition) throw new Error(message);
 };
 
+function transactionalTree(tree: any): any {
+    let active = false;
+    return {
+        ...tree,
+        begin_candidate: () => {
+            check(!active, "test tree candidate already active");
+            active = true;
+        },
+        has_candidate: () => active,
+        candidate_delete_batch: (json: string) => {
+            check(active, "candidate delete without active transaction");
+            tree.delete_batch(json);
+        },
+        candidate_update_batch: (json: string) => {
+            check(active, "candidate update without active transaction");
+            tree.update_batch(json);
+        },
+        commit_candidate: () => {
+            check(active, "candidate commit without active transaction");
+            active = false;
+        },
+        abort_candidate: () => {
+            check(active, "candidate abort without active transaction");
+            active = false;
+        },
+    };
+}
+
 async function locallyEditedDeltaKeepsHonestBase(): Promise<void> {
     const remote: FileDelta = {
         action: "modified",
@@ -40,11 +68,11 @@ async function locallyEditedDeltaKeepsHonestBase(): Promise<void> {
         getEntry: () => ({ hash: "base-hash", mtime: 1, size: 4 }),
         getTreeMtime: () => 1,
     } as any;
-    const tree = {
+    const tree = transactionalTree({
         root_hash_hex: () => "base-root",
         delete_batch: () => { throw new Error("deferred path reached tree delete"); },
         update_batch: () => { throw new Error("deferred path reached tree upsert"); },
-    } as any;
+    });
     const wasm = {
         wasm_root_hash_from_bytes: () => "server-root",
     } as any;
@@ -105,11 +133,11 @@ async function renameAfterCrashIsIdempotent(): Promise<void> {
         setLastSyncTimestamp: () => {},
         save: async () => {},
     } as any;
-    const tree = {
+    const tree = transactionalTree({
         root_hash_hex: () => "tree-root",
         delete_batch: () => {},
         update_batch: () => {},
-    } as any;
+    });
     const wasm = {
         wasm_root_hash_from_bytes: () => "server-root",
         wasm_hash: () => "remote-hash",
@@ -154,11 +182,11 @@ async function sameSizeUnverifiedRenameTargetIsDeferred(): Promise<void> {
         setLastSyncTimestamp: () => {},
         save: async () => {},
     } as any;
-    const tree = {
+    const tree = transactionalTree({
         root_hash_hex: () => "tree-root",
         delete_batch: () => {},
         update_batch: () => {},
-    } as any;
+    });
     class Hasher {
         update(): void {}
         finalize(): string { return "wrong-hash"; }
@@ -192,14 +220,14 @@ async function firstSyncAdoptsAnExistingEmptyServerRoot(): Promise<void> {
         save: async () => {},
     } as any;
     let treeRoot: string | null = null;
-    const tree = {
+    const tree = transactionalTree({
         root_hash_hex: () => treeRoot,
         build_from_entries: (json: string) => {
             check(json === "[]", "empty first sync built a non-empty tree");
             treeBuilds++;
             treeRoot = "empty-server-root";
         },
-    } as any;
+    });
     const wasm = {
         wasm_root_hash_from_bytes: () => "empty-server-root",
     } as any;
@@ -244,11 +272,11 @@ async function editArrivingDuringDownloadDefersRemoteWrite(): Promise<void> {
         setLastSyncTimestamp: () => {},
         save: async () => {},
     } as any;
-    const tree = {
+    const tree = transactionalTree({
         root_hash_hex: () => "local-root",
         delete_batch: () => {},
         update_batch: () => {},
-    } as any;
+    });
     const wasm = {
         wasm_root_hash_from_bytes: () => "server-root",
         wasm_hash: () => "remote-hash",
@@ -303,11 +331,11 @@ async function untrackedLocalCollisionIsPreservedBeforePullWrite(): Promise<void
         setLastSyncTimestamp: () => {},
         save: async () => {},
     } as any;
-    const tree = {
+    const tree = transactionalTree({
         root_hash_hex: () => "local-root",
         delete_batch: () => {},
         update_batch: () => {},
-    } as any;
+    });
     class Hasher {
         update(): void {}
         finalize(): string { return "local-hash"; }
@@ -359,11 +387,11 @@ async function unchangedBaseIsReplacedWithoutConflictCopy(): Promise<void> {
         setLastSyncTimestamp: () => {},
         save: async () => {},
     } as any;
-    const tree = {
+    const tree = transactionalTree({
         root_hash_hex: () => "local-root",
         delete_batch: () => {},
         update_batch: () => {},
-    } as any;
+    });
     class Hasher {
         update(): void {}
         finalize(): string { return "base-hash"; }
@@ -423,11 +451,11 @@ async function offlineEditSurvivesRemoteDelete(): Promise<void> {
         setLastSyncTimestamp: () => {},
         save: async () => {},
     } as any;
-    const tree = {
+    const tree = transactionalTree({
         root_hash_hex: () => "base-root",
         delete_batch: () => { treeDeletes++; },
         update_batch: () => {},
-    } as any;
+    });
     class Hasher {
         update(): void {}
         finalize(): string { return "local-hash"; }
@@ -466,11 +494,11 @@ async function unchangedBaseAllowsRemoteDelete(): Promise<void> {
         setLastSyncTimestamp: () => {},
         save: async () => {},
     } as any;
-    const tree = {
+    const tree = transactionalTree({
         root_hash_hex: () => "base-root",
         delete_batch: () => { treeDeletes++; },
         update_batch: () => {},
-    } as any;
+    });
     const wasm = {
         wasm_root_hash_from_bytes: () => "server-root",
     } as any;
@@ -483,6 +511,65 @@ async function unchangedBaseAllowsRemoteDelete(): Promise<void> {
     check(result.deferredCount === 0, "unchanged delete was falsely deferred");
 }
 
+async function failedTreeRebaseAbortsCandidate(): Promise<void> {
+    let active = false;
+    let begins = 0;
+    let aborts = 0;
+    let commits = 0;
+    let candidateDeletes = 0;
+    const api = {
+        getDiff: async () => [{ action: "deleted", path: "doc.md" }],
+        getRoot: async () => new Uint8Array([1]),
+    } as any;
+    const io = {
+        stat: async () => ({ mtime: 1, size: 4 }),
+        deleteFile: async () => {},
+    } as any;
+    const syncBase = {
+        getEntry: () => ({ hash: "base-hash", mtime: 1, size: 4 }),
+        getTreeMtime: () => 1,
+        removeEntry: () => {},
+        checkpoint: async () => {},
+        setLastSyncTimestamp: () => {},
+        save: async () => {},
+    } as any;
+    const tree = {
+        root_hash_hex: () => "base-root",
+        begin_candidate: () => {
+            check(!active, "candidate was already active");
+            begins++;
+            active = true;
+        },
+        has_candidate: () => active,
+        candidate_delete_batch: () => {
+            candidateDeletes++;
+            throw new Error("injected candidate rebase failure");
+        },
+        candidate_update_batch: () => {},
+        commit_candidate: () => {
+            commits++;
+            active = false;
+        },
+        abort_candidate: () => {
+            aborts++;
+            active = false;
+        },
+        delete_batch: () => { throw new Error("legacy committed delete used"); },
+        update_batch: () => { throw new Error("legacy committed update used"); },
+    } as any;
+    const wasm = {
+        wasm_root_hash_from_bytes: () => "server-root",
+    } as any;
+
+    const result = await pull(api, io, syncBase, "vault", "base-root", wasm, tree);
+    check(begins === 1, "pull rebase did not open exactly one candidate");
+    check(candidateDeletes === 1, "pull rebase did not mutate the candidate tree");
+    check(aborts === 1, "failed pull rebase did not abort its candidate");
+    check(commits === 0, "failed pull rebase committed a partial tree");
+    check(!active, "failed pull rebase leaked an active candidate");
+    check(result.treeParity === false, "failed pull rebase falsely reported parity");
+}
+
 void locallyEditedDeltaKeepsHonestBase()
     .then(renameAfterCrashIsIdempotent)
     .then(sameSizeUnverifiedRenameTargetIsDeferred)
@@ -492,7 +579,8 @@ void locallyEditedDeltaKeepsHonestBase()
     .then(unchangedBaseIsReplacedWithoutConflictCopy)
     .then(offlineEditSurvivesRemoteDelete)
     .then(unchangedBaseAllowsRemoteDelete)
-    .then(() => console.log("pull.test: 41 assertions passed"))
+    .then(failedTreeRebaseAbortsCandidate)
+    .then(() => console.log("pull.test: 47 assertions passed"))
     .catch((error) => {
         console.error(error);
         process.exitCode = 1;

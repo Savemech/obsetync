@@ -1,5 +1,6 @@
 use crate::chunk::ChunkError;
 use crate::hash::{hash_bytes, hash_to_hex, FileHash};
+use std::collections::HashSet;
 use std::io::Write;
 
 /// Abstract byte-addressed store for Merkle index data (LeafChunk/InternalNode).
@@ -208,6 +209,23 @@ impl MemoryChunkStore {
 
     pub fn all_chunk_hashes(&self) -> Vec<FileHash> {
         self.data.borrow().keys().copied().collect()
+    }
+
+    /// Retain exactly the marked graph after reachability has been validated.
+    /// The caller must finish the complete mark phase before invoking this;
+    /// keeping mutation here as one RefCell borrow prevents a partial sweep.
+    pub(crate) fn retain_chunks(&self, reachable: &HashSet<FileHash>) -> (usize, usize, u64) {
+        let mut data = self.data.borrow_mut();
+        let before = data.len();
+        let mut bytes_removed = 0u64;
+        data.retain(|hash, bytes| {
+            let keep = reachable.contains(hash);
+            if !keep {
+                bytes_removed = bytes_removed.saturating_add(bytes.len() as u64);
+            }
+            keep
+        });
+        (before, data.len(), bytes_removed)
     }
 }
 

@@ -22,8 +22,12 @@ function fixture() {
         ["gone.md", { hash: goneHash, mtime: 2, size: 2 }],
     ]);
     let saved = 0;
+    let allPathsCalls = 0;
     const syncBase = {
-        allPaths: () => [...entries.keys()],
+        allPaths: () => {
+            allPathsCalls++;
+            return [...entries.keys()];
+        },
         entryCount: () => entries.size,
         getEntry: (path: string) => entries.get(path) ?? null,
         getTreeMtime: (path: string) => entries.get(path)?.mtime ?? null,
@@ -36,12 +40,52 @@ function fixture() {
     } as any;
 
     let treeEntries = new Set(entries.keys());
+    let candidateEntries: Set<string> | null = null;
     let deleteCalls = 0;
     let rebuildCalls = 0;
+    let beginCalls = 0;
+    let commitCalls = 0;
+    let abortCalls = 0;
     const tree = {
         root_hash_hex: () => `root:${[...treeEntries].sort().join(",")}`,
         root_bytes: () => new Uint8Array([1]),
         total_files: () => treeEntries.size,
+        begin_candidate: () => {
+            beginCalls++;
+            if (candidateEntries) throw new Error("candidate already active");
+            candidateEntries = new Set(treeEntries);
+        },
+        has_candidate: () => candidateEntries !== null,
+        candidate_root_hash_hex: () => candidateEntries
+            ? `root:${[...candidateEntries].sort().join(",")}`
+            : undefined,
+        candidate_root_bytes: () => candidateEntries ? new Uint8Array([1]) : undefined,
+        candidate_total_files: () => candidateEntries?.size ?? 0,
+        candidate_delete_batch: (json: string) => {
+            if (!candidateEntries) throw new Error("no candidate");
+            for (const path of JSON.parse(json) as string[]) candidateEntries.delete(path);
+        },
+        candidate_update_batch: (json: string) => {
+            if (!candidateEntries) throw new Error("no candidate");
+            for (const row of JSON.parse(json) as Array<{ path: string }>) {
+                candidateEntries.add(row.path);
+            }
+        },
+        commit_candidate: () => {
+            if (!candidateEntries) throw new Error("no candidate");
+            commitCalls++;
+            treeEntries = candidateEntries;
+            candidateEntries = null;
+            return { before: 2, reachable: treeEntries.size, removed: 1, after: treeEntries.size };
+        },
+        abort_candidate: () => {
+            if (!candidateEntries) throw new Error("no candidate");
+            abortCalls++;
+            candidateEntries = null;
+            return { before: 2, reachable: treeEntries.size, removed: 1, after: treeEntries.size };
+        },
+        // Legacy methods remain in the fixture so the assertions prove push
+        // selected the transactional API rather than merely failing early.
         delete_batch: (json: string) => {
             deleteCalls++;
             for (const path of JSON.parse(json) as string[]) treeEntries.delete(path);
@@ -55,6 +99,9 @@ function fixture() {
     const wasm = {
         wasm_should_chunk: () => false,
         wasm_tree_chunk_hashes: () => [],
+        wasm_tree_committed_chunk_hashes: () => [],
+        wasm_tree_candidate_chunk_hashes: () => [],
+        wasm_tree_new_candidate_chunk_hashes: () => [],
         wasm_tree_get_chunk: () => null,
     } as any;
     const io = {} as any;
@@ -68,6 +115,10 @@ function fixture() {
         treePaths: () => [...treeEntries].sort(),
         deleteCalls: () => deleteCalls,
         rebuildCalls: () => rebuildCalls,
+        beginCalls: () => beginCalls,
+        commitCalls: () => commitCalls,
+        abortCalls: () => abortCalls,
+        allPathsCalls: () => allPathsCalls,
         saves: () => saved,
     };
 }
@@ -98,6 +149,7 @@ async function terminalPreflightDoesNotMutate(): Promise<void> {
         "transient error was classified as terminal",
     );
     check(f.deleteCalls() === 0, "terminal preflight mutated the tree");
+    check(f.beginCalls() === 0, "terminal preflight opened a candidate");
     check(f.entries.has("gone.md"), "terminal preflight mutated sync-base");
 }
 
@@ -125,7 +177,10 @@ async function failedRootRestoresCandidate(): Promise<void> {
     check(baseWasIntactAtRequest, "sync-base changed before root acceptance");
     check(f.entries.has("gone.md"), "failed root request changed sync-base");
     check(f.treePaths().join(",") === "gone.md,keep.md", "failed root request left tree mutated");
-    check(f.rebuildCalls() === 1, "failed candidate tree was not rebuilt exactly once");
+    check(f.abortCalls() === 1, "failed candidate was not aborted exactly once");
+    check(f.commitCalls() === 0, "failed candidate was committed");
+    check(f.rebuildCalls() === 0, "failed push rebuilt the complete tree");
+    check(f.allPathsCalls() === 0, "failed incremental push enumerated the full sync-base");
     check(f.saves() === 0, "failed root request saved sync-base");
 }
 
@@ -150,7 +205,11 @@ async function acceptedRootCommitsMetadata(): Promise<void> {
     check(baseWasIntactAtRequest, "sync-base committed before root acceptance");
     check(!f.entries.has("gone.md"), "accepted root did not commit sync-base deletion");
     check(f.treePaths().join(",") === "keep.md", "accepted candidate tree was rolled back");
+    check(f.beginCalls() === 1, "accepted push did not open exactly one candidate");
+    check(f.commitCalls() === 1, "accepted push did not commit exactly one candidate");
+    check(f.abortCalls() === 0, "accepted push aborted its candidate");
     check(f.rebuildCalls() === 0, "accepted root unexpectedly rebuilt the tree");
+    check(f.allPathsCalls() === 0, "accepted incremental push enumerated the full sync-base");
     check(f.saves() === 1, "accepted root did not save sync-base exactly once");
     const record = trace.recent()[0];
     check(record.filesTotal === 1, "push trace lost total path count");
@@ -194,9 +253,93 @@ async function failedRootDoesNotCommitUpsert(): Promise<void> {
     check(f.saves() === 0, "failed upsert saved sync-base");
 }
 
+async function everyPostCandidateFailureAbortsWithoutFullSnapshot(): Promise<void> {
+    const replacementHash = "d".repeat(64);
+    const cases = ["content-check", "content-upload", "index-check", "index-upload"] as const;
+    for (const failure of cases) {
+        const f = fixture();
+        const api: any = {
+            ensureTransportReady: async () => {},
+            checkContent: async () => [],
+            checkChunks: async () => [],
+            putRoot: async () => ({ root_hash: "accepted", conflicts: [] }),
+        };
+        if (failure === "content-check") {
+            api.checkContent = async () => { throw new Error(failure); };
+        } else if (failure === "content-upload") {
+            api.checkContent = async () => [replacementHash];
+            api.putContent = async () => { throw new Error(failure); };
+        } else {
+            f.wasm.wasm_tree_candidate_chunk_hashes = () => ["index"];
+            f.wasm.wasm_tree_new_candidate_chunk_hashes = () => ["index"];
+            f.wasm.wasm_tree_get_chunk = () => new Uint8Array([1]);
+            if (failure === "index-check") {
+                api.checkChunks = async () => { throw new Error(failure); };
+            } else {
+                api.checkChunks = async () => ["index"];
+                api.putChunk = async () => { throw new Error(failure); };
+            }
+        }
+
+        let caught: unknown;
+        try {
+            await push(api, f.io, f.syncBase, f.wasm, f.tree, "vault", [{
+                action: "modified",
+                path: "keep.md",
+                hash: replacementHash,
+                data: new Uint8Array([4, 5, 6]),
+                mtime: 4,
+                size: 3,
+            }], "base");
+        } catch (error) {
+            caught = error;
+        }
+
+        check(caught instanceof Error && caught.message === failure, `${failure}: wrong error`);
+        check(f.abortCalls() === 1, `${failure}: candidate was not aborted`);
+        check(f.commitCalls() === 0, `${failure}: candidate was committed`);
+        check(f.treePaths().join(",") === "gone.md,keep.md", `${failure}: root changed`);
+        check(f.entries.get("keep.md")?.hash === keepHash, `${failure}: sync-base changed`);
+        check(f.allPathsCalls() === 0, `${failure}: full sync-base snapshot was built`);
+        check(f.saves() === 0, `${failure}: sync-base was saved`);
+    }
+}
+
+async function incrementalPushChecksOnlyNewCandidateChunks(): Promise<void> {
+    const f = fixture();
+    const replacementHash = "e".repeat(64);
+    f.wasm.wasm_tree_committed_chunk_hashes = () => ["old"];
+    f.wasm.wasm_tree_candidate_chunk_hashes = () => ["new", "old"];
+    f.wasm.wasm_tree_new_candidate_chunk_hashes = () => ["new"];
+    let checked: string[] = [];
+    const api = {
+        ensureTransportReady: async () => {},
+        checkContent: async () => [],
+        checkChunks: async (hashes: string[]) => {
+            checked = hashes;
+            return [];
+        },
+        putRoot: async () => ({ root_hash: "accepted", conflicts: [] }),
+    } as any;
+
+    await push(api, f.io, f.syncBase, f.wasm, f.tree, "vault", [{
+        action: "modified",
+        path: "keep.md",
+        hash: replacementHash,
+        mtime: 5,
+        size: 3,
+    }], "base");
+
+    check(checked.join(",") === "new", "incremental push checked historical index chunks");
+    check(f.commitCalls() === 1, "incremental push did not commit its candidate");
+    check(f.abortCalls() === 0, "incremental push aborted after success");
+}
+
 void terminalPreflightDoesNotMutate()
     .then(failedRootRestoresCandidate)
     .then(failedRootDoesNotCommitUpsert)
+    .then(everyPostCandidateFailureAbortsWithoutFullSnapshot)
+    .then(incrementalPushChecksOnlyNewCandidateChunks)
     .then(acceptedRootCommitsMetadata)
     .then(() => console.log(`push-transaction.test: ${assertions} assertions passed`))
     .catch((error) => {

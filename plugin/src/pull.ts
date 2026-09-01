@@ -455,8 +455,9 @@ function parity(tree: WasmTree | null, serverRootHash: string | null): boolean |
  *
  * - Tree not bootstrapped yet → build it from sync-base, which at this
  *   point already reflects the deltas. One O(n log n) build.
- * - Tree live → one delete_batch (deletions + rename old_paths) and one
- *   update_batch (adds/mods/renames), same batching the push path uses.
+ * - Tree live → apply deletions and upserts to one candidate, then atomically
+ *   commit it. A failure aborts the candidate and preserves the committed
+ *   root, so pull can never strand a half-rebased tree.
  *
  * Entry mtimes come from the server's delta (`mtime_ms`) so leaf metadata
  * — and therefore the root hash — can match the server byte-for-byte.
@@ -516,8 +517,30 @@ function rebaseTree(
                 });
             }
         }
-        if (deletePaths.length > 0) tree.delete_batch(JSON.stringify(deletePaths));
-        if (upserts.length > 0) tree.update_batch(JSON.stringify(upserts));
+        if (deletePaths.length === 0 && upserts.length === 0) return allHadMtime;
+
+        try {
+            tree.begin_candidate();
+            if (deletePaths.length > 0) {
+                tree.candidate_delete_batch(JSON.stringify(deletePaths));
+            }
+            if (upserts.length > 0) {
+                tree.candidate_update_batch(JSON.stringify(upserts));
+            }
+            tree.commit_candidate();
+        } catch (error) {
+            // commit_candidate validates the complete graph before advancing
+            // the committed root. If any candidate operation or that final
+            // validation fails, discard all newly-created chunks together.
+            if (tree.has_candidate()) {
+                try {
+                    tree.abort_candidate();
+                } catch (abortError) {
+                    console.error("[obsetync] failed to abort pull tree candidate:", abortError);
+                }
+            }
+            throw error;
+        }
     } catch (e) {
         // A failed rebase leaves the tree behind disk/sync-base — the caller
         // sees treeParity=false and blocks pushes rather than publishing a

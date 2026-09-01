@@ -2,7 +2,7 @@
 
 use crate::chunk::{FileEntry, RootNode};
 use crate::hash::{hash_bytes, hash_to_hex, hex_to_hash};
-use crate::store::MemoryChunkStore;
+use crate::transactional_tree::TransactionalTree;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
@@ -30,10 +30,7 @@ pub fn wasm_hash(data: &[u8]) -> String {
 /// Used by the plugin's push path to incrementally update the tree.
 #[wasm_bindgen]
 pub struct WasmTree {
-    root: Option<RootNode>,
-    store: MemoryChunkStore,
-    vault_id: String,
-    device_id: String,
+    inner: TransactionalTree,
 }
 
 #[wasm_bindgen]
@@ -41,10 +38,7 @@ impl WasmTree {
     #[wasm_bindgen(constructor)]
     pub fn new(vault_id: &str, device_id: &str) -> Self {
         Self {
-            root: None,
-            store: MemoryChunkStore::new(),
-            vault_id: vault_id.to_string(),
-            device_id: device_id.to_string(),
+            inner: TransactionalTree::new(vault_id, device_id),
         }
     }
 
@@ -56,26 +50,72 @@ impl WasmTree {
         // Root bytes live separately from the byte-addressed leaf/internal
         // store: RootNode::hash() is semantic and intentionally excludes its
         // history metadata, so it is not a Blake3 address for root_bytes.
-        self.root = Some(root);
+        self.inner.load_root_without_chunks(root);
         Ok(())
     }
 
     /// Get the current root hash as hex string.
     pub fn root_hash_hex(&self) -> Option<String> {
-        self.root.as_ref().map(|r| hash_to_hex(&r.hash()))
+        self.inner
+            .committed_root_hash()
+            .map(|hash| hash_to_hex(&hash))
     }
 
     /// Get the serialized root bytes for upload to server.
     pub fn root_bytes(&self) -> Option<Vec<u8>> {
-        self.root.as_ref().map(|r| r.serialize())
+        self.inner.committed_root().map(RootNode::serialize)
     }
 
     /// Get total file count in the tree.
     pub fn total_files(&self) -> f64 {
-        self.root
-            .as_ref()
+        self.inner
+            .committed_root()
             .map(|r| r.total_files as f64)
             .unwrap_or(0.0)
+    }
+
+    /// Begin an isolated candidate rooted at the committed graph.
+    pub fn begin_candidate(&mut self) -> Result<(), JsValue> {
+        self.inner
+            .begin_candidate()
+            .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    pub fn has_candidate(&self) -> bool {
+        self.inner.has_candidate()
+    }
+
+    pub fn candidate_root_hash_hex(&self) -> Option<String> {
+        self.inner
+            .candidate_root_hash()
+            .map(|hash| hash_to_hex(&hash))
+    }
+
+    pub fn candidate_root_bytes(&self) -> Option<Vec<u8>> {
+        self.inner.candidate_root().map(RootNode::serialize)
+    }
+
+    pub fn candidate_total_files(&self) -> f64 {
+        self.inner
+            .candidate_root()
+            .map(|root| root.total_files as f64)
+            .unwrap_or(0.0)
+    }
+
+    /// Promote the candidate only after the server has accepted its root.
+    pub fn commit_candidate(&mut self) -> Result<JsValue, JsValue> {
+        self.inner
+            .commit_candidate()
+            .map(|stats| to_js(&stats))
+            .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Discard a failed candidate and retain only the committed graph.
+    pub fn abort_candidate(&mut self) -> Result<JsValue, JsValue> {
+        self.inner
+            .abort_candidate()
+            .map(|stats| to_js(&stats))
+            .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
     /// Update a single file entry in the tree.
@@ -87,38 +127,18 @@ impl WasmTree {
         size: f64,
     ) -> Result<(), JsValue> {
         let file_hash = hex_to_hash(hash_hex)
-            .map_err(|e| JsValue::from_str(&format!("invalid hash: {}", e)))?;
-
-        let entry = FileEntry::new(path.to_string(), file_hash, mtime_ms as u64, size as u64);
-
-        let root = self.root.as_ref().ok_or_else(|| {
-            JsValue::from_str("no root loaded — call load_root or build_from_entries first")
-        })?;
-
-        // Run the async update_tree in a blocking context (WASM is single-threaded,
-        // async is cooperative, MemoryChunkStore resolves immediately).
-        let new_root =
-            run_local(async { crate::tree::update_tree(&self.store, root, &[entry], &[]).await })
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        self.root = Some(new_root);
-        Ok(())
+            .map_err(|error| JsValue::from_str(&format!("invalid hash: {error}")))?;
+        let entry = FileEntry::new(path.to_owned(), file_hash, mtime_ms as u64, size as u64);
+        run_local(self.inner.apply_committed(&[entry], &[]))
+            .map(|_| ())
+            .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
     /// Delete a file entry from the tree.
     pub fn delete_entry(&mut self, path: &str) -> Result<(), JsValue> {
-        let root = self
-            .root
-            .as_ref()
-            .ok_or_else(|| JsValue::from_str("no root loaded"))?;
-
-        let new_root = run_local(async {
-            crate::tree::update_tree(&self.store, root, &[], &[path.to_string()]).await
-        })
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        self.root = Some(new_root);
-        Ok(())
+        run_local(self.inner.apply_committed(&[], &[path.to_owned()]))
+            .map(|_| ())
+            .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
     /// Apply a batch of upserts in ONE update_tree call.
@@ -131,35 +151,13 @@ impl WasmTree {
     ///
     /// Input: [{ "path": "...", "hash": "hex", "mtime_ms": u64, "size": u64 }, ...]
     pub fn update_batch(&mut self, entries_json: &str) -> Result<(), JsValue> {
-        let raw: Vec<RawEntry> = serde_json::from_str(entries_json)
-            .map_err(|e| JsValue::from_str(&format!("invalid entries JSON: {}", e)))?;
-
-        if raw.is_empty() {
+        let entries = parse_entries(entries_json)?;
+        if entries.is_empty() {
             return Ok(());
         }
-
-        let entries: Result<Vec<FileEntry>, JsValue> = raw
-            .into_iter()
-            .map(|e| {
-                let hash = hex_to_hash(&e.hash).map_err(|err| {
-                    JsValue::from_str(&format!("bad hash for {}: {}", e.path, err))
-                })?;
-                Ok(FileEntry::new(e.path, hash, e.mtime_ms, e.size))
-            })
-            .collect();
-        let entries = entries?;
-
-        let root = self
-            .root
-            .as_ref()
-            .ok_or_else(|| JsValue::from_str("no root — call build_from_entries first"))?;
-
-        let new_root =
-            run_local(async { crate::tree::update_tree(&self.store, root, &entries, &[]).await })
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        self.root = Some(new_root);
-        Ok(())
+        run_local(self.inner.apply_committed(&entries, &[]))
+            .map(|_| ())
+            .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
     /// Delete a batch of paths in ONE update_tree call.
@@ -167,51 +165,36 @@ impl WasmTree {
     ///
     /// Input: ["path/a.md", "path/b.md", ...]
     pub fn delete_batch(&mut self, paths_json: &str) -> Result<(), JsValue> {
-        let paths: Vec<String> =
-            serde_json::from_str(paths_json).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let paths = parse_paths(paths_json)?;
 
         if paths.is_empty() {
             return Ok(());
         }
 
-        let root = self
-            .root
-            .as_ref()
-            .ok_or_else(|| JsValue::from_str("no root — call build_from_entries first"))?;
+        run_local(self.inner.apply_committed(&[], &paths))
+            .map(|_| ())
+            .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
 
-        let new_root =
-            run_local(async { crate::tree::update_tree(&self.store, root, &[], &paths).await })
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    pub fn candidate_update_batch(&mut self, entries_json: &str) -> Result<(), JsValue> {
+        let entries = parse_entries(entries_json)?;
+        run_local(self.inner.apply_candidate(&entries, &[]))
+            .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
 
-        self.root = Some(new_root);
-        Ok(())
+    pub fn candidate_delete_batch(&mut self, paths_json: &str) -> Result<(), JsValue> {
+        let paths = parse_paths(paths_json)?;
+        run_local(self.inner.apply_candidate(&[], &paths))
+            .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
     /// Build a tree from scratch given a JSON array of file entries.
     ///
     /// Input: [{ "path": "...", "hash": "hex", "mtime_ms": u64, "size": u64 }, ...]
     pub fn build_from_entries(&mut self, entries_json: &str) -> Result<(), JsValue> {
-        let raw_entries: Vec<RawEntry> = serde_json::from_str(entries_json)
-            .map_err(|e| JsValue::from_str(&format!("invalid entries JSON: {}", e)))?;
-
-        let entries: Result<Vec<FileEntry>, JsValue> = raw_entries
-            .into_iter()
-            .map(|e| -> Result<FileEntry, JsValue> {
-                let hash = hex_to_hash(&e.hash).map_err(|err| {
-                    JsValue::from_str(&format!("bad hash for {}: {}", e.path, err))
-                })?;
-                Ok(FileEntry::new(e.path, hash, e.mtime_ms, e.size))
-            })
-            .collect();
-        let entries = entries?;
-
-        let root = run_local(async {
-            crate::tree::build_tree(&self.store, entries, &self.vault_id, &self.device_id).await
-        })
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        self.root = Some(root);
-        Ok(())
+        let entries = parse_entries(entries_json)?;
+        run_local(self.inner.rebuild(entries))
+            .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 }
 
@@ -220,19 +203,43 @@ impl WasmTree {
 #[wasm_bindgen]
 pub fn wasm_tree_get_chunk(tree: &WasmTree, hash_hex: &str) -> Option<Vec<u8>> {
     let hash = hex_to_hash(hash_hex).ok()?;
-    tree.store.get_chunk(&hash)
+    tree.inner.chunk_bytes(&hash)
 }
 
 /// Return hex hashes of all byte-addressed index chunks (LeafChunk/InternalNode)
 /// held in the WASM tree's in-memory store.
 /// The plugin calls this before putRoot to upload any chunks the server is missing.
 #[wasm_bindgen]
-pub fn wasm_tree_chunk_hashes(tree: &WasmTree) -> Vec<String> {
-    tree.store
-        .all_chunk_hashes()
-        .into_iter()
-        .map(|hash| hash_to_hex(&hash))
-        .collect()
+pub fn wasm_tree_chunk_hashes(tree: &WasmTree) -> Result<Vec<String>, JsValue> {
+    if tree.inner.has_candidate() {
+        wasm_tree_candidate_chunk_hashes(tree)
+    } else {
+        wasm_tree_committed_chunk_hashes(tree)
+    }
+}
+
+#[wasm_bindgen]
+pub fn wasm_tree_committed_chunk_hashes(tree: &WasmTree) -> Result<Vec<String>, JsValue> {
+    tree.inner
+        .committed_chunk_hashes()
+        .map(hex_hashes)
+        .map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+#[wasm_bindgen]
+pub fn wasm_tree_candidate_chunk_hashes(tree: &WasmTree) -> Result<Vec<String>, JsValue> {
+    tree.inner
+        .candidate_chunk_hashes()
+        .map(hex_hashes)
+        .map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+#[wasm_bindgen]
+pub fn wasm_tree_new_candidate_chunk_hashes(tree: &WasmTree) -> Result<Vec<String>, JsValue> {
+    tree.inner
+        .new_candidate_chunk_hashes()
+        .map(hex_hashes)
+        .map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
 /// Parse the root hash from cached root bytes without loading the tree structure.
@@ -400,6 +407,28 @@ struct RawEntry {
     hash: String,
     mtime_ms: u64,
     size: u64,
+}
+
+fn parse_entries(entries_json: &str) -> Result<Vec<FileEntry>, JsValue> {
+    let raw: Vec<RawEntry> = serde_json::from_str(entries_json)
+        .map_err(|error| JsValue::from_str(&format!("invalid entries JSON: {error}")))?;
+    raw.into_iter()
+        .map(|entry| {
+            let hash = hex_to_hash(&entry.hash).map_err(|error| {
+                JsValue::from_str(&format!("bad hash for {}: {error}", entry.path))
+            })?;
+            Ok(FileEntry::new(entry.path, hash, entry.mtime_ms, entry.size))
+        })
+        .collect()
+}
+
+fn parse_paths(paths_json: &str) -> Result<Vec<String>, JsValue> {
+    serde_json::from_str(paths_json)
+        .map_err(|error| JsValue::from_str(&format!("invalid paths JSON: {error}")))
+}
+
+fn hex_hashes(hashes: Vec<crate::hash::FileHash>) -> Vec<String> {
+    hashes.into_iter().map(|hash| hash_to_hex(&hash)).collect()
 }
 
 /// Run a !Send future synchronously. Works in WASM because WASM is single-threaded
