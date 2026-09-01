@@ -19,6 +19,7 @@ mod state;
 mod storage;
 mod storage_writer;
 mod ws;
+mod ws_data;
 mod ws_ticket;
 
 use clap::{Parser, Subcommand};

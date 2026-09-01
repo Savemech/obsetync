@@ -855,6 +855,7 @@ mod http_v2_tests {
 const WS_INFO_C2S: &[u8] = b"obsetync/ws/v2/c2s";
 const WS_INFO_S2C: &[u8] = b"obsetync/ws/v2/s2c";
 const WS_AAD_PREFIX: &[u8] = b"obsetync/ws/v2";
+const WS_DATA_AAD_PREFIX: &[u8] = b"obsetync/ws-data/v1";
 
 /// Directional key pair for one WS session.
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -871,9 +872,9 @@ pub fn derive_ws_keys(shared: &[u8; KEY_LEN], ticket_hex: &str) -> WsSessionKeys
     }
 }
 
-fn ws_aad(dir: &str, seq: u64) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(WS_AAD_PREFIX.len() + 1 + dir.len() + 1 + 8);
-    aad.extend_from_slice(WS_AAD_PREFIX);
+fn ws_aad(prefix: &[u8], dir: &str, seq: u64) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(prefix.len() + 1 + dir.len() + 1 + 8);
+    aad.extend_from_slice(prefix);
     aad.push(b' ');
     aad.extend_from_slice(dir.as_bytes());
     aad.push(b' ');
@@ -888,12 +889,34 @@ pub fn ws_seal(
     seq: u64,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, SecureError> {
+    ws_seal_with_prefix(key, WS_AAD_PREFIX, dir, seq, plaintext)
+}
+
+/// Seal a ws-data-v1 frame. It deliberately keeps the ticket-derived keys
+/// but uses a generation-specific AAD domain, so a valid realtime frame
+/// cannot be replayed onto the data endpoint (or vice versa).
+pub fn ws_data_seal(
+    key: &[u8; KEY_LEN],
+    dir: &str,
+    seq: u64,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, SecureError> {
+    ws_seal_with_prefix(key, WS_DATA_AAD_PREFIX, dir, seq, plaintext)
+}
+
+fn ws_seal_with_prefix(
+    key: &[u8; KEY_LEN],
+    prefix: &[u8],
+    dir: &str,
+    seq: u64,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, SecureError> {
     let mut nonce = [0u8; NONCE_LEN];
     use rand::RngCore;
     rand::rng().fill_bytes(&mut nonce);
 
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    let aad = ws_aad(dir, seq);
+    let aad = ws_aad(prefix, dir, seq);
     let ct = cipher
         .encrypt(
             Nonce::from_slice(&nonce),
@@ -917,12 +940,32 @@ pub fn ws_open(
     seq: u64,
     frame: &[u8],
 ) -> Result<Vec<u8>, SecureError> {
+    ws_open_with_prefix(key, WS_AAD_PREFIX, dir, seq, frame)
+}
+
+/// Open one ws-data-v1 frame in its protocol-specific AAD domain.
+pub fn ws_data_open(
+    key: &[u8; KEY_LEN],
+    dir: &str,
+    seq: u64,
+    frame: &[u8],
+) -> Result<Vec<u8>, SecureError> {
+    ws_open_with_prefix(key, WS_DATA_AAD_PREFIX, dir, seq, frame)
+}
+
+fn ws_open_with_prefix(
+    key: &[u8; KEY_LEN],
+    prefix: &[u8],
+    dir: &str,
+    seq: u64,
+    frame: &[u8],
+) -> Result<Vec<u8>, SecureError> {
     if frame.len() < NONCE_LEN + TAG_LEN {
         return Err(SecureError::TooShort(frame.len(), NONCE_LEN + TAG_LEN));
     }
     let (nonce, ct) = frame.split_at(NONCE_LEN);
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    let aad = ws_aad(dir, seq);
+    let aad = ws_aad(prefix, dir, seq);
     cipher
         .decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad: &aad })
         .map_err(|_| SecureError::AeadOpen)
@@ -960,6 +1003,17 @@ mod ws_frame_tests {
         assert!(ws_open(&k.c2s, "c2s", 4, &frame).is_err());
         // Cross-direction reflection dies on key AND AAD.
         assert!(ws_open(&k.s2c, "s2c", 3, &frame).is_err());
+    }
+
+    #[test]
+    fn realtime_and_data_aad_domains_reject_each_other() {
+        let k = keys();
+        let realtime = ws_seal(&k.c2s, "c2s", 0, b"OBW1").unwrap();
+        assert!(ws_data_open(&k.c2s, "c2s", 0, &realtime).is_err());
+
+        let data = ws_data_seal(&k.c2s, "c2s", 0, b"OBW1").unwrap();
+        assert!(ws_open(&k.c2s, "c2s", 0, &data).is_err());
+        assert_eq!(ws_data_open(&k.c2s, "c2s", 0, &data).unwrap(), b"OBW1");
     }
 
     #[test]

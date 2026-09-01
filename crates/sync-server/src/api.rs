@@ -31,10 +31,10 @@ const MAX_BODY_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 /// Authenticated bulk-v1 limits. The legacy sealed middleware accepts larger
 /// single-object requests, while the buffering fast path stays deliberately
 /// small enough for old mobile renderers and bounded server allocations.
-const BULK_REQUEST_BYTES: usize = 8 * 1024 * 1024;
-const BULK_OBJECTS: usize = 256;
-const BULK_OBJECT_BYTES: usize = 1024 * 1024 - 1;
-const WS_FRAME_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const BULK_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const BULK_OBJECTS: usize = 256;
+pub(crate) const BULK_OBJECT_BYTES: usize = 1024 * 1024 - 1;
+pub(crate) const WS_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const DIFF_PAGE_BYTES: usize = 2 * 1024 * 1024;
 
 fn storage_writer_error(error: StoreError) -> ServerError {
@@ -611,6 +611,7 @@ pub fn sync_router(state: SharedState) -> Router {
         // responses and cannot wrap a stream. Wire-v2 frames are separately
         // sealed; root notifications carry hashes and presence carries paths.
         .route("/api/v1/ws", get(crate::ws::ws_route))
+        .route("/api/v1/ws-data", get(crate::ws_data::ws_data_route))
         .merge(protected)
         .with_state(state)
 }
@@ -641,11 +642,13 @@ async fn get_server_eph(State(state): State<SharedState>) -> impl IntoResponse {
 fn capability_bundle() -> serde_json::Value {
     serde_json::json!({
         // Never advertise a future fast path before this binary can serve it.
-        "capabilities": ["bulk-http-v1"],
+        "capabilities": ["bulk-http-v1", "ws-data-v1"],
         "limits": {
             "bulk_request_bytes": BULK_REQUEST_BYTES,
             "bulk_objects": BULK_OBJECTS,
             "ws_frame_bytes": WS_FRAME_BYTES,
+            "ws_inflight_requests": 4,
+            "ws_inflight_bytes": 32 * 1024 * 1024,
             "diff_page_bytes": DIFF_PAGE_BYTES,
         }
     })
@@ -1994,16 +1997,17 @@ fn bulk_object_is_usable(state: &SharedState, kind: ObjectKind, hash: &FileHash)
     }
 }
 
-async fn post_bulk_check(
-    State(state): State<SharedState>,
-    body: axum::body::Bytes,
-) -> Result<impl IntoResponse, ServerError> {
-    if body.len() > BULK_REQUEST_BYTES {
+pub(crate) fn process_bulk_check(
+    state: &SharedState,
+    body: &[u8],
+    max_request_bytes: usize,
+) -> Result<Vec<u8>, ServerError> {
+    if body.len() > max_request_bytes {
         return Err(ServerError::PayloadTooLarge(
             "bulk check exceeds advertised byte limit".into(),
         ));
     }
-    let request = bulk::decode_check_request(&body, BULK_OBJECTS)
+    let request = bulk::decode_check_request(body, BULK_OBJECTS)
         .map_err(|error| ServerError::BadRequest(error.to_string()))?;
     state
         .perf
@@ -2011,10 +2015,16 @@ async fn post_bulk_check(
     let needed: Vec<bool> = request
         .hashes
         .iter()
-        .map(|hash| !bulk_object_is_usable(&state, request.kind, hash))
+        .map(|hash| !bulk_object_is_usable(state, request.kind, hash))
         .collect();
-    let response = bulk::encode_check_response(&needed)
-        .map_err(|error| ServerError::Internal(error.to_string()))?;
+    bulk::encode_check_response(&needed).map_err(|error| ServerError::Internal(error.to_string()))
+}
+
+async fn post_bulk_check(
+    State(state): State<SharedState>,
+    body: axum::body::Bytes,
+) -> Result<impl IntoResponse, ServerError> {
+    let response = process_bulk_check(&state, &body, BULK_REQUEST_BYTES)?;
     Ok((
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
@@ -2022,13 +2032,14 @@ async fn post_bulk_check(
     ))
 }
 
-async fn post_bulk_put(
-    State(state): State<SharedState>,
-    body: axum::body::Bytes,
-) -> Result<impl IntoResponse, ServerError> {
+pub(crate) async fn process_bulk_put(
+    state: &SharedState,
+    body: &[u8],
+    max_request_bytes: usize,
+) -> Result<Vec<u8>, ServerError> {
     let pack =
-        bulk::decode_upload_pack(&body, BULK_OBJECTS, BULK_REQUEST_BYTES).map_err(|error| {
-            if body.len() > BULK_REQUEST_BYTES {
+        bulk::decode_upload_pack(body, BULK_OBJECTS, max_request_bytes).map_err(|error| {
+            if body.len() > max_request_bytes {
                 ServerError::PayloadTooLarge(error.to_string())
             } else {
                 ServerError::BadRequest(error.to_string())
@@ -2112,7 +2123,7 @@ async fn post_bulk_put(
             (record.bytes.to_vec(), Vec::new())
         };
 
-        if bulk_object_is_usable(&state, record.kind, &record.hash) {
+        if bulk_object_is_usable(state, record.kind, &record.hash) {
             statuses[record_index] = Some(UploadStatus::AlreadyPresent);
             continue;
         }
@@ -2166,8 +2177,14 @@ async fn post_bulk_put(
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| ServerError::Internal("bulk writer left an ACK unset".into()))?;
 
-    let response = bulk::encode_upload_ack(&statuses)
-        .map_err(|error| ServerError::Internal(error.to_string()))?;
+    bulk::encode_upload_ack(&statuses).map_err(|error| ServerError::Internal(error.to_string()))
+}
+
+async fn post_bulk_put(
+    State(state): State<SharedState>,
+    body: axum::body::Bytes,
+) -> Result<impl IntoResponse, ServerError> {
+    let response = process_bulk_put(&state, &body, BULK_REQUEST_BYTES).await?;
     Ok((
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
@@ -2206,19 +2223,21 @@ fn read_bulk_object(
     Ok(Some(bytes))
 }
 
-async fn post_bulk_get(
-    State(state): State<SharedState>,
-    body: axum::body::Bytes,
-) -> Result<impl IntoResponse, ServerError> {
-    if body.len() > BULK_REQUEST_BYTES {
+pub(crate) fn process_bulk_get(
+    state: &SharedState,
+    body: &[u8],
+    max_request_bytes: usize,
+    max_response_bytes: usize,
+) -> Result<Vec<u8>, ServerError> {
+    if body.len() > max_request_bytes {
         return Err(ServerError::PayloadTooLarge(
             "bulk get request exceeds advertised byte limit".into(),
         ));
     }
-    let request = bulk::decode_get_request(&body, BULK_OBJECTS)
+    let request = bulk::decode_get_request(body, BULK_OBJECTS)
         .map_err(|error| ServerError::BadRequest(error.to_string()))?;
     let response_budget = request.max_response_bytes as usize;
-    if response_budget == 0 || response_budget > BULK_REQUEST_BYTES {
+    if response_budget == 0 || response_budget > max_response_bytes {
         return Err(ServerError::PayloadTooLarge(
             "bulk get response budget exceeds advertised limit".into(),
         ));
@@ -2240,7 +2259,7 @@ async fn post_bulk_get(
     let mut encoded_bytes = fixed_bytes;
     let mut owned_records: Vec<(FileHash, Vec<u8>)> = Vec::new();
     for hash in request.hashes.iter().skip(start) {
-        let Some(bytes) = read_bulk_object(&state, request.kind, hash)? else {
+        let Some(bytes) = read_bulk_object(state, request.kind, hash)? else {
             // Missing is deliberately distinct from "not inspected yet": at
             // completion the client detects any requested hash absent from
             // the returned record set and raises the same failure as GET 404.
@@ -2292,6 +2311,14 @@ async fn post_bulk_get(
     state
         .perf
         .record_request_objects((next_cursor - start) as u64);
+    Ok(response)
+}
+
+async fn post_bulk_get(
+    State(state): State<SharedState>,
+    body: axum::body::Bytes,
+) -> Result<impl IntoResponse, ServerError> {
+    let response = process_bulk_get(&state, &body, BULK_REQUEST_BYTES, BULK_REQUEST_BYTES)?;
     Ok((
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
@@ -2744,19 +2771,20 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn capability_bundle_advertises_only_implemented_bulk_path_and_hard_limits() {
+    async fn capability_bundle_advertises_bulk_and_ws_data_with_hard_limits() {
         let env = setup();
         let (status, body) = send_semantic(&env, "POST", "/api/v1/capabilities", &[]).await;
         assert_eq!(status, StatusCode::OK.as_u16());
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["capabilities"], serde_json::json!(["bulk-http-v1"]));
+        assert_eq!(
+            value["capabilities"],
+            serde_json::json!(["bulk-http-v1", "ws-data-v1"])
+        );
         assert_eq!(value["limits"]["bulk_request_bytes"], BULK_REQUEST_BYTES);
         assert_eq!(value["limits"]["bulk_objects"], BULK_OBJECTS);
-        assert!(!value["capabilities"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|capability| capability == "ws-data-v1"));
+        assert_eq!(value["limits"]["ws_frame_bytes"], WS_FRAME_BYTES);
+        assert_eq!(value["limits"]["ws_inflight_requests"], 4);
+        assert_eq!(value["limits"]["ws_inflight_bytes"], 32 * 1024 * 1024);
     }
 
     #[tokio::test]
@@ -3201,7 +3229,10 @@ mod integration_tests {
             .as_str()
             .is_some_and(|value| !value.is_empty()));
         assert!(bundle["valid_until"].as_u64().is_some());
-        assert_eq!(bundle["capabilities"], serde_json::json!(["bulk-http-v1"]));
+        assert_eq!(
+            bundle["capabilities"],
+            serde_json::json!(["bulk-http-v1", "ws-data-v1"])
+        );
         assert_eq!(bundle["limits"]["bulk_request_bytes"], BULK_REQUEST_BYTES);
     }
 
