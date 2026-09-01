@@ -454,13 +454,11 @@ where
     let mut cx = Context::from_waker(&waker);
     let mut future = Box::pin(future);
 
-    loop {
-        match future.as_mut().poll(&mut cx) {
-            Poll::Ready(val) => return val,
-            Poll::Pending => {
-                // MemoryChunkStore should never return Pending.
-                panic!("WASM async operation returned Pending — this should not happen with MemoryChunkStore");
-            }
+    match future.as_mut().poll(&mut cx) {
+        Poll::Ready(value) => value,
+        Poll::Pending => {
+            // MemoryChunkStore should never return Pending.
+            panic!("WASM async operation returned Pending — this should not happen with MemoryChunkStore");
         }
     }
 }
