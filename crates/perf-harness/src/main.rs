@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use perf_harness::{
-    apply_operation, benchmark, materialize, verify, MaterializeOptions, Scale, WorkloadId,
-    WorkloadPlan,
+    apply_operation, benchmark, benchmark_prefix_merge, materialize, verify, MaterializeOptions,
+    Scale, WorkloadId, WorkloadPlan,
 };
 use std::path::PathBuf;
 
@@ -69,6 +69,22 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Compare legacy repeated scans with the linear Tree-v1 prefix merge.
+    PrefixBench {
+        #[arg(long, default_value_t = 10_000)]
+        entries: usize,
+        #[arg(long, default_value_t = 5_000)]
+        upserts: usize,
+        #[arg(long, default_value_t = 5_000)]
+        deletes: usize,
+        #[arg(long, default_value_t = 5)]
+        iterations: usize,
+        #[arg(long, default_value_t = DEFAULT_SEED)]
+        seed: u64,
+        /// Optional JSON report path; stdout is used when omitted.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -108,6 +124,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             output,
         } => {
             let report = benchmark(&input, iterations, max_operations).await?;
+            if let Some(path) = output {
+                let file = std::fs::File::create(path)?;
+                serde_json::to_writer_pretty(std::io::BufWriter::new(file), &report)?;
+                return Ok(());
+            }
+            serde_json::to_value(report)?
+        }
+        Command::PrefixBench {
+            entries,
+            upserts,
+            deletes,
+            iterations,
+            seed,
+            output,
+        } => {
+            let report =
+                benchmark_prefix_merge(entries, upserts, deletes, iterations, seed).await?;
             if let Some(path) = output {
                 let file = std::fs::File::create(path)?;
                 serde_json::to_writer_pretty(std::io::BufWriter::new(file), &report)?;

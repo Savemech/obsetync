@@ -51,6 +51,19 @@ cargo run -p perf-harness --release -- bench \
   --input /bench/W6 --iterations 5 --output reports/W6.json
 ```
 
+Compare the retained pre-Slice-2 Tree-v1 algorithm with the production linear
+prefix merge on identical deterministic final states:
+
+```bash
+cargo run -p perf-harness --release -- prefix-bench \
+  --entries 10000 --upserts 5000 --deletes 5000 --iterations 5 \
+  --output reports/tree-v1-prefix.json
+```
+
+Each iteration builds independent initial stores outside the timed region,
+alternates execution order to reduce cache bias, and rejects the report unless
+both roots match an independently constructed flat-state oracle.
+
 ## Workload semantics
 
 - W1: 100,000 Markdown files, each 1–16 KiB.

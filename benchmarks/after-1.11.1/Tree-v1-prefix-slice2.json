@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "harness_version": "1.10.2",
+  "operating_system": "linux",
+  "architecture": "x86_64",
+  "seed": 819217251961995265,
+  "existing_entries": 10000,
+  "upsert_operations": 5000,
+  "delete_operations": 5000,
+  "iterations": [
+    {
+      "legacy_update_ns": 358793588,
+      "linear_update_ns": 8811922,
+      "speedup": 40.7168365766288,
+      "final_files": 8058,
+      "roots_match": true
+    },
+    {
+      "legacy_update_ns": 341547186,
+      "linear_update_ns": 4733301,
+      "speedup": 72.15834910984955,
+      "final_files": 8058,
+      "roots_match": true
+    },
+    {
+      "legacy_update_ns": 362751569,
+      "linear_update_ns": 8306951,
+      "speedup": 43.668437312318325,
+      "final_files": 8058,
+      "roots_match": true
+    },
+    {
+      "legacy_update_ns": 389427843,
+      "linear_update_ns": 5699501,
+      "speedup": 68.32665578969106,
+      "final_files": 8058,
+      "roots_match": true
+    },
+    {
+      "legacy_update_ns": 363856260,
+      "linear_update_ns": 8140580,
+      "speedup": 44.69660147065688,
+      "final_files": 8058,
+      "roots_match": true
+    },
+    {
+      "legacy_update_ns": 362411539,
+      "linear_update_ns": 6965342,
+      "speedup": 52.0306883710807,
+      "final_files": 8058,
+      "roots_match": true
+    },
+    {
+      "legacy_update_ns": 331294964,
+      "linear_update_ns": 5465515,
+      "speedup": 60.615507230334195,
+      "final_files": 8058,
+      "roots_match": true
+    }
+  ]
+}

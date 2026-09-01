@@ -15,6 +15,13 @@ against an independent flat rebuild. The mandatory Slice 1 invariant is
 semantic final root is identical while the final in-memory store drops from
 101 chunks (one live + 100 historical) to exactly one reachable chunk.
 
+`Tree-v1-prefix-slice2.json` compares the retained legacy repeated-scan
+algorithm with production `update_tree` on the same deterministic batch:
+10,000 existing entries, 5,000 upserts, and 5,000 deletes. Every root matches
+the independent flat-state oracle. Across seven alternating-order iterations,
+median update time falls from 362.41 ms to 6.97 ms (52.03x by median time); the
+slowest observed speedup is 40.72x.
+
 This Linux/x86_64 run is implementation evidence, not the final cross-hardware
 release report. A17, M1, Snapdragon, cold/warm cache, power, and network fields
 are added by the final hardware gate.

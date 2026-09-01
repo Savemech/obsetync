@@ -343,6 +343,28 @@ pub struct BenchmarkIteration {
     pub operation_latency_p99_ns: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrefixMergeBenchmarkReport {
+    pub schema_version: u8,
+    pub harness_version: String,
+    pub operating_system: String,
+    pub architecture: String,
+    pub seed: u64,
+    pub existing_entries: u64,
+    pub upsert_operations: u64,
+    pub delete_operations: u64,
+    pub iterations: Vec<PrefixMergeBenchmarkIteration>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrefixMergeBenchmarkIteration {
+    pub legacy_update_ns: u64,
+    pub linear_update_ns: u64,
+    pub speedup: f64,
+    pub final_files: u64,
+    pub roots_match: bool,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum HarnessError {
     #[error("invalid scale {0:?}; expected a decimal in (0, 1] with at most six digits")]
@@ -729,6 +751,195 @@ pub async fn benchmark(
     })
 }
 
+/// Compare the pre-Slice-2 repeated retain/find algorithm with production
+/// Tree-v1 update_tree on one deterministic large prefix. Tree construction is
+/// outside the timed section; both paths still include subtree load, mutation,
+/// sort/normalization, leaf serialization, and store writes.
+pub async fn benchmark_prefix_merge(
+    existing_entries: usize,
+    upsert_operations: usize,
+    delete_operations: usize,
+    iterations: usize,
+    seed: u64,
+) -> Result<PrefixMergeBenchmarkReport, HarnessError> {
+    const MAX_OPERATIONS: usize = 1_000_000;
+    if existing_entries == 0 || iterations == 0 {
+        return Err(HarnessError::ManifestMismatch(
+            "prefix benchmark entries and iterations must be positive".into(),
+        ));
+    }
+    if existing_entries > MAX_OPERATIONS
+        || upsert_operations > MAX_OPERATIONS
+        || delete_operations > MAX_OPERATIONS
+    {
+        return Err(HarnessError::ManifestMismatch(format!(
+            "prefix benchmark counts must not exceed {MAX_OPERATIONS}"
+        )));
+    }
+
+    let initial: Vec<_> = (0..existing_entries)
+        .map(|index| benchmark_tree_entry(&format!("wide/{index:08}.md"), index as u64 + 1))
+        .collect();
+    let path_universe = existing_entries
+        .saturating_add(upsert_operations / 5)
+        .max(1);
+    let changed: Vec<_> = (0..upsert_operations)
+        .map(|operation| {
+            let index = mix64(seed.wrapping_add(operation as u64)) as usize % path_universe;
+            benchmark_tree_entry(
+                &format!("wide/{index:08}.md"),
+                existing_entries as u64 + operation as u64 + 1,
+            )
+        })
+        .collect();
+    let deleted: Vec<_> = (0..delete_operations)
+        .map(|operation| {
+            let index = mix64(seed ^ (operation as u64).rotate_left(17)) as usize % path_universe;
+            format!("wide/{index:08}.md")
+        })
+        .collect();
+
+    let mut expected: BTreeMap<String, sync_core::chunk::FileEntry> = initial
+        .iter()
+        .cloned()
+        .map(|entry| (entry.path.clone(), entry))
+        .collect();
+    for path in &deleted {
+        expected.remove(path);
+    }
+    for entry in &changed {
+        expected.insert(entry.path.clone(), entry.clone());
+    }
+    let oracle_store = sync_core::store::MemoryChunkStore::new();
+    let oracle_root = sync_core::tree::build_tree(
+        &oracle_store,
+        expected.values().cloned().collect(),
+        "prefix-benchmark",
+        "perf-harness",
+    )
+    .await
+    .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+
+    let mut results = Vec::with_capacity(iterations);
+    for iteration in 0..iterations {
+        let legacy_store = sync_core::store::MemoryChunkStore::new();
+        let legacy_base = sync_core::tree::build_tree(
+            &legacy_store,
+            initial.clone(),
+            "prefix-benchmark",
+            "perf-harness",
+        )
+        .await
+        .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+        let linear_store = sync_core::store::MemoryChunkStore::new();
+        let linear_base = sync_core::tree::build_tree(
+            &linear_store,
+            initial.clone(),
+            "prefix-benchmark",
+            "perf-harness",
+        )
+        .await
+        .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+
+        let (legacy_root, legacy_update_ns, linear_root, linear_update_ns) = if iteration % 2 == 0 {
+            let started = Instant::now();
+            let legacy =
+                legacy_prefix_update(&legacy_store, &legacy_base, &changed, &deleted).await?;
+            let legacy_ns = elapsed_ns(started.elapsed());
+            let started = Instant::now();
+            let linear =
+                sync_core::tree::update_tree(&linear_store, &linear_base, &changed, &deleted)
+                    .await
+                    .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+            let linear_ns = elapsed_ns(started.elapsed());
+            (legacy, legacy_ns, linear, linear_ns)
+        } else {
+            let started = Instant::now();
+            let linear =
+                sync_core::tree::update_tree(&linear_store, &linear_base, &changed, &deleted)
+                    .await
+                    .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+            let linear_ns = elapsed_ns(started.elapsed());
+            let started = Instant::now();
+            let legacy =
+                legacy_prefix_update(&legacy_store, &legacy_base, &changed, &deleted).await?;
+            let legacy_ns = elapsed_ns(started.elapsed());
+            (legacy, legacy_ns, linear, linear_ns)
+        };
+
+        let roots_match = legacy_root.hash() == oracle_root.hash()
+            && linear_root.hash() == oracle_root.hash()
+            && legacy_root.total_files == expected.len() as u64
+            && linear_root.total_files == expected.len() as u64;
+        if !roots_match {
+            return Err(HarnessError::ManifestMismatch(format!(
+                "prefix benchmark semantic mismatch in iteration {iteration}"
+            )));
+        }
+        results.push(PrefixMergeBenchmarkIteration {
+            legacy_update_ns,
+            linear_update_ns,
+            speedup: legacy_update_ns as f64 / linear_update_ns.max(1) as f64,
+            final_files: expected.len() as u64,
+            roots_match,
+        });
+    }
+
+    Ok(PrefixMergeBenchmarkReport {
+        schema_version: 1,
+        harness_version: env!("CARGO_PKG_VERSION").to_owned(),
+        operating_system: std::env::consts::OS.to_owned(),
+        architecture: std::env::consts::ARCH.to_owned(),
+        seed,
+        existing_entries: existing_entries as u64,
+        upsert_operations: upsert_operations as u64,
+        delete_operations: delete_operations as u64,
+        iterations: results,
+    })
+}
+
+async fn legacy_prefix_update(
+    store: &sync_core::store::MemoryChunkStore,
+    root: &sync_core::chunk::RootNode,
+    changed: &[sync_core::chunk::FileEntry],
+    deleted: &[String],
+) -> Result<sync_core::chunk::RootNode, HarnessError> {
+    let child_hash = root
+        .children
+        .first()
+        .ok_or_else(|| HarnessError::ManifestMismatch("legacy tree has no prefix".into()))?
+        .1;
+    let mut entries = sync_core::tree::load_all_entries(store, &child_hash)
+        .await
+        .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+    for path in deleted {
+        entries.retain(|entry| &entry.path != path);
+    }
+    for changed_entry in changed {
+        if let Some(existing) = entries
+            .iter_mut()
+            .find(|entry| entry.path == changed_entry.path)
+        {
+            *existing = changed_entry.clone();
+        } else {
+            entries.push(changed_entry.clone());
+        }
+    }
+    entries.sort();
+    sync_core::tree::build_tree(store, entries, &root.vault_id, &root.device_id)
+        .await
+        .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))
+}
+
+fn benchmark_tree_entry(path: &str, revision: u64) -> sync_core::chunk::FileEntry {
+    sync_core::chunk::FileEntry::new(
+        path.to_owned(),
+        sync_core::hash::hash_bytes(format!("{path}:{revision}").as_bytes()),
+        revision,
+        revision.saturating_add(1),
+    )
+}
+
 fn markdown_files(seed: u64, count: usize, prefix: &str) -> Vec<FileSpec> {
     (0..count)
         .map(|index| FileSpec {
@@ -1094,5 +1305,19 @@ mod tests {
         assert_eq!(iteration.unreachable_tree_chunks, 0);
         assert!(iteration.gc_removed_chunks > 0);
         assert!(iteration.root_matches_flat_oracle);
+    }
+
+    #[tokio::test]
+    async fn prefix_merge_benchmark_requires_oracle_parity() {
+        let report = benchmark_prefix_merge(200, 100, 80, 2, 42).await.unwrap();
+        assert_eq!(report.iterations.len(), 2);
+        assert!(report
+            .iterations
+            .iter()
+            .all(|iteration| iteration.roots_match));
+        assert!(report
+            .iterations
+            .iter()
+            .all(|iteration| iteration.linear_update_ns > 0));
     }
 }
