@@ -8,6 +8,9 @@ import {
 import { PerfTrace } from "./perf-trace";
 import { HashWorkerFileDriftError } from "./desktop-hash-workers";
 import { BulkObjectKind } from "./bulk-codec";
+import { mkdtemp, open, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 (globalThis as any).window ??= globalThis;
 
@@ -350,22 +353,283 @@ async function incrementalPushChecksOnlyNewCandidateChunks(): Promise<void> {
 async function workerManifestAvoidsRendererFileBytes(): Promise<void> {
     const f = fixture();
     const fileHash = "f".repeat(64);
-    const chunkHash = "1".repeat(64);
+    const firstChunkHash = "1".repeat(64);
+    const secondChunkHash = "2".repeat(64);
     const size = 2 * 1024 * 1024;
-    f.wasm.wasm_should_chunk = (bytes: number) => bytes >= 1024 * 1024;
-    let readCalls = 0;
-    f.io.getAbsolutePath = (path: string) => `/vault/${path}`;
-    f.io.readFile = async () => {
-        readCalls++;
-        throw new Error("renderer read should not happen");
-    };
-    let workerInput: any;
-    const workers = {
-        run: async (input: any) => {
-            workerInput = input;
-            return {
+    const directory = await mkdtemp(join(tmpdir(), "obsetync-ranged-push-"));
+    const absolutePath = join(directory, "large.bin");
+    try {
+        const handle = await open(absolutePath, "w");
+        try {
+            await handle.truncate(size);
+            await handle.write(new Uint8Array([7, 8, 9]), 0, 3, 1024 * 1024);
+        } finally {
+            await handle.close();
+        }
+        const info = await stat(absolutePath);
+        const fingerprint = {
+            size: Number(info.size),
+            mtime: Number(info.mtimeMs),
+            ctime: Number(info.ctimeMs),
+            device: Number(info.dev),
+            inode: Number(info.ino),
+        };
+        f.wasm.wasm_should_chunk = (bytes: number) => bytes >= 1024 * 1024;
+        let readCalls = 0;
+        f.io.getAbsolutePath = () => absolutePath;
+        f.io.readFile = async () => {
+            readCalls++;
+            throw new Error("renderer read should not happen");
+        };
+        let workerInput: any;
+        const workers = {
+            run: async (input: any) => {
+                workerInput = input;
+                return {
+                    type: "result",
+                    job_id: "test",
+                    mode: "manifest",
+                    manifest: {
+                        file_hash: fileHash,
+                        total_size: size,
+                        chunks: [
+                            { hash: firstChunkHash, offset: 0, size: 1024 * 1024 },
+                            { hash: secondChunkHash, offset: 1024 * 1024, size: 1024 * 1024 },
+                        ],
+                    },
+                    size,
+                    mtime: fingerprint.mtime,
+                    fingerprint,
+                    read_ms: 1,
+                    hash_ms: 2,
+                };
+            },
+        } as any;
+        let manifestUploads = 0;
+        let contentChunkUploads = 0;
+        let uploadedRangeLength = -1;
+        let uploadedRangeFirst = -1;
+        let uploadedRangeThird = -1;
+        const api = {
+            ensureTransportReady: async () => {},
+            checkContentChunks: async () => [secondChunkHash],
+            putObjects: async (records: Array<{
+                kind: BulkObjectKind;
+                data: Uint8Array;
+            }>) => {
+                manifestUploads += records.filter((record) =>
+                    record.kind === BulkObjectKind.Manifest).length;
+                for (const record of records) {
+                    if (record.kind === BulkObjectKind.ContentChunk) {
+                        contentChunkUploads++;
+                        uploadedRangeLength = record.data.byteLength;
+                        uploadedRangeFirst = record.data[0];
+                        uploadedRangeThird = record.data[2];
+                    }
+                }
+            },
+            putRoot: async () => ({ root_hash: "accepted", conflicts: [] }),
+        } as any;
+
+        await push(api, f.io, f.syncBase, f.wasm, f.tree, "vault", [{
+            action: "created",
+            path: "large.bin",
+            mtime: fingerprint.mtime,
+            size,
+        }], "base", undefined, undefined, workers);
+
+        check(workerInput.absolutePath === absolutePath, "worker did not receive absolute path");
+        check(workerInput.mode === "manifest", "large file did not request a manifest job");
+        check(!("data" in workerInput), "file bytes crossed the worker boundary");
+        check(readCalls === 0, "desktop ranged upload called renderer readFile");
+        check(contentChunkUploads === 1, "missing bitmap did not select one range");
+        check(uploadedRangeLength === 1024 * 1024, "ranged read returned the wrong size");
+        check(uploadedRangeFirst === 7 && uploadedRangeThird === 9, "ranged read used the wrong offset");
+        check(manifestUploads === 1, "worker manifest was not uploaded");
+        check(f.entries.get("large.bin")?.hash === fileHash, "worker hash was not committed");
+    } finally {
+        await rm(directory, { recursive: true, force: true });
+    }
+}
+
+async function interruptedRangedUploadResumesFromServerBitmap(): Promise<void> {
+    const f = fixture();
+    const mib = 1024 * 1024;
+    const size = 12 * mib;
+    const fileHash = "3".repeat(64);
+    const chunkHashes = ["4".repeat(64), "5".repeat(64), "6".repeat(64)];
+    const directory = await mkdtemp(join(tmpdir(), "obsetync-ranged-resume-"));
+    const absolutePath = join(directory, "resume.bin");
+    try {
+        const handle = await open(absolutePath, "w");
+        try {
+            await handle.truncate(size);
+        } finally {
+            await handle.close();
+        }
+        const info = await stat(absolutePath);
+        const fingerprint = {
+            size: Number(info.size),
+            mtime: Number(info.mtimeMs),
+            ctime: Number(info.ctimeMs),
+            device: Number(info.dev),
+            inode: Number(info.ino),
+        };
+        f.wasm.wasm_should_chunk = (bytes: number) => bytes >= mib;
+        f.io.getAbsolutePath = () => absolutePath;
+        let rendererReads = 0;
+        f.io.readFile = async () => {
+            rendererReads++;
+            throw new Error("renderer read should not happen");
+        };
+        const manifest = {
+            file_hash: fileHash,
+            total_size: size,
+            chunks: chunkHashes.map((hash, index) => ({
+                hash,
+                offset: index * 4 * mib,
+                size: 4 * mib,
+            })),
+        };
+        const workers = {
+            run: async () => ({
                 type: "result",
-                job_id: "test",
+                job_id: "resume",
+                mode: "manifest",
+                manifest,
+                size,
+                mtime: fingerprint.mtime,
+                fingerprint,
+                read_ms: 1,
+                hash_ms: 2,
+            }),
+        } as any;
+        const change = {
+            action: "created" as const,
+            path: "resume.bin",
+            mtime: fingerprint.mtime,
+            size,
+        };
+
+        const stored = new Set<string>();
+        const firstAttempted: string[] = [];
+        let chunkPutCalls = 0;
+        const firstApi = {
+            ensureTransportReady: async () => {},
+            checkContentChunks: async () => chunkHashes,
+            putObjects: async (records: Array<{
+                kind: BulkObjectKind;
+                hash: string;
+            }>) => {
+                const chunks = records.filter((record) =>
+                    record.kind === BulkObjectKind.ContentChunk);
+                if (chunks.length === 0) return;
+                chunkPutCalls++;
+                firstAttempted.push(...chunks.map((record) => record.hash));
+                if (chunkPutCalls === 2) throw new Error("injected ranged disconnect");
+                for (const record of chunks) stored.add(record.hash);
+            },
+        } as any;
+        let interrupted = false;
+        try {
+            await push(
+                firstApi,
+                f.io,
+                f.syncBase,
+                f.wasm,
+                f.tree,
+                "vault",
+                [change],
+                "base",
+                undefined,
+                undefined,
+                workers,
+            );
+        } catch (error) {
+            interrupted = (error as Error).message === "injected ranged disconnect";
+        }
+        check(interrupted, "ranged interruption was hidden");
+        check(f.abortCalls() === 1 && f.commitCalls() === 0, "interruption did not abort candidate");
+        check(stored.size === 2, "first ACKed range pack differs");
+        check(
+            firstAttempted.join(",") === chunkHashes.join(","),
+            "first attempt did not stop on the failing range pack",
+        );
+        check(!f.entries.has("resume.bin"), "interrupted range upload committed metadata");
+
+        const retryContent: string[] = [];
+        let retryManifest = 0;
+        const retryApi = {
+            ensureTransportReady: async () => {},
+            checkContentChunks: async () => chunkHashes.filter((hash) => !stored.has(hash)),
+            putObjects: async (records: Array<{
+                kind: BulkObjectKind;
+                hash: string;
+            }>) => {
+                for (const record of records) {
+                    if (record.kind === BulkObjectKind.ContentChunk) {
+                        retryContent.push(record.hash);
+                        stored.add(record.hash);
+                    } else if (record.kind === BulkObjectKind.Manifest) {
+                        retryManifest++;
+                    }
+                }
+            },
+            putRoot: async () => ({ root_hash: "accepted", conflicts: [] }),
+        } as any;
+        await push(
+            retryApi,
+            f.io,
+            f.syncBase,
+            f.wasm,
+            f.tree,
+            "vault",
+            [change],
+            "base",
+            undefined,
+            undefined,
+            workers,
+        );
+        check(retryContent.join(",") === chunkHashes[2], "retry re-uploaded an ACKed range");
+        check(retryManifest === 1, "retry did not upload the dependent manifest once");
+        check(stored.size === 3, "retry left content ranges missing");
+        check(f.abortCalls() === 1 && f.commitCalls() === 1, "retry candidate outcome differs");
+        check(f.entries.get("resume.bin")?.hash === fileHash, "retry did not commit metadata");
+        check(rendererReads === 0, "ranged resume called renderer readFile");
+    } finally {
+        await rm(directory, { recursive: true, force: true });
+    }
+}
+
+async function rangedDriftAfterTransferAbortsCandidate(): Promise<void> {
+    const f = fixture();
+    const mib = 1024 * 1024;
+    const size = 2 * mib;
+    const fileHash = "7".repeat(64);
+    const chunkHash = "8".repeat(64);
+    const directory = await mkdtemp(join(tmpdir(), "obsetync-ranged-drift-"));
+    const absolutePath = join(directory, "drift.bin");
+    try {
+        const initial = await open(absolutePath, "w");
+        try {
+            await initial.truncate(size);
+        } finally {
+            await initial.close();
+        }
+        const info = await stat(absolutePath);
+        const fingerprint = {
+            size: Number(info.size),
+            mtime: Number(info.mtimeMs),
+            ctime: Number(info.ctimeMs),
+            device: Number(info.dev),
+            inode: Number(info.ino),
+        };
+        f.wasm.wasm_should_chunk = (bytes: number) => bytes >= mib;
+        f.io.getAbsolutePath = () => absolutePath;
+        const workers = {
+            run: async () => ({
+                type: "result",
+                job_id: "drift",
                 mode: "manifest",
                 manifest: {
                     file_hash: fileHash,
@@ -373,36 +637,54 @@ async function workerManifestAvoidsRendererFileBytes(): Promise<void> {
                     chunks: [{ hash: chunkHash, offset: 0, size }],
                 },
                 size,
-                mtime: 10,
+                mtime: fingerprint.mtime,
+                fingerprint,
                 read_ms: 1,
                 hash_ms: 2,
-            };
-        },
-    } as any;
-    let manifestUploads = 0;
-    const api = {
-        ensureTransportReady: async () => {},
-        checkContentChunks: async () => [],
-        putObjects: async (records: Array<{ kind: BulkObjectKind }>) => {
-            manifestUploads += records.filter((record) =>
-                record.kind === BulkObjectKind.Manifest).length;
-        },
-        putRoot: async () => ({ root_hash: "accepted", conflicts: [] }),
-    } as any;
+            }),
+        } as any;
+        let manifestUploads = 0;
+        let putRootCalled = false;
+        const api = {
+            ensureTransportReady: async () => {},
+            checkContentChunks: async () => [chunkHash],
+            putObjects: async (records: Array<{ kind: BulkObjectKind }>) => {
+                if (records.some((record) => record.kind === BulkObjectKind.ContentChunk)) {
+                    const changed = await open(absolutePath, "r+");
+                    try {
+                        await changed.truncate(size - 1);
+                    } finally {
+                        await changed.close();
+                    }
+                }
+                manifestUploads += records.filter((record) =>
+                    record.kind === BulkObjectKind.Manifest).length;
+            },
+            putRoot: async () => {
+                putRootCalled = true;
+                return { root_hash: "accepted", conflicts: [] };
+            },
+        } as any;
 
-    await push(api, f.io, f.syncBase, f.wasm, f.tree, "vault", [{
-        action: "created",
-        path: "large.bin",
-        mtime: 10,
-        size,
-    }], "base", undefined, undefined, workers);
-
-    check(workerInput.absolutePath === "/vault/large.bin", "worker did not receive absolute path");
-    check(workerInput.mode === "manifest", "large file did not request a manifest job");
-    check(!("data" in workerInput), "file bytes crossed the worker boundary");
-    check(readCalls === 0, "deduplicated worker manifest re-read the file in renderer");
-    check(manifestUploads === 1, "worker manifest was not uploaded");
-    check(f.entries.get("large.bin")?.hash === fileHash, "worker hash was not committed");
+        let drifted = false;
+        try {
+            await push(api, f.io, f.syncBase, f.wasm, f.tree, "vault", [{
+                action: "created",
+                path: "drift.bin",
+                mtime: fingerprint.mtime,
+                size,
+            }], "base", undefined, undefined, workers);
+        } catch (error) {
+            drifted = error instanceof HashWorkerFileDriftError;
+        }
+        check(drifted, "post-transfer file drift was hidden");
+        check(manifestUploads === 1, "final drift check ran before transfer completion");
+        check(!putRootCalled, "drifted ranged upload reached root commit");
+        check(f.abortCalls() === 1 && f.commitCalls() === 0, "drift did not abort candidate");
+        check(!f.entries.has("drift.bin"), "drifted range metadata reached sync-base");
+    } finally {
+        await rm(directory, { recursive: true, force: true });
+    }
 }
 
 async function workerDriftAbortsCandidate(): Promise<void> {
@@ -469,6 +751,8 @@ void terminalPreflightDoesNotMutate()
     .then(everyPostCandidateFailureAbortsWithoutFullSnapshot)
     .then(incrementalPushChecksOnlyNewCandidateChunks)
     .then(workerManifestAvoidsRendererFileBytes)
+    .then(interruptedRangedUploadResumesFromServerBitmap)
+    .then(rangedDriftAfterTransferAbortsCandidate)
     .then(workerDriftAbortsCandidate)
     .then(smallFilesReachTransportAsPacksNotPerFilePuts)
     .then(acceptedRootCommitsMetadata)

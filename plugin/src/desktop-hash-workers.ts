@@ -1,4 +1,5 @@
 import type {
+    DesktopFileFingerprint,
     HashWorkerErrorCode,
     HashWorkerJob,
     HashWorkerMode,
@@ -6,6 +7,7 @@ import type {
     HashWorkerResponse,
     HashWorkerResult,
 } from "./hash-worker-protocol";
+import { MAX_FASTCDC_CHUNK_BYTES } from "./hash-worker-protocol";
 
 export interface HashWorkerInput {
     absolutePath: string;
@@ -102,11 +104,29 @@ function validHash(value: unknown): value is string {
     return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
 }
 
+function validFingerprint(
+    value: unknown,
+    request: HashWorkerJob,
+): value is DesktopFileFingerprint {
+    if (!value || typeof value !== "object") return false;
+    const fingerprint = value as DesktopFileFingerprint;
+    return Number.isSafeInteger(fingerprint.size) &&
+        fingerprint.size === request.expected_size &&
+        Number.isFinite(fingerprint.mtime) && fingerprint.mtime >= 0 &&
+        Math.abs(fingerprint.mtime - request.expected_mtime) <= 1 &&
+        Number.isFinite(fingerprint.ctime) && fingerprint.ctime >= 0 &&
+        Number.isInteger(fingerprint.device) && fingerprint.device >= 0 &&
+        Number.isInteger(fingerprint.inode) && fingerprint.inode >= 0;
+}
+
 function validResult(message: HashWorkerResult, request: HashWorkerJob): boolean {
     if (
         message.size !== request.expected_size ||
         !Number.isFinite(message.mtime) ||
         Math.abs(message.mtime - request.expected_mtime) > 1 ||
+        !validFingerprint(message.fingerprint, request) ||
+        message.size !== message.fingerprint.size ||
+        Math.abs(message.mtime - message.fingerprint.mtime) > 1 ||
         !Number.isFinite(message.read_ms) || message.read_ms < 0 ||
         !Number.isFinite(message.hash_ms) || message.hash_ms < 0
     ) {
@@ -126,7 +146,9 @@ function validResult(message: HashWorkerResult, request: HashWorkerJob): boolean
         if (
             !chunk || !validHash(chunk.hash) ||
             !Number.isSafeInteger(chunk.offset) || chunk.offset !== offset ||
-            !Number.isSafeInteger(chunk.size) || chunk.size <= 0
+            !Number.isSafeInteger(chunk.size) || chunk.size <= 0 ||
+            chunk.size > MAX_FASTCDC_CHUNK_BYTES ||
+            chunk.offset > manifest.total_size - chunk.size
         ) {
             return false;
         }

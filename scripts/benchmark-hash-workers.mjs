@@ -174,6 +174,16 @@ try {
     if (manifest.manifest.file_hash !== fileZeroHash.hash) {
         throw new Error("worker hash/manifest file hash mismatch");
     }
+    const fileZeroInfo = await stat(files[0].path);
+    const fingerprintStable = [fileZeroHash, manifest].every((result) =>
+        result.fingerprint?.size === fileZeroInfo.size &&
+        Math.abs(result.fingerprint?.mtime - fileZeroInfo.mtimeMs) <= 1 &&
+        Math.abs(result.fingerprint?.ctime - fileZeroInfo.ctimeMs) <= 1 &&
+        result.fingerprint?.device === fileZeroInfo.dev &&
+        result.fingerprint?.inode === fileZeroInfo.ino);
+    if (!fingerprintStable) {
+        throw new Error("worker result was not bound to the scanned pathname fingerprint");
+    }
 
     let driftDetected = false;
     try {
@@ -231,6 +241,7 @@ try {
         invariants: {
             scalar_simd_hash_parity_inherited_from_slice3: true,
             hash_manifest_parity: true,
+            pathname_fingerprint_stable: fingerprintStable,
             protocol_metadata_only: clients.every((client) => client.metadataOnly),
             drift_detected: driftDetected,
             cancellation_observed: cancellationObserved,

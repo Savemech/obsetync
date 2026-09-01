@@ -20,6 +20,7 @@ import "./perf-trace.test";
 import "./reconcile-content.test";
 import "./wasm-runtime.test";
 import "./desktop-hash-workers.test";
+import "./desktop-ranged-upload.test";
 import "./hash-runtime.test";
 import "./bulk-codec.test";
 import "./ws-data-codec.test";

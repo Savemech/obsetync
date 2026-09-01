@@ -8,6 +8,7 @@ import type {
     HashWorkerRequest,
     HashWorkerResponse,
 } from "./hash-worker-protocol";
+import { MAX_FASTCDC_CHUNK_BYTES } from "./hash-worker-protocol";
 
 let assertions = 0;
 const check = (condition: unknown, message: string) => {
@@ -53,6 +54,14 @@ const jobFrom = (worker: FakeWorker, index = 0) => {
     return job;
 };
 
+const fingerprintFor = (job: ReturnType<typeof jobFrom>) => ({
+    size: job.expected_size,
+    mtime: job.expected_mtime,
+    ctime: job.expected_mtime + 1,
+    device: 7,
+    inode: 11,
+});
+
 const hashResult = (job: ReturnType<typeof jobFrom>) => ({
     type: "result" as const,
     job_id: job.job_id,
@@ -60,6 +69,7 @@ const hashResult = (job: ReturnType<typeof jobFrom>) => ({
     hash: "a".repeat(64),
     size: job.expected_size,
     mtime: job.expected_mtime,
+    fingerprint: fingerprintFor(job),
     read_ms: 2,
     hash_ms: 3,
 });
@@ -140,6 +150,7 @@ async function schedulerIsBoundedAndMetadataOnly(): Promise<void> {
         },
         size: 10,
         mtime: 30,
+        fingerprint: fingerprintFor(manifestJob),
         read_ms: 2,
         hash_ms: 3,
     });
@@ -238,9 +249,76 @@ async function crashedWorkerRestartsAndBinaryResponseIsRejected(): Promise<void>
     await pool.close();
 }
 
+async function hostileWorkerMetadataIsRejected(): Promise<void> {
+    {
+        const worker = new FakeWorker();
+        const pool = new DesktopHashWorkerPool(() => worker as any, 1, 1);
+        worker.emit({ type: "ready", wasm_mode: "simd" });
+        const pending = pool.run({
+            absolutePath: "/vault/bad-fingerprint.md",
+            expectedSize: 9,
+            expectedMtime: 10,
+            mode: "hash",
+            feedBytes: 64 * 1024,
+        });
+        const job = jobFrom(worker);
+        worker.emit({
+            ...hashResult(job),
+            fingerprint: { ...fingerprintFor(job), inode: -1 },
+        });
+        await pending.then(
+            () => check(false, "invalid fingerprint resolved"),
+            (error) => check(
+                error instanceof HashWorkerPoolError && error.code === "PROTOCOL",
+                "invalid fingerprint was accepted",
+            ),
+        );
+        await pool.close();
+    }
+
+    {
+        const worker = new FakeWorker();
+        const pool = new DesktopHashWorkerPool(() => worker as any, 1, 1);
+        worker.emit({ type: "ready", wasm_mode: "simd" });
+        const size = MAX_FASTCDC_CHUNK_BYTES + 1;
+        const pending = pool.run({
+            absolutePath: "/vault/oversized-chunk.bin",
+            expectedSize: size,
+            expectedMtime: 12,
+            mode: "manifest",
+            feedBytes: 64 * 1024,
+        });
+        const job = jobFrom(worker);
+        worker.emit({
+            type: "result",
+            job_id: job.job_id,
+            mode: "manifest",
+            manifest: {
+                file_hash: "b".repeat(64),
+                total_size: size,
+                chunks: [{ hash: "c".repeat(64), offset: 0, size }],
+            },
+            size,
+            mtime: job.expected_mtime,
+            fingerprint: fingerprintFor(job),
+            read_ms: 1,
+            hash_ms: 1,
+        });
+        await pending.then(
+            () => check(false, "oversized manifest chunk resolved"),
+            (error) => check(
+                error instanceof HashWorkerPoolError && error.code === "PROTOCOL",
+                "oversized manifest chunk was accepted",
+            ),
+        );
+        await pool.close();
+    }
+}
+
 void schedulerIsBoundedAndMetadataOnly()
     .then(activeCancellationAndDriftAreTyped)
     .then(crashedWorkerRestartsAndBinaryResponseIsRejected)
+    .then(hostileWorkerMetadataIsRejected)
     .then(() => console.log(`desktop-hash-workers.test: ${assertions} assertions passed`))
     .catch((error) => {
         console.error(error);

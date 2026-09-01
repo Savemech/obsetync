@@ -2,6 +2,7 @@ import { open, stat as statPath } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { parentPort } from "node:worker_threads";
 import type {
+    DesktopFileFingerprint,
     HashWorkerFailure,
     HashWorkerJob,
     HashWorkerRequest,
@@ -32,15 +33,9 @@ class WorkerTaskError extends Error {
     }
 }
 
-interface Fingerprint {
-    size: number;
-    mtime: number;
-    ctime: number;
-    device: number;
-    inode: number;
-}
-
-function fingerprint(stats: Awaited<ReturnType<typeof statPath>>): Fingerprint {
+function fingerprint(
+    stats: Awaited<ReturnType<typeof statPath>>,
+): DesktopFileFingerprint {
     return {
         size: Number(stats.size),
         mtime: Number(stats.mtimeMs),
@@ -54,12 +49,15 @@ function mtimeMatches(left: number, right: number): boolean {
     return Math.abs(left - right) <= 1;
 }
 
-function expectedMatches(job: HashWorkerJob, actual: Fingerprint): boolean {
+function expectedMatches(job: HashWorkerJob, actual: DesktopFileFingerprint): boolean {
     return actual.size === job.expected_size &&
         mtimeMatches(actual.mtime, job.expected_mtime);
 }
 
-function unchanged(before: Fingerprint, after: Fingerprint): boolean {
+function unchanged(
+    before: DesktopFileFingerprint,
+    after: DesktopFileFingerprint,
+): boolean {
     return before.size === after.size &&
         mtimeMatches(before.mtime, after.mtime) &&
         mtimeMatches(before.ctime, after.ctime) &&
@@ -175,6 +173,7 @@ async function execute(job: HashWorkerJob, wasm: WasmModule): Promise<HashWorker
                 hash: value as string,
                 size: after.size,
                 mtime: after.mtime,
+                fingerprint: after,
                 read_ms: readMs,
                 hash_ms: hashMs,
             };
@@ -186,6 +185,7 @@ async function execute(job: HashWorkerJob, wasm: WasmModule): Promise<HashWorker
             manifest: value as any,
             size: after.size,
             mtime: after.mtime,
+            fingerprint: after,
             read_ms: readMs,
             hash_ms: hashMs,
         };

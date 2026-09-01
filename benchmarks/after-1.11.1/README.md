@@ -113,6 +113,21 @@ insert/delete cases create only 3/4 new reachable v2 nodes instead of 102/100 v1
 nodes. This passes the Slice 11 gain/churn gate and selects the range-tree design
 over the radix fallback; production root migration remains isolated to Slice 12.
 
+`W4-ranged-upload-slice13.json` exercises the production desktop positional
+reader against real sparse files of 256 MiB and 20 GiB. Both cases read and
+retain only two server-selected 4 MiB ranges: the queue peak is exactly 8 MiB
+and the observed ArrayBuffer delta is 8,390,008 bytes in both runs. The
+manifest callback runs only after the content-pack ACK. Unit and transactional
+tests additionally cover inode/ctime pathname replacement, per-read and final
+drift checks, hostile offsets, candidate abort, and retry from a fresh server
+missing bitmap without re-reading already ACKed ranges.
+
+`desktop-workers-slice13.json` reruns the production minified SIMD worker
+bundle over 1 GiB after extending its metadata-only result with the exact
+size/mtime/ctime/device/inode fingerprint consumed by ranged pass 2. Hash and
+manifest fingerprints agree with the live pathname, no binary payload crosses
+the worker boundary, and renderer event-loop lag remains below 1 ms p95.
+
 This Linux/x86_64 run is implementation evidence, not the final cross-hardware
 release report. A17, M1, Snapdragon, cold/warm cache, power, and network fields
 are added by the final hardware gate.

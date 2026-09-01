@@ -1,5 +1,17 @@
 export type HashWorkerMode = "hash" | "manifest";
 
+/** Identity of the exact desktop file scanned by a hash worker. Size/mtime
+ * alone do not detect an atomic same-metadata pathname replacement. */
+export interface DesktopFileFingerprint {
+    size: number;
+    mtime: number;
+    ctime: number;
+    device: number;
+    inode: number;
+}
+
+export const MAX_FASTCDC_CHUNK_BYTES = 4 * 1024 * 1024;
+
 export interface HashWorkerJob {
     type: "job";
     job_id: string;
@@ -29,6 +41,7 @@ export interface HashWorkerHashResult {
     hash: string;
     size: number;
     mtime: number;
+    fingerprint: DesktopFileFingerprint;
     read_ms: number;
     hash_ms: number;
 }
@@ -44,6 +57,7 @@ export interface HashWorkerManifestResult {
     };
     size: number;
     mtime: number;
+    fingerprint: DesktopFileFingerprint;
     read_ms: number;
     hash_ms: number;
 }

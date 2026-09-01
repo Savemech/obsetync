@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "runtime": {
+    "platform": "linux",
+    "architecture": "x64",
+    "node": "v22.23.2",
+    "cpu": "AMD Ryzen 9 5950X 16-Core Processor"
+  },
+  "workload": "W4 desktop ranged upload",
+  "queue_limit_bytes": 8388608,
+  "cases": {
+    "small": {
+      "source_bytes": 268435456,
+      "selected_range_bytes": 8388608,
+      "queue_peak_bytes": 8388608,
+      "observed_array_buffer_delta_bytes": 8390008,
+      "read_ms": 8.828248000000002,
+      "elapsed_ms": 9.862132000000003,
+      "transport_calls": 1
+    },
+    "w4": {
+      "source_bytes": 21474836480,
+      "selected_range_bytes": 8388608,
+      "queue_peak_bytes": 8388608,
+      "observed_array_buffer_delta_bytes": 8390008,
+      "read_ms": 7.929963999999998,
+      "elapsed_ms": 8.382736000000008,
+      "transport_calls": 1
+    }
+  },
+  "invariants": {
+    "positional_reads_only": true,
+    "manifest_after_chunk_ack": true,
+    "queue_peak_independent_of_source_size": true
+  }
+}

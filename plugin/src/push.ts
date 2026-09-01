@@ -17,6 +17,10 @@ import {
     HashWorkerPoolError,
     type DesktopHashWorkerPool,
 } from "./desktop-hash-workers";
+import {
+    uploadDesktopMissingRanges,
+    type DesktopRangeSource,
+} from "./desktop-ranged-upload";
 
 /** Streaming Blake3 hasher — feed bounded slices, call finalize(), then free(). */
 export interface WasmHasher {
@@ -116,6 +120,8 @@ class ObsetyncBatchFile {
         public chunkInfo?: any,
         /** kept only for large files through upload */
         public largeData?: Uint8Array,
+        /** exact pass-1 source identity for desktop ranged pass 2 */
+        public rangedSource?: DesktopRangeSource,
     ) {}
 }
 
@@ -410,6 +416,11 @@ export async function push(
                             row.result.size,
                             change.mtime!,
                             row.result.manifest,
+                            undefined,
+                            {
+                                absolutePath: row.candidate.absolutePath,
+                                fingerprint: row.result.fingerprint,
+                            },
                         ));
                     }
                 }
@@ -522,12 +533,79 @@ export async function push(
         const queuedContentChunks = new Set<string>();
         const queuedManifests = new Set<string>();
         let batchContentBytes = 0;
-        for (const { change, size, mtime, chunkInfo, largeData } of batchFiles) {
+        for (const {
+            change,
+            size,
+            mtime,
+            chunkInfo,
+            largeData,
+            rangedSource,
+        } of batchFiles) {
             if (chunkInfo) {
-                const missingChunks = (chunkInfo.chunks as any[])
-                    .filter((chunk: any) =>
+                const missingChunks: Array<{ hash: string; offset: number; size: number }> = [];
+                for (const chunk of chunkInfo.chunks as Array<{
+                    hash: string;
+                    offset: number;
+                    size: number;
+                }>) {
+                    if (
                         neededChunksSet.has(chunk.hash) &&
-                        !queuedContentChunks.has(chunk.hash));
+                        !queuedContentChunks.has(chunk.hash)
+                    ) {
+                        queuedContentChunks.add(chunk.hash);
+                        missingChunks.push(chunk);
+                    }
+                }
+                const uploadManifest = !queuedManifests.has(change.hash!);
+                if (uploadManifest) queuedManifests.add(change.hash!);
+                const makeManifestRecord = (): BulkUploadRecord => ({
+                    kind: BulkObjectKind.Manifest,
+                    hash: change.hash!,
+                    data: new TextEncoder().encode(JSON.stringify({
+                        file_hash: change.hash!,
+                        total_size: chunkInfo.total_size,
+                        chunks: chunkInfo.chunks,
+                    })),
+                });
+
+                if (rangedSource) {
+                    const putRangedRecords = async (
+                        records: readonly BulkUploadRecord[],
+                    ): Promise<void> => {
+                        const endUpload = perf?.phase("upload");
+                        try {
+                            await api.putObjects(records, perf);
+                        } finally {
+                            endUpload?.();
+                        }
+                        const bytes = records.reduce(
+                            (sum, record) => sum + record.data.byteLength,
+                            0,
+                        );
+                        uploadedBytes += bytes;
+                        perf?.increment({ bytesTransferred: bytes });
+                    };
+                    const ranged = await uploadDesktopMissingRanges(
+                        rangedSource,
+                        missingChunks,
+                        putRangedRecords,
+                        async () => {
+                            if (!uploadManifest) return;
+                            const manifestRecord = makeManifestRecord();
+                            perf?.observePeakBatchBytes(manifestRecord.data.byteLength);
+                            const endUpload = perf?.phase("upload");
+                            try {
+                                await api.putObjects([manifestRecord], perf);
+                            } finally {
+                                endUpload?.();
+                            }
+                        },
+                    );
+                    perf?.addPhase("read", ranged.readMs);
+                    perf?.observePeakBatchBytes(ranged.peakBufferedBytes);
+                    continue;
+                }
+
                 let content = largeData;
                 if (missingChunks.length > 0 && !content) {
                     const before = await io.stat(change.path);
@@ -562,7 +640,6 @@ export async function push(
                         chunk.offset,
                         chunk.offset + chunk.size,
                     );
-                    queuedContentChunks.add(chunk.hash);
                     uploadRecords.push({
                         kind: BulkObjectKind.ContentChunk,
                         hash: chunk.hash,
@@ -570,18 +647,7 @@ export async function push(
                     });
                     batchContentBytes += chunkData.length;
                 }
-                if (!queuedManifests.has(change.hash!)) {
-                    queuedManifests.add(change.hash!);
-                    uploadRecords.push({
-                        kind: BulkObjectKind.Manifest,
-                        hash: change.hash!,
-                        data: new TextEncoder().encode(JSON.stringify({
-                        file_hash:  change.hash!,
-                        total_size: chunkInfo.total_size,
-                        chunks:     chunkInfo.chunks,
-                        })),
-                    });
-                }
+                if (uploadManifest) uploadRecords.push(makeManifestRecord());
             } else if (
                 change.hash &&
                 neededSmallSet.has(change.hash) &&
