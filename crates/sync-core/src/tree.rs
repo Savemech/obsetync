@@ -140,7 +140,7 @@ impl FinalPathState {
 /// are stable-sorted so the last input value for a duplicate path wins, which
 /// preserves the legacy sequential-update behavior. Deletes are applied first
 /// semantically, so an upsert for the same path always wins.
-fn merge_prefix_entries(
+pub(crate) fn merge_prefix_entries(
     existing: Vec<FileEntry>,
     mut sorted_upserts: Vec<FileEntry>,
     mut deletions: Vec<String>,

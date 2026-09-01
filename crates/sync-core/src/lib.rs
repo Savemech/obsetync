@@ -10,6 +10,7 @@ pub mod store;
 pub mod sync_rules;
 pub mod transactional_tree;
 pub mod tree;
+pub mod tree_v2;
 
 #[cfg(feature = "wasm")]
 pub mod wasm;

@@ -4,7 +4,7 @@ use crate::store::ChunkStore;
 use crate::tree::load_all_entries;
 
 /// A single file-level change between two roots.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum FileDelta {
     Added {
@@ -173,7 +173,7 @@ pub async fn compute_deltas_with_stats<S: ChunkStore>(
 }
 
 /// Diff two sorted entry lists and produce raw deltas.
-fn diff_entries(
+pub(crate) fn diff_entries(
     from: &[crate::chunk::FileEntry],
     to: &[crate::chunk::FileEntry],
     deltas: &mut Vec<FileDelta>,
@@ -239,7 +239,7 @@ fn diff_entries(
 /// share a content hash. Ambiguous duplicate-content sets remain delete+add;
 /// guessing which identical source moved would make ignore-boundary handling
 /// and diagnostics misleading even though the final bytes happen to match.
-fn detect_renames(deltas: Vec<FileDelta>) -> Vec<FileDelta> {
+pub(crate) fn detect_renames(deltas: Vec<FileDelta>) -> Vec<FileDelta> {
     use std::collections::{HashMap, HashSet};
 
     let mut deleted: HashMap<FileHash, Vec<usize>> = HashMap::new();

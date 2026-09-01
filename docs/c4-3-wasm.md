@@ -12,6 +12,10 @@ This diagram zooms inside the **sync-core WASM** container from Level 2 and show
    untrusted field is checked again at the JS boundary; a shared FNV fixture keeps
    the two implementations byte-compatible.
 
+4. **`tree_v2.rs` is an isolated prototype, not a production root path.** It is
+   compiled for property and benchmark coverage, but neither `WasmTree` nor the
+   native server bridge accepts or publishes its nodes before Slice 12 migration.
+
 ---
 
 ```mermaid
@@ -25,6 +29,8 @@ C4Component
         Component(wasm_bindings, "WASM Bindings + WasmTree + streaming helpers", "wasm.rs · #[wasm_bindgen]", "Public surface includes WasmTree, streaming Blake3 Hasher, incremental WasmChunker, batch/single hashes, root decoding, and tree chunk access. run_local() single-polls synchronous MemoryChunkStore futures.")
 
         Component(tree_builder, "TreeBuilder", "tree.rs", "Builds and incrementally updates prefix-partitioned trees. The shared loader traverses iteratively with node/entry bounds and path-sorts the flattened result, so wide internal-node labels such as 1, 10, 2 cannot violate diff/merge ordering assumptions.")
+
+        Component(tree_v2, "TreeV2Prototype", "tree_v2.rs · isolated", "Deterministic path-CDC range tree with byte-bounded canonical nodes, localized resynchronizing updates, recursive range diff, cursor traversal, and strict validation. Property/benchmark-only until the fleet-safe migration.")
 
         Component(diff_engine, "DiffEngine", "diff.rs · native build only", "Two-pointer tree/entry diff compares content hash, mtime, and size. It emits metadata-complete deltas and converts only unambiguous one-delete/one-add hash matches into Renamed. Called by the native server bridge, not JavaScript.")
 
@@ -56,6 +62,10 @@ C4Component
     Rel(tree_builder, flatbuf_codec, "LeafChunk/InternalNode/RootNode serialize/deserialize for every tree read and write")
     Rel(tree_builder, blake3_hasher, "hash_bytes(node.serialize()) to compute each node's content hash")
 
+    Rel(tree_v2, chunk_store, "get/put immutable range nodes during isolated property and benchmark runs")
+    Rel(tree_v2, blake3_hasher, "content-address canonical OVL2/OVI2 nodes and OVR2 roots")
+    Rel(tree_v2, diff_engine, "reuse canonical leaf comparison and rename detection")
+
     Rel(diff_engine, chunk_store, "get — load LeafChunk and InternalNode bytes for both tree sides")
     Rel(diff_engine, flatbuf_codec, "deserialize nodes to compare FileEntry lists")
     Rel(diff_page_codec, diff_engine, "pages the canonical ordered FileDelta stream; Tree v1 producer is transitional")
@@ -78,6 +88,7 @@ C4Component
 |-----------|--------|------|
 | **WASM Bindings + WasmTree + Hasher** | `wasm.rs` | The only module compiled with `#[cfg(feature = "wasm")]`. Everything the plugin can call lives here. `WasmTree` is a stateful WASM class that owns both the current `RootNode` and the `MemoryChunkStore` that backs it. `run_local()` is a minimal single-poll executor: it creates a no-op `Waker`, pins the future, calls `poll()` once, and panics on `Pending` (which `MemoryChunkStore` never returns). This avoids pulling in a full async runtime for WASM. |
 | **TreeBuilder** | `tree.rs` | Pure tree manipulation — no I/O except through the `ChunkStore` trait. `build_tree` groups by top-level prefix, splits groups into leaves of ≤1000 entries, and promotes wide groups to internal nodes. `update_tree` only re-chunks touched prefixes. `load_all_entries` is iterative rather than attacker-depth recursive, bounds visited nodes/entries, and path-sorts its final stream because lexicographic child labels (`1`, `10`, `2`) do not themselves guarantee `FileEntry` order. |
+| **TreeV2Prototype** | `tree_v2.rs` | Isolated path-CDC range Merkle tree used by Slice 11 property tests and benchmarks. It provides canonical byte-bounded range nodes, localized resynchronizing updates, recursive equal-hash skipping, cursor traversal, and strict traversal/codec limits. It is not accepted or published by the production plugin/server root path before the Slice 12 fleet-safe migration. See [Tree v2 prototype](tree-v2-prototype.md). |
 | **DiffEngine** | `diff.rs` | Two-pointer merge over sorted roots and entries. A path is modified when hash, mtime, or size changes, preventing distinct roots from yielding a false empty delta. Only an unambiguous unique deleted/added hash pair becomes `Renamed`; duplicate-content ambiguity stays delete+add. **Not reachable from the plugin via WASM**. |
 | **Paged Diff Codec** | `diff_page.rs` | Canonical native `OBQ1`/`OBD1`/`OBC1` representation. The decoder validates hard caps and exact lengths before tree work; the encoder accounts for cursor overhead while enforcing the negotiated plaintext cap. Continuations carry both immutable roots and the exact last ordered record, and the server verifies that record exists before resuming. The TypeScript mirror is intentionally separate and strict. **Not exposed through WASM bindings.** |
 | **MergeEngine** | `merge.rs` | Three-way merge at the prefix and path levels. Single-side changes auto-resolve. A two-sided same-path change provisionally keeps side A, then eligible small strict-UTF-8 files get a deterministic line-merge post-pass; overlap, binary, large, missing, or invalid content emits `FileConflict`. The returned root stays outside the byte-addressed chunk store and is persisted by the server in per-vault history. **Not reachable from the plugin via WASM.** |
