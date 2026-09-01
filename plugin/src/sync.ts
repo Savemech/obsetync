@@ -31,7 +31,11 @@ import { PullEchoTracker } from "./pull-echo";
 import { DirtyPathSet, type DirtyFileChange } from "./dirty-set";
 import { OperationCheckpoint } from "./operation-checkpoint";
 import { exactArrayBuffer } from "./binary";
-import { getHashTuning } from "./hash-runtime";
+import { getHashTuning, planByteBoundedBatches } from "./hash-runtime";
+import {
+    BulkObjectKind,
+    type BulkUploadRecord,
+} from "./bulk-codec";
 import {
     HashWorkerFileDriftError,
     type DesktopHashWorkerPool,
@@ -646,54 +650,103 @@ export class ObsetyncSyncEngine {
 
         // --- Step 3: upload missing tree (index) chunks.
         const endTreeUpload = perf?.phase("tree_index_upload");
+        const treeRecords: BulkUploadRecord[] = [];
         for (const hash of missingTreeChunks) {
             const chunkBytes = this.wasm.wasm_tree_get_chunk(this.tree, hash);
             if (chunkBytes) {
-                await this.api.putChunk(hash, chunkBytes, perf);
-                treeChunksUploaded++;
+                treeRecords.push({
+                    kind: BulkObjectKind.IndexChunk,
+                    hash,
+                    data: chunkBytes,
+                });
                 bytes += chunkBytes.length;
-                perf?.increment({ bytesTransferred: chunkBytes.length });
             }
         }
+        await this.api.putObjects(treeRecords, perf);
+        treeChunksUploaded += treeRecords.length;
+        perf?.increment({
+            bytesTransferred: treeRecords.reduce((sum, record) => sum + record.data.length, 0),
+        });
         endTreeUpload?.();
 
-        // --- Step 4: upload missing small-file content. Concurrent within
-        // bounded batches to keep peak memory sane.
-        const UPLOAD_CONCURRENCY = 4;
-        for (let i = 0; i < missingSmall.length; i += UPLOAD_CONCURRENCY) {
-            const batch = missingSmall.slice(i, i + UPLOAD_CONCURRENCY);
-            const uploadedBytes = await Promise.all(batch.map(async hash => {
-                const source = smallByHash.get(hash);
-                if (!source) return 0;
-                const { path } = source;
-                try {
-                    const endRead = perf?.phase("read");
-                    const data = await this.io.readFile(path);
-                    endRead?.();
-                    // If content drifted since sync-base recorded it, skip — the next
-                    // scan cycle will detect the change via hash mismatch and push
-                    // the new version. Don't upload bytes under the WRONG hash.
-                    const endHash = perf?.phase("hash");
-                    const actual = streamingHash(this.wasm, data);
-                    endHash?.();
-                    if (actual !== hash) return 0;
-                    const endUpload = perf?.phase("upload");
-                    await this.api.putContent(hash, data, perf);
-                    endUpload?.();
-                    smallUploaded++;
-                    bytes += data.length;
-                    perf?.increment({
-                        filesCompleted: 1,
-                        bytesTransferred: data.length,
-                    });
-                    return data.length;
-                } catch (e) {
-                    console.warn(`[obsetync] reconcile skipped ${path}:`, e);
-                    return 0;
+        // --- Step 4: read/hash with bounded concurrency, then upload every
+        // valid object in byte/count-bounded packs.
+        const reconcileTuning = getHashTuning();
+        const smallBatches = planByteBoundedBatches(
+            missingSmall,
+            (hash) => smallByHash.get(hash)?.size ?? 0,
+            {
+                maxFiles: reconcileTuning.maxBatchFiles,
+                maxBytes: reconcileTuning.maxBatchBytes,
+                maxSingleBytes: reconcileTuning.maxSingleBatchFileBytes,
+                maxHoldMs: reconcileTuning.maxBatchHoldMs,
+            },
+        );
+        let smallChecked = 0;
+        for (const batch of smallBatches) {
+            const records: BulkUploadRecord[] = [];
+            for (let i = 0; i < batch.length; i += reconcileTuning.readConcurrency) {
+                const group = batch.slice(i, i + reconcileTuning.readConcurrency);
+                const prepared = await Promise.all(group.map(async (hash) => {
+                    const source = smallByHash.get(hash);
+                    if (!source) return null;
+                    const { path } = source;
+                    try {
+                        const endRead = perf?.phase("read");
+                        let data: Uint8Array;
+                        try {
+                            data = await this.io.readFile(path);
+                        } finally {
+                            endRead?.();
+                        }
+                        // Drift never uploads bytes under the sync-base hash.
+                        const endHash = perf?.phase("hash");
+                        let actual: string;
+                        try {
+                            actual = streamingHash(this.wasm, data);
+                        } finally {
+                            endHash?.();
+                        }
+                        if (actual !== hash) return null;
+                        return {
+                            kind: BulkObjectKind.Content,
+                            hash,
+                            data,
+                        } satisfies BulkUploadRecord;
+                    } catch (error) {
+                        console.warn(`[obsetync] reconcile skipped ${path}:`, error);
+                        return null;
+                    }
+                }));
+                for (const record of prepared) {
+                    if (record) records.push(record as BulkUploadRecord);
                 }
-            }));
-            perf?.observePeakBatchBytes(uploadedBytes.reduce((sum, n) => sum + n, 0));
-            const done = Math.min(i + UPLOAD_CONCURRENCY, missingSmall.length);
+            }
+            const residentBytes = records.reduce((sum, record) => sum + record.data.length, 0);
+            perf?.observePeakBatchBytes(residentBytes);
+            if (records.length > 0) {
+                try {
+                    const endUpload = perf?.phase("upload");
+                    try {
+                        await this.api.putObjects(records, perf);
+                    } finally {
+                        endUpload?.();
+                    }
+                    smallUploaded += records.length;
+                    bytes += residentBytes;
+                    perf?.increment({
+                        filesCompleted: records.length,
+                        bytesTransferred: residentBytes,
+                    });
+                } catch (error) {
+                    console.warn(
+                        `[obsetync] reconcile skipped ${records.length} packed small object(s):`,
+                        error,
+                    );
+                }
+            }
+            smallChecked += batch.length;
+            const done = smallChecked;
             const msg = `reconcile: ${done}/${missingSmall.length} files · ${formatBytes(bytes)}`;
             progress(msg);
             notice?.setMessage(`Re-uploading: ${done}/${missingSmall.length} · ${formatBytes(bytes)}`);
@@ -736,23 +789,36 @@ export class ObsetyncSyncEngine {
                     }
                 }
                 let fileBytesUploaded = 0;
+                const records: BulkUploadRecord[] = [];
+                const queuedChunks = new Set<string>();
                 for (const c of info.chunks as any[]) {
-                    if (missingSet.has(c.hash)) {
+                    if (missingSet.has(c.hash) && !queuedChunks.has(c.hash)) {
+                        queuedChunks.add(c.hash);
                         const chunkData = data.subarray(c.offset, c.offset + c.size);
-                        const endUpload = perf?.phase("upload");
-                        await this.api.putContentChunk(c.hash, chunkData, perf);
-                        endUpload?.();
-                        bytes += chunkData.length;
+                        records.push({
+                            kind: BulkObjectKind.ContentChunk,
+                            hash: c.hash,
+                            data: chunkData,
+                        });
                         fileBytesUploaded += chunkData.length;
                     }
                 }
-                const endManifestUpload = perf?.phase("upload");
-                await this.api.putManifest(hash, {
-                    file_hash: hash,
-                    total_size: info.total_size,
-                    chunks: info.chunks,
-                }, perf);
-                endManifestUpload?.();
+                records.push({
+                    kind: BulkObjectKind.Manifest,
+                    hash,
+                    data: new TextEncoder().encode(JSON.stringify({
+                        file_hash: hash,
+                        total_size: info.total_size,
+                        chunks: info.chunks,
+                    })),
+                });
+                const endUpload = perf?.phase("upload");
+                try {
+                    await this.api.putObjects(records, perf);
+                } finally {
+                    endUpload?.();
+                }
+                bytes += fileBytesUploaded;
                 largeUploaded++;
                 perf?.increment({
                     filesCompleted: 1,

@@ -13,6 +13,26 @@ import {
     reenrollmentRequired,
 } from "./transport-errors";
 import type { PerfOperation } from "./perf-trace";
+import {
+    BulkObjectKind,
+    BulkUploadStatus,
+    BULK_MAX_OBJECTS,
+    BULK_MOBILE_MAX_BYTES,
+    BULK_SERVER_MAX_BYTES,
+    decodeBulkCheckResponse,
+    decodeBulkDownloadResponse,
+    decodeBulkUploadAck,
+    encodeBulkCheckRequest,
+    encodeBulkGetRequest,
+    encodeBulkUploadPack,
+    negotiateBulkLimits,
+    planBulkUploadSteps,
+    type BulkCodecLimits,
+    type BulkRuntime,
+    type BulkUploadRecord,
+} from "./bulk-codec";
+
+export { BulkObjectKind, type BulkUploadRecord } from "./bulk-codec";
 
 export interface FileDelta {
     action: "added" | "modified" | "deleted" | "renamed";
@@ -112,6 +132,10 @@ export class ObsetyncApi {
     private channel: ObsetyncSecureChannel | null = null;
     private channelPromise: Promise<ObsetyncSecureChannel> | null = null;
     private refreshPromise: Promise<void> | null = null;
+    /** undefined = not negotiated this session; null = authenticated server
+     *  does not offer a valid bulk-v1 path. */
+    private bulkLimits: BulkCodecLimits | null | undefined;
+    private capabilitiesPromise: Promise<BulkCodecLimits | null> | null = null;
     private readonly sequences: DurableSequenceAllocator;
 
     constructor(
@@ -119,6 +143,7 @@ export class ObsetyncApi {
         private readonly serverBoxPubBase64: string,
         private readonly bearerTokenHex: string,
         private readonly transportPersistence?: TransportPersistence,
+        private readonly runtime: BulkRuntime = "desktop",
     ) {
         // The sync port speaks plain HTTP — the AEAD envelope is the trust
         // boundary. Fold legacy https:// URLs down to http:// transparently
@@ -290,6 +315,171 @@ export class ObsetyncApi {
         return validateFileDeltas(await res.json());
     }
 
+    // --- Bounded bulk HTTP v1 ---
+
+    /** Whether the authenticated server and this runtime share bulk-http-v1. */
+    async supportsBulkHttp(perf?: PerfOperation): Promise<boolean> {
+        return (await this.getBulkLimits(perf)) !== null;
+    }
+
+    async getBulkDiagnostics(): Promise<{
+        enabled: boolean;
+        requestBytes?: number;
+        objects?: number;
+        objectBytes?: number;
+    }> {
+        const limits = await this.getBulkLimits();
+        return limits ? {
+            enabled: true,
+            requestBytes: limits.maxBytes,
+            objects: limits.maxObjects,
+            objectBytes: limits.maxObjectBytes,
+        } : { enabled: false };
+    }
+
+    /** Upload records in ordered, count/byte-bounded packs. Records above the
+     *  v1 per-object cap use the unchanged single-object endpoint. Ordering is
+     *  intentional: a manifest in the same call observes all preceding chunk
+     *  ACKs before it is validated server-side. */
+    async putObjects(
+        records: readonly BulkUploadRecord[],
+        perf?: PerfOperation,
+    ): Promise<void> {
+        if (records.length === 0) return;
+        const limits = await this.getBulkLimits(perf);
+        if (!limits) {
+            for (const record of records) await this.putObjectLegacy(record, perf);
+            return;
+        }
+
+        for (const step of planBulkUploadSteps(records, limits)) {
+            if (step.kind === "bulk") {
+                if (this.bulkLimits === null) {
+                    for (const record of step.records) await this.putObjectLegacy(record, perf);
+                } else {
+                    await this.putBulkPack(step.records, limits, perf);
+                }
+            } else {
+                await this.putObjectLegacy(step.record, perf);
+            }
+        }
+    }
+
+    /** Download an ordered set through bounded cursor pages. The returned map
+     *  owns copies independent of the decrypted response allocation. Callers
+     *  still verify BLAKE3/manifest semantics before applying bytes to disk. */
+    async getObjects(
+        kind: BulkObjectKind,
+        hashes: readonly string[],
+        perf?: PerfOperation,
+    ): Promise<Map<string, Uint8Array>> {
+        const unique = [...new Set(hashes.map((hash) => hash.toLowerCase()))];
+        const output = new Map<string, Uint8Array>();
+        if (unique.length === 0) return output;
+        if (unique.length > BULK_MAX_OBJECTS) {
+            throw new RangeError("bulk get caller exceeded the bounded apply object cap");
+        }
+        const localRetentionBytes = this.runtime === "mobile"
+            ? BULK_MOBILE_MAX_BYTES
+            : BULK_SERVER_MAX_BYTES;
+        let retainedBytes = 0;
+        const retain = (hash: string, data: Uint8Array): void => {
+            const next = retainedBytes + data.byteLength;
+            // One legacy FastCDC object (or a W4-sized manifest) may be up to
+            // 4 MiB. It remains bounded and is applied immediately by the
+            // large-file caller.
+            const allowedSingleLegacyObject =
+                unique.length === 1 &&
+                (kind === BulkObjectKind.ContentChunk || kind === BulkObjectKind.Manifest) &&
+                data.byteLength <= 4 * 1024 * 1024;
+            if (next > localRetentionBytes && !allowedSingleLegacyObject) {
+                throw new RangeError("bulk get apply batch exceeded the local retention budget");
+            }
+            output.set(hash, data);
+            retainedBytes = next;
+        };
+        const limits = await this.getBulkLimits(perf);
+        if (!limits) {
+            for (const hash of unique) {
+                retain(hash, await this.getObjectLegacy(kind, hash, perf));
+            }
+            return output;
+        }
+
+        const hashesPerRequest = Math.max(
+            1,
+            Math.min(limits.maxObjects, Math.floor((limits.maxBytes - 17) / 32)),
+        );
+        for (let offset = 0; offset < unique.length; offset += hashesPerRequest) {
+            const group = unique.slice(offset, offset + hashesPerRequest);
+            if (this.bulkLimits === null) {
+                for (const hash of group) {
+                    retain(hash, await this.getObjectLegacy(kind, hash, perf));
+                }
+                continue;
+            }
+            let cursor = 0;
+            while (cursor < group.length) {
+                const request = encodeBulkGetRequest(
+                    kind,
+                    group,
+                    cursor,
+                    limits.maxBytes,
+                    limits.maxObjects,
+                );
+                const response = await this.sealed("POST", "/api/v1/bulk/get", request, perf);
+                if (response.status === 404 || response.status === 405) {
+                    this.bulkLimits = null;
+                    for (const hash of group.slice(cursor)) {
+                        retain(hash, await this.getObjectLegacy(kind, hash, perf));
+                    }
+                    cursor = group.length;
+                    continue;
+                }
+                if (response.status === 413) {
+                    // A stored object may predate bulk-v1 and exceed its
+                    // per-object cap (notably a 4 MiB FastCDC chunk). Preserve
+                    // correctness through the stable single-object GET.
+                    const hash = group[cursor];
+                    retain(hash, await this.getObjectLegacy(kind, hash, perf));
+                    cursor++;
+                    continue;
+                }
+                if (!response.ok) throw new Error(`bulk get failed: ${response.status}`);
+                const page = decodeBulkDownloadResponse(
+                    new Uint8Array(await response.arrayBuffer()),
+                    group.length,
+                    cursor,
+                    limits,
+                );
+                if (page.nextCursor === cursor) {
+                    throw new Error("bulk get made no cursor progress");
+                }
+                let searchFrom = cursor;
+                for (const record of page.records) {
+                    if (record.kind !== kind) throw new Error("bulk get returned the wrong object kind");
+                    let requestIndex = searchFrom;
+                    while (
+                        requestIndex < page.nextCursor &&
+                        group[requestIndex] !== record.hash
+                    ) {
+                        requestIndex++;
+                    }
+                    if (requestIndex >= page.nextCursor || output.has(record.hash)) {
+                        throw new Error("bulk get returned an unexpected or duplicate hash");
+                    }
+                    retain(record.hash, record.data.slice());
+                    searchFrom = requestIndex + 1;
+                }
+                cursor = page.nextCursor;
+            }
+            for (const hash of group) {
+                if (!output.has(hash)) throw new Error(`bulk get ${hash}: object not found`);
+            }
+        }
+        return output;
+    }
+
     // --- Index chunks ---
 
     async getChunk(hash: string, perf?: PerfOperation): Promise<Uint8Array> {
@@ -304,6 +494,8 @@ export class ObsetyncApi {
     }
 
     async checkChunks(hashes: string[], perf?: PerfOperation): Promise<string[]> {
+        const bulk = await this.checkObjectsBulk(BulkObjectKind.IndexChunk, hashes, perf);
+        if (bulk) return bulk;
         const body = new TextEncoder().encode(JSON.stringify(hashes));
         const res = await this.sealed("POST", "/api/v1/chunks/check", body, perf);
         if (!res.ok) throw new Error(`checkChunks: ${res.status}`);
@@ -324,6 +516,8 @@ export class ObsetyncApi {
     }
 
     async checkContent(hashes: string[], perf?: PerfOperation): Promise<string[]> {
+        const bulk = await this.checkObjectsBulk(BulkObjectKind.Content, hashes, perf);
+        if (bulk) return bulk;
         const body = new TextEncoder().encode(JSON.stringify(hashes));
         const res = await this.sealed("POST", "/api/v1/content/check", body, perf);
         if (!res.ok) throw new Error(`checkContent: ${res.status}`);
@@ -354,6 +548,8 @@ export class ObsetyncApi {
     }
 
     async checkManifests(hashes: string[], perf?: PerfOperation): Promise<string[]> {
+        const bulk = await this.checkObjectsBulk(BulkObjectKind.Manifest, hashes, perf);
+        if (bulk) return bulk;
         const body = new TextEncoder().encode(JSON.stringify(hashes));
         const res = await this.sealed("POST", "/api/v1/content/manifests/check", body, perf);
         if (!res.ok) throw new Error(`checkManifests: ${res.status}`);
@@ -383,10 +579,150 @@ export class ObsetyncApi {
     }
 
     async checkContentChunks(hashes: string[], perf?: PerfOperation): Promise<string[]> {
+        const bulk = await this.checkObjectsBulk(BulkObjectKind.ContentChunk, hashes, perf);
+        if (bulk) return bulk;
         const body = new TextEncoder().encode(JSON.stringify(hashes));
         const res = await this.sealed("POST", "/api/v1/content/chunks/check", body, perf);
         if (!res.ok) throw new Error(`checkContentChunks: ${res.status}`);
         return (await res.json()).needed;
+    }
+
+    private async checkObjectsBulk(
+        kind: BulkObjectKind,
+        hashes: readonly string[],
+        perf?: PerfOperation,
+    ): Promise<string[] | null> {
+        if (hashes.length === 0) return [];
+        const limits = await this.getBulkLimits(perf);
+        if (!limits) return null;
+        const hashesPerRequest = Math.max(
+            1,
+            Math.min(limits.maxObjects, Math.floor((limits.maxBytes - 9) / 32)),
+        );
+        const needed: string[] = [];
+        for (let offset = 0; offset < hashes.length; offset += hashesPerRequest) {
+            const batch = hashes.slice(offset, offset + hashesPerRequest);
+            const body = encodeBulkCheckRequest(kind, batch, limits.maxObjects);
+            const response = await this.sealed("POST", "/api/v1/bulk/check", body, perf);
+            if (response.status === 404 || response.status === 405) {
+                this.bulkLimits = null;
+                return null;
+            }
+            if (!response.ok) throw new Error(`bulk check failed: ${response.status}`);
+            needed.push(...decodeBulkCheckResponse(
+                new Uint8Array(await response.arrayBuffer()),
+                batch,
+            ));
+        }
+        return needed;
+    }
+
+    private async putBulkPack(
+        records: readonly BulkUploadRecord[],
+        limits: BulkCodecLimits,
+        perf?: PerfOperation,
+    ): Promise<void> {
+        const body = encodeBulkUploadPack(records, limits);
+        const retryDelays = [0, 25, 100];
+        for (let attempt = 0; attempt < retryDelays.length; attempt++) {
+            if (retryDelays[attempt] > 0) {
+                await new Promise<void>((resolve) =>
+                    globalThis.setTimeout(resolve, retryDelays[attempt]));
+            }
+            const response = await this.sealed("POST", "/api/v1/bulk/put", body, perf);
+            if (response.status === 404 || response.status === 405) {
+                this.bulkLimits = null;
+                for (const record of records) await this.putObjectLegacy(record, perf);
+                return;
+            }
+            if (!response.ok) throw new Error(`bulk put failed: ${response.status}`);
+            const statuses = decodeBulkUploadAck(
+                new Uint8Array(await response.arrayBuffer()),
+                records.length,
+            );
+            const permanent = statuses.findIndex((status) =>
+                status === BulkUploadStatus.BadHash ||
+                status === BulkUploadStatus.RejectedLimit);
+            if (permanent >= 0) {
+                const reason = statuses[permanent] === BulkUploadStatus.BadHash
+                    ? "bad hash"
+                    : "rejected limit";
+                throw new Error(
+                    `bulk put record ${permanent} (${records[permanent].hash}) failed: ${reason}`,
+                );
+            }
+            if (!statuses.includes(BulkUploadStatus.RetryableStorageError)) return;
+            if (attempt + 1 < retryDelays.length) {
+                perf?.increment({ retries: 1 });
+                continue;
+            }
+            throw new Error("bulk put exhausted retries after a storage error");
+        }
+    }
+
+    private async getBulkLimits(perf?: PerfOperation): Promise<BulkCodecLimits | null> {
+        if (this.bulkLimits !== undefined) return this.bulkLimits;
+        if (this.capabilitiesPromise) return this.capabilitiesPromise;
+        this.capabilitiesPromise = (async () => {
+            // A fresh/rotated server-eph bundle already carries capabilities.
+            // Existing sessions upgraded in place discover them through this
+            // one sealed endpoint without requiring re-enrollment.
+            await this.getChannel(perf);
+            if (this.bulkLimits !== undefined) return this.bulkLimits;
+            const response = await this.sealed(
+                "POST",
+                "/api/v1/capabilities",
+                new Uint8Array(),
+                perf,
+            );
+            if (response.status === 404 || response.status === 405) {
+                this.bulkLimits = null;
+                return null;
+            }
+            if (!response.ok) throw new Error(`capability negotiation failed: ${response.status}`);
+            const bundle = await response.json();
+            this.bulkLimits = negotiateBulkLimits(bundle, this.runtime);
+            return this.bulkLimits;
+        })();
+        try {
+            return await this.capabilitiesPromise;
+        } finally {
+            this.capabilitiesPromise = null;
+        }
+    }
+
+    private async putObjectLegacy(
+        record: BulkUploadRecord,
+        perf?: PerfOperation,
+    ): Promise<void> {
+        const path = this.objectPath(record.kind, record.hash);
+        const response = await this.sealed("PUT", path, record.data, perf);
+        if (!response.ok) throw new Error(`put object ${record.hash}: ${response.status}`);
+    }
+
+    private async getObjectLegacy(
+        kind: BulkObjectKind,
+        hash: string,
+        perf?: PerfOperation,
+    ): Promise<Uint8Array> {
+        const response = await this.sealed("GET", this.objectPath(kind, hash), new Uint8Array(), perf);
+        if (!response.ok) throw new Error(`get object ${hash}: ${response.status}`);
+        return new Uint8Array(await response.arrayBuffer());
+    }
+
+    private objectPath(kind: BulkObjectKind, hash: string): string {
+        switch (kind) {
+            case BulkObjectKind.Content:
+                return `/api/v1/content/${hash}`;
+            case BulkObjectKind.ContentChunk:
+                return `/api/v1/content/chunk/${hash}`;
+            case BulkObjectKind.IndexChunk:
+                return `/api/v1/chunk/${hash}`;
+            case BulkObjectKind.Manifest:
+                return `/api/v1/content/manifest/${hash}`;
+            default:
+                throw new Error("unknown bulk object kind");
+        }
     }
 
     // --- Health / connectivity ---
@@ -622,6 +958,7 @@ export class ObsetyncApi {
         ) {
             throw new Error("server returned an invalid transport-v2 ephemeral bundle");
         }
+        this.bulkLimits = negotiateBulkLimits(bundle, this.runtime);
         await persistence.update({
             esPub: bundle.Es_pub,
             esPubValidUntil: bundle.valid_until,

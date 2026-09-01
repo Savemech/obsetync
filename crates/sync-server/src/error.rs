@@ -9,6 +9,7 @@ pub enum ServerError {
     Chunk(ChunkError),
     NotFound(String),
     BadRequest(String),
+    PayloadTooLarge(String),
     Conflict(String),
     Unauthorized,
     Internal(String),
@@ -21,6 +22,7 @@ impl std::fmt::Display for ServerError {
             Self::Chunk(e) => write!(f, "chunk: {}", e),
             Self::NotFound(msg) => write!(f, "not found: {}", msg),
             Self::BadRequest(msg) => write!(f, "bad request: {}", msg),
+            Self::PayloadTooLarge(msg) => write!(f, "payload too large: {}", msg),
             Self::Conflict(msg) => write!(f, "conflict: {}", msg),
             Self::Unauthorized => write!(f, "unauthorized"),
             Self::Internal(msg) => write!(f, "internal: {}", msg),
@@ -36,6 +38,7 @@ impl IntoResponse for ServerError {
             Self::Chunk(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             Self::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
+            Self::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg.clone()),
             Self::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".into()),
             Self::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
@@ -100,6 +103,16 @@ mod tests {
             status_and_body(ServerError::Conflict("merge needed".into()).into_response()).await;
         assert_eq!(s, StatusCode::CONFLICT);
         assert!(b.contains("merge needed"));
+    }
+
+    #[tokio::test]
+    async fn payload_too_large_renders_413() {
+        let (s, b) = status_and_body(
+            ServerError::PayloadTooLarge("bounded endpoint".into()).into_response(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(b.contains("bounded endpoint"));
     }
 
     #[tokio::test]

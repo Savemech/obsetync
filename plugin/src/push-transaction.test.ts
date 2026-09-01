@@ -5,6 +5,7 @@ import {
 } from "./transport-errors";
 import { PerfTrace } from "./perf-trace";
 import { HashWorkerFileDriftError } from "./desktop-hash-workers";
+import { BulkObjectKind } from "./bulk-codec";
 
 (globalThis as any).window ??= globalThis;
 
@@ -269,7 +270,7 @@ async function everyPostCandidateFailureAbortsWithoutFullSnapshot(): Promise<voi
             api.checkContent = async () => { throw new Error(failure); };
         } else if (failure === "content-upload") {
             api.checkContent = async () => [replacementHash];
-            api.putContent = async () => { throw new Error(failure); };
+            api.putObjects = async () => { throw new Error(failure); };
         } else {
             f.wasm.wasm_tree_candidate_chunk_hashes = () => ["index"];
             f.wasm.wasm_tree_new_candidate_chunk_hashes = () => ["index"];
@@ -278,7 +279,7 @@ async function everyPostCandidateFailureAbortsWithoutFullSnapshot(): Promise<voi
                 api.checkChunks = async () => { throw new Error(failure); };
             } else {
                 api.checkChunks = async () => ["index"];
-                api.putChunk = async () => { throw new Error(failure); };
+                api.putObjects = async () => { throw new Error(failure); };
             }
         }
 
@@ -372,7 +373,10 @@ async function workerManifestAvoidsRendererFileBytes(): Promise<void> {
     const api = {
         ensureTransportReady: async () => {},
         checkContentChunks: async () => [],
-        putManifest: async () => { manifestUploads++; },
+        putObjects: async (records: Array<{ kind: BulkObjectKind }>) => {
+            manifestUploads += records.filter((record) =>
+                record.kind === BulkObjectKind.Manifest).length;
+        },
         putRoot: async () => ({ root_hash: "accepted", conflicts: [] }),
     } as any;
 
@@ -413,6 +417,42 @@ async function workerDriftAbortsCandidate(): Promise<void> {
     check(f.abortCalls() === 1, "worker stat drift did not abort candidate");
 }
 
+async function smallFilesReachTransportAsPacksNotPerFilePuts(): Promise<void> {
+    const f = fixture();
+    const changes = Array.from({ length: 600 }, (_, index) => ({
+        action: "created" as const,
+        path: `bulk/${index}.md`,
+        hash: index.toString(16).padStart(64, "0"),
+        data: new Uint8Array([index & 0xff]),
+        mtime: 100 + index,
+        size: 1,
+    }));
+    let checkCalls = 0;
+    let packedCalls = 0;
+    let packedRecords = 0;
+    let legacyPuts = 0;
+    const api = {
+        ensureTransportReady: async () => {},
+        checkContent: async (hashes: string[]) => {
+            checkCalls++;
+            return hashes;
+        },
+        putObjects: async (records: unknown[]) => {
+            packedCalls++;
+            packedRecords += records.length;
+        },
+        putContent: async () => { legacyPuts++; },
+        putRoot: async () => ({ root_hash: "accepted", conflicts: [] }),
+    } as any;
+
+    await push(api, f.io, f.syncBase, f.wasm, f.tree, "vault", changes, "base");
+    check(checkCalls <= 10, `600 files expanded to ${checkCalls} check batches`);
+    check(packedCalls === checkCalls, "each stream batch did not become one packed upload call");
+    check(packedRecords === 600, "packed push lost content records");
+    check(legacyPuts === 0, "packed push issued a per-file content PUT");
+    check(f.commitCalls() === 1, "packed push did not commit its candidate");
+}
+
 void terminalPreflightDoesNotMutate()
     .then(failedRootRestoresCandidate)
     .then(failedRootDoesNotCommitUpsert)
@@ -420,6 +460,7 @@ void terminalPreflightDoesNotMutate()
     .then(incrementalPushChecksOnlyNewCandidateChunks)
     .then(workerManifestAvoidsRendererFileBytes)
     .then(workerDriftAbortsCandidate)
+    .then(smallFilesReachTransportAsPacksNotPerFilePuts)
     .then(acceptedRootCommitsMetadata)
     .then(() => console.log(`push-transaction.test: ${assertions} assertions passed`))
     .catch((error) => {

@@ -1,4 +1,8 @@
 use crate::bridge;
+use crate::bulk::{
+    self, ObjectKind, UploadRecord, UploadStatus, DOWNLOAD_HEADER_BYTES, PACK_HEADER_BYTES,
+    RECORD_HEADER_BYTES,
+};
 use crate::devices;
 use crate::error::ServerError;
 use crate::perf::{DiffSample, RequestPhase, ServerPerfCounters};
@@ -24,6 +28,15 @@ use x25519_dalek::StaticSecret;
 /// occasional large-file blob upload (FastCDC caps chunks at 4 MiB each,
 /// while large manifests and root batches can also exceed small defaults).
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+
+/// Authenticated bulk-v1 limits. The legacy sealed middleware accepts larger
+/// single-object requests, while the buffering fast path stays deliberately
+/// small enough for old mobile renderers and bounded server allocations.
+const BULK_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+const BULK_OBJECTS: usize = 256;
+const BULK_OBJECT_BYTES: usize = 1024 * 1024 - 1;
+const WS_FRAME_BYTES: usize = 4 * 1024 * 1024;
+const DIFF_PAGE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Authenticated device id, inserted into request extensions by
 /// `secure_envelope` after bearer validation.
@@ -497,6 +510,10 @@ pub fn sync_router(state: SharedState) -> Router {
     // `X-Obsetync-Method` and delegates to the right semantic handler.
     let protected = Router::new()
         .route("/api/v1/server-eph", post(get_server_eph))
+        .route("/api/v1/capabilities", post(post_capabilities))
+        .route("/api/v1/bulk/check", post(post_bulk_check))
+        .route("/api/v1/bulk/put", post(post_bulk_put))
+        .route("/api/v1/bulk/get", post(post_bulk_get))
         .route(
             "/api/v1/root/{vault_id}",
             get(get_root).put(put_root).post(root_dispatcher),
@@ -564,13 +581,42 @@ pub fn sync_router(state: SharedState) -> Router {
 
 async fn get_server_eph(State(state): State<SharedState>) -> impl IntoResponse {
     let (public, valid_until) = crate::eph_rotation::current_bundle(&state.eph);
-    axum::Json(serde_json::json!({
-        "Es_pub": public,
-        "rotation_timestamp": valid_until.saturating_sub(crate::eph_rotation::ROTATION_PERIOD_SECONDS),
-        "valid_until": valid_until,
-        "rotation_period_seconds": crate::eph_rotation::ROTATION_PERIOD_SECONDS,
-        "grace_seconds": crate::eph_rotation::GRACE_SECONDS,
-    }))
+    let mut bundle = capability_bundle();
+    let object = bundle
+        .as_object_mut()
+        .expect("capability bundle is always an object");
+    object.insert("Es_pub".into(), serde_json::json!(public));
+    object.insert(
+        "rotation_timestamp".into(),
+        serde_json::json!(valid_until.saturating_sub(crate::eph_rotation::ROTATION_PERIOD_SECONDS)),
+    );
+    object.insert("valid_until".into(), serde_json::json!(valid_until));
+    object.insert(
+        "rotation_period_seconds".into(),
+        serde_json::json!(crate::eph_rotation::ROTATION_PERIOD_SECONDS),
+    );
+    object.insert(
+        "grace_seconds".into(),
+        serde_json::json!(crate::eph_rotation::GRACE_SECONDS),
+    );
+    axum::Json(bundle)
+}
+
+fn capability_bundle() -> serde_json::Value {
+    serde_json::json!({
+        // Never advertise a future fast path before this binary can serve it.
+        "capabilities": ["bulk-http-v1"],
+        "limits": {
+            "bulk_request_bytes": BULK_REQUEST_BYTES,
+            "bulk_objects": BULK_OBJECTS,
+            "ws_frame_bytes": WS_FRAME_BYTES,
+            "diff_page_bytes": DIFF_PAGE_BYTES,
+        }
+    })
+}
+
+async fn post_capabilities() -> impl IntoResponse {
+    axum::Json(capability_bundle())
 }
 
 // --- Semantic-method dispatchers ---
@@ -1900,6 +1946,320 @@ async fn post_content_chunks_check(
     Ok(axum::Json(serde_json::json!({ "needed": needed })))
 }
 
+// --- Bounded binary bulk HTTP v1 -----------------------------------------
+
+fn bulk_object_path(
+    layout: &StorageLayout,
+    kind: ObjectKind,
+    hash: &FileHash,
+) -> std::path::PathBuf {
+    match kind {
+        ObjectKind::Content => layout.content_blob_path(hash),
+        ObjectKind::ContentChunk => layout.content_chunk_path(hash),
+        ObjectKind::IndexChunk => layout.index_path(hash),
+        ObjectKind::Manifest => layout.content_manifest_path(hash),
+    }
+}
+
+fn bulk_object_is_usable(state: &SharedState, kind: ObjectKind, hash: &FileHash) -> bool {
+    match kind {
+        ObjectKind::Manifest => stored_manifest_is_usable(&state.layout, hash, state.perf.as_ref()),
+        _ => blob_matches_hash_measured(
+            &bulk_object_path(&state.layout, kind, hash),
+            hash,
+            state.perf.as_ref(),
+        ),
+    }
+}
+
+async fn post_bulk_check(
+    State(state): State<SharedState>,
+    body: axum::body::Bytes,
+) -> Result<impl IntoResponse, ServerError> {
+    if body.len() > BULK_REQUEST_BYTES {
+        return Err(ServerError::PayloadTooLarge(
+            "bulk check exceeds advertised byte limit".into(),
+        ));
+    }
+    let request = bulk::decode_check_request(&body, BULK_OBJECTS)
+        .map_err(|error| ServerError::BadRequest(error.to_string()))?;
+    state
+        .perf
+        .record_request_objects(request.hashes.len() as u64);
+    let needed: Vec<bool> = request
+        .hashes
+        .iter()
+        .map(|hash| !bulk_object_is_usable(&state, request.kind, hash))
+        .collect();
+    let response = bulk::encode_check_response(&needed)
+        .map_err(|error| ServerError::Internal(error.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        response,
+    ))
+}
+
+async fn post_bulk_put(
+    State(state): State<SharedState>,
+    body: axum::body::Bytes,
+) -> Result<impl IntoResponse, ServerError> {
+    let pack =
+        bulk::decode_upload_pack(&body, BULK_OBJECTS, BULK_REQUEST_BYTES).map_err(|error| {
+            if body.len() > BULK_REQUEST_BYTES {
+                ServerError::PayloadTooLarge(error.to_string())
+            } else {
+                ServerError::BadRequest(error.to_string())
+            }
+        })?;
+    state.perf.record_request_objects(pack.records.len() as u64);
+
+    let mut statuses = Vec::with_capacity(pack.records.len());
+    // A manifest later in the same ordered pack depends on every preceding
+    // content chunk being durable.  If one of those writes failed, report the
+    // manifest as retryable too; classifying the now-missing reference as a
+    // permanent bad manifest would make an otherwise idempotent pack
+    // impossible for the client to recover by retrying it.
+    let mut retryable_content_chunks = std::collections::HashSet::new();
+    for record in pack.records {
+        let plain_len = record.plain_len as usize;
+        if record.flags != 0 || plain_len != record.bytes.len() || plain_len > BULK_OBJECT_BYTES {
+            statuses.push(UploadStatus::RejectedLimit);
+            continue;
+        }
+
+        let (path, stored_bytes): (std::path::PathBuf, std::borrow::Cow<'_, [u8]>) =
+            if record.kind == ObjectKind::Manifest {
+                let manifest = match serde_json::from_slice::<WireContentManifest>(record.bytes) {
+                    Ok(manifest) => manifest,
+                    Err(_) => {
+                        statuses.push(UploadStatus::BadHash);
+                        continue;
+                    }
+                };
+                let referenced_chunks =
+                    match validate_content_manifest_structure(&record.hash, &manifest) {
+                        Ok(chunks) => chunks,
+                        Err(_) => {
+                            statuses.push(UploadStatus::BadHash);
+                            continue;
+                        }
+                    };
+                if referenced_chunks
+                    .iter()
+                    .any(|hash| retryable_content_chunks.contains(hash))
+                {
+                    statuses.push(UploadStatus::RetryableStorageError);
+                    continue;
+                }
+                if validate_content_manifest(
+                    &state.layout,
+                    &record.hash,
+                    &manifest,
+                    state.perf.as_ref(),
+                )
+                .is_err()
+                {
+                    statuses.push(UploadStatus::BadHash);
+                    continue;
+                }
+                let encoded = match serde_json::to_vec(&manifest) {
+                    Ok(encoded) => encoded,
+                    Err(_) => {
+                        statuses.push(UploadStatus::BadHash);
+                        continue;
+                    }
+                };
+                (
+                    state.layout.content_manifest_path(&record.hash),
+                    std::borrow::Cow::Owned(encoded),
+                )
+            } else {
+                let hash_started = std::time::Instant::now();
+                let actual = hash_bytes(record.bytes);
+                state
+                    .perf
+                    .record_hash_verify(record.bytes.len() as u64, hash_started.elapsed());
+                if actual != record.hash {
+                    statuses.push(UploadStatus::BadHash);
+                    continue;
+                }
+                (
+                    bulk_object_path(&state.layout, record.kind, &record.hash),
+                    std::borrow::Cow::Borrowed(record.bytes),
+                )
+            };
+
+        if bulk_object_is_usable(&state, record.kind, &record.hash) {
+            if record.kind == ObjectKind::ContentChunk {
+                retryable_content_chunks.remove(&record.hash);
+            }
+            statuses.push(UploadStatus::AlreadyPresent);
+            continue;
+        }
+        match write_blob_measured(&path, stored_bytes.as_ref(), state.perf.as_ref()) {
+            Ok(()) => {
+                if record.kind == ObjectKind::ContentChunk {
+                    retryable_content_chunks.remove(&record.hash);
+                }
+                statuses.push(UploadStatus::Stored);
+            }
+            Err(error) => {
+                if record.kind == ObjectKind::ContentChunk {
+                    retryable_content_chunks.insert(record.hash);
+                }
+                tracing::warn!(
+                    kind = ?record.kind,
+                    reason = %error,
+                    "bulk object storage failed; client may retry the pack"
+                );
+                statuses.push(UploadStatus::RetryableStorageError);
+            }
+        }
+    }
+
+    let response = bulk::encode_upload_ack(&statuses)
+        .map_err(|error| ServerError::Internal(error.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        response,
+    ))
+}
+
+/// Load and validate one stored object for a bulk download. Missing objects
+/// are represented by `Ok(None)`; corrupt objects fail closed exactly like
+/// their legacy single-object GET endpoint.
+fn read_bulk_object(
+    state: &SharedState,
+    kind: ObjectKind,
+    hash: &FileHash,
+) -> Result<Option<Vec<u8>>, ServerError> {
+    let path = bulk_object_path(&state.layout, kind, hash);
+    let Some(bytes) = read_blob_measured(&path, state.perf.as_ref()) else {
+        return Ok(None);
+    };
+    if kind == ObjectKind::Manifest {
+        let manifest: WireContentManifest = serde_json::from_slice(&bytes)
+            .map_err(|error| ServerError::Internal(format!("corrupt manifest: {error}")))?;
+        let chunks = validate_content_manifest_structure(hash, &manifest)
+            .map_err(|error| ServerError::Internal(format!("corrupt manifest: {error}")))?;
+        if chunks.iter().any(|chunk| {
+            !blob_exists_measured(&state.layout.content_chunk_path(chunk), state.perf.as_ref())
+        }) {
+            return Err(ServerError::Internal(
+                "manifest references a missing content chunk".into(),
+            ));
+        }
+        return Ok(Some(bytes));
+    }
+
+    let hash_started = std::time::Instant::now();
+    let matches = hash_bytes(&bytes) == *hash;
+    state
+        .perf
+        .record_hash_check(bytes.len() as u64, hash_started.elapsed(), matches);
+    if !matches {
+        return Err(ServerError::Internal(
+            "bulk object failed content-address validation".into(),
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+async fn post_bulk_get(
+    State(state): State<SharedState>,
+    body: axum::body::Bytes,
+) -> Result<impl IntoResponse, ServerError> {
+    if body.len() > BULK_REQUEST_BYTES {
+        return Err(ServerError::PayloadTooLarge(
+            "bulk get request exceeds advertised byte limit".into(),
+        ));
+    }
+    let request = bulk::decode_get_request(&body, BULK_OBJECTS)
+        .map_err(|error| ServerError::BadRequest(error.to_string()))?;
+    let response_budget = request.max_response_bytes as usize;
+    if response_budget == 0 || response_budget > BULK_REQUEST_BYTES {
+        return Err(ServerError::PayloadTooLarge(
+            "bulk get response budget exceeds advertised limit".into(),
+        ));
+    }
+    let bitmap_len = bulk::bitmap_bytes(request.hashes.len())
+        .map_err(|error| ServerError::BadRequest(error.to_string()))?;
+    let fixed_bytes = DOWNLOAD_HEADER_BYTES
+        .checked_add(bitmap_len)
+        .and_then(|value| value.checked_add(PACK_HEADER_BYTES))
+        .ok_or_else(|| ServerError::BadRequest("bulk get response length overflow".into()))?;
+    if fixed_bytes > response_budget {
+        return Err(ServerError::PayloadTooLarge(
+            "bulk get response budget is below protocol overhead".into(),
+        ));
+    }
+
+    let start = request.cursor as usize;
+    let mut next_cursor = start;
+    let mut encoded_bytes = fixed_bytes;
+    let mut owned_records: Vec<(FileHash, Vec<u8>)> = Vec::new();
+    for hash in request.hashes.iter().skip(start) {
+        let Some(bytes) = read_bulk_object(&state, request.kind, hash)? else {
+            // Missing is deliberately distinct from "not inspected yet": at
+            // completion the client detects any requested hash absent from
+            // the returned record set and raises the same failure as GET 404.
+            next_cursor += 1;
+            continue;
+        };
+        if bytes.len() > BULK_OBJECT_BYTES {
+            return Err(ServerError::PayloadTooLarge(
+                "object exceeds bulk-v1 per-object limit; use single GET".into(),
+            ));
+        }
+        let record_bytes = RECORD_HEADER_BYTES
+            .checked_add(bytes.len())
+            .ok_or_else(|| ServerError::BadRequest("bulk record length overflow".into()))?;
+        if encoded_bytes
+            .checked_add(record_bytes)
+            .is_none_or(|total| total > response_budget)
+        {
+            if next_cursor == start {
+                return Err(ServerError::PayloadTooLarge(
+                    "bulk get response budget cannot fit the next object".into(),
+                ));
+            }
+            break;
+        }
+        encoded_bytes += record_bytes;
+        owned_records.push((*hash, bytes));
+        next_cursor += 1;
+    }
+
+    let mut remaining = vec![0u8; bitmap_len];
+    for index in next_cursor..request.hashes.len() {
+        bulk::bitmap_set(&mut remaining, index);
+    }
+    let records: Vec<UploadRecord<'_>> = owned_records
+        .iter()
+        .map(|(hash, bytes)| UploadRecord {
+            kind: request.kind,
+            flags: 0,
+            hash: *hash,
+            plain_len: bytes.len() as u32,
+            bytes,
+        })
+        .collect();
+    let response =
+        bulk::encode_download_response(request.hashes.len(), next_cursor, &remaining, &records)
+            .map_err(|error| ServerError::Internal(error.to_string()))?;
+    debug_assert!(response.len() <= response_budget);
+    state
+        .perf
+        .record_request_objects((next_cursor - start) as u64);
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        response,
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Integration tests — exercise the FULL stack: sync_router + middleware +
 // dispatchers + hyper response serialization. Catches the class of bugs
@@ -2033,6 +2393,26 @@ mod integration_tests {
     ) -> (StatusCode, Vec<u8>) {
         let (wire_body, _) = seal(env, semantic_method, path, inner_body);
         dispatch_wire(env, semantic_method, path, wire_body).await
+    }
+
+    async fn send_semantic(
+        env: &Env,
+        semantic_method: &str,
+        path: &str,
+        inner_body: &[u8],
+    ) -> (u16, Vec<u8>) {
+        let (wire_body, opened_request) = seal(env, semantic_method, path, inner_body);
+        let (wire_status, wire_response) =
+            dispatch_wire(env, semantic_method, path, wire_body).await;
+        assert_eq!(wire_status, StatusCode::OK);
+        decrypt_response_for_tests(
+            &wire_response,
+            &opened_request.key_material,
+            opened_request.mode,
+            semantic_method,
+            path,
+            &opened_request.nonce_req,
+        )
     }
 
     /// Regression guard for the 204-strip bug. The semantic 204 now lives
@@ -2276,6 +2656,340 @@ mod integration_tests {
         assert_eq!(response["needed"][0], hash_to_hex(&file_hash));
     }
 
+    #[tokio::test]
+    async fn capability_bundle_advertises_only_implemented_bulk_path_and_hard_limits() {
+        let env = setup();
+        let (status, body) = send_semantic(&env, "POST", "/api/v1/capabilities", &[]).await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["capabilities"], serde_json::json!(["bulk-http-v1"]));
+        assert_eq!(value["limits"]["bulk_request_bytes"], BULK_REQUEST_BYTES);
+        assert_eq!(value["limits"]["bulk_objects"], BULK_OBJECTS);
+        assert!(!value["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability == "ws-data-v1"));
+    }
+
+    #[tokio::test]
+    async fn bulk_put_check_and_get_preserve_order_mixed_ack_and_hash_integrity() {
+        let env = setup();
+        let first = b"first bulk object";
+        let second = b"second bulk object";
+        let first_hash = hash_bytes(first);
+        let second_hash = hash_bytes(second);
+        let declared_bad_hash = hash_bytes(b"not the supplied bytes");
+        let records = [
+            UploadRecord {
+                kind: ObjectKind::Content,
+                flags: 0,
+                hash: first_hash,
+                plain_len: first.len() as u32,
+                bytes: first,
+            },
+            UploadRecord {
+                kind: ObjectKind::Content,
+                flags: 0,
+                hash: first_hash,
+                plain_len: first.len() as u32,
+                bytes: first,
+            },
+            UploadRecord {
+                kind: ObjectKind::Content,
+                flags: 0,
+                hash: declared_bad_hash,
+                plain_len: second.len() as u32,
+                bytes: second,
+            },
+            UploadRecord {
+                kind: ObjectKind::Content,
+                flags: 0,
+                hash: second_hash,
+                plain_len: second.len() as u32,
+                bytes: second,
+            },
+            UploadRecord {
+                kind: ObjectKind::Content,
+                flags: 1,
+                hash: second_hash,
+                plain_len: second.len() as u32,
+                bytes: second,
+            },
+        ];
+        let pack = bulk::encode_upload_pack(&records).unwrap();
+        let (put_status, ack) = send_semantic(&env, "POST", "/api/v1/bulk/put", &pack).await;
+        assert_eq!(put_status, StatusCode::OK.as_u16());
+        assert_eq!(&ack[..4], bulk::PACK_ACK_MAGIC);
+        assert_eq!(&ack[8..], &[0, 1, 2, 0, 3]);
+        assert!(env.state.layout.content_blob_path(&first_hash).exists());
+        assert!(env.state.layout.content_blob_path(&second_hash).exists());
+        assert!(!env
+            .state
+            .layout
+            .content_blob_path(&declared_bad_hash)
+            .exists());
+
+        let missing_hash = hash_bytes(b"missing");
+        let check = bulk::encode_check_request(
+            ObjectKind::Content,
+            &[first_hash, missing_hash, second_hash],
+        )
+        .unwrap();
+        let (check_status, check_ack) =
+            send_semantic(&env, "POST", "/api/v1/bulk/check", &check).await;
+        assert_eq!(check_status, StatusCode::OK.as_u16());
+        assert_eq!(&check_ack[..4], bulk::CHECK_ACK_MAGIC);
+        assert_eq!(check_ack[8], 0b0000_0010);
+
+        let get = bulk::encode_get_request(
+            ObjectKind::Content,
+            &[second_hash, first_hash],
+            0,
+            BULK_REQUEST_BYTES as u32,
+        )
+        .unwrap();
+        let (get_status, download) = send_semantic(&env, "POST", "/api/v1/bulk/get", &get).await;
+        assert_eq!(get_status, StatusCode::OK.as_u16());
+        assert_eq!(&download[..4], bulk::DOWNLOAD_MAGIC);
+        assert_eq!(u32::from_le_bytes(download[8..12].try_into().unwrap()), 2);
+        let bitmap_len = bulk::bitmap_bytes(2).unwrap();
+        assert_eq!(download[12], 0);
+        let returned = bulk::decode_upload_pack(
+            &download[DOWNLOAD_HEADER_BYTES + bitmap_len..],
+            BULK_OBJECTS,
+            BULK_REQUEST_BYTES,
+        )
+        .unwrap();
+        assert_eq!(returned.records.len(), 2);
+        assert_eq!(returned.records[0].hash, second_hash);
+        assert_eq!(returned.records[0].bytes, second);
+        assert_eq!(returned.records[1].hash, first_hash);
+        assert_eq!(returned.records[1].bytes, first);
+    }
+
+    #[tokio::test]
+    async fn bulk_download_pages_at_byte_budget_without_repeating_records() {
+        let env = setup();
+        let first = vec![1u8; 64];
+        let second = vec![2u8; 64];
+        let hashes = [hash_bytes(&first), hash_bytes(&second)];
+        let records = [
+            UploadRecord {
+                kind: ObjectKind::Content,
+                flags: 0,
+                hash: hashes[0],
+                plain_len: first.len() as u32,
+                bytes: &first,
+            },
+            UploadRecord {
+                kind: ObjectKind::Content,
+                flags: 0,
+                hash: hashes[1],
+                plain_len: second.len() as u32,
+                bytes: &second,
+            },
+        ];
+        let pack = bulk::encode_upload_pack(&records).unwrap();
+        assert_eq!(
+            send_semantic(&env, "POST", "/api/v1/bulk/put", &pack)
+                .await
+                .0,
+            StatusCode::OK.as_u16()
+        );
+
+        let bitmap_len = bulk::bitmap_bytes(hashes.len()).unwrap();
+        let one_record_budget = DOWNLOAD_HEADER_BYTES
+            + bitmap_len
+            + PACK_HEADER_BYTES
+            + RECORD_HEADER_BYTES
+            + first.len();
+        let first_request =
+            bulk::encode_get_request(ObjectKind::Content, &hashes, 0, one_record_budget as u32)
+                .unwrap();
+        let (_, first_page) = send_semantic(&env, "POST", "/api/v1/bulk/get", &first_request).await;
+        assert_eq!(u32::from_le_bytes(first_page[8..12].try_into().unwrap()), 1);
+        assert_eq!(first_page[12], 0b0000_0010);
+        let first_pack = bulk::decode_upload_pack(
+            &first_page[DOWNLOAD_HEADER_BYTES + bitmap_len..],
+            BULK_OBJECTS,
+            BULK_REQUEST_BYTES,
+        )
+        .unwrap();
+        assert_eq!(first_pack.records.len(), 1);
+        assert_eq!(first_pack.records[0].hash, hashes[0]);
+
+        let second_request =
+            bulk::encode_get_request(ObjectKind::Content, &hashes, 1, one_record_budget as u32)
+                .unwrap();
+        let (_, second_page) =
+            send_semantic(&env, "POST", "/api/v1/bulk/get", &second_request).await;
+        assert_eq!(
+            u32::from_le_bytes(second_page[8..12].try_into().unwrap()),
+            2
+        );
+        assert_eq!(second_page[12], 0);
+        let second_pack = bulk::decode_upload_pack(
+            &second_page[DOWNLOAD_HEADER_BYTES + bitmap_len..],
+            BULK_OBJECTS,
+            BULK_REQUEST_BYTES,
+        )
+        .unwrap();
+        assert_eq!(second_pack.records.len(), 1);
+        assert_eq!(second_pack.records[0].hash, hashes[1]);
+    }
+
+    #[tokio::test]
+    async fn bulk_pack_can_store_chunks_then_validate_manifest_in_one_request() {
+        let env = setup();
+        let chunk = b"bulk manifest content";
+        let chunk_hash = hash_bytes(chunk);
+        let file_hash = chunk_hash;
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "file_hash": hash_to_hex(&file_hash),
+            "total_size": chunk.len(),
+            "chunks": [{
+                "hash": hash_to_hex(&chunk_hash),
+                "offset": 0,
+                "size": chunk.len(),
+            }],
+        }))
+        .unwrap();
+        let records = [
+            UploadRecord {
+                kind: ObjectKind::ContentChunk,
+                flags: 0,
+                hash: chunk_hash,
+                plain_len: chunk.len() as u32,
+                bytes: chunk,
+            },
+            UploadRecord {
+                kind: ObjectKind::Manifest,
+                flags: 0,
+                hash: file_hash,
+                plain_len: manifest.len() as u32,
+                bytes: &manifest,
+            },
+        ];
+        let pack = bulk::encode_upload_pack(&records).unwrap();
+        let (status, ack) = send_semantic(&env, "POST", "/api/v1/bulk/put", &pack).await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        assert_eq!(&ack[8..], &[0, 0]);
+        assert!(env.state.layout.content_chunk_path(&chunk_hash).exists());
+        assert!(env.state.layout.content_manifest_path(&file_hash).exists());
+    }
+
+    #[tokio::test]
+    async fn bulk_storage_error_is_per_record_retryable_and_whole_pack_is_idempotent() {
+        let env = setup();
+        let first = b"retry after blocked prefix".to_vec();
+        let first_hash = hash_bytes(&first);
+        let (second, second_hash) = (0u32..)
+            .map(|salt| format!("independent record {salt}").into_bytes())
+            .map(|bytes| {
+                let hash = hash_bytes(&bytes);
+                (bytes, hash)
+            })
+            .find(|(_, hash)| hash[0] != first_hash[0])
+            .unwrap();
+        let blocked_parent = env
+            .state
+            .layout
+            .content_blob_path(&first_hash)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        std::fs::write(&blocked_parent, b"not a directory").unwrap();
+
+        let records = [
+            UploadRecord {
+                kind: ObjectKind::Content,
+                flags: 0,
+                hash: first_hash,
+                plain_len: first.len() as u32,
+                bytes: &first,
+            },
+            UploadRecord {
+                kind: ObjectKind::Content,
+                flags: 0,
+                hash: second_hash,
+                plain_len: second.len() as u32,
+                bytes: &second,
+            },
+        ];
+        let pack = bulk::encode_upload_pack(&records).unwrap();
+        let (status, first_ack) = send_semantic(&env, "POST", "/api/v1/bulk/put", &pack).await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        assert_eq!(&first_ack[8..], &[4, 0]);
+        assert!(!env.state.layout.content_blob_path(&first_hash).exists());
+        assert!(env.state.layout.content_blob_path(&second_hash).exists());
+
+        std::fs::remove_file(&blocked_parent).unwrap();
+        let (_, retry_ack) = send_semantic(&env, "POST", "/api/v1/bulk/put", &pack).await;
+        assert_eq!(&retry_ack[8..], &[0, 1]);
+        assert_eq!(
+            std::fs::read(env.state.layout.content_blob_path(&first_hash)).unwrap(),
+            first
+        );
+        assert_eq!(
+            std::fs::read(env.state.layout.content_blob_path(&second_hash)).unwrap(),
+            second
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_manifest_dependency_is_retryable_when_its_chunk_write_fails() {
+        let env = setup();
+        let chunk = b"manifest waits for durable chunk";
+        let chunk_hash = hash_bytes(chunk);
+        let file_hash = chunk_hash;
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "file_hash": hash_to_hex(&file_hash),
+            "total_size": chunk.len(),
+            "chunks": [{
+                "hash": hash_to_hex(&chunk_hash),
+                "offset": 0,
+                "size": chunk.len(),
+            }],
+        }))
+        .unwrap();
+        let blocked_parent = env
+            .state
+            .layout
+            .content_chunk_path(&chunk_hash)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        std::fs::write(&blocked_parent, b"not a directory").unwrap();
+
+        let records = [
+            UploadRecord {
+                kind: ObjectKind::ContentChunk,
+                flags: 0,
+                hash: chunk_hash,
+                plain_len: chunk.len() as u32,
+                bytes: chunk,
+            },
+            UploadRecord {
+                kind: ObjectKind::Manifest,
+                flags: 0,
+                hash: file_hash,
+                plain_len: manifest.len() as u32,
+                bytes: &manifest,
+            },
+        ];
+        let pack = bulk::encode_upload_pack(&records).unwrap();
+        let (_, first_ack) = send_semantic(&env, "POST", "/api/v1/bulk/put", &pack).await;
+        assert_eq!(&first_ack[8..], &[4, 4]);
+        assert!(!env.state.layout.content_manifest_path(&file_hash).exists());
+
+        std::fs::remove_file(&blocked_parent).unwrap();
+        let (_, retry_ack) = send_semantic(&env, "POST", "/api/v1/bulk/put", &pack).await;
+        assert_eq!(&retry_ack[8..], &[0, 0]);
+        assert!(env.state.layout.content_chunk_path(&chunk_hash).exists());
+        assert!(env.state.layout.content_manifest_path(&file_hash).exists());
+    }
+
     /// An envelope encrypted against the wrong server pubkey must 401 (AEAD
     /// decrypt failure), not panic and not leak routing info.
     #[tokio::test]
@@ -2388,6 +3102,8 @@ mod integration_tests {
             .as_str()
             .is_some_and(|value| !value.is_empty()));
         assert!(bundle["valid_until"].as_u64().is_some());
+        assert_eq!(bundle["capabilities"], serde_json::json!(["bulk-http-v1"]));
+        assert_eq!(bundle["limits"]["bulk_request_bytes"], BULK_REQUEST_BYTES);
     }
 
     /// /health stays plaintext — must survive without the envelope machinery.

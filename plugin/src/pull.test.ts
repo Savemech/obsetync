@@ -570,6 +570,65 @@ async function failedTreeRebaseAbortsCandidate(): Promise<void> {
     check(result.treeParity === false, "failed pull rebase falsely reported parity");
 }
 
+async function smallMissesUseOneVerifiedBulkDownload(): Promise<void> {
+    const hashes = ["01".repeat(32), "02".repeat(32), "03".repeat(32)];
+    const deltas: FileDelta[] = hashes.map((hash, index) => ({
+        action: "added",
+        path: `bulk-${index}.md`,
+        hash,
+        size: 1,
+        mtime_ms: index + 1,
+    }));
+    let bulkCalls = 0;
+    let singleCalls = 0;
+    const api = {
+        getDiff: async () => deltas,
+        getObjects: async (_kind: number, requested: string[]) => {
+            bulkCalls++;
+            return new Map(requested.map((hash, index) => [hash, new Uint8Array([index + 1])]));
+        },
+        getContent: async () => {
+            singleCalls++;
+            throw new Error("single GET must not run");
+        },
+        getRoot: async () => new Uint8Array([1]),
+    } as any;
+    const files = new Map<string, Uint8Array>();
+    const io = {
+        stat: async (path: string) => {
+            const data = files.get(path);
+            return data ? { mtime: 10, size: data.length } : null;
+        },
+        writeFile: async (path: string, data: Uint8Array) => files.set(path, data.slice()),
+        getAbsolutePath: (path: string) => `/vault/${path}`,
+        exists: async (path: string) => files.has(path),
+        renameFile: async () => {},
+    } as any;
+    const syncBase = {
+        getEntry: () => null,
+        getTreeMtime: () => null,
+        setEntry: () => {},
+        checkpoint: async () => {},
+        setLastSyncTimestamp: () => {},
+        save: async () => {},
+    } as any;
+    const tree = transactionalTree({
+        root_hash_hex: () => "base-root",
+        delete_batch: () => {},
+        update_batch: () => {},
+    });
+    const wasm = {
+        wasm_hash: (data: Uint8Array) => hashes[data[0] - 1],
+        wasm_root_hash_from_bytes: () => "server-root",
+    } as any;
+
+    const result = await pull(api, io, syncBase, "vault", "base-root", wasm, tree);
+    check(bulkCalls === 1, "three small misses were not coalesced into one bulk GET");
+    check(singleCalls === 0, "bulk pull fell through to a single GET");
+    check(files.size === 3, "bulk pull did not apply every verified record");
+    check(result.downloaded === 3, "bulk pull lost physical-file progress");
+}
+
 void locallyEditedDeltaKeepsHonestBase()
     .then(renameAfterCrashIsIdempotent)
     .then(sameSizeUnverifiedRenameTargetIsDeferred)
@@ -580,7 +639,8 @@ void locallyEditedDeltaKeepsHonestBase()
     .then(offlineEditSurvivesRemoteDelete)
     .then(unchangedBaseAllowsRemoteDelete)
     .then(failedTreeRebaseAbortsCandidate)
-    .then(() => console.log("pull.test: 47 assertions passed"))
+    .then(smallMissesUseOneVerifiedBulkDownload)
+    .then(() => console.log("pull.test: 51 assertions passed"))
     .catch((error) => {
         console.error(error);
         process.exitCode = 1;

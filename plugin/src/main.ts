@@ -47,6 +47,12 @@ import simdWasmBytes from "../wasm/sync_core_simd_bg.wasm";
 const embeddedScalarWasmBytes = scalarWasmBytes as unknown as Uint8Array;
 const embeddedSimdWasmBytes = simdWasmBytes as unknown as Uint8Array;
 
+function formatDebugBytes(bytes: number): string {
+    if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(0)} MiB`;
+    if (bytes >= 1024) return `${(bytes / 1024).toFixed(0)} KiB`;
+    return `${bytes} B`;
+}
+
 export default class ObsetyncPlugin extends Plugin {
     settings: SyncSettings = DEFAULT_SETTINGS;
     private io!: PlatformIO;
@@ -315,6 +321,16 @@ export default class ObsetyncPlugin extends Plugin {
             } catch (e: any) {
                 push(`  ping failed:      ${e?.message ?? e}`);
             }
+            try {
+                const bulk = await this.api.getBulkDiagnostics();
+                push(
+                    `  Bulk HTTP:        ${bulk.enabled
+                        ? `v1 · ${bulk.objects} objects · ${formatDebugBytes(bulk.requestBytes ?? 0)} request cap`
+                        : "server fallback"}`,
+                );
+            } catch (e: any) {
+                push(`  Bulk HTTP:        negotiation failed: ${e?.message ?? e}`);
+            }
             if (this.settings.vaultId) {
                 try {
                     push(`getRoot("${this.settings.vaultId}") → ...`);
@@ -489,6 +505,7 @@ export default class ObsetyncPlugin extends Plugin {
                     await this.saveSettings();
                 },
             },
+            Platform.isMobile ? "mobile" : "desktop",
         );
 
         // Load the bundled WASM module. Sync must fail closed if this cannot

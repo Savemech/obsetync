@@ -2,6 +2,7 @@ mod admin;
 mod api;
 mod box_key;
 mod bridge;
+mod bulk;
 mod config;
 mod crdt;
 mod devices;

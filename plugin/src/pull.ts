@@ -5,10 +5,14 @@ import { hashFileStreaming, type WasmModule, type WasmTree } from "./push";
 import type { PullWriteExpectation } from "./pull-echo";
 import { conflictCopyPath } from "./conflict-path";
 import type { PerfOperation } from "./perf-trace";
+import { BulkObjectKind } from "./bulk-codec";
+import { planByteBoundedBatches } from "./hash-runtime";
 
 const CHUNK_THRESHOLD = 1_048_576; // 1MB
-const DOWNLOAD_CONCURRENCY = 6;
 const MAX_CONTENT_CHUNK = 4 * 1_048_576;
+const DESKTOP_BULK_DOWNLOAD_BYTES = 8 * 1_048_576;
+const MOBILE_BULK_DOWNLOAD_BYTES = 2 * 1_048_576;
+const BULK_DOWNLOAD_FILES = 256;
 const TRANSFER_DIR = ".obsidian/plugins/obsetync/transfers";
 
 /** Sentinel device-root that tells the server "I'm fresh, give me every
@@ -826,7 +830,27 @@ async function applyDeltas(
     const failed: FileDelta[] = [];
     const startedAt = Date.now();
     let completed = 0;
-    const applyBatch = async (batch: FileDelta[]) => {
+    const checkpointAndReport = async (batchLength: number): Promise<void> => {
+        // Persist every completed batch as a tiny WAL append. A process kill
+        // resumes from here without re-hashing all already-applied files.
+        const endCheckpoint = perf?.phase("checkpoint");
+        try {
+            await syncBase.checkpoint();
+        } finally {
+            endCheckpoint?.();
+        }
+        completed += batchLength;
+        const verified = stats.cacheHit + stats.localHit;
+        const elapsed = (Date.now() - startedAt) / 1000;
+        const rate = elapsed > 0 ? ` · ${(completed / elapsed).toFixed(0)} f/s` : "";
+        const failMsg = failed.length > 0 ? ` · ✗${failed.length} deferred` : "";
+        onProgress?.(
+            `${completed}/${toDownload.length} files applied · ` +
+            `✓${verified} verified · ↓${stats.downloaded} (${fmtBytes(stats.bytesDownloaded)})${failMsg}${rate}`
+        );
+    };
+
+    const applyLargeBatch = async (batch: FileDelta[]) => {
         const results = await Promise.allSettled(
             batch.map((delta) => applyContentDelta(
                 api,
@@ -843,26 +867,77 @@ async function applyDeltas(
             if (r.status === "rejected") failed.push(batch[j]);
             else if (!r.value) deferLocal(batch[j]);
         });
-        // Persist every completed batch as a tiny WAL append. A process kill
-        // resumes from here without re-hashing all already-applied files.
-        const endCheckpoint = perf?.phase("checkpoint");
-        try {
-            await syncBase.checkpoint();
-        } finally {
-            endCheckpoint?.();
+        await checkpointAndReport(batch.length);
+    };
+
+    const applySmallBatch = async (batch: FileDelta[]): Promise<void> => {
+        const preparations = await Promise.allSettled(batch.map((delta) =>
+            prepareContentDelta(
+                io,
+                syncBase,
+                wasm,
+                delta,
+                stats,
+                () => shouldSkip(delta),
+                perf,
+            )));
+        const pending: Array<{ delta: FileDelta; preparation: PendingContentDownload }> = [];
+        preparations.forEach((result, index) => {
+            const delta = batch[index];
+            if (result.status === "rejected") {
+                failed.push(delta);
+            } else if (result.value.kind === "deferred") {
+                deferLocal(delta);
+            } else if (result.value.kind === "download") {
+                pending.push({ delta, preparation: result.value });
+            }
+        });
+
+        if (pending.length > 0) {
+            let downloaded: Map<string, Uint8Array>;
+            try {
+                const endDownload = perf?.phase("download");
+                try {
+                    downloaded = await getSmallContentBatch(
+                        api,
+                        pending.map(({ delta }) => delta.hash!),
+                        perf,
+                    );
+                } finally {
+                    endDownload?.();
+                }
+            } catch {
+                // A page is the retry unit. Keep every path honest and let the
+                // existing one-pass recovery retry them independently below.
+                failed.push(...pending.map(({ delta }) => delta));
+                await checkpointAndReport(batch.length);
+                return;
+            }
+            const countedHashes = new Set<string>();
+            const applied = await Promise.allSettled(pending.map(({ delta, preparation }) => {
+                const canonicalHash = delta.hash!.toLowerCase();
+                const countTransferredBytes = !countedHashes.has(canonicalHash);
+                countedHashes.add(canonicalHash);
+                return finishContentDownload(
+                    api,
+                    io,
+                    syncBase,
+                    wasm,
+                    delta,
+                    stats,
+                    preparation,
+                    () => shouldSkip(delta),
+                    perf,
+                    downloaded.get(canonicalHash),
+                    countTransferredBytes,
+                );
+            }));
+            applied.forEach((result, index) => {
+                if (result.status === "rejected") failed.push(pending[index].delta);
+                else if (!result.value) deferLocal(pending[index].delta);
+            });
         }
-        completed += batch.length;
-        // One tick per batch: position, what was verified-for-free vs actually
-        // downloaded, bytes moved, deferred count, and the current rate —
-        // everything a human needs to see that a big pull is alive and moving.
-        const verified = stats.cacheHit + stats.localHit;
-        const elapsed = (Date.now() - startedAt) / 1000;
-        const rate = elapsed > 0 ? ` · ${(completed / elapsed).toFixed(0)} f/s` : "";
-        const failMsg = failed.length > 0 ? ` · ✗${failed.length} deferred` : "";
-        onProgress?.(
-            `${completed}/${toDownload.length} files applied · ` +
-            `✓${verified} verified · ↓${stats.downloaded} (${fmtBytes(stats.bytesDownloaded)})${failMsg}${rate}`
-        );
+        await checkpointAndReport(batch.length);
     };
 
     // Small files retain bounded parallelism. Large files run strictly one at
@@ -870,11 +945,22 @@ async function applyDeltas(
     // exceed the practical Jetsam limit on older 2 GB iPads.
     const smallDownloads = toDownload.filter((delta) => (delta.size ?? 0) < CHUNK_THRESHOLD);
     const largeDownloads = toDownload.filter((delta) => (delta.size ?? 0) >= CHUNK_THRESHOLD);
-    for (let i = 0; i < smallDownloads.length; i += DOWNLOAD_CONCURRENCY) {
-        await applyBatch(smallDownloads.slice(i, i + DOWNLOAD_CONCURRENCY));
+    const desktop = smallDownloads.length > 0 &&
+        io.getAbsolutePath(smallDownloads[0].path) !== null;
+    const smallBatches = planByteBoundedBatches(
+        smallDownloads,
+        (delta) => delta.size ?? 0,
+        {
+            maxFiles: BULK_DOWNLOAD_FILES,
+            maxBytes: desktop ? DESKTOP_BULK_DOWNLOAD_BYTES : MOBILE_BULK_DOWNLOAD_BYTES,
+            maxSingleBytes: CHUNK_THRESHOLD - 1,
+        },
+    );
+    for (const batch of smallBatches) {
+        await applySmallBatch(batch);
     }
     for (const delta of largeDownloads) {
-        await applyBatch([delta]);
+        await applyLargeBatch([delta]);
     }
 
     // One retry pass — most failures are transient. A file that STILL fails is
@@ -972,8 +1058,20 @@ async function diskStillMatchesDeleteBase(
     }
 }
 
-async function applyContentDelta(
-    api: ObsetyncApi,
+type ContentPreparation =
+    | { kind: "applied" }
+    | { kind: "deferred" }
+    | PendingContentDownload;
+
+interface PendingContentDownload {
+    kind: "download";
+    size: number;
+    preserveExisting: boolean;
+}
+
+/** Resolve the two zero-network tiers first. This separation lets a large
+ *  delta set collect only genuine misses into bounded bulk download pages. */
+async function prepareContentDelta(
     io: PlatformIO,
     syncBase: ObsetyncSyncBase,
     wasm: WasmModule | null,
@@ -981,9 +1079,9 @@ async function applyContentDelta(
     stats: ApplyStats,
     shouldDefer?: () => boolean,
     perf?: PerfOperation,
-): Promise<boolean> {
-    if (!delta.hash) return true;
-    if (shouldDefer?.()) return false;
+): Promise<ContentPreparation> {
+    if (!delta.hash) return { kind: "applied" };
+    if (shouldDefer?.()) return { kind: "deferred" };
 
     const size = delta.size ?? 0;
     let preserveExisting = false;
@@ -1003,7 +1101,7 @@ async function applyContentDelta(
             base.mtime === stat.mtime &&
             base.size === stat.size
         ) {
-            if (shouldDefer?.()) return false;
+            if (shouldDefer?.()) return { kind: "deferred" };
             // Content and local disk metadata are already right, but a
             // metadata-only server delta can still change the tree mtime.
             // Record it so the rebased Merkle root reproduces the server.
@@ -1021,7 +1119,7 @@ async function applyContentDelta(
             }
             stats.cacheHit++;
             stats.bytesSkipped += size || stat.size;
-            return true;
+            return { kind: "applied" };
         }
 
         // --- Tier 2: local hash matches target --------------------------
@@ -1039,7 +1137,7 @@ async function applyContentDelta(
             try {
                 const actualHash = await tracedHashFile(delta.path, io, wasm, perf);
                 if (actualHash === delta.hash) {
-                    if (shouldDefer?.()) return false;
+                    if (shouldDefer?.()) return { kind: "deferred" };
                     syncBase.setEntry(
                         delta.path,
                         delta.hash,
@@ -1049,7 +1147,7 @@ async function applyContentDelta(
                     );
                     stats.localHit++;
                     stats.bytesSkipped += size || stat.size;
-                    return true;
+                    return { kind: "applied" };
                 }
                 // The target differs, but overwriting is safe when disk still
                 // holds the exact previously-synced base. Any third hash is an
@@ -1068,6 +1166,26 @@ async function applyContentDelta(
             preserveExisting = !metadataMatchesBase;
         }
     }
+
+    if (shouldDefer?.()) return { kind: "deferred" };
+    return { kind: "download", size, preserveExisting };
+}
+
+async function finishContentDownload(
+    api: ObsetyncApi,
+    io: PlatformIO,
+    syncBase: ObsetyncSyncBase,
+    wasm: WasmModule | null,
+    delta: FileDelta,
+    stats: ApplyStats,
+    preparation: PendingContentDownload,
+    shouldDefer?: () => boolean,
+    perf?: PerfOperation,
+    prefetchedSmallData?: Uint8Array,
+    countTransferredBytes = true,
+): Promise<boolean> {
+    if (!delta.hash) return true;
+    const { size, preserveExisting } = preparation;
 
     // --- Tier 3: actual download from server -----------------------------
     if (shouldDefer?.()) return false;
@@ -1089,12 +1207,16 @@ async function applyContentDelta(
             throw error;
         }
     } else {
-        const endDownload = perf?.phase("download");
         let data: Uint8Array;
-        try {
-            data = await api.getContent(delta.hash, perf);
-        } finally {
-            endDownload?.();
+        if (prefetchedSmallData) {
+            data = prefetchedSmallData;
+        } else {
+            const endDownload = perf?.phase("download");
+            try {
+                data = await api.getContent(delta.hash, perf);
+            } finally {
+                endDownload?.();
+            }
         }
         const endHash = perf?.phase("hash");
         let actualHash: string | null = null;
@@ -1117,7 +1239,7 @@ async function applyContentDelta(
         await io.writeFile(delta.path, data);
     }
     stats.downloaded++;
-    stats.bytesDownloaded += size;
+    if (countTransferredBytes) stats.bytesDownloaded += size;
 
     const postStat = await io.stat(delta.path);
     syncBase.setEntry(
@@ -1128,6 +1250,59 @@ async function applyContentDelta(
         delta.mtime_ms,
     );
     return true;
+}
+
+async function applyContentDelta(
+    api: ObsetyncApi,
+    io: PlatformIO,
+    syncBase: ObsetyncSyncBase,
+    wasm: WasmModule | null,
+    delta: FileDelta,
+    stats: ApplyStats,
+    shouldDefer?: () => boolean,
+    perf?: PerfOperation,
+): Promise<boolean> {
+    const preparation = await prepareContentDelta(
+        io,
+        syncBase,
+        wasm,
+        delta,
+        stats,
+        shouldDefer,
+        perf,
+    );
+    if (preparation.kind === "applied") return true;
+    if (preparation.kind === "deferred") return false;
+    return finishContentDownload(
+        api,
+        io,
+        syncBase,
+        wasm,
+        delta,
+        stats,
+        preparation,
+        shouldDefer,
+        perf,
+    );
+}
+
+async function getSmallContentBatch(
+    api: ObsetyncApi,
+    hashes: readonly string[],
+    perf?: PerfOperation,
+): Promise<Map<string, Uint8Array>> {
+    // Test/old embedding compatibility: production ObsetyncApi always has
+    // getObjects, while small pure-unit fixtures may implement only getContent.
+    const bulk = (api as any).getObjects as
+        | ((kind: BulkObjectKind, hashes: readonly string[], perf?: PerfOperation) =>
+            Promise<Map<string, Uint8Array>>)
+        | undefined;
+    if (bulk) return bulk.call(api, BulkObjectKind.Content, hashes, perf);
+    const output = new Map<string, Uint8Array>();
+    await Promise.all([...new Set(hashes.map((hash) => hash.toLowerCase()))].map(async (hash) => {
+        output.set(hash, await api.getContent(hash, perf));
+    }));
+    return output;
 }
 
 class LocalEditDuringPull extends Error {}
@@ -1253,6 +1428,43 @@ export function validateManifest(
     return manifest as FileManifest;
 }
 
+async function getManifestForPull(
+    api: ObsetyncApi,
+    hash: string,
+    perf?: PerfOperation,
+): Promise<FileManifest> {
+    const bulk = (api as any).getObjects as
+        | ((kind: BulkObjectKind, hashes: readonly string[], perf?: PerfOperation) =>
+            Promise<Map<string, Uint8Array>>)
+        | undefined;
+    if (!bulk) return api.getManifest(hash, perf);
+    const objects = await bulk.call(api, BulkObjectKind.Manifest, [hash], perf);
+    const bytes = objects.get(hash.toLowerCase());
+    if (!bytes) throw new Error(`manifest ${hash} missing from bulk response`);
+    try {
+        return JSON.parse(new TextDecoder().decode(bytes)) as FileManifest;
+    } catch {
+        throw new Error(`manifest ${hash} is not valid JSON`);
+    }
+}
+
+async function getContentChunkBatch(
+    api: ObsetyncApi,
+    hashes: readonly string[],
+    perf?: PerfOperation,
+): Promise<Map<string, Uint8Array>> {
+    const bulk = (api as any).getObjects as
+        | ((kind: BulkObjectKind, hashes: readonly string[], perf?: PerfOperation) =>
+            Promise<Map<string, Uint8Array>>)
+        | undefined;
+    if (bulk) return bulk.call(api, BulkObjectKind.ContentChunk, hashes, perf);
+    const output = new Map<string, Uint8Array>();
+    await Promise.all([...new Set(hashes.map((hash) => hash.toLowerCase()))].map(async (hash) => {
+        output.set(hash, await api.getContentChunk(hash, perf));
+    }));
+    return output;
+}
+
 /** Download a large file into an internal staging file. Each chunk is
  *  length/hash checked, appended, and durably checkpointed before proceeding;
  *  an iOS process kill resumes at the next chunk instead of starting over. */
@@ -1272,7 +1484,7 @@ export async function applyLargeFile(
     const endManifestDownload = perf?.phase("download");
     let rawManifest: FileManifest;
     try {
-        rawManifest = await api.getManifest(hash, perf);
+        rawManifest = await getManifestForPull(api, hash, perf);
     } finally {
         endManifestDownload?.();
     }
@@ -1332,46 +1544,73 @@ export async function applyLargeFile(
     const wholeHasher = checkpoint!.nextChunk === 0 ? new wasm.Hasher() : null;
     let assembledHash: string | null = null;
     try {
-        for (let index = checkpoint!.nextChunk; index < manifest.chunks.length; index++) {
+        const pendingChunks = manifest.chunks
+            .map((chunk, index) => ({ chunk, index }))
+            .slice(checkpoint!.nextChunk);
+        const desktop = typeof (io as any).getAbsolutePath === "function" &&
+            io.getAbsolutePath(path) !== null;
+        const bulkEnabled = typeof (api as any).supportsBulkHttp === "function"
+            ? await api.supportsBulkHttp(perf)
+            : false;
+        const chunkBatches = planByteBoundedBatches(
+            pendingChunks,
+            ({ chunk }) => chunk.size,
+            {
+                // Legacy GET keeps its original one-chunk transaction and
+                // checkpoint semantics. Only an authenticated bulk page may
+                // group several chunks before the first one is applied.
+                maxFiles: bulkEnabled ? BULK_DOWNLOAD_FILES : 1,
+                maxBytes: desktop ? DESKTOP_BULK_DOWNLOAD_BYTES : MOBILE_BULK_DOWNLOAD_BYTES,
+                maxSingleBytes: CHUNK_THRESHOLD - 1,
+            },
+        );
+        for (const batch of chunkBatches) {
             if (shouldAbort?.()) throw new LocalEditDuringPull();
-            const chunk = manifest.chunks[index];
             const endDownload = perf?.phase("download");
-            let data: Uint8Array;
+            let downloaded: Map<string, Uint8Array>;
             try {
-                data = await api.getContentChunk(chunk.hash, perf);
+                downloaded = await getContentChunkBatch(
+                    api,
+                    batch.map(({ chunk }) => chunk.hash),
+                    perf,
+                );
             } finally {
                 endDownload?.();
             }
-            if (data.length !== chunk.size) {
-                throw new Error(`large-file chunk ${index} length mismatch`);
+            for (const { chunk, index } of batch) {
+                if (shouldAbort?.()) throw new LocalEditDuringPull();
+                const data = downloaded.get(chunk.hash.toLowerCase());
+                if (!data || data.length !== chunk.size) {
+                    throw new Error(`large-file chunk ${index} length mismatch`);
+                }
+                const endHash = perf?.phase("hash");
+                let actualHash: string;
+                try {
+                    actualHash = wholeHasher
+                        ? wholeHasher.update_and_hash(data)
+                        : wasm.wasm_hash(data);
+                } finally {
+                    endHash?.();
+                }
+                if (actualHash.toLowerCase() !== chunk.hash.toLowerCase()) {
+                    throw new Error(`large-file chunk ${index} hash mismatch`);
+                }
+                await io.appendFile(stagingPath, data);
+                checkpoint = {
+                    ...checkpoint!,
+                    nextChunk: index + 1,
+                    bytesWritten: chunk.offset + chunk.size,
+                };
+                const endCheckpoint = perf?.phase("checkpoint");
+                try {
+                    await writeLargeCheckpoint(io, checkpointPath, checkpoint);
+                } finally {
+                    endCheckpoint?.();
+                }
+                // Apply/checkpoint records independently even though transport
+                // grouped them; a kill repeats less than one completed pack.
+                await new Promise<void>((resolve) => globalThis.setTimeout(resolve, 0));
             }
-            const endHash = perf?.phase("hash");
-            let actualHash: string;
-            try {
-                actualHash = wholeHasher
-                    ? wholeHasher.update_and_hash(data)
-                    : wasm.wasm_hash(data);
-            } finally {
-                endHash?.();
-            }
-            if (actualHash.toLowerCase() !== chunk.hash.toLowerCase()) {
-                throw new Error(`large-file chunk ${index} hash mismatch`);
-            }
-            await io.appendFile(stagingPath, data);
-            checkpoint = {
-                ...checkpoint!,
-                nextChunk: index + 1,
-                bytesWritten: chunk.offset + chunk.size,
-            };
-            const endCheckpoint = perf?.phase("checkpoint");
-            try {
-                await writeLargeCheckpoint(io, checkpointPath, checkpoint);
-            } finally {
-                endCheckpoint?.();
-            }
-            // One chunk at a time bounds live plaintext to ~4 MiB; yielding also
-            // keeps old WKWebView render/watchdog queues responsive.
-            await new Promise<void>((resolve) => globalThis.setTimeout(resolve, 0));
         }
         if (wholeHasher) assembledHash = wholeHasher.finalize().toLowerCase();
     } finally {

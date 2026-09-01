@@ -1,8 +1,9 @@
 # Transport security (HTTP wire 0x02)
 
-This is the normative specification for the sync API shipped in 1.10.1.
-Wire v2 is intentionally incompatible with wire v1; devices enrolled by a v1
-server must re-enroll.
+This is the normative specification for the sync API. Wire v2 was introduced
+in 1.10.1 and is intentionally incompatible with wire v1; devices enrolled by
+a v1 server must re-enroll. The capability-negotiated bulk HTTP extension is
+additive in 1.11.1 and does not change enrollment identity or the outer wire.
 
 The sync port uses plain HTTP as a carrier. Request and response bodies are
 protected with X25519, HKDF-SHA256, and AES-256-GCM. The public `/health`
@@ -135,7 +136,14 @@ The encrypted response authenticates the new `Es_pub` to the already pinned
   "rotation_timestamp": 0,
   "valid_until": 0,
   "rotation_period_seconds": 86400,
-  "grace_seconds": 172800
+  "grace_seconds": 172800,
+  "capabilities": ["bulk-http-v1"],
+  "limits": {
+    "bulk_request_bytes": 8388608,
+    "bulk_objects": 256,
+    "ws_frame_bytes": 4194304,
+    "diff_page_bytes": 2097152
+  }
 }
 ```
 
@@ -144,6 +152,42 @@ one hour before `valid_until`. If the server restarts or a cached key falls
 outside the previous-key window, the ordinary request receives the constant
 decoy described below; the plugin performs one bootstrap refresh and retries
 once.
+
+The capability/limit fields are authenticated by the same pinned bootstrap
+response. A client that already has a valid cached ephemeral key discovers an
+in-place server upgrade once per plugin session through sealed
+`POST /api/v1/capabilities`; no enrollment identity changes. Only implemented
+capabilities are advertised. Unknown/missing capabilities retain the stable
+single-object HTTP endpoints.
+
+## Bulk HTTP v1
+
+`bulk-http-v1` keeps the wire-v2 envelope unchanged and replaces many inner
+object transactions with three sealed binary endpoints:
+
+- `POST /api/v1/bulk/check`: `OBC1`, one object kind, a u32 count, then ordered
+  raw 32-byte hashes. `OBA1` returns the same count and an LSB-first needed
+  bitmap.
+- `POST /api/v1/bulk/put`: `OBP1`, zero v1 flags, a u32 record count, then
+  `(kind, flags, hash, plain_len, stored_len, bytes)` records. Compression is
+  disabled, so both lengths must agree. `OBK1` returns one ordered status byte
+  per record: stored, already present, bad hash, rejected limit, or retryable
+  storage error.
+- `POST /api/v1/bulk/get`: `OBG1`, kind/count/cursor/response budget and ordered
+  hashes. `OBD1` returns the next cursor, an LSB-first bitmap for the uninspected
+  tail, and a nested `OBP1`. A completed cursor with no matching record is a
+  missing-object error, never an implicit success.
+
+All integer fields are little-endian. Requests and responses reject unknown
+magic/kinds or pack flags, count or arithmetic overflow, truncation, trailing
+bytes, and non-zero bitmap padding. An unsupported per-record flag or length is
+reported at that record's `rejected_limit` ACK position so the rest of a valid
+pack can still complete. Desktop plaintext is capped at 8 MiB; mobile chooses
+2 MiB; both cap a request at 256 objects and a bulk record below 1 MiB. Larger
+FastCDC chunks use the unchanged single-object route. The receiver revalidates
+every content address (and full manifest semantics) before storage or
+application. Packs are idempotent, mixed ACKs are legal, and progress moves only
+after stored/already-present ACKs.
 
 ## Replay protection and concurrency
 

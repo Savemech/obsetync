@@ -1,4 +1,8 @@
-import { ObsetyncApi } from "./api";
+import type { ObsetyncApi } from "./api";
+import {
+    BulkObjectKind,
+    type BulkUploadRecord,
+} from "./bulk-codec";
 import { PlatformIO } from "./platform";
 import { ObsetyncSyncBase } from "./sync-base";
 import type { PerfOperation } from "./perf-trace";
@@ -507,12 +511,19 @@ export async function push(
         }
 
         // ------------------------------------------------------------------
-        // C. Upload missing content. Collect tree updates.
+        // C. Prepare missing content, then ACK one or more byte-bounded packs.
         // ------------------------------------------------------------------
+        const uploadRecords: BulkUploadRecord[] = [];
+        const queuedContent = new Set<string>();
+        const queuedContentChunks = new Set<string>();
+        const queuedManifests = new Set<string>();
+        let batchContentBytes = 0;
         for (const { change, size, mtime, chunkInfo, largeData } of batchFiles) {
             if (chunkInfo) {
                 const missingChunks = (chunkInfo.chunks as any[])
-                    .filter((chunk: any) => neededChunksSet.has(chunk.hash));
+                    .filter((chunk: any) =>
+                        neededChunksSet.has(chunk.hash) &&
+                        !queuedContentChunks.has(chunk.hash));
                 let content = largeData;
                 if (missingChunks.length > 0 && !content) {
                     const before = await io.stat(change.path);
@@ -542,33 +553,36 @@ export async function push(
                     }
                     perf?.observePeakBatchBytes(content.length);
                 }
-                let fileBytesUploaded = 0;
                 for (const chunk of missingChunks) {
                     const chunkData = content!.subarray(
                         chunk.offset,
                         chunk.offset + chunk.size,
                     );
-                    const endUpload = perf?.phase("upload");
-                    try {
-                        await api.putContentChunk(chunk.hash, chunkData, perf);
-                    } finally {
-                        endUpload?.();
-                    }
-                    fileBytesUploaded += chunkData.length;
+                    queuedContentChunks.add(chunk.hash);
+                    uploadRecords.push({
+                        kind: BulkObjectKind.ContentChunk,
+                        hash: chunk.hash,
+                        data: chunkData,
+                    });
+                    batchContentBytes += chunkData.length;
                 }
-                const endManifest = perf?.phase("upload");
-                try {
-                    await api.putManifest(change.hash!, {
+                if (!queuedManifests.has(change.hash!)) {
+                    queuedManifests.add(change.hash!);
+                    uploadRecords.push({
+                        kind: BulkObjectKind.Manifest,
+                        hash: change.hash!,
+                        data: new TextEncoder().encode(JSON.stringify({
                         file_hash:  change.hash!,
                         total_size: chunkInfo.total_size,
                         chunks:     chunkInfo.chunks,
-                    }, perf);
-                } finally {
-                    endManifest?.();
+                        })),
+                    });
                 }
-                uploadedBytes += fileBytesUploaded;
-                perf?.increment({ bytesTransferred: fileBytesUploaded });
-            } else if (change.hash && neededSmallSet.has(change.hash)) {
+            } else if (
+                change.hash &&
+                neededSmallSet.has(change.hash) &&
+                !queuedContent.has(change.hash)
+            ) {
                 // Re-read the file — only done for the small fraction the server needs.
                 let data = change.data;
                 if (!data) {
@@ -580,16 +594,31 @@ export async function push(
                     }
                 }
                 perf?.observePeakBatchBytes(data.length);
-                const endUpload = perf?.phase("upload");
-                try {
-                    await api.putContent(change.hash, data, perf);
-                } finally {
-                    endUpload?.();
-                }
-                uploadedBytes += data.length;
-                perf?.increment({ bytesTransferred: data.length });
+                queuedContent.add(change.hash);
+                uploadRecords.push({
+                    kind: BulkObjectKind.Content,
+                    hash: change.hash,
+                    data,
+                });
+                batchContentBytes += data.length;
             }
 
+            // Tree/progress state is appended below only after every object
+            // in this batch has a successful stored/already-present ACK.
+        }
+
+        if (uploadRecords.length > 0) {
+            const endUpload = perf?.phase("upload");
+            try {
+                await api.putObjects(uploadRecords, perf);
+            } finally {
+                endUpload?.();
+            }
+            uploadedBytes += batchContentBytes;
+            perf?.increment({ bytesTransferred: batchContentBytes });
+        }
+
+        for (const { change, size, mtime } of batchFiles) {
             processed++;
             perf?.increment({ filesCompleted: 1 });
             onProgress?.(`↑ ${processed}/${total} ${throughput(processed, uploadedBytes, startTime)}`);
@@ -656,23 +685,20 @@ export async function push(
         }
         if (neededChunks.length > 0) {
             onProgress?.(`↑ uploading ${neededChunks.length} index chunks...`);
-            // Thousands of simultaneous encrypted requests retain thousands
-            // of request/response buffers and can terminate an old iOS
-            // renderer. Keep network parallelism useful but strictly bounded.
-            const INDEX_UPLOAD_CONCURRENCY = 8;
-            for (let i = 0; i < neededChunks.length; i += INDEX_UPLOAD_CONCURRENCY) {
-                const batch = neededChunks.slice(i, i + INDEX_UPLOAD_CONCURRENCY);
-                const endIndexUpload = perf?.phase("tree_index_upload");
-                try {
-                    await Promise.all(batch.map(hash => {
-                        const bytes = wasm.wasm_tree_get_chunk(tree, hash);
-                        return bytes ? api.putChunk(hash, bytes, perf) : Promise.resolve();
-                    }));
-                } finally {
-                    endIndexUpload?.();
+            const records: BulkUploadRecord[] = [];
+            for (const hash of neededChunks) {
+                const bytes = wasm.wasm_tree_get_chunk(tree, hash);
+                if (bytes) {
+                    records.push({ kind: BulkObjectKind.IndexChunk, hash, data: bytes });
                 }
-                await yieldToUI();
             }
+            const endIndexUpload = perf?.phase("tree_index_upload");
+            try {
+                await api.putObjects(records, perf);
+            } finally {
+                endIndexUpload?.();
+            }
+            await yieldToUI();
         }
     }
 
