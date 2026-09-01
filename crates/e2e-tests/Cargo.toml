@@ -86,3 +86,8 @@ required-features = ["e2e"]
 name = "realtime_ws"
 path = "tests/realtime_ws.rs"
 required-features = ["e2e"]
+
+[[test]]
+name = "ws_data"
+path = "tests/ws_data.rs"
+required-features = ["e2e"]

@@ -2,8 +2,9 @@
 
 This is the normative specification for the sync API. Wire v2 was introduced
 in 1.10.1 and is intentionally incompatible with wire v1; devices enrolled by
-a v1 server must re-enroll. The capability-negotiated bulk HTTP extension is
-additive in 1.11.1 and does not change enrollment identity or the outer wire.
+a v1 server must re-enroll. The capability-negotiated bulk HTTP and WS data
+extensions are additive in 1.11.1 and do not change enrollment identity or the
+stable HTTP outer wire.
 
 The sync port uses plain HTTP as a carrier. Request and response bodies are
 protected with X25519, HKDF-SHA256, and AES-256-GCM. The public `/health`
@@ -17,8 +18,10 @@ Implementation entry points:
 - rotating server key: `crates/sync-server/src/eph_rotation.rs`
 - anti-replay state: `crates/sync-server/src/seq_tracker.rs`
 - server middleware: `crates/sync-server/src/api.rs`
+- server WS data lane: `crates/sync-server/src/ws_data.rs`
 - plugin crypto: `plugin/src/secure.ts`
 - plugin request funnel: `plugin/src/api.ts`
+- plugin WS data lane/codecs: `plugin/src/ws-data.ts`, `plugin/src/ws-data-codec.ts`
 - client sequence allocator: `plugin/src/transport-sequence.ts`
 
 ## Keys and default key schedule
@@ -137,11 +140,13 @@ The encrypted response authenticates the new `Es_pub` to the already pinned
   "valid_until": 0,
   "rotation_period_seconds": 86400,
   "grace_seconds": 172800,
-  "capabilities": ["bulk-http-v1"],
+  "capabilities": ["bulk-http-v1", "ws-data-v1"],
   "limits": {
     "bulk_request_bytes": 8388608,
     "bulk_objects": 256,
     "ws_frame_bytes": 4194304,
+    "ws_inflight_requests": 4,
+    "ws_inflight_bytes": 33554432,
     "diff_page_bytes": 2097152
   }
 }
@@ -211,6 +216,81 @@ before the API opens because it may contain acknowledged bytes without a loose
 mirror. Queue exhaustion maps to the retryable storage status (or HTTP 503 on a
 legacy endpoint), preserving backpressure without weakening idempotent retry
 semantics.
+
+## Sealed WebSocket data lane v1
+
+`ws-data-v1` is an optional accelerator for the exact `OBC1`/`OBA1`,
+`OBP1`/`OBK1`, and `OBG1`/`OBD1` bulk payloads described above. It uses a
+dedicated `/api/v1/ws-data` socket, separate from realtime root, presence, and
+CRDT traffic. A saturated object transfer therefore cannot head-of-line block
+control notifications. Capability absence, lack of a runtime WebSocket,
+connection backoff, a remote busy/error result, timeout, or any socket loss
+selects authenticated bulk HTTP for the current RPC.
+
+The client mints a fresh single-use ticket over sealed HTTP with a fresh
+X25519 public key. Its first socket message is the same credential-free auth
+shape used by realtime v2:
+
+```json
+{"v":2,"t":"auth","ticket":"64 lowercase hex characters"}
+```
+
+Both peers derive the existing directional WS keys with
+`obsetync/ws/v2/c2s` and `obsetync/ws/v2/s2c`. Data frames use their own AAD
+domain so a valid realtime frame cannot be replayed or misrouted into this
+protocol:
+
+```text
+obsetync/ws-data/v1 <c2s|s2c> <sequence_be_u64>
+```
+
+Every post-auth socket message is binary and has the existing sealed outer
+shape (`12-byte random nonce || AES-256-GCM ciphertext || 16-byte tag`). The
+authenticated plaintext is strictly decoded before dispatch; integer fields
+below are little-endian:
+
+```text
+offset  size  field
+0       4     magic = "OBW1"
+4       1     frame type
+5       1     flags = 0
+6       8     request_id
+14      4     payload_len
+18      N     payload
+```
+
+The first sealed frame is `HELLO` with request id zero. Its 24-byte `OWH1`
+payload carries version 1, requested in-flight request count, maximum payload
+bytes, four zero reserved bytes, and the in-flight plaintext-byte budget.
+`HELLO_ACK` returns `OWA1` and may only lower those three limits. The compiled
+server ceilings are four requests, 4 MiB per payload, and 32 MiB in flight;
+the mobile client requests two requests, 2 MiB payloads, and 8 MiB in flight.
+Invalid, zero, raised, overflowing, or internally inconsistent limits close
+the session.
+
+Frame types are `HELLO/HELLO_ACK`, `CHECK_OBJECTS/CHECK_RESULT`,
+`PUT_PACK/PUT_ACK`, `GET_PACK/GET_RESULT`, `CANCEL`, and `ERROR`. Every RPC has
+a positive request id that is unique and strictly increasing within one
+session. Responses may complete in a different order and are matched by id;
+the AEAD sequence remains serialized independently. A valid per-RPC `ERROR`
+(`OWE1`, bounded code/retry hint/UTF-8 message) rejects only that RPC. Unknown
+types, flags, ids, lengths, trailing bytes, malformed error payloads, or an
+AEAD failure close the whole session.
+
+Client admission reserves request and plaintext-byte credits atomically before
+constructing a pending RPC. It also pauses transmission above the negotiated
+`WebSocket.bufferedAmount` high watermark and resumes below half. At most 16
+callers may wait for credit. The server applies the same request/byte ceilings,
+returns bounded `busy/retry_after` errors instead of queueing without limit,
+and cancels outstanding tasks when the socket disappears. Root commits never
+move onto this lane.
+
+An ACK can be lost after a durable content-addressed PUT. The client therefore
+never treats an unconsumed response as progress: it opens a new ticket/session,
+checks the affected hashes, retransmits only missing records, and may perform
+that recovery over bulk HTTP. Repeating CHECK/GET has no side effect; repeating
+PUT is idempotent by content hash. No RPC session state is required after
+disconnect, and enrollment/device identity is unchanged.
 
 ## Replay protection and concurrency
 

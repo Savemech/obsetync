@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "runtime": {
+    "platform": "linux",
+    "architecture": "x64",
+    "node": "v22.23.2",
+    "cpu": "AMD Ryzen 9 5950X 16-Core Processor"
+  },
+  "workload": {
+    "id": "W1",
+    "files": 100000,
+    "bytes": 870400000,
+    "size_distribution": "deterministic round-robin 1..16 KiB"
+  },
+  "runs_per_profile": 3,
+  "scope": "production client codecs and AEAD only; excludes socket/HTTP I/O and server work",
+  "profiles": [
+    {
+      "profile": "desktop",
+      "limits": {
+        "bulk_bytes": 8388608,
+        "ws_payload_bytes": 4194304,
+        "objects": 256
+      },
+      "data_rpcs": 782,
+      "plaintext_bytes": 877807429,
+      "median_http_envelope_ms": 1484.239929999991,
+      "median_ws_data_envelope_ms": 582.0088209999881,
+      "median_envelope_speedup": 2.5502017777837453,
+      "http_wire_bytes": 877917691,
+      "ws_wire_bytes": 877843401,
+      "metadata_bytes_saved": 74290,
+      "max_rpc_payload_bytes": 2238986,
+      "bounds_held": true,
+      "samples": [
+        {
+          "iteration": 1,
+          "http_envelope_ms": 1657.2068099999988,
+          "ws_data_envelope_ms": 637.9497389999974,
+          "envelope_speedup": 2.597707481780168,
+          "checksum": 162
+        },
+        {
+          "iteration": 2,
+          "http_envelope_ms": 1484.239929999991,
+          "ws_data_envelope_ms": 582.0088209999881,
+          "envelope_speedup": 2.5502017777837453,
+          "checksum": 189
+        },
+        {
+          "iteration": 3,
+          "http_envelope_ms": 1246.9844730000013,
+          "ws_data_envelope_ms": 533.0791130000107,
+          "envelope_speedup": 2.3392109024537535,
+          "checksum": 73
+        }
+      ]
+    },
+    {
+      "profile": "mobile",
+      "limits": {
+        "bulk_bytes": 2097152,
+        "ws_payload_bytes": 2097152,
+        "objects": 256
+      },
+      "data_rpcs": 810,
+      "plaintext_bytes": 877807709,
+      "median_http_envelope_ms": 1041.7928040000243,
+      "median_ws_data_envelope_ms": 810.2680329999985,
+      "median_envelope_speedup": 1.2857384983371622,
+      "http_wire_bytes": 877921919,
+      "ws_wire_bytes": 877844969,
+      "metadata_bytes_saved": 76950,
+      "max_rpc_payload_bytes": 2096960,
+      "bounds_held": true,
+      "samples": [
+        {
+          "iteration": 1,
+          "http_envelope_ms": 1137.9722300000085,
+          "ws_data_envelope_ms": 719.6544310000281,
+          "envelope_speedup": 1.5812759304749755,
+          "checksum": 36
+        },
+        {
+          "iteration": 2,
+          "http_envelope_ms": 1041.7928040000243,
+          "ws_data_envelope_ms": 833.6224609999863,
+          "envelope_speedup": 1.2497177712202279,
+          "checksum": 255
+        },
+        {
+          "iteration": 3,
+          "http_envelope_ms": 1012.5781919999936,
+          "ws_data_envelope_ms": 810.2680329999985,
+          "envelope_speedup": 1.2496830070550191,
+          "checksum": 150
+        }
+      ]
+    }
+  ],
+  "invariants": {
+    "same_plaintext_pack_per_comparison": true,
+    "production_http_envelope": true,
+    "production_ws_data_envelope": true,
+    "ticket_key_derivation_excluded_from_timed_region": true,
+    "enrollment_identity_unchanged": true
+  }
+}

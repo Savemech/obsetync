@@ -64,6 +64,18 @@ bytes rehashed. Recovery tests cover torn tails, durable unpublished records,
 response loss, corrupt sidecars, framed payload corruption, bounded loose
 import, and the Slice 6 journal migration.
 
+`W1-ws-data-slice8.json` seals the production W1 check/upload plan through
+both production client envelopes, alternating order for three full runs per
+profile. It covers 877.8 MB of identical bulk plaintext in 782 desktop or 810
+mobile RPCs. On this host, keeping one ticket-derived WS AES-GCM session cuts
+median client envelope time from 1,484 ms to 582 ms on the desktop profile
+(2.55x) and from 1,042 ms to 810 ms with the 2 MiB mobile profile (1.29x).
+This deliberately excludes socket/HTTP I/O and server work, so it does not
+claim the additional request-routing/network win. Protocol/E2E tests separately
+prove request multiplexing, negotiated request/byte credits, buffered-amount
+hysteresis, protocol-specific AAD, strict decoding, bulk-HTTP fallback, and
+recovery after loss at auth, HELLO, CHECK, GET, and unknown PUT boundaries.
+
 This Linux/x86_64 run is implementation evidence, not the final cross-hardware
 release report. A17, M1, Snapdragon, cold/warm cache, power, and network fields
 are added by the final hardware gate.
