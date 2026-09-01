@@ -756,6 +756,89 @@ pub fn get_device(layout: &StorageLayout, device_id: &str) -> Option<DeviceInfo>
     serde_json::from_str(&data).ok()
 }
 
+/// Recover the one legacy failure shape that is both unambiguous and safe:
+/// an exactly zero-length canonical record with one canonical token index that
+/// points byte-for-byte at its directory id. Older direct writers could leave
+/// this shape after truncation; the pre-registry server merely skipped it, so
+/// making strict startup abort would turn one already-inert device into a
+/// fleet-wide outage.
+///
+/// The token preserves authentication identity. Human metadata is
+/// unrecoverable, so the replacement is labelled explicitly and starts with no
+/// vault/capability claims. A revoke marker is loaded independently after this
+/// function returns. Non-empty malformed JSON and ambiguous token indexes stay
+/// fail-closed.
+fn recover_zero_length_device(
+    layout: &StorageLayout,
+    device_id: &str,
+) -> Result<Option<DeviceInfo>, std::io::Error> {
+    let token_root = layout.token_path("");
+    let tokens_dir = token_root
+        .parent()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "token index has no parent"))?;
+    let entries = match fs::read_dir(tokens_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut matches = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let Ok(token) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !valid_token(&token) {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        if metadata.len() != device_id.len() as u64 {
+            continue;
+        }
+        if fs::read(entry.path())? == device_id.as_bytes() {
+            matches.push((token, metadata));
+        }
+    }
+    matches.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    if matches.len() > 1 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("device {device_id} has multiple token index entries"),
+        ));
+    }
+    let Some((bearer_token, token_metadata)) = matches.pop() else {
+        tracing::warn!(
+            device_id,
+            "ignoring zero-length unpublished device metadata without a token index"
+        );
+        return Ok(None);
+    };
+    let recorded_at = token_metadata
+        .modified()
+        .ok()
+        .and_then(|timestamp| timestamp.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0);
+    let short_id: String = device_id.chars().take(8).collect();
+    let info = DeviceInfo {
+        name: format!("Recovered device {short_id}"),
+        device_id: device_id.to_owned(),
+        enrolled_at: recorded_at,
+        last_seen: recorded_at,
+        vaults: Vec::new(),
+        capabilities: Vec::new(),
+        bearer_token,
+    };
+    persist_device_info(layout, &info)?;
+    tracing::warn!(
+        device_id,
+        "recovered zero-length device metadata from its unique token index"
+    );
+    Ok(Some(info))
+}
+
 fn load_devices_strict(layout: &StorageLayout) -> Result<Vec<DeviceInfo>, std::io::Error> {
     let devices_dir = layout.base.join("devices");
     if !devices_dir.exists() {
@@ -783,12 +866,19 @@ fn load_devices_strict(layout: &StorageLayout) -> Result<Vec<DeviceInfo>, std::i
                 ))
             }
         };
-        let info: DeviceInfo = serde_json::from_str(&data).map_err(|error| {
-            Error::new(
-                ErrorKind::InvalidData,
-                format!("parse device metadata {}: {error}", path.display()),
-            )
-        })?;
+        let info: DeviceInfo = if data.is_empty() {
+            let Some(info) = recover_zero_length_device(layout, &directory_id)? else {
+                continue;
+            };
+            info
+        } else {
+            serde_json::from_str(&data).map_err(|error| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("parse device metadata {}: {error}", path.display()),
+                )
+            })?
+        };
         if info.device_id != directory_id {
             return Err(Error::new(
                 ErrorKind::InvalidData,
@@ -1502,6 +1592,63 @@ mod tests {
         assert!(registry
             .report_capabilities("dev", [1; 32], Some(""), &[])
             .is_err());
+    }
+
+    #[test]
+    fn startup_recovers_zero_length_device_metadata_from_unique_token_index() {
+        let (_d, layout) = fresh_layout();
+        let token = token_64();
+        register_device(&layout, "dev", "Desktop", &token).unwrap();
+        fs::write(layout.device_dir("dev").join("device.json"), b"").unwrap();
+
+        let registry = DeviceRegistry::load(layout.clone()).unwrap();
+        assert_eq!(registry.authenticate(&token).unwrap().device_id, "dev");
+        let recovered = registry.get("dev").unwrap();
+        assert_eq!(recovered.device_id, "dev");
+        assert_eq!(recovered.bearer_token, token);
+        assert!(recovered.name.starts_with("Recovered device "));
+        assert!(recovered.vaults.is_empty());
+        assert!(recovered.capabilities.is_empty());
+        assert_eq!(registry.fleet_capability("tree-v2").ready_devices, 0);
+
+        let repaired_bytes = fs::read(layout.device_dir("dev").join("device.json")).unwrap();
+        assert!(!repaired_bytes.is_empty());
+        drop(registry);
+        assert!(DeviceRegistry::load(layout).is_ok());
+    }
+
+    #[test]
+    fn startup_recovery_preserves_revocation_and_rejects_ambiguous_tokens() {
+        let (_d, layout) = fresh_layout();
+        let token = token_64();
+        register_device(&layout, "dev", "Desktop", &token).unwrap();
+        persist_revocation(&layout, "dev", 42).unwrap();
+        fs::write(layout.device_dir("dev").join("device.json"), b"").unwrap();
+
+        let registry = DeviceRegistry::load(layout.clone()).unwrap();
+        assert_eq!(
+            registry.authenticate(&token).unwrap_err(),
+            AuthenticationError::Revoked
+        );
+        assert_eq!(registry.revoked_at("dev"), Some(42));
+
+        let second_token = "b".repeat(64);
+        atomic_write(&layout.token_path(&second_token), b"dev").unwrap();
+        fs::write(layout.device_dir("dev").join("device.json"), b"").unwrap();
+        assert_eq!(
+            DeviceRegistry::load(layout).unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn startup_ignores_zero_length_unpublished_device_without_token_index() {
+        let (_d, layout) = fresh_layout();
+        let dir = layout.device_dir("orphan");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("device.json"), b"").unwrap();
+
+        assert!(DeviceRegistry::load(layout).unwrap().list().is_empty());
     }
 
     #[test]
