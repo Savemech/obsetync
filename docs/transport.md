@@ -140,14 +140,16 @@ The encrypted response authenticates the new `Es_pub` to the already pinned
   "valid_until": 0,
   "rotation_period_seconds": 86400,
   "grace_seconds": 172800,
-  "capabilities": ["bulk-http-v1", "ws-data-v1"],
+  "capabilities": ["bulk-http-v1", "ws-data-v1", "paged-diff-v1"],
   "limits": {
     "bulk_request_bytes": 8388608,
     "bulk_objects": 256,
     "ws_frame_bytes": 4194304,
     "ws_inflight_requests": 4,
     "ws_inflight_bytes": 33554432,
-    "diff_page_bytes": 2097152
+    "diff_page_bytes": 2097152,
+    "diff_page_records": 8192,
+    "diff_path_bytes": 4096
   }
 }
 ```
@@ -164,6 +166,69 @@ in-place server upgrade once per plugin session through sealed
 `POST /api/v1/capabilities`; no enrollment identity changes. Only implemented
 capabilities are advertised. Unknown/missing capabilities retain the stable
 single-object HTTP endpoints.
+
+## Paged binary diff v1
+
+`paged-diff-v1` replaces the legacy whole-delta JSON response without changing
+wire v2. Desktop requests at most the authenticated 2 MiB server limit; mobile
+locally clamps it to 512 KiB. Both additionally cap a page at 8,192 records and
+each UTF-8 vault-relative path at 4,096 bytes.
+
+`POST /api/v1/diff-page/{vault}` accepts an `OBQ1` body:
+
+```text
+magic             4 bytes  "OBQ1"
+from_root         32 bytes
+to_root           32 bytes (zero only on the first request)
+max_records       u32 little-endian
+max_plain_bytes   u32 little-endian
+cursor_len        u16 little-endian
+cursor            cursor_len bytes
+```
+
+The first response snapshots the vault's current root. Every continuation
+repeats that exact `to_root`; a later publication only affects the next pull.
+Roots are immutable history objects and this server does not expire them, so a
+cursor needs no lease while that retention policy remains in force. The client
+fetches the matching cached-root bytes through sealed semantic GET
+`/api/v1/root/{vault}/{to_root}` rather than reading the moving current pointer.
+
+The response is:
+
+```text
+magic          4 bytes  "OBD1"
+from_root      32 bytes
+to_root        32 bytes
+record_count   u32 little-endian
+next_len       u16 little-endian
+next_cursor    next_len bytes
+
+record:
+  action       u8 (1 add, 2 modify, 3 delete, 4 rename)
+  path_len     canonical u32 varint
+  path         UTF-8 bytes
+  old_len/path canonical varint + UTF-8 (rename only)
+  hash         32 bytes (all actions except delete)
+  size         u64 little-endian (all actions except delete)
+  mtime_ms     u64 little-endian (all actions except delete)
+```
+
+`OBD1` is also the bulk-get response magic; the authenticated endpoint/AAD
+selects the codec, so the formats cannot be confused across routes. Diff
+records are strictly ordered by UTF-8 path bytes, action, then rename-source
+bytes. The opaque continuation contains version, both roots, and the exact
+last key. The server validates that key still exists in the recomputed fixed
+snapshot; root substitution, invented skip cursors, unsafe paths, truncation,
+non-canonical varints, unsafe JavaScript u64 values, and trailing bytes fail
+closed.
+
+After applying one page, the plugin appends its idempotent sync-base mutations
+and then the next cursor to the same WAL write. A torn tail can lose the cursor
+and replay a page, but cannot preserve a cursor ahead of local state. The
+volatile WASM tree is rebased per page. `treeBaseRoot` advances and the cursor
+is cleared together only after the final page, exact historical-root fetch,
+and semantic tree parity. A renderer kill before or after the final cursor
+therefore resumes without retaining or redownloading the complete delta.
 
 ## Bulk HTTP v1
 

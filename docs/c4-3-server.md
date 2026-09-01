@@ -19,7 +19,7 @@ C4Component
 
         Component(secure_envelope, "SecureEnvelope", "api.rs · axum middleware", "Accepts wire POST only, opens wire v2, validates bearer/revocation and durable sequence before the handler, then encrypts semantic status + body under outer HTTP 200. Pre-open failures collapse to one 256-zero decoy; credential-free bootstrap is endpoint-scoped.")
 
-        Component(sync_router, "Sync API Router", "api.rs · axum handlers", "Registers all sealed sync routes: roots/diffs, content/manifests/FastCDC and index chunks, legacy existence checks, authenticated capabilities, and bounded binary bulk check/put/get. GET /health remains plaintext and public. Semantic verbs are also registered as POST dispatchers for iOS tunnelling.")
+        Component(sync_router, "Sync API Router", "api.rs · axum handlers", "Registers sealed roots, legacy JSON diff, snapshot-pinned OBD1 diff pages, content/manifests/FastCDC/index chunks, authenticated capabilities, and bounded binary bulk routes. Historical-root GET preserves the exact paged snapshot. GET /health remains plaintext and public.")
 
         Component(ws_data_lane, "WS Data Lane", "ws_data.rs", "Separate sealed bulk socket. Negotiates request/byte credits, multiplexes strict binary CHECK/PUT/GET RPCs by request id, and cancels bounded work on disconnect; bulk HTTP remains the recovery path.")
 
@@ -56,7 +56,7 @@ C4Component
     Rel(sync_router, storage_writer, "Enqueue verified immutable objects; await durable per-object results")
     Rel(sync_router, storage_writer, "Run whole check/get/put packs on bounded storage read slots")
     Rel(sync_router, storage, "Read/write vault root metadata")
-    Rel(sync_router, sync_core_bridge, "run_diff() on POST /diff · run_merge() on PUT /root when roots diverge")
+    Rel(sync_router, sync_core_bridge, "run_diff() on legacy /diff and each fixed /diff-page · run_merge() on divergent PUT /root")
     Rel(ws_data_lane, secure_transport, "Opens/seals ws-data-v1 frames with directional sequence AAD")
     Rel(ws_data_lane, sync_router, "Reuses bounded bulk check/put/get processors")
 
@@ -86,7 +86,7 @@ C4Component
 |-----------|--------|------|
 | **AppState** | `state.rs` | The shared `Arc<AppState>` holds layout/vault storage, static key bytes, rotating key state, preloaded device/replay registries, a two-slot control-I/O pool independent of storage, per-vault async commit locks, notification/presence maps, and uptime. The rotating private key is never persisted. |
 | **SecureEnvelope** | `api.rs` (middleware fn) | An axum Tower middleware applied with `.layer(from_fn_with_state(..., secure_envelope))` to the `protected` router. Runs as a pre/post wrapper around each handler. The critical detail: all sync requests arrive as HTTP `POST` (iOS `requestUrl` drops the body on `GET`), but axum's per-method routing dispatches before middleware can rewrite the method. Fix: each semantic route also registers a `POST` dispatcher that reads `X-Obsetync-Method` and delegates to the correct handler. The middleware then restores `parts.method` for logging. |
-| **Sync API Router** | `api.rs` (handler fns) | Handles `root`, `diff`, content/manifests, FastCDC and index chunks, history/rollback, legacy existence checks, sealed capabilities, and the three `bulk-http-v1` binary endpoints. Bulk codecs reject malformed lengths, flags, counts, cursors, padding, and trailing data before allocation; handlers independently verify every content address and manifest dependency. Packs preserve record order, return one mixed ACK status per object, and cursor downloads stay within the authenticated client budget. `put_root` still proves the complete bounded tree and all content references before fast-forward or three-way merge. |
+| **Sync API Router** | `api.rs` (handler fns) | Handles current/historical roots, legacy JSON diff, `paged-diff-v1`, content/manifests, FastCDC/index chunks, history/rollback, existence checks, sealed capabilities, and `bulk-http-v1`. `OBQ1` fixes a target history root on page one; `OBD1` pages stay below authenticated byte/record/path caps and continuations must name the exact last ordered record under the same roots. A concurrent publish changes only the next pull. Bulk codecs likewise reject malformed lengths, flags, counts, cursors, padding, and trailing data before allocation; handlers independently verify content addresses and manifest dependencies. `put_root` proves the complete bounded tree and all content references before fast-forward or three-way merge. |
 | **WS Data Lane** | `ws_data.rs` | Claims a fresh single-use ticket on a socket independent of realtime, binds AEAD to the `ws-data-v1` generation, negotiates payload/request/byte ceilings, and dispatches multiplexed bulk CHECK/PUT/GET tasks. Strict inner framing, monotonically increasing request ids, bounded busy errors, cancellation, and close-on-AEAD/parser-failure keep state finite. No progress depends on the session surviving. |
 | **Admin Router** | `admin.rs` (handler fns) | All responses are Rust format-string HTML — no templating engine. `create_enrollment` is triggered by the "Add Device" page; the generated code is shown once. `claim_enrollment` is the URL the user visits on their Obsidian device; it calls `EnrollmentManager.claim_enrollment`, then renders the `device_id`, `bearer_token`, and `server_box_pub` as copyable fields. The admin port (27183) is intentionally plain HTTP — it is meant to be accessed only over a trusted network or VPN. |
 | **SecureTransport** | `secure.rs` | Pure wire-v2 crypto. `decrypt_request` opens the 53-byte header plus ciphertext using double DH, extracts bearer/sequence/body, and returns short-lived response key material. `encrypt_response` encrypts a two-byte semantic status and body with response AAD bound to the exact request nonce. Realtime and data sockets reuse ticket-derived directional keys but have distinct generation-specific AAD domains. The all-zero fingerprint selects the credential-free, endpoint-scoped bootstrap schedule. Full byte layout and threat limits are in `transport.md`. |
@@ -117,17 +117,24 @@ Plugin HTTP POST
   ← Encrypted HTTP 200
 ```
 
-### Pull (POST /api/v1/diff/{vault_id})
+### Pull (`paged-diff-v1`; legacy `/diff` remains compatible)
 ```
-SyncRouter.post_diff
-  → VaultStore.get_current_root()       # read vaults/{id}/current
-  → VaultStore.get_root(current_hash)   # read current root bytes
-  → VaultStore.get_root(device_hash)    # read device's last-known root bytes
+SyncRouter.post_diff_page(OBQ1)
+  → first page: VaultStore.get_current_root()    # freeze exact to_root
+  → continuation: use authenticated to_root      # ignore moving current
+  → VaultStore.get_root(to_root/from_root)       # immutable root history
   → SyncCoreBridge.run_diff()
-      → DiskChunkStore reads index/{hash} for each tree traversal step
+      → bounded StorageWriter reads indexed pack records
       → sync_core::diff::compute_deltas() — two-pointer O(n+m) merge
-  → serialize FileDelta[] as JSON with hashes as hex strings
+  → diff_page::sort_and_validate_deltas()
+  → encode <= max_plain_bytes / max_records as OBD1
+  → continuation repeats exact roots + last emitted path/action/old-path key
+  → final client GET /root/{vault}/{to_root} retrieves matching cached root
 ```
+
+Tree v1 still materializes/recomputes its complete delta for each page. This is
+an intentional transitional producer: the wire and client heap are bounded
+now; Tree v2 replaces it with range/cursor traversal in the following slices.
 
 ### Push (PUT /api/v1/root/{vault_id})
 ```

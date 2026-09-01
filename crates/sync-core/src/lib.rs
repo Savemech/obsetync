@@ -2,6 +2,7 @@ pub mod chunk;
 pub mod conflict;
 pub mod content_store;
 pub mod diff;
+pub mod diff_page;
 pub mod fastcdc_chunker;
 pub mod hash;
 pub mod merge;

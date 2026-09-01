@@ -20,6 +20,9 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use sync_core::diff_page::{
+    self, MAX_PAGE_BYTES as DIFF_PAGE_BYTES, MAX_PAGE_RECORDS, MAX_PATH_BYTES,
+};
 use sync_core::hash::{hash_bytes, hash_to_hex, hex_to_hash, FileHash};
 use x25519_dalek::StaticSecret;
 
@@ -35,8 +38,6 @@ pub(crate) const BULK_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const BULK_OBJECTS: usize = 256;
 pub(crate) const BULK_OBJECT_BYTES: usize = 1024 * 1024 - 1;
 pub(crate) const WS_FRAME_BYTES: usize = 4 * 1024 * 1024;
-const DIFF_PAGE_BYTES: usize = 2 * 1024 * 1024;
-
 fn storage_writer_error(error: StoreError) -> ServerError {
     match error {
         StoreError::InvalidObject(message) => ServerError::BadRequest(message),
@@ -601,6 +602,11 @@ pub fn sync_router(state: SharedState) -> Router {
             get(get_root).put(put_root).post(root_dispatcher),
         )
         .route("/api/v1/diff/{vault_id}", post(post_diff))
+        .route("/api/v1/diff-page/{vault_id}", post(post_diff_page))
+        .route(
+            "/api/v1/root/{vault_id}/{hash}",
+            get(get_root_at).post(root_at_dispatcher),
+        )
         .route(
             "/api/v1/chunk/{hash}",
             get(get_chunk).put(put_chunk).post(chunk_dispatcher),
@@ -688,7 +694,7 @@ async fn get_server_eph(State(state): State<SharedState>) -> impl IntoResponse {
 fn capability_bundle() -> serde_json::Value {
     serde_json::json!({
         // Never advertise a future fast path before this binary can serve it.
-        "capabilities": ["bulk-http-v1", "ws-data-v1"],
+        "capabilities": ["bulk-http-v1", "ws-data-v1", "paged-diff-v1"],
         "limits": {
             "bulk_request_bytes": BULK_REQUEST_BYTES,
             "bulk_objects": BULK_OBJECTS,
@@ -696,6 +702,8 @@ fn capability_bundle() -> serde_json::Value {
             "ws_inflight_requests": 4,
             "ws_inflight_bytes": 32 * 1024 * 1024,
             "diff_page_bytes": DIFF_PAGE_BYTES,
+            "diff_page_records": MAX_PAGE_RECORDS,
+            "diff_path_bytes": MAX_PATH_BYTES,
         }
     })
 }
@@ -760,6 +768,22 @@ async fn root_dispatcher(
             }
         }
         _ => method_not_allowed("/api/v1/root"),
+    }
+}
+
+async fn root_at_dispatcher(
+    State(state): State<SharedState>,
+    Path((vault_id, hash)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    match semantic_method(request.headers()) {
+        Some(ref method) if method == Method::GET => {
+            match get_root_at(State(state), Path((vault_id, hash))).await {
+                Ok(response) => response.into_response(),
+                Err(error) => error.into_response(),
+            }
+        }
+        _ => method_not_allowed("/api/v1/root/{vault_id}/{hash}"),
     }
 }
 
@@ -883,6 +907,29 @@ async fn get_root(
         .get_root(&vault_id, &hash)
         .ok_or_else(|| ServerError::NotFound("root data missing".into()))?;
 
+    Ok((StatusCode::OK, data))
+}
+
+/// Fetch one immutable root from history. Paged pulls use this instead of the
+/// moving `current` pointer so cached-root persistence refers to the exact
+/// snapshot whose pages were applied.
+async fn get_root_at(
+    State(state): State<SharedState>,
+    Path((vault_id, hash_hex)): Path<(String, String)>,
+) -> Result<impl IntoResponse, ServerError> {
+    let hash = hex_to_hash(&hash_hex)
+        .map_err(|_| ServerError::BadRequest("invalid historical root hash".into()))?;
+    let data = state
+        .vaults
+        .get_root(&vault_id, &hash)
+        .ok_or_else(|| ServerError::NotFound("root not found in history".into()))?;
+    let root = sync_core::chunk::RootNode::deserialize(&data)
+        .map_err(|error| ServerError::Internal(format!("corrupt historical root: {error}")))?;
+    if root.vault_id != vault_id || root.hash() != hash {
+        return Err(ServerError::Internal(
+            "historical root identity mismatch".into(),
+        ));
+    }
     Ok((StatusCode::OK, data))
 }
 
@@ -1424,6 +1471,106 @@ fn unix_time_ms() -> u64 {
 }
 
 // --- Diff ---
+
+fn load_snapshot_root(
+    state: &SharedState,
+    vault_id: &str,
+    hash: &FileHash,
+    description: &str,
+) -> Result<sync_core::chunk::RootNode, ServerError> {
+    let data = state.vaults.get_root(vault_id, hash).ok_or_else(|| {
+        ServerError::BadRequest(format!(
+            "{description} root not found in history — full rescan needed"
+        ))
+    })?;
+    let root = sync_core::chunk::RootNode::deserialize(&data)
+        .map_err(|error| ServerError::Internal(format!("corrupt {description} root: {error}")))?;
+    if root.vault_id != vault_id || root.hash() != *hash {
+        return Err(ServerError::Internal(format!(
+            "{description} root identity mismatch"
+        )));
+    }
+    Ok(root)
+}
+
+fn empty_diff_root(vault_id: &str) -> sync_core::chunk::RootNode {
+    sync_core::chunk::RootNode {
+        vault_id: vault_id.to_owned(),
+        created_ms: 0,
+        version: 1,
+        children: vec![],
+        total_files: 0,
+        parent_hash: None,
+        device_id: "fresh-client".to_owned(),
+    }
+}
+
+/// Bounded binary delta page. The first request omits `to_root`; this handler
+/// snapshots the current pointer and every continuation is pinned to that
+/// immutable history root even if another device publishes meanwhile.
+async fn post_diff_page(
+    State(state): State<SharedState>,
+    Path(vault_id): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<Response, ServerError> {
+    let started = std::time::Instant::now();
+    let request = diff_page::decode_request(&body)
+        .map_err(|error| ServerError::BadRequest(error.to_string()))?;
+    let to_hash = match request.to_root {
+        Some(hash) => hash,
+        None => state
+            .vaults
+            .get_current_root(&vault_id)
+            .ok_or_else(|| ServerError::NotFound(format!("vault '{vault_id}' not found")))?,
+    };
+
+    let to_root = load_snapshot_root(&state, &vault_id, &to_hash, "target")?;
+    let from_root = if request.from_root == [0; 32] {
+        empty_diff_root(&vault_id)
+    } else {
+        load_snapshot_root(&state, &vault_id, &request.from_root, "source")?
+    };
+
+    let mut diff_result =
+        bridge::run_diff_with_stats(state.storage_writer.clone(), from_root, to_root)
+            .await
+            .map_err(|error| ServerError::Internal(format!("paged diff failed: {error}")))?;
+    diff_page::sort_and_validate_deltas(&mut diff_result.deltas)
+        .map_err(|error| ServerError::Internal(format!("invalid computed diff: {error}")))?;
+    let encoded = diff_page::encode_page(request.from_root, to_hash, &diff_result.deltas, &request)
+        .map_err(|error| ServerError::BadRequest(error.to_string()))?;
+
+    state
+        .perf
+        .record_request_objects(encoded.record_count as u64);
+    state.perf.record_diff(DiffSample {
+        nodes_visited: diff_result.stats.nodes_visited,
+        nodes_skipped: diff_result.stats.nodes_skipped,
+        entries_materialized: diff_result.stats.entries_materialized,
+        serialized_bytes: encoded.bytes.len() as u64,
+        pages: 1,
+        elapsed: started.elapsed(),
+    });
+    tracing::debug!(
+        vault = %vault_id,
+        from = %&hash_to_hex(&request.from_root)[..16],
+        to = %&hash_to_hex(&to_hash)[..16],
+        records = encoded.record_count,
+        bytes = encoded.bytes.len(),
+        more = encoded.has_more,
+        "post_diff_page: encoded snapshot page"
+    );
+
+    Ok((
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/vnd.obsetync.diff-page",
+        )],
+        encoded.bytes,
+    )
+        .into_response())
+}
 
 async fn post_diff(
     State(state): State<SharedState>,
@@ -2906,20 +3053,163 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn capability_bundle_advertises_bulk_and_ws_data_with_hard_limits() {
+    async fn capability_bundle_advertises_bounded_fast_paths() {
         let env = setup();
         let (status, body) = send_semantic(&env, "POST", "/api/v1/capabilities", &[]).await;
         assert_eq!(status, StatusCode::OK.as_u16());
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
             value["capabilities"],
-            serde_json::json!(["bulk-http-v1", "ws-data-v1"])
+            serde_json::json!(["bulk-http-v1", "ws-data-v1", "paged-diff-v1"])
         );
         assert_eq!(value["limits"]["bulk_request_bytes"], BULK_REQUEST_BYTES);
         assert_eq!(value["limits"]["bulk_objects"], BULK_OBJECTS);
         assert_eq!(value["limits"]["ws_frame_bytes"], WS_FRAME_BYTES);
         assert_eq!(value["limits"]["ws_inflight_requests"], 4);
         assert_eq!(value["limits"]["ws_inflight_bytes"], 32 * 1024 * 1024);
+        assert_eq!(value["limits"]["diff_page_bytes"], DIFF_PAGE_BYTES);
+        assert_eq!(value["limits"]["diff_page_records"], MAX_PAGE_RECORDS);
+        assert_eq!(value["limits"]["diff_path_bytes"], MAX_PATH_BYTES);
+    }
+
+    fn paged_diff_request(
+        from_root: FileHash,
+        to_root: Option<FileHash>,
+        cursor: &[u8],
+        max_records: u32,
+        max_bytes: u32,
+    ) -> Vec<u8> {
+        let mut body = Vec::with_capacity(diff_page::REQUEST_HEADER_BYTES + cursor.len());
+        body.extend_from_slice(diff_page::REQUEST_MAGIC);
+        body.extend_from_slice(&from_root);
+        body.extend_from_slice(&to_root.unwrap_or([0; 32]));
+        body.extend_from_slice(&max_records.to_le_bytes());
+        body.extend_from_slice(&max_bytes.to_le_bytes());
+        body.extend_from_slice(&(cursor.len() as u16).to_le_bytes());
+        body.extend_from_slice(cursor);
+        body
+    }
+
+    #[tokio::test]
+    async fn paged_diff_stays_on_fixed_root_after_current_moves() {
+        let env = setup();
+        let vault = "paged-snapshot";
+        let mut entries: Vec<_> = (0..2_000)
+            .map(|index| {
+                let contents = format!("contents-{index}");
+                sync_core::chunk::FileEntry::new(
+                    format!("notes/{index:05}.md"),
+                    hash_bytes(contents.as_bytes()),
+                    1_800_000_000_000 + index,
+                    contents.len() as u64,
+                )
+            })
+            .collect();
+        let snapshot = sync_core::tree::build_tree(
+            &env.state.storage_writer,
+            entries.clone(),
+            vault,
+            "snapshot-device",
+        )
+        .await
+        .unwrap();
+        let snapshot_hash = snapshot.hash();
+        env.state
+            .vaults
+            .store_root(vault, &snapshot_hash, &snapshot.serialize())
+            .unwrap();
+        env.state
+            .vaults
+            .set_current_root(vault, &snapshot_hash)
+            .unwrap();
+
+        entries.push(sync_core::chunk::FileEntry::new(
+            "published-later.md".into(),
+            hash_bytes(b"later"),
+            1_900_000_000_000,
+            5,
+        ));
+        let later =
+            sync_core::tree::build_tree(&env.state.storage_writer, entries, vault, "later-device")
+                .await
+                .unwrap();
+        let later_hash = later.hash();
+        env.state
+            .vaults
+            .store_root(vault, &later_hash, &later.serialize())
+            .unwrap();
+
+        let path = format!("/api/v1/diff-page/{vault}");
+        let first_request =
+            paged_diff_request([0; 32], None, &[], 200, diff_page::MIN_PAGE_BYTES as u32);
+        let (first_status, first) = send_semantic(&env, "POST", &path, &first_request).await;
+        assert_eq!(first_status, StatusCode::OK.as_u16());
+        assert!(first.len() <= diff_page::MIN_PAGE_BYTES);
+        assert_eq!(&first[..4], diff_page::PAGE_MAGIC);
+        assert_eq!(&first[36..68], snapshot_hash.as_slice());
+        let mut total = u32::from_le_bytes(first[68..72].try_into().unwrap()) as usize;
+        let first_cursor_len = u16::from_le_bytes(first[72..74].try_into().unwrap()) as usize;
+        assert!(first_cursor_len > 0);
+        let mut cursor = first[74..74 + first_cursor_len].to_vec();
+
+        // A concurrent publication changes current, but continuation requests
+        // remain pinned to the immutable target selected above.
+        env.state
+            .vaults
+            .set_current_root(vault, &later_hash)
+            .unwrap();
+        for _ in 0..20 {
+            let request = paged_diff_request(
+                [0; 32],
+                Some(snapshot_hash),
+                &cursor,
+                200,
+                diff_page::MIN_PAGE_BYTES as u32,
+            );
+            let (status, page) = send_semantic(&env, "POST", &path, &request).await;
+            assert_eq!(status, StatusCode::OK.as_u16());
+            assert!(page.len() <= diff_page::MIN_PAGE_BYTES);
+            assert_eq!(&page[36..68], snapshot_hash.as_slice());
+            total += u32::from_le_bytes(page[68..72].try_into().unwrap()) as usize;
+            let cursor_len = u16::from_le_bytes(page[72..74].try_into().unwrap()) as usize;
+            if cursor_len == 0 {
+                cursor.clear();
+                break;
+            }
+            cursor = page[74..74 + cursor_len].to_vec();
+        }
+        assert!(cursor.is_empty(), "paged diff did not terminate");
+        assert_eq!(total, 2_000);
+        assert_eq!(env.state.vaults.get_current_root(vault), Some(later_hash));
+
+        let root_path = format!("/api/v1/root/{vault}/{}", hash_to_hex(&snapshot_hash));
+        let (root_status, root_bytes) = send_semantic(&env, "GET", &root_path, &[]).await;
+        assert_eq!(root_status, StatusCode::OK.as_u16());
+        assert_eq!(root_bytes, snapshot.serialize());
+    }
+
+    #[tokio::test]
+    async fn paged_diff_rejects_cursor_root_substitution_before_tree_work() {
+        let env = setup();
+        let mut cursor = vec![0u8; 74 + 4];
+        cursor[..4].copy_from_slice(b"OBC1");
+        cursor[4] = 1;
+        cursor[5..37].copy_from_slice(&[1; 32]);
+        cursor[37..69].copy_from_slice(&[2; 32]);
+        cursor[69] = 1;
+        cursor[70..72].copy_from_slice(&4u16.to_le_bytes());
+        cursor[72..74].copy_from_slice(&0u16.to_le_bytes());
+        cursor[74..].copy_from_slice(b"a.md");
+        let request = paged_diff_request(
+            [1; 32],
+            Some([3; 32]),
+            &cursor,
+            10,
+            diff_page::MIN_PAGE_BYTES as u32,
+        );
+        let (status, _) =
+            send_semantic(&env, "POST", "/api/v1/diff-page/substituted", &request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST.as_u16());
     }
 
     #[tokio::test]
@@ -3401,7 +3691,7 @@ mod integration_tests {
         assert!(bundle["valid_until"].as_u64().is_some());
         assert_eq!(
             bundle["capabilities"],
-            serde_json::json!(["bulk-http-v1", "ws-data-v1"])
+            serde_json::json!(["bulk-http-v1", "ws-data-v1", "paged-diff-v1"])
         );
         assert_eq!(bundle["limits"]["bulk_request_bytes"], BULK_REQUEST_BYTES);
     }

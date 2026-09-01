@@ -6,6 +6,12 @@ This diagram zooms inside the **sync-core WASM** container from Level 2 and show
 
 2. **`wasm.rs` contains a handwritten single-poll executor (`run_local`)** that drives async tree operations synchronously. WASM is single-threaded; `MemoryChunkStore` has no real I/O and never returns `Poll::Pending`, so a single `poll()` call always completes. This lets the tree code use `async fn + ChunkStore` uniformly across WASM and native without a special-case path.
 
+3. **`diff_page.rs` is a native/server binary codec, not a JavaScript binding.**
+   It defines the canonical `OBQ1` request, `OBD1` response, and `OBC1` exact-key
+   cursor. The plugin has a deliberately independent TypeScript decoder so every
+   untrusted field is checked again at the JS boundary; a shared FNV fixture keeps
+   the two implementations byte-compatible.
+
 ---
 
 ```mermaid
@@ -13,7 +19,7 @@ C4Component
     title Component Diagram — sync-core WASM
 
     Container_Ext(plugin, "ObsetyNC Plugin", "TypeScript · Obsidian", "Calls all WASM-exposed functions. Crosses the JS↔WASM boundary once per operation group.")
-    Container_Ext(server_bridge, "SyncCoreBridge (in Sync Server)", "bridge.rs · native Rust build", "Uses the native (non-WASM) build of sync-core. Calls compute_deltas and merge_trees with a DiskChunkStore backed by the index/ directory.")
+    Container_Ext(server_bridge, "SyncCoreBridge (in Sync Server)", "bridge.rs · native Rust build", "Uses the native build of sync-core. Calls compute_deltas/merge_trees through bounded storage reads; paged responses use the canonical diff-page codec.")
 
     Container_Boundary(b_wasm, "sync-core WASM · Rust → wasm32-unknown-unknown · base64-inlined in plugin/main.js") {
         Component(wasm_bindings, "WASM Bindings + WasmTree + streaming helpers", "wasm.rs · #[wasm_bindgen]", "Public surface includes WasmTree, streaming Blake3 Hasher, incremental WasmChunker, batch/single hashes, root decoding, and tree chunk access. run_local() single-polls synchronous MemoryChunkStore futures.")
@@ -21,6 +27,8 @@ C4Component
         Component(tree_builder, "TreeBuilder", "tree.rs", "Builds and incrementally updates prefix-partitioned trees. The shared loader traverses iteratively with node/entry bounds and path-sorts the flattened result, so wide internal-node labels such as 1, 10, 2 cannot violate diff/merge ordering assumptions.")
 
         Component(diff_engine, "DiffEngine", "diff.rs · native build only", "Two-pointer tree/entry diff compares content hash, mtime, and size. It emits metadata-complete deltas and converts only unambiguous one-delete/one-add hash matches into Renamed. Called by the native server bridge, not JavaScript.")
+
+        Component(diff_page_codec, "Paged Diff Codec", "diff_page.rs · native protocol", "Strict OBQ1/OBD1/OBC1 codec. Freezes both root hashes, validates exact continuation keys, orders records by UTF-8 bytes/action/old path, and emits a response under negotiated byte/record/path caps.")
 
         Component(merge_engine, "MergeEngine", "merge.rs · native build only", "merge_trees(store, base, side_a, side_b): union of all three roots' prefixes. For each prefix: both same as base → keep base; only A changed → take A (auto-resolve); only B changed → take B (auto-resolve); both changed → diff file-level entries, call merge_file_entries for per-file resolution, collect FileConflict for unresolvable cases. Calls build_tree on the merged entry list to produce the new RootNode. Returns MergeResult{new_root, file_conflicts, auto_resolved_count}. Not exposed via WASM bindings — called only by SyncCoreBridge in the native server build.")
 
@@ -35,6 +43,7 @@ C4Component
 
     Rel(plugin, wasm_bindings, "All plugin WASM calls cross here", "JS → WASM boundary — one call per operation group")
     Rel(server_bridge, diff_engine, "compute_deltas() — native build only", "via DiskChunkStore reading index/ directory")
+    Rel(server_bridge, diff_page_codec, "decode bounded request · encode one snapshot-bound response page")
     Rel(server_bridge, merge_engine, "merge_trees() — native build only", "via DiskChunkStore reading index/ directory")
 
     Rel(wasm_bindings, tree_builder, "WasmTree.build_from_entries → build_tree · WasmTree.update_batch / delete_batch → update_tree")
@@ -49,6 +58,7 @@ C4Component
 
     Rel(diff_engine, chunk_store, "get — load LeafChunk and InternalNode bytes for both tree sides")
     Rel(diff_engine, flatbuf_codec, "deserialize nodes to compare FileEntry lists")
+    Rel(diff_page_codec, diff_engine, "pages the canonical ordered FileDelta stream; Tree v1 producer is transitional")
 
     Rel(merge_engine, chunk_store, "get — load all three tree versions' nodes")
     Rel(merge_engine, tree_builder, "build_tree — assemble merged entries into a new RootNode after all prefixes resolved")
@@ -69,6 +79,7 @@ C4Component
 | **WASM Bindings + WasmTree + Hasher** | `wasm.rs` | The only module compiled with `#[cfg(feature = "wasm")]`. Everything the plugin can call lives here. `WasmTree` is a stateful WASM class that owns both the current `RootNode` and the `MemoryChunkStore` that backs it. `run_local()` is a minimal single-poll executor: it creates a no-op `Waker`, pins the future, calls `poll()` once, and panics on `Pending` (which `MemoryChunkStore` never returns). This avoids pulling in a full async runtime for WASM. |
 | **TreeBuilder** | `tree.rs` | Pure tree manipulation — no I/O except through the `ChunkStore` trait. `build_tree` groups by top-level prefix, splits groups into leaves of ≤1000 entries, and promotes wide groups to internal nodes. `update_tree` only re-chunks touched prefixes. `load_all_entries` is iterative rather than attacker-depth recursive, bounds visited nodes/entries, and path-sorts its final stream because lexicographic child labels (`1`, `10`, `2`) do not themselves guarantee `FileEntry` order. |
 | **DiffEngine** | `diff.rs` | Two-pointer merge over sorted roots and entries. A path is modified when hash, mtime, or size changes, preventing distinct roots from yielding a false empty delta. Only an unambiguous unique deleted/added hash pair becomes `Renamed`; duplicate-content ambiguity stays delete+add. **Not reachable from the plugin via WASM**. |
+| **Paged Diff Codec** | `diff_page.rs` | Canonical native `OBQ1`/`OBD1`/`OBC1` representation. The decoder validates hard caps and exact lengths before tree work; the encoder accounts for cursor overhead while enforcing the negotiated plaintext cap. Continuations carry both immutable roots and the exact last ordered record, and the server verifies that record exists before resuming. The TypeScript mirror is intentionally separate and strict. **Not exposed through WASM bindings.** |
 | **MergeEngine** | `merge.rs` | Three-way merge at the prefix and path levels. Single-side changes auto-resolve. A two-sided same-path change provisionally keeps side A, then eligible small strict-UTF-8 files get a deterministic line-merge post-pass; overlap, binary, large, missing, or invalid content emits `FileConflict`. The returned root stays outside the byte-addressed chunk store and is persisted by the server in per-vault history. **Not reachable from the plugin via WASM.** |
 | **FastCDC Chunker** | `fastcdc_chunker.rs` | Content-defined 256 KiB / 1 MiB / 4 MiB min/target/max cuts. `StreamingChunker` accepts small feeds, incrementally computes full-file and chunk hashes, avoids per-chunk `Vec::drain` memmoves, and returns only the manifest. `reassemble_file` verifies both chunks and final Blake3 address. |
 | **Blake3Hasher** | `hash.rs` | `FileHash = [u8; 32]` identifies file content, chunks, and tree references. `IncrementalHasher` computes deterministic structured hashes. The streaming WASM `Hasher` keeps bridge memory bounded; `update_and_hash(slice)` updates the ordered whole-file digest and returns that slice's independent address in one JS→WASM copy, which lets pull verify both manifest chunks and the fresh assembled stream without duplicating plaintext. |
@@ -100,7 +111,9 @@ its job. The wire object contains path, expected size/mtime, feed, and
 The worker stats the open inode before processing and the pathname afterward,
 rejecting drift or atomic replacement before the candidate tree can commit.
 
-The native build exposes (to `bridge.rs`): `sync_core::diff::compute_deltas`, `sync_core::merge::merge_trees`, `sync_core::store::DiskChunkStore`.
+The native build exposes (to `bridge.rs` and the server API):
+`sync_core::diff::compute_deltas`, `sync_core::diff_page`,
+`sync_core::merge::merge_trees`, and `sync_core::store::DiskChunkStore`.
 
 `diff.rs` and `merge.rs` are compiled into the WASM binary but all their code is unreachable from JavaScript and will be eliminated by `wasm-opt` dead-code elimination during the release build.
 
@@ -146,16 +159,27 @@ plugin: wasm_tree_chunk_hashes(tree)         # byte-addressed leaf/internal hash
 plugin: wasm_tree_get_chunk(tree, hash)      # get individual node bytes for upload
 ```
 
-### Server diff (native build)
+### Server paged diff (native build)
 ```
-SyncCoreBridge.run_diff(storage_writer, from_root, to_root)
-  → bounded StorageWriter read pool + LocalSet
-      → diff::compute_deltas(pack-backed store, from_root, to_root)
-          → two-pointer over sorted prefix children
-          → for changed prefix: indexed pack read → FlatBuffersCodec.deserialize → diff entries
-          → detect_renames: pair only unique one-delete/one-add matches per hash
-  ← Vec<FileDelta>
+server: POST /diff-page/{vault}, sealed OBQ1
+  → diff_page::decode_request and validate byte/record/path caps
+  → resolve immutable from_root and first-page/fixed to_root from history
+  → SyncCoreBridge.run_diff(storage_writer, from_root, to_root)
+      → bounded StorageWriter read pool + LocalSet
+          → diff::compute_deltas(pack-backed store, from_root, to_root)
+              → two-pointer over sorted prefix children
+              → for changed prefix: indexed pack read → deserialize → diff entries
+              → detect_renames: pair only unique one-delete/one-add matches per hash
+  → sort/validate canonical records and verify an exact continuation key
+  → diff_page::encode_response_page under the negotiated plaintext cap
+  ← one OBD1 page + exact next OBC1 cursor
 ```
+
+The page retained by the transport and plugin is strictly bounded. Tree v1 still
+materializes the complete `Vec<FileDelta>` transiently inside the server producer;
+this is an explicit migration limitation, not a claim of end-to-end streaming.
+Tree v2 replaces that producer with a recursive range iterator so server peak diff
+memory also follows the page cap.
 
 ---
 
