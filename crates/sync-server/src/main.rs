@@ -11,6 +11,7 @@ mod eph_rotation;
 mod error;
 mod guard;
 mod ignore_match;
+mod pack_store;
 mod perf;
 mod secure;
 mod seq_tracker;

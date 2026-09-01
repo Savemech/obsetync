@@ -31,6 +31,7 @@ impl StorageLayout {
             "content/manifests",
             "content/chunks",
             "storage-writer",
+            "objects-v1/segments",
         ];
         for dir in &dirs {
             std::fs::create_dir_all(self.base.join(dir))?;
@@ -73,6 +74,22 @@ impl StorageLayout {
     /// current read/index backend until pack storage replaces them.
     pub fn storage_writer_journal_path(&self) -> PathBuf {
         self.base.join("storage-writer/loose-groups-v1.log")
+    }
+
+    /// Immutable-object pack storage. Segment names are fixed-width lowercase
+    /// hex so directory order is generation order on every supported host.
+    pub fn object_segments_dir(&self) -> PathBuf {
+        self.base.join("objects-v1/segments")
+    }
+
+    pub fn object_segment_path(&self, segment_id: u64) -> PathBuf {
+        self.object_segments_dir()
+            .join(format!("{segment_id:016x}.pack"))
+    }
+
+    pub fn object_segment_index_path(&self, segment_id: u64) -> PathBuf {
+        self.object_segments_dir()
+            .join(format!("{segment_id:016x}.idx"))
     }
 
     /// Durable HTTP-v2 anti-replay window for one enrolled device.

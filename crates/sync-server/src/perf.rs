@@ -235,6 +235,26 @@ impl ServerPerfCounters {
         self.fdatasyncs.fetch_add(1, RELAXED);
     }
 
+    pub fn record_pack_read(
+        &self,
+        bytes: u64,
+        read_elapsed: Duration,
+        verify_elapsed: Duration,
+        valid: bool,
+    ) {
+        self.pack_reads.fetch_add(1, RELAXED);
+        self.bytes_read.fetch_add(bytes, RELAXED);
+        self.bytes_rehashed.fetch_add(bytes, RELAXED);
+        self.storage_read_ns
+            .fetch_add(duration_ns(read_elapsed), RELAXED);
+        self.hash_verify_ns
+            .fetch_add(duration_ns(verify_elapsed), RELAXED);
+        self.open_count.fetch_add(1, RELAXED);
+        if !valid {
+            self.corrupted_records.fetch_add(1, RELAXED);
+        }
+    }
+
     pub fn record_writer_queue_add(&self, objects: u64) {
         let depth = self.writer_queue_depth.fetch_add(objects, RELAXED) + objects;
         let mut peak = self.writer_queue_peak.load(RELAXED);
