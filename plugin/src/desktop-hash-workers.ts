@@ -19,6 +19,8 @@ export interface HashWorkerInput {
 
 export interface HashWorkerPoolStats {
     workers: number;
+    capacity: number;
+    limit: number;
     ready: number;
     active: number;
     queued: number;
@@ -63,6 +65,7 @@ interface WorkerSlot {
     worker: WorkerLike;
     ready: boolean;
     dead: boolean;
+    retiring: boolean;
     restarts: number;
     current: PendingJob | null;
     startupTimer: ReturnType<typeof setTimeout> | null;
@@ -173,15 +176,18 @@ export function desktopHashWorkerCount(
  * binary payloads in either direction are rejected as a protocol violation.
  */
 export class DesktopHashWorkerPool {
-    private readonly slots: WorkerSlot[] = [];
+    private readonly slots: Array<WorkerSlot | undefined> = [];
     private readonly queue: PendingJob[] = [];
     private nextJobId = 1;
     private closed = false;
+    private activeWorkerLimit: number;
 
     constructor(
         private readonly workerFactory: HashWorkerFactory,
+        /** Maximum worker capacity; workers above the active limit are lazy. */
         readonly workerCount: number,
         readonly maxQueuedJobs = Math.max(1, workerCount * 8),
+        initialWorkerLimit = workerCount,
     ) {
         if (!Number.isInteger(workerCount) || workerCount <= 0 || workerCount > 4) {
             throw new RangeError("hash worker count must be between 1 and 4");
@@ -189,11 +195,19 @@ export class DesktopHashWorkerPool {
         if (!Number.isInteger(maxQueuedJobs) || maxQueuedJobs <= 0) {
             throw new RangeError("hash worker queue bound must be positive");
         }
+        if (
+            !Number.isInteger(initialWorkerLimit) || initialWorkerLimit <= 0 ||
+            initialWorkerLimit > workerCount
+        ) {
+            throw new RangeError("initial hash worker limit must fit pool capacity");
+        }
+        this.activeWorkerLimit = initialWorkerLimit;
         try {
-            for (let index = 0; index < workerCount; index++) this.spawn(index, 0);
+            for (let index = 0; index < initialWorkerLimit; index++) this.spawn(index, 0);
         } catch (error) {
             this.closed = true;
             for (const slot of this.slots) {
+                if (!slot) continue;
                 slot.dead = true;
                 if (slot.startupTimer) clearTimeout(slot.startupTimer);
                 try { void slot.worker.terminate(); } catch { /* construction rollback */ }
@@ -207,7 +221,9 @@ export class DesktopHashWorkerPool {
             return Promise.reject(new HashWorkerPoolError("hash worker pool is closed", "CLOSED"));
         }
         if (signal?.aborted) return Promise.reject(abortError());
-        const freeSlot = this.slots.some((slot) => slot.ready && !slot.dead && !slot.current);
+        const freeSlot = this.slots.some((slot, index) =>
+            index < this.activeWorkerLimit && !!slot &&
+            slot.ready && !slot.dead && !slot.retiring && !slot.current);
         if (!freeSlot && this.queue.length >= this.maxQueuedJobs) {
             return Promise.reject(new HashWorkerPoolError("hash worker queue is full", "QUEUE_FULL"));
         }
@@ -238,15 +254,63 @@ export class DesktopHashWorkerPool {
     }
 
     stats(): HashWorkerPoolStats {
-        const live = this.slots.filter((slot) => !slot.dead);
-        const ready = live.filter((slot) => slot.ready).length;
+        const live = this.slots.filter((slot): slot is WorkerSlot => !!slot && !slot.dead);
+        const eligible = live.filter((slot) =>
+            slot.index < this.activeWorkerLimit && !slot.retiring);
+        const ready = eligible.filter((slot) => slot.ready).length;
         return {
             workers: live.length,
+            capacity: this.workerCount,
+            limit: this.activeWorkerLimit,
             ready,
             active: live.filter((slot) => slot.current !== null).length,
             queued: this.queue.length,
-            wasmMode: ready > 0 ? "simd" : live.length > 0 ? "starting" : "unavailable",
+            wasmMode: ready > 0 ? "simd" : eligible.length > 0 ? "starting" : "unavailable",
         };
+    }
+
+    /** Additively grow or multiplicatively shrink the live SIMD worker set. */
+    setActiveWorkerLimit(limit: number): void {
+        if (this.closed) return;
+        if (!Number.isInteger(limit) || limit <= 0 || limit > this.workerCount) {
+            throw new RangeError("hash worker limit must fit pool capacity");
+        }
+        if (limit === this.activeWorkerLimit) return;
+        const previous = this.activeWorkerLimit;
+        if (limit > previous) {
+            const spawned: WorkerSlot[] = [];
+            const reactivated: WorkerSlot[] = [];
+            try {
+                for (let index = previous; index < limit; index++) {
+                    const slot = this.slots[index];
+                    if (slot && !slot.dead) {
+                        if (slot.retiring) reactivated.push(slot);
+                        slot.retiring = false;
+                    } else {
+                        this.spawn(index, 0);
+                        const created = this.slots[index];
+                        if (created) spawned.push(created);
+                    }
+                }
+            } catch (error) {
+                for (const slot of spawned) this.retire(slot);
+                for (const slot of reactivated) {
+                    if (slot.current) slot.retiring = true;
+                    else this.retire(slot);
+                }
+                throw error;
+            }
+            this.activeWorkerLimit = limit;
+            this.dispatch();
+            return;
+        }
+        this.activeWorkerLimit = limit;
+        for (let index = limit; index < this.slots.length; index++) {
+            const slot = this.slots[index];
+            if (!slot || slot.dead) continue;
+            if (slot.current) slot.retiring = true;
+            else this.retire(slot);
+        }
     }
 
     async close(): Promise<void> {
@@ -256,6 +320,7 @@ export class DesktopHashWorkerPool {
         for (const pending of this.queue.splice(0)) this.settle(pending, error);
         const terminations: Array<Promise<number>> = [];
         for (const slot of this.slots) {
+            if (!slot) continue;
             slot.dead = true;
             if (slot.current) {
                 this.settle(slot.current, error);
@@ -285,6 +350,7 @@ export class DesktopHashWorkerPool {
             worker,
             ready: false,
             dead: false,
+            retiring: false,
             restarts,
             current: null,
             startupTimer: null,
@@ -369,6 +435,9 @@ export class DesktopHashWorkerPool {
         } else {
             this.settle(pending, null, message);
         }
+        if (slot.retiring || slot.index >= this.activeWorkerLimit) {
+            this.retire(slot);
+        }
         this.dispatch();
     }
 
@@ -387,14 +456,18 @@ export class DesktopHashWorkerPool {
         } catch {
             // Already gone.
         }
-        if (!this.closed && slot.restarts < MAX_RESTARTS_PER_SLOT) {
+        if (
+            !this.closed && !slot.retiring && slot.index < this.activeWorkerLimit &&
+            slot.restarts < MAX_RESTARTS_PER_SLOT
+        ) {
             try {
                 this.spawn(slot.index, slot.restarts + 1);
             } catch {
                 // The all-dead check below fails the remaining queue.
             }
         }
-        if (this.slots.every((candidate) => candidate?.dead)) {
+        const eligible = this.slots.slice(0, this.activeWorkerLimit);
+        if (eligible.every((candidate) => !candidate || candidate.dead)) {
             const unavailable = new HashWorkerPoolError("all hash workers unavailable", "UNAVAILABLE");
             for (const pending of this.queue.splice(0)) this.settle(pending, unavailable);
         }
@@ -407,7 +480,7 @@ export class DesktopHashWorkerPool {
             this.settle(pending, abortError());
             return;
         }
-        const slot = this.slots.find((candidate) => candidate.current === pending);
+        const slot = this.slots.find((candidate) => candidate?.current === pending);
         if (!slot || slot.dead) return;
         pending.abortRequested = true;
         try {
@@ -419,9 +492,10 @@ export class DesktopHashWorkerPool {
 
     private dispatch(): void {
         if (this.closed) return;
-        for (const slot of this.slots) {
+        for (let index = 0; index < this.activeWorkerLimit; index++) {
+            const slot = this.slots[index];
             if (this.queue.length === 0) break;
-            if (!slot || slot.dead || !slot.ready || slot.current) continue;
+            if (!slot || slot.dead || slot.retiring || !slot.ready || slot.current) continue;
             while (this.queue.length > 0 && !slot.current) {
                 const pending = this.queue.shift()!;
                 if (pending.signal?.aborted) {
@@ -441,6 +515,20 @@ export class DesktopHashWorkerPool {
         }
     }
 
+    private retire(slot: WorkerSlot): void {
+        if (slot.dead) return;
+        slot.dead = true;
+        slot.ready = false;
+        slot.retiring = false;
+        if (slot.startupTimer) clearTimeout(slot.startupTimer);
+        slot.startupTimer = null;
+        try {
+            void slot.worker.terminate();
+        } catch {
+            // A worker which exited while being retired already released its resources.
+        }
+    }
+
     private settle(
         pending: PendingJob,
         error: Error | null,
@@ -455,7 +543,15 @@ export class DesktopHashWorkerPool {
 }
 
 /** Create the real Electron/Node pool without importing Node builtins on iOS. */
-export function createDesktopHashWorkerPool(workerSource: string): DesktopHashWorkerPool | null {
+export interface DesktopHashWorkerPoolOptions {
+    initialWorkers?: number;
+    maxWorkers?: number;
+}
+
+export function createDesktopHashWorkerPool(
+    workerSource: string,
+    options: DesktopHashWorkerPoolOptions = {},
+): DesktopHashWorkerPool | null {
     try {
         const nodeRequire = (typeof require === "function"
             ? require
@@ -468,14 +564,17 @@ export function createDesktopHashWorkerPool(workerSource: string): DesktopHashWo
         const cores = typeof os.availableParallelism === "function"
             ? os.availableParallelism()
             : os.cpus().length;
-        const count = desktopHashWorkerCount(process.platform, process.arch, cores);
+        const defaultInitial = desktopHashWorkerCount(process.platform, process.arch, cores);
+        const capacity = options.maxWorkers ?? Math.min(4, Math.max(1, cores - 1));
+        const initial = options.initialWorkers ?? Math.min(defaultInitial, capacity);
         return new DesktopHashWorkerPool(
             (index) => new Worker(workerSource, {
                 eval: true,
                 name: `obsetync-hash-${index + 1}`,
             }) as unknown as WorkerLike,
-            count,
-            count * 8,
+            capacity,
+            capacity * 8,
+            initial,
         );
     } catch {
         return null;

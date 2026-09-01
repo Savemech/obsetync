@@ -315,10 +315,83 @@ async function hostileWorkerMetadataIsRejected(): Promise<void> {
     }
 }
 
+async function workerLimitGrowsLazilyAndShrinksAfterActiveJobs(): Promise<void> {
+    const workers: FakeWorker[] = [];
+    const pool = new DesktopHashWorkerPool(() => {
+        const worker = new FakeWorker();
+        workers.push(worker);
+        return worker as any;
+    }, 3, 12, 1);
+    check(workers.length === 1, "inactive capacity was spawned eagerly");
+    check(pool.stats().capacity === 3 && pool.stats().limit === 1, "initial limit missing");
+    workers[0].emit({ type: "ready", wasm_mode: "simd" });
+
+    const jobs = [0, 1, 2].map((index) => pool.run({
+        absolutePath: `/vault/dynamic-${index}.md`,
+        expectedSize: index + 1,
+        expectedMtime: index + 10,
+        mode: "hash",
+        feedBytes: 64 * 1024,
+    }));
+    pool.setActiveWorkerLimit(3);
+    check(workers.length === 3, "worker growth did not spawn lazily");
+    workers[1].emit({ type: "ready", wasm_mode: "simd" });
+    workers[2].emit({ type: "ready", wasm_mode: "simd" });
+    check(pool.stats().active === 3 && pool.stats().queued === 0, "grown pool did not drain queue");
+
+    const posted = workers.map((worker) => jobFrom(worker));
+    pool.setActiveWorkerLimit(1);
+    check(pool.stats().limit === 1, "reduced worker limit was not applied");
+    check(!workers[1].terminated && !workers[2].terminated, "active workers were killed mid-job");
+    workers[1].emit(hashResult(posted[1]));
+    workers[2].emit(hashResult(posted[2]));
+    check(workers[1].terminated && workers[2].terminated, "retiring workers kept resources");
+    workers[0].emit(hashResult(posted[0]));
+    await Promise.all(jobs);
+    check(pool.stats().workers === 1, "retired workers remained live");
+
+    pool.setActiveWorkerLimit(2);
+    check(workers.length === 4, "regrowth did not replace a retired worker");
+    workers[3].emit({ type: "ready", wasm_mode: "simd" });
+    check(pool.stats().ready === 2, "regrown pool did not become ready");
+    let rejected = false;
+    try {
+        pool.setActiveWorkerLimit(4);
+    } catch (error) {
+        rejected = error instanceof RangeError;
+    }
+    check(rejected, "worker limit above capacity was accepted");
+    await pool.close();
+}
+
+async function failedGrowthRollsBackTheWorkerSet(): Promise<void> {
+    const workers: FakeWorker[] = [];
+    const pool = new DesktopHashWorkerPool((index) => {
+        if (index === 2) throw new Error("injected worker construction failure");
+        const worker = new FakeWorker();
+        workers.push(worker);
+        return worker as any;
+    }, 3, 12, 1);
+    workers[0].emit({ type: "ready", wasm_mode: "simd" });
+    let rejected = false;
+    try {
+        pool.setActiveWorkerLimit(3);
+    } catch (error) {
+        rejected = (error as Error).message === "injected worker construction failure";
+    }
+    check(rejected, "failed worker growth was hidden");
+    check(pool.stats().limit === 1, "failed growth changed the active limit");
+    check(pool.stats().workers === 1, "failed growth leaked a live worker");
+    check(workers[1].terminated, "partially-created worker survived rollback");
+    await pool.close();
+}
+
 void schedulerIsBoundedAndMetadataOnly()
     .then(activeCancellationAndDriftAreTyped)
     .then(crashedWorkerRestartsAndBinaryResponseIsRejected)
     .then(hostileWorkerMetadataIsRejected)
+    .then(workerLimitGrowsLazilyAndShrinksAfterActiveJobs)
+    .then(failedGrowthRollsBackTheWorkerSet)
     .then(() => console.log(`desktop-hash-workers.test: ${assertions} assertions passed`))
     .catch((error) => {
         console.error(error);
