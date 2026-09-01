@@ -31,6 +31,7 @@ import { PullEchoTracker } from "./pull-echo";
 import { DirtyPathSet, type DirtyFileChange } from "./dirty-set";
 import { OperationCheckpoint } from "./operation-checkpoint";
 import { exactArrayBuffer } from "./binary";
+import { getHashTuning } from "./hash-runtime";
 import {
     automaticChangeNeedsReview,
     metadataScanNeedsReview,
@@ -867,12 +868,12 @@ export class ObsetyncSyncEngine {
             //   - Large files (≥ 1 MB) skip WASM hash entirely here. push.ts reads
             //     them during upload and gets file_hash from FastCDC. This keeps
             //     WASM linear memory bounded regardless of PDF/image sizes.
-            //   - READ_CONCURRENCY=4 limits concurrent IPC reads. 8 concurrent 200 MB
-            //     PDFs = 1.6 GB peak; 4 = 800 MB — and hash is serial anyway.
+            //   - Platform read concurrency limits concurrent IPC reads. Large
+            //     files are excluded above; mobile stays more conservative.
             //   - FLUSH_BATCH=500 periodically moves local arrays into the
             //     coalescing DirtyPathSet without touching the network/tree.
             //   - yieldToUI() every group lets Electron's audio/render callbacks run.
-            const READ_CONCURRENCY = 4;
+            const READ_CONCURRENCY = getHashTuning().readConcurrency;
             const FLUSH_BATCH = 500;
             let pending: FileChange[] = [];
             let totalChanges = 0;
@@ -888,7 +889,7 @@ export class ObsetyncSyncEngine {
                 const batch = toHash.slice(i, i + READ_CONCURRENCY);
                 perf.observePeakBatchBytes(batch.reduce((sum, item) => {
                     const residentBytes = this.io.getAbsolutePath(item.path)
-                        ? Math.min(item.stat.size, 65_536)
+                        ? Math.min(item.stat.size, getHashTuning().feedBytes)
                         : item.stat.size;
                     return sum + residentBytes;
                 }, 0));
@@ -1706,7 +1707,7 @@ export class ObsetyncSyncEngine {
             let found = plan.deleted.length;
             let changedBytes = 0;
             if (plan.toHash.length > 0) {
-                const readConcurrency = 4;
+                const readConcurrency = getHashTuning().readConcurrency;
                 const hashableTotal = plan.toHash.reduce(
                     (count, item) =>
                         count + (item.stat.size < LARGE_FILE_THRESHOLD ? 1 : 0),
@@ -1728,7 +1729,7 @@ export class ObsetyncSyncEngine {
                         const batch = plan.toHash.slice(i, i + readConcurrency);
                         perf.observePeakBatchBytes(batch.reduce((sum, item) => {
                             const residentBytes = this.io.getAbsolutePath(item.path)
-                                ? Math.min(item.stat.size, 65_536)
+                                ? Math.min(item.stat.size, getHashTuning().feedBytes)
                                 : item.stat.size;
                             return sum + residentBytes;
                         }, 0));

@@ -94,8 +94,8 @@ For bit-for-bit reproducible builds (same inputs → identical outputs on any ma
 ```sh
 # Everything pinned via flake.lock — Rust toolchain, nixpkgs, build inputs.
 nix build .#server           # -> ./result/bin/sync-server
-nix build .#wasm             # -> ./result/  (wasm-bindgen output)
-nix build .#plugin           # -> ./result/  (main.js + manifest.json + wasm/)
+nix build .#wasm             # -> ./result/  (scalar + SIMD wasm-bindgen output)
+nix build .#plugin           # -> ./result/  (main.js + manifest.json + both WASM variants)
 
 nix flake check              # runs the full cargo test suite
 nix develop                  # shell with the exact toolchain
@@ -200,7 +200,7 @@ Obsidian keeps it up to date automatically. Until the directory listing lands, u
 1. In Obsidian, open **Settings → Community plugins** and disable Restricted Mode if it's on.
 2. **Browse**, search for *BRAT*, install it, and enable it.
 3. Open **BRAT** settings → **Add Beta plugin** → paste `Savemech/obsetync` and confirm.
-4. BRAT downloads `main.js`, `manifest.json`, and the two WASM files from our latest GitHub release into your vault.
+4. BRAT downloads `main.js`, `manifest.json`, and the scalar/SIMD WASM artifacts from our latest GitHub release into your vault.
 5. Back in **Community plugins**, enable *ObsetyNC*.
 
 Subsequent releases auto-update via BRAT — no further action needed.
@@ -208,7 +208,7 @@ Subsequent releases auto-update via BRAT — no further action needed.
 ### C. Manual install (no BRAT, fully offline after first download)
 
 1. Go to the [Releases page](https://github.com/Savemech/obsetync/releases/latest) and download `obsetync-<version>.zip`.
-2. Unzip it — you'll see an `obsetync/` folder containing `main.js`, `manifest.json`, `sync_core.js`, `sync_core_bg.wasm`.
+2. Unzip it — you'll see an `obsetync/` folder containing `main.js`, `manifest.json`, and scalar (`sync_core*`) plus SIMD (`sync_core_simd*`) WASM artifacts. ObsetyNC validates SIMD at runtime and automatically falls back to scalar on older WebViews.
 3. Drop that `obsetync/` folder into `<your-vault>/.obsidian/plugins/`.
 4. In Obsidian, **Settings → Community plugins** → disable Restricted Mode → refresh the list → enable *ObsetyNC*.
 
@@ -386,7 +386,7 @@ Then `just ship` does:
 3. `scp docker-compose.yml $OBSETYNC_SERVER:$OBSETYNC_DEST/`
 4. `ssh` — `docker load`, tag as both `obsetync/server:local` and `ghcr.io/savemech/obsetync-nix:<version>`, `docker compose up -d`
 5. `curl /health` to verify the new image is serving
-6. If `OBSETYNC_VAULT` is set: rebuild plugin artifacts and copy `main.js` + `manifest.json` + `sync_core_bg.wasm` into that vault
+6. If `OBSETYNC_VAULT` is set: rebuild plugin artifacts and copy `main.js`, `manifest.json`, and both scalar/SIMD WASM variants into that vault
 
 Public users: ignore `just ship` — `just build` + `just up` is the full flow.
 

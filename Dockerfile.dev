@@ -32,6 +32,7 @@ RUN apt-get update && \
         curl \
         just \
         build-essential \
+        binaryen \
         pkg-config \
         less \
         vim-tiny \

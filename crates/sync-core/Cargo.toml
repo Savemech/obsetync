@@ -11,6 +11,9 @@ wasm = [
     "console_error_panic_hook",
     "serde-wasm-bindgen",
 ]
+# Opt-in only: the scalar `wasm` feature remains the universal fallback.
+# This must be paired with rustc `-C target-feature=+simd128` at build time.
+wasm-simd = ["wasm", "blake3/wasm32_simd"]
 
 [dependencies]
 blake3.workspace = true

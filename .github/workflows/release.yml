@@ -73,8 +73,10 @@ jobs:
           toolchain: 1.95.0
           target: wasm32-unknown-unknown
 
-      - name: Install wasm-pack
+      - name: Install WASM tools
         run: |
+          sudo apt-get update
+          sudo apt-get install -y binaryen
           curl -sSfL https://github.com/rustwasm/wasm-pack/releases/download/v0.13.1/wasm-pack-v0.13.1-x86_64-unknown-linux-musl.tar.gz \
             | sudo tar -xz -C /usr/local/bin --strip-components=1 \
                 wasm-pack-v0.13.1-x86_64-unknown-linux-musl/wasm-pack
@@ -86,12 +88,10 @@ jobs:
           cache-dependency-path: plugin/package-lock.json
 
       - name: Build WASM
-        run: |
-          wasm-pack build crates/sync-core \
-            --target web \
-            --out-dir ../../plugin/wasm \
-            --release \
-            -- --features wasm --no-default-features
+        run: bash scripts/build-wasm.sh plugin/wasm
+
+      - name: Verify scalar/SIMD parity
+        run: node scripts/verify-wasm-parity.mjs plugin/wasm
 
       - name: Build plugin bundle
         working-directory: plugin
@@ -110,6 +110,8 @@ jobs:
           cp plugin/styles.css                release/styles.css
           cp plugin/wasm/sync_core.js         release/sync_core.js
           cp plugin/wasm/sync_core_bg.wasm    release/sync_core_bg.wasm
+          cp plugin/wasm/sync_core_simd.js    release/sync_core_simd.js
+          cp plugin/wasm/sync_core_simd_bg.wasm release/sync_core_simd_bg.wasm
           cp versions.json                    release/versions.json
 
           # ZIP for manual install (drop its contents into .obsidian/plugins/obsetync/).
@@ -119,6 +121,8 @@ jobs:
           cp release/styles.css               zip-staging/obsetync/
           cp release/sync_core.js             zip-staging/obsetync/
           cp release/sync_core_bg.wasm        zip-staging/obsetync/
+          cp release/sync_core_simd.js        zip-staging/obsetync/
+          cp release/sync_core_simd_bg.wasm   zip-staging/obsetync/
           (cd zip-staging && zip -r ../release/obsetync-${{ github.ref_name }}.zip obsetync)
 
           echo "Release assets:"
@@ -133,6 +137,8 @@ jobs:
             release/styles.css
             release/sync_core.js
             release/sync_core_bg.wasm
+            release/sync_core_simd.js
+            release/sync_core_simd_bg.wasm
             release/versions.json
             release/obsetync-*.zip
           generate_release_notes: true

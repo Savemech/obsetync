@@ -31,6 +31,7 @@ ENV CARGO_TERM_COLOR=never \
 #   cmake     — aws-lc-sys build
 #   perl      — aws-lc-sys build (OpenSSL-style scripts)
 #   git       — cargo fetches some deps via git
+#   binaryen  — validates/optimizes scalar and SIMD WASM artifacts
 # wasm-pack — fetches pre-built binary from rustwasm releases
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -38,6 +39,7 @@ RUN apt-get update && \
         cmake \
         perl \
         git \
+        binaryen \
         ca-certificates \
         curl \
         && rm -rf /var/lib/apt/lists/*
@@ -84,6 +86,7 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
 # Bring in the actual crate sources and compile.
 # ------------------------------------------------------------------------------
 COPY crates ./crates
+COPY scripts ./scripts
 
 # Overwrite the stubs so cargo recompiles with the real code.
 RUN find crates -name '*.rs' -exec touch {} +
@@ -97,16 +100,13 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
     cp /build/target/release/sync-server /out/sync-server && \
     chmod 0755 /out/sync-server
 
-# WASM module for the Obsidian plugin.
+# Universal scalar + SIMD WASM modules for the Obsidian plugin. The plugin
+# validates SIMD at runtime and falls back to scalar on older WebViews.
 # Output goes to /build/plugin/wasm which becomes part of the image layer.
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=wasm-target,target=/build/target,sharing=locked \
-    wasm-pack build crates/sync-core \
-        --target web \
-        --out-dir /build/plugin/wasm \
-        --release \
-        -- --features wasm --no-default-features
+    bash scripts/build-wasm.sh /build/plugin/wasm
 
 
 # ------------------------------------------------------------------------------
@@ -178,6 +178,8 @@ CMD ["run", "--data-dir", "/data"]
 #   ./dist/plugin/manifest.json
 #   ./dist/plugin/sync_core.js
 #   ./dist/plugin/sync_core_bg.wasm
+#   ./dist/plugin/sync_core_simd.js
+#   ./dist/plugin/sync_core_simd_bg.wasm
 # All flat — drop the whole folder into a vault's .obsidian/plugins/obsetync/.
 # ------------------------------------------------------------------------------
 FROM scratch AS plugin-dist
@@ -187,6 +189,8 @@ COPY --from=plugin-builder /build/plugin/manifest.json            /manifest.json
 COPY --from=plugin-builder /build/plugin/styles.css               /styles.css
 COPY --from=plugin-builder /build/plugin/wasm/sync_core.js        /sync_core.js
 COPY --from=plugin-builder /build/plugin/wasm/sync_core_bg.wasm   /sync_core_bg.wasm
+COPY --from=plugin-builder /build/plugin/wasm/sync_core_simd.js   /sync_core_simd.js
+COPY --from=plugin-builder /build/plugin/wasm/sync_core_simd_bg.wasm /sync_core_simd_bg.wasm
 
 
 # ------------------------------------------------------------------------------

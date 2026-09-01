@@ -14,6 +14,8 @@ import {
     normalizePerfArchitecture,
     perfTrace,
 } from "./perf-trace";
+import { configureHashRuntime, type HashTuning } from "./hash-runtime";
+import { createWasmLoader, type WasmSelection } from "./wasm-runtime";
 
 // Static import of the wasm-bindgen --target web glue. esbuild inlines this
 // ES module into main.js at build time — no runtime `new Function(...)` or
@@ -25,15 +27,20 @@ import {
 // wasm/ artifacts but isn't guaranteed present during every build environment.
 // The runtime shape matches WasmModule structurally.
 // @ts-ignore
-import initWasm, * as WasmExports from "../wasm/sync_core";
+import initScalarWasm, * as ScalarWasmExports from "../wasm/sync_core";
+// @ts-ignore
+import initSimdWasm, * as SimdWasmExports from "../wasm/sync_core_simd";
 
 // Static import of the WASM binary — esbuild's "binary" loader (configured
 // in esbuild.config.mjs) turns this into a base64-embedded Uint8Array at
-// build time. The plugin ships as a single self-contained main.js, no
-// separate `sync_core_bg.wasm` file for BRAT/Obsidian to (fail to) deliver.
+// build time. The plugin ships as a single self-contained main.js, with no
+// separate scalar/SIMD binaries for BRAT/Obsidian to (fail to) deliver.
 // @ts-ignore
-import wasmBytes from "../wasm/sync_core_bg.wasm";
-const embeddedWasmBytes = wasmBytes as unknown as Uint8Array;
+import scalarWasmBytes from "../wasm/sync_core_bg.wasm";
+// @ts-ignore
+import simdWasmBytes from "../wasm/sync_core_simd_bg.wasm";
+const embeddedScalarWasmBytes = scalarWasmBytes as unknown as Uint8Array;
+const embeddedSimdWasmBytes = simdWasmBytes as unknown as Uint8Array;
 
 export default class ObsetyncPlugin extends Plugin {
     settings: SyncSettings = DEFAULT_SETTINGS;
@@ -44,6 +51,7 @@ export default class ObsetyncPlugin extends Plugin {
     private syncEngine!: ObsetyncSyncEngine;
     private wasm!: WasmModule;
     private tree!: WasmTree;
+    private wasmLoader: (() => Promise<WasmSelection<WasmModule>>) | null = null;
     private operationCheckpoint!: OperationCheckpoint;
     private statusBarEl: HTMLElement | null = null;
 
@@ -55,15 +63,25 @@ export default class ObsetyncPlugin extends Plugin {
                 : (globalThis as any).process?.arch ??
                     (globalThis.navigator as any)?.userAgentData?.architecture,
         );
+        const applyHashTuning = (tuning: HashTuning) => {
+            const current = perfTrace.getProfile();
+            perfTrace.setProfile({
+                ...current,
+                readConcurrency: tuning.readConcurrency,
+                feedBytes: tuning.feedBytes,
+                batchBytes: tuning.maxBatchBytes,
+            });
+        };
+        const hashTuning = configureHashRuntime(runtime, applyHashTuning);
         perfTrace.setProfile({
             runtime,
             architecture: detectedArchitecture,
-            wasmMode: "scalar",
+            wasmMode: "unknown",
             hashConcurrency: 1,
-            readConcurrency: 4,
+            readConcurrency: hashTuning.readConcurrency,
             networkConcurrency: 8,
-            feedBytes: 65_536,
-            batchBytes: 0,
+            feedBytes: hashTuning.feedBytes,
+            batchBytes: hashTuning.maxBatchBytes,
             diffPageBytes: 0,
         });
 
@@ -185,7 +203,7 @@ export default class ObsetyncPlugin extends Plugin {
 
         push("--- Platform ---");
         push(`Transport:         AEAD envelope over HTTP (X25519 + HKDF-SHA256 + AES-256-GCM)`);
-        push(`WASM:              ${this.wasm ? "loaded" : "not loaded"}`);
+        push(`WASM:              ${this.wasm ? `loaded (${perfTrace.getProfile().wasmMode})` : "not loaded"}`);
         push(`Plugin id:         ${this.manifest.id}`);
         push(`Plugin version:    ${this.manifest.version}`);
         push("");
@@ -521,19 +539,44 @@ export default class ObsetyncPlugin extends Plugin {
     }
 
     private async loadWasm(): Promise<WasmModule> {
-        // Both the wasm-bindgen --target web glue AND the WASM binary are
-        // bundled into main.js at build time (the glue via esbuild's ES
-        // module inlining, the binary via the "binary" loader emitting a
-        // base64-encoded Uint8Array constant). At runtime we call the
-        // bundled init function with the bundled bytes — no file I/O, no
-        // `new Function()`, no dynamic import. This is what keeps iOS
-        // WKWebView + CSP + BRAT's spotty pluginFiles delivery from
-        // breaking sync.
+        // Scalar and SIMD wasm-bindgen modules are both bundled into main.js.
+        // Runtime validation rejects SIMD before instantiation on an older
+        // WebView; an unexpected SIMD compile/init failure also falls back to
+        // the independently generated universal module. The loader promise is
+        // cached for this plugin session so concurrent startup paths cannot
+        // initialize two module instances.
         const endSpan = perfSpan("wasm.load");
         try {
-            await initWasm({ module_or_path: embeddedWasmBytes });
-            console.log(`[obsetync] WASM loaded (${embeddedWasmBytes.byteLength} bytes, inline)`);
-            return WasmExports as unknown as WasmModule;
+            this.wasmLoader ??= createWasmLoader<WasmModule>({
+                scalar: {
+                    mode: "scalar",
+                    bytes: embeddedScalarWasmBytes,
+                    exports: ScalarWasmExports as unknown as WasmModule,
+                    initialize: async (bytes) => {
+                        await initScalarWasm({ module_or_path: bytes });
+                    },
+                },
+                simd: {
+                    mode: "simd",
+                    bytes: embeddedSimdWasmBytes,
+                    exports: SimdWasmExports as unknown as WasmModule,
+                    initialize: async (bytes) => {
+                        await initSimdWasm({ module_or_path: bytes });
+                    },
+                },
+                onSimdFallback: (reason) => {
+                    console.warn(`[obsetync] SIMD WASM unavailable (${reason}); using scalar`);
+                },
+            });
+            const selected = await this.wasmLoader();
+            perfTrace.setProfile({
+                ...perfTrace.getProfile(),
+                wasmMode: selected.mode,
+            });
+            console.log(
+                `[obsetync] WASM loaded (${selected.mode}, ${selected.bytes} bytes, inline)`,
+            );
+            return selected.exports;
         } catch (e: any) {
             const msg = e?.message ?? String(e);
             const name = e?.name ?? "Error";

@@ -2,8 +2,14 @@ import { ObsetyncApi } from "./api";
 import { PlatformIO } from "./platform";
 import { ObsetyncSyncBase } from "./sync-base";
 import type { PerfOperation } from "./perf-trace";
+import {
+    getHashTuning,
+    observeHashFeedback,
+    planByteBoundedBatches,
+    type HashTuning,
+} from "./hash-runtime";
 
-/** Streaming Blake3 hasher — feed in 64 KB chunks, call finalize(), then free(). */
+/** Streaming Blake3 hasher — feed bounded slices, call finalize(), then free(). */
 export interface WasmHasher {
     update(chunk: Uint8Array): void;
     update_and_hash(chunk: Uint8Array): string;
@@ -28,7 +34,7 @@ export interface WasmModule {
     wasm_tree_candidate_chunk_hashes(tree: any): string[];
     wasm_tree_new_candidate_chunk_hashes(tree: any): string[];
     wasm_root_hash_from_bytes(bytes: Uint8Array): string | undefined;
-    /** Streaming Blake3 hasher. Peak WASM heap = chunk size (64 KB), not file size. */
+    /** Streaming Blake3 hasher. Peak WASM heap = feed size, not file size. */
     Hasher: new () => WasmHasher;
     WasmChunker: new () => WasmChunker;
     /**
@@ -100,15 +106,64 @@ class ObsetyncBatchFile {
     ) {}
 }
 
-// Max files held in memory at once. Keeps RSS bounded even for 10k-file vaults.
-const STREAM_BATCH = 50;
-// Concurrent reads within a batch. 4 is the sweet spot: amortises IPC latency for
-// small files without inflating peak WASM heap (8 concurrent 200 MB PDFs = 1.6 GB).
-const READ_CONCURRENCY = 4;
+interface ObsetyncRead {
+    change: FileChange;
+    data: Uint8Array;
+}
+
+function hashUnknownSmallReads(
+    wasm: WasmModule,
+    reads: ObsetyncRead[],
+    tuning: HashTuning,
+    perf?: PerfOperation,
+): ObsetyncBatchFile[] {
+    const result: ObsetyncBatchFile[] = [];
+    const batches = planByteBoundedBatches(reads, (read) => read.data.length, {
+        maxFiles: tuning.maxBatchFiles,
+        maxBytes: tuning.maxBatchBytes,
+        maxSingleBytes: tuning.maxSingleBatchFileBytes,
+        maxHoldMs: tuning.maxBatchHoldMs,
+    });
+    const residentBytes = reads.reduce((sum, read) => sum + read.data.length, 0);
+
+    for (const batch of batches) {
+        const totalBytes = batch.reduce((sum, read) => sum + read.data.length, 0);
+        perf?.observePeakBatchBytes(residentBytes + totalBytes);
+        const flat = new Uint8Array(totalBytes);
+        const offsets = new Uint32Array(batch.length);
+        const sizes = new Uint32Array(batch.length);
+        let offset = 0;
+        for (let index = 0; index < batch.length; index++) {
+            flat.set(batch[index].data, offset);
+            offsets[index] = offset;
+            sizes[index] = batch[index].data.length;
+            offset += batch[index].data.length;
+        }
+        const endHash = perf?.phase("hash");
+        const hashStarted = monotonicNow();
+        let hashes: string[];
+        try {
+            hashes = wasm.wasm_hash_batch(flat, offsets, sizes);
+        } finally {
+            observeHashStep(totalBytes, hashStarted);
+            endHash?.();
+        }
+        for (let index = 0; index < batch.length; index++) {
+            const read = batch[index];
+            read.change.hash = hashes[index];
+            result.push(new ObsetyncBatchFile(
+                read.change,
+                read.data.length,
+                read.change.mtime ?? Date.now(),
+            ));
+        }
+    }
+    return result;
+}
 
 /**
- * Push path — streams through changes in batches so peak memory is
- * STREAM_BATCH × avg_file_size, not total_vault_size.
+ * Push path — streams through byte- and count-bounded batches so peak memory
+ * follows the platform budget, not total vault size.
  *
  * Per batch:
  *   A. Read + hash (parallel reads; wasm_hash_batch for small unknown files per group)
@@ -227,26 +282,24 @@ export async function push(
     // Collected here; applied in ONE update_batch call after all content batches.
     const allTreeUpdates: { path: string; hash: string; mtime_ms: number; size: number }[] = [];
 
-    // Stream through non-deleted files in batches. A large (or size-unknown)
-    // file always gets a singleton batch: retaining up to 50 full PDFs/videos
-    // until phase C was the dominant old-iPad Jetsam failure mode.
-    for (let batchStart = 0; batchStart < nonDeleted.length;) {
+    // Stream through byte- and count-bounded batches. Large or size-unknown
+    // files are singletons, while small files may share one WASM hash call
+    // without allowing retained JS buffers to exceed the platform budget.
+    const tuning = getHashTuning();
+    const streamBatches = planByteBoundedBatches(nonDeleted, (change) => {
+        if (change.size === undefined || wasm.wasm_should_chunk(change.size)) {
+            return tuning.maxSingleBatchFileBytes + 1;
+        }
+        return change.size;
+    }, {
+        maxFiles: tuning.maxBatchFiles,
+        maxBytes: tuning.maxBatchBytes,
+        maxSingleBytes: tuning.maxSingleBatchFileBytes,
+        maxHoldMs: tuning.maxBatchHoldMs,
+    });
+    for (const batchChanges of streamBatches) {
         // Yield before each batch so Electron's audio/render callbacks can run.
         await yieldToUI();
-        let batchEnd = batchStart + 1;
-        const firstSize = nonDeleted[batchStart].size;
-        if (firstSize !== undefined && !wasm.wasm_should_chunk(firstSize)) {
-            while (
-                batchEnd < nonDeleted.length &&
-                batchEnd - batchStart < STREAM_BATCH &&
-                nonDeleted[batchEnd].size !== undefined &&
-                !wasm.wasm_should_chunk(nonDeleted[batchEnd].size!)
-            ) {
-                batchEnd++;
-            }
-        }
-        const batchChanges = nonDeleted.slice(batchStart, batchEnd);
-        batchStart = batchEnd;
 
         // ------------------------------------------------------------------
         // A. Hash resolution — parallel reads, wasm_hash_batch per group.
@@ -261,9 +314,10 @@ export async function push(
         //   for the whole sub-group — ONE WASM boundary crossing regardless of N.
         // ------------------------------------------------------------------
         const batchFiles: ObsetyncBatchFile[] = [];
+        const unknownSmallReads: ObsetyncRead[] = [];
 
-        for (let i = 0; i < batchChanges.length; i += READ_CONCURRENCY) {
-            const group = batchChanges.slice(i, i + READ_CONCURRENCY);
+        for (let i = 0; i < batchChanges.length; i += tuning.readConcurrency) {
+            const group = batchChanges.slice(i, i + tuning.readConcurrency);
 
             // Partition: known-hash small files skip reading.
             const skipRead: FileChange[] = [];
@@ -324,40 +378,15 @@ export async function push(
                 batchFiles.push(new ObsetyncBatchFile(change, data.length, change.mtime ?? Date.now()));
             }
 
-            const unknownSmall = smallReads.filter(r => !r.change.hash);
-            if (unknownSmall.length === 0) continue;
-
-            // Concatenate all unknown-hash small files → ONE WASM boundary crossing.
-            const totalBytes = unknownSmall.reduce((s, r) => s + r.data.length, 0);
-            perf?.observePeakBatchBytes(residentReadBytes + totalBytes);
-            const flat    = new Uint8Array(totalBytes);
-            const offsets = new Uint32Array(unknownSmall.length);
-            const sizes   = new Uint32Array(unknownSmall.length);
-            let off = 0;
-            for (let j = 0; j < unknownSmall.length; j++) {
-                flat.set(unknownSmall[j].data, off);
-                offsets[j] = off;
-                sizes[j]   = unknownSmall[j].data.length;
-                off       += unknownSmall[j].data.length;
-            }
-            const endHash = perf?.phase("hash");
-            let hashes: string[];
-            try {
-                hashes = wasm.wasm_hash_batch(flat, offsets, sizes);
-            } finally {
-                endHash?.();
-            }
-            // flat, offsets, sizes go out of scope → GC-eligible.
-
-            for (let j = 0; j < unknownSmall.length; j++) {
-                unknownSmall[j].change.hash = hashes[j];
-                batchFiles.push(new ObsetyncBatchFile(
-                    unknownSmall[j].change,
-                    unknownSmall[j].data.length,
-                    unknownSmall[j].change.mtime ?? Date.now(),
-                ));
-            }
+            unknownSmallReads.push(...smallReads.filter(r => !r.change.hash));
         }
+
+        // Read concurrency and WASM call size are independent budgets. Keep
+        // reads parallel, then hash the accumulated small-file payload in
+        // byte-bounded calls so neither bridge overhead nor retained memory
+        // grows with the number of files in this stream batch.
+        batchFiles.push(...hashUnknownSmallReads(wasm, unknownSmallReads, tuning, perf));
+        unknownSmallReads.length = 0;
 
         // ------------------------------------------------------------------
         // B. Two batch-check requests for this batch.
@@ -615,17 +644,45 @@ export async function push(
 /** Yield control back to the JS event loop so Obsidian stays responsive. */
 const yieldToUI = () => new Promise<void>(r => window.setTimeout(r, 0));
 
+const monotonicNow = (): number => globalThis.performance?.now?.() ?? Date.now();
+
+function memoryPressureDetected(): boolean {
+    const memory = (globalThis.performance as any)?.memory;
+    return Number.isFinite(memory?.usedJSHeapSize) &&
+        Number.isFinite(memory?.jsHeapSizeLimit) &&
+        memory.jsHeapSizeLimit > 0 &&
+        memory.usedJSHeapSize / memory.jsHeapSizeLimit >= 0.85;
+}
+
+function observeHashStep(bytes: number, startedAt: number): number {
+    const durationMs = Math.max(0, monotonicNow() - startedAt);
+    // A synchronous WASM call occupies the renderer for its full duration,
+    // so that duration is also a conservative event-loop-lag observation.
+    observeHashFeedback({
+        bytes,
+        durationMs,
+        eventLoopLagMs: durationMs,
+        memoryPressure: memoryPressureDetected(),
+    });
+    return durationMs;
+}
+
 /**
- * Hash file bytes via the streaming WASM Hasher — feeds data in 64 KB slices.
- * WASM linear memory grows to the largest single slice (64 KB), never the full
- * file size. Use this instead of wasm_hash() for anything > 64 KB.
+ * Hash file bytes via the streaming WASM Hasher. Feed size is selected for the
+ * active platform and adapts between 64 KiB and its platform cap. WASM linear
+ * memory therefore follows the feed budget, never the full file size.
  */
 export function streamingHash(wasm: WasmModule, data: Uint8Array): string {
-    const CHUNK = 65536;
     const hasher = new wasm.Hasher();
     try {
-        for (let off = 0; off < data.length; off += CHUNK) {
-            hasher.update(data.subarray(off, off + CHUNK));
+        let offset = 0;
+        while (offset < data.length) {
+            const feedBytes = getHashTuning().feedBytes;
+            const end = Math.min(data.length, offset + feedBytes);
+            const started = monotonicNow();
+            hasher.update(data.subarray(offset, end));
+            observeHashStep(end - offset, started);
+            offset = end;
         }
         return hasher.finalize();
     } finally {
@@ -637,13 +694,22 @@ export function streamingHash(wasm: WasmModule, data: Uint8Array): string {
  *  necessarily whole-file on Obsidian mobile, but WASM never receives a
  *  second whole-file copy and retains a bounded ~4 MiB window. */
 export async function chunkFileStreaming(wasm: WasmModule, data: Uint8Array): Promise<any> {
-    const FEED = 64 * 1024;
     const YIELD_EVERY = 4 * 1024 * 1024;
     const chunker = new wasm.WasmChunker();
     try {
-        for (let offset = 0; offset < data.length; offset += FEED) {
-            chunker.update(data.subarray(offset, offset + FEED));
-            if (offset > 0 && offset % YIELD_EVERY === 0) await yieldToUI();
+        let offset = 0;
+        let nextYield = YIELD_EVERY;
+        while (offset < data.length) {
+            const feedBytes = getHashTuning().feedBytes;
+            const end = Math.min(data.length, offset + feedBytes);
+            const started = monotonicNow();
+            chunker.update(data.subarray(offset, end));
+            observeHashStep(end - offset, started);
+            offset = end;
+            if (offset >= nextYield) {
+                await yieldToUI();
+                nextYield = offset + YIELD_EVERY;
+            }
         }
         return chunker.finish();
     } finally {
@@ -653,7 +719,8 @@ export async function chunkFileStreaming(wasm: WasmModule, data: Uint8Array): Pr
 
 /**
  * Stream-hash a file directly from disk using Node.js fs (Electron/desktop only).
- * Reads in 64 KB chunks — peak memory per file ≈ 64 KB regardless of file size.
+ * Uses the adaptive platform feed — peak read memory follows that bounded feed
+ * regardless of file size.
  * Falls back to readFile + streamingHash on mobile (no Node.js fs).
  *
  * This is the nproc-ready path: each Web Worker calls this independently,
@@ -671,38 +738,29 @@ export async function hashFileStreaming(
         const fs = (globalThis as any).require?.('fs') as typeof import('fs') | undefined;
         if (fs?.createReadStream) {
             const hasher = new wasm.Hasher();
-            const now = () => globalThis.performance?.now?.() ?? Date.now();
-            const started = perf ? now() : 0;
+            const started = perf ? monotonicNow() : 0;
             let hashMs = 0;
             try {
                 await new Promise<void>((resolve, reject) => {
-                    fs.createReadStream(absPath, { highWaterMark: 65536 })
+                    fs.createReadStream(absPath, { highWaterMark: getHashTuning().feedBytes })
                         .on('data', (chunk: Buffer | string) => {
                             const buf = chunk as Buffer;
-                            if (perf) {
-                                const hashStarted = now();
-                                hasher.update(new Uint8Array(
-                                    buf.buffer,
-                                    buf.byteOffset,
-                                    buf.byteLength,
-                                ));
-                                hashMs += Math.max(0, now() - hashStarted);
-                            } else {
-                                hasher.update(new Uint8Array(
-                                    buf.buffer,
-                                    buf.byteOffset,
-                                    buf.byteLength,
-                                ));
-                            }
+                            const hashStarted = monotonicNow();
+                            hasher.update(new Uint8Array(
+                                buf.buffer,
+                                buf.byteOffset,
+                                buf.byteLength,
+                            ));
+                            hashMs += observeHashStep(buf.byteLength, hashStarted);
                         })
                         .on('end', resolve)
                         .on('error', reject);
                 });
-                const finalizeStarted = perf ? now() : 0;
+                const finalizeStarted = perf ? monotonicNow() : 0;
                 const result = hasher.finalize();
                 if (perf) {
-                    hashMs += Math.max(0, now() - finalizeStarted);
-                    const totalMs = Math.max(0, now() - started);
+                    hashMs += Math.max(0, monotonicNow() - finalizeStarted);
+                    const totalMs = Math.max(0, monotonicNow() - started);
                     perf.addPhase("hash", hashMs * perfWeight);
                     perf.addPhase("read", Math.max(0, totalMs - hashMs) * perfWeight);
                 }
@@ -713,13 +771,12 @@ export async function hashFileStreaming(
         }
     }
     // Mobile / no-fs fallback.
-    const now = () => globalThis.performance?.now?.() ?? Date.now();
-    const readStarted = perf ? now() : 0;
+    const readStarted = perf ? monotonicNow() : 0;
     const data = await io.readFile(path);
-    if (perf) perf.addPhase("read", Math.max(0, now() - readStarted) * perfWeight);
-    const hashStarted = perf ? now() : 0;
+    if (perf) perf.addPhase("read", Math.max(0, monotonicNow() - readStarted) * perfWeight);
+    const hashStarted = perf ? monotonicNow() : 0;
     const result = streamingHash(wasm, data);
-    if (perf) perf.addPhase("hash", Math.max(0, now() - hashStarted) * perfWeight);
+    if (perf) perf.addPhase("hash", Math.max(0, monotonicNow() - hashStarted) * perfWeight);
     return result;
 }
 

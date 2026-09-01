@@ -16,3 +16,5 @@ import "./delta-validation.test";
 import "./push-transaction.test";
 import "./perf-trace.test";
 import "./reconcile-content.test";
+import "./wasm-runtime.test";
+import "./hash-runtime.test";

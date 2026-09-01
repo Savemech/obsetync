@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "runtime": {
+    "platform": "linux",
+    "architecture": "x64",
+    "node": "v22.23.2",
+    "cpu": "AMD Ryzen 9 5950X 16-Core Processor"
+  },
+  "workload": {
+    "deterministic_seed": "0x6d2b79f5",
+    "payload_bytes": 33554432,
+    "measured_iterations": 7,
+    "warmup_iterations_per_mode_and_feed": 1
+  },
+  "artifacts": {
+    "scalar_bytes": 303482,
+    "simd_bytes": 309990
+  },
+  "results": [
+    {
+      "mode": "scalar",
+      "feed_bytes": 65536,
+      "elapsed_ns": [59398872, 50429280, 49197310, 66756444, 63804992, 50885869, 39858838],
+      "median_ns": 50885869,
+      "median_mib_per_second": 628.8582789064682,
+      "hashes_match": true
+    },
+    {
+      "mode": "scalar",
+      "feed_bytes": 262144,
+      "elapsed_ns": [41404568, 53477879, 50474419, 65767732, 63051532, 42798008, 47078689],
+      "median_ns": 50474419,
+      "median_mib_per_second": 633.9845140168924,
+      "hashes_match": true
+    },
+    {
+      "mode": "scalar",
+      "feed_bytes": 524288,
+      "elapsed_ns": [52147285, 51215440, 55818281, 62483882, 55849940, 44165218, 59705111],
+      "median_ns": 55818281,
+      "median_mib_per_second": 573.2888836186123,
+      "hashes_match": true
+    },
+    {
+      "mode": "scalar",
+      "feed_bytes": 1048576,
+      "elapsed_ns": [64776587, 60006061, 49990339, 53513514, 55169986, 53574421, 48394639],
+      "median_ns": 53574421,
+      "median_mib_per_second": 597.2999689534676,
+      "hashes_match": true
+    },
+    {
+      "mode": "simd",
+      "feed_bytes": 65536,
+      "elapsed_ns": [22286774, 18076554, 22208583, 25677245, 27989551, 25292955, 24987625],
+      "median_ns": 24987625,
+      "median_mib_per_second": 1280.6339137873247,
+      "hashes_match": true
+    },
+    {
+      "mode": "simd",
+      "feed_bytes": 262144,
+      "elapsed_ns": [19091724, 23076474, 34397087, 29189505, 24246394, 28761726, 22729835],
+      "median_ns": 24246394,
+      "median_mib_per_second": 1319.783882089848,
+      "hashes_match": true
+    },
+    {
+      "mode": "simd",
+      "feed_bytes": 524288,
+      "elapsed_ns": [21562234, 27156216, 20732014, 29233301, 25619475, 23221193, 26482255],
+      "median_ns": 25619475,
+      "median_mib_per_second": 1249.049795126559,
+      "hashes_match": true
+    },
+    {
+      "mode": "simd",
+      "feed_bytes": 1048576,
+      "elapsed_ns": [26940845, 33864976, 25375826, 37892707, 27268335, 35399458, 29429345],
+      "median_ns": 29429345,
+      "median_mib_per_second": 1087.3500582496824,
+      "hashes_match": true
+    }
+  ],
+  "summary": {
+    "best_scalar_feed_bytes": 262144,
+    "best_simd_feed_bytes": 262144,
+    "best_simd_speedup": 2.0817288954390496,
+    "all_hashes_match": true
+  }
+}

@@ -113,6 +113,8 @@ ship-plugin: build-plugin
     cp dist/plugin/styles.css              "{{vault}}/"
     cp dist/plugin/sync_core.js            "{{vault}}/"
     cp dist/plugin/sync_core_bg.wasm       "{{vault}}/"
+    cp dist/plugin/sync_core_simd.js       "{{vault}}/"
+    cp dist/plugin/sync_core_simd_bg.wasm  "{{vault}}/"
 
 # Build the Nix docker image, transfer it to the remote host, load + restart.
 # Does NOT re-run `init` — the server's existing data dir + box keypair stay

@@ -22,6 +22,13 @@ the independent flat-state oracle. Across seven alternating-order iterations,
 median update time falls from 362.41 ms to 6.97 ms (52.03x by median time); the
 slowest observed speedup is 40.72x.
 
+`WASM-SIMD-feed-slice3.json` measures the two production WASM artifacts over a
+deterministic 32 MiB payload, with seven alternating-order iterations at 64,
+256, 512, and 1024 KiB feeds. Every digest matches. On this Ryzen 5950X host,
+the best SIMD median is 1,320 MiB/s versus 634 MiB/s scalar (2.08x). The parity
+gate separately checks one-shot/batched BLAKE3 plus streaming BLAKE3 and
+FastCDC manifests at five feed sizes over boundary-focused and 10 MiB inputs.
+
 This Linux/x86_64 run is implementation evidence, not the final cross-hardware
 release report. A17, M1, Snapdragon, cold/warm cache, power, and network fields
 are added by the final hardware gate.

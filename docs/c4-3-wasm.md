@@ -83,10 +83,13 @@ The same `sync-core` source compiles to two different targets that are used in t
 
 | Target | Built by | Used by | ChunkStore | Exposed APIs |
 |--------|----------|---------|-----------|--------------|
-| `wasm32-unknown-unknown` (WASM feature) | `wasm-pack build --target web` | ObsetyNC Plugin (base64-inlined in main.js) | `MemoryChunkStore` | All `#[wasm_bindgen]` exports in `wasm.rs` |
+| `wasm32-unknown-unknown` scalar (`wasm`) | `scripts/build-wasm.sh` / `wasm-pack --target web` | Universal ObsetyNC Plugin fallback (base64-inlined in main.js) | `MemoryChunkStore` | All `#[wasm_bindgen]` exports in `wasm.rs` |
+| `wasm32-unknown-unknown` SIMD (`wasm-simd`, `+simd128`, `blake3/wasm32_simd`) | `scripts/build-wasm.sh` / `wasm-pack --target web` | Fast path after runtime `WebAssembly.validate`; falls back to scalar if validation or initialization fails | `MemoryChunkStore` | Identical API and byte-for-byte hash/FastCDC semantics |
 | Native (`x86_64-linux` or similar) | `cargo build --release` | Sync Server (linked into binary) | `DiskChunkStore` | Direct Rust function calls via `bridge.rs` |
 
-The WASM build exposes: `WasmTree`, `Hasher`, `WasmChunker`, `wasm_hash`, `wasm_hash_batch`, the compatibility one-shot chunk helpers, `wasm_root_hash_from_bytes`, `wasm_should_chunk`, and tree-chunk accessors.
+Both WASM builds expose: `WasmTree`, `Hasher`, `WasmChunker`, `wasm_hash`, `wasm_hash_batch`, the compatibility one-shot chunk helpers, `wasm_root_hash_from_bytes`, `wasm_should_chunk`, and tree-chunk accessors. The selected mode is cached for the plugin session and included in debug/performance diagnostics.
+
+Streaming calls use an adaptive bounded feed: 512 KiB initially on desktop (up to 1 MiB), 256 KiB on mobile, and back down toward 64 KiB when a synchronous WASM step blocks the event loop or Chromium reports heap pressure. Feed size changes never alter hashes or FastCDC boundaries.
 
 The native build exposes (to `bridge.rs`): `sync_core::diff::compute_deltas`, `sync_core::merge::merge_trees`, `sync_core::store::DiskChunkStore`.
 

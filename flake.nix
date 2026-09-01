@@ -76,8 +76,8 @@
         });
 
         # ------------------------------------------------------------------
-        # WASM module — compile to wasm32, then run wasm-bindgen to emit
-        # the JS glue + optimized .wasm.
+        # WASM modules — compile a universal scalar fallback and a SIMD fast
+        # path, then run wasm-bindgen/wasm-opt over both artifacts.
         # ------------------------------------------------------------------
         sync-core-wasm-raw = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
@@ -86,6 +86,19 @@
           doCheck = false;
 
           # cargo won't put the .wasm anywhere pretty — grab it by hand.
+          installPhaseCommand = ''
+            mkdir -p $out/lib
+            cp target/wasm32-unknown-unknown/release/sync_core.wasm $out/lib/
+          '';
+        });
+
+        sync-core-wasm-simd-raw = craneLib.buildPackage (commonArgs // {
+          inherit cargoArtifacts;
+          pname = "sync-core-wasm-simd";
+          cargoExtraArgs = "--locked -p sync-core --target wasm32-unknown-unknown --features wasm-simd --no-default-features";
+          RUSTFLAGS = "-C target-feature=+simd128";
+          doCheck = false;
+
           installPhaseCommand = ''
             mkdir -p $out/lib
             cp target/wasm32-unknown-unknown/release/sync_core.wasm $out/lib/
@@ -109,7 +122,14 @@
             wasm-bindgen \
               --target web \
               --out-dir bindings \
+              --out-name sync_core \
               lib/sync_core.wasm
+
+            wasm-bindgen \
+              --target web \
+              --out-dir bindings \
+              --out-name sync_core_simd \
+              ${sync-core-wasm-simd-raw}/lib/sync_core.wasm
 
             # Optimize with wasm-opt (same feature flags as the Docker path).
             wasm-opt -O \
@@ -121,6 +141,17 @@
               bindings/sync_core_bg.wasm \
               -o bindings/sync_core_bg.wasm.opt
             mv bindings/sync_core_bg.wasm.opt bindings/sync_core_bg.wasm
+
+            wasm-opt -O \
+              --enable-bulk-memory \
+              --enable-nontrapping-float-to-int \
+              --enable-sign-ext \
+              --enable-mutable-globals \
+              --enable-reference-types \
+              --enable-simd \
+              bindings/sync_core_simd_bg.wasm \
+              -o bindings/sync_core_simd_bg.wasm.opt
+            mv bindings/sync_core_simd_bg.wasm.opt bindings/sync_core_simd_bg.wasm
 
             runHook postBuild
           '';
@@ -158,7 +189,12 @@
             runHook preInstall
             mkdir -p $out
             cp main.js manifest.json $out/
-            cp wasm/sync_core.js wasm/sync_core_bg.wasm $out/
+            cp \
+              wasm/sync_core.js \
+              wasm/sync_core_bg.wasm \
+              wasm/sync_core_simd.js \
+              wasm/sync_core_simd_bg.wasm \
+              $out/
             runHook postInstall
           '';
 
