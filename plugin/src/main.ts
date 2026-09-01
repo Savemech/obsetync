@@ -1,4 +1,4 @@
-import { Plugin, Notice } from "obsidian";
+import { Plugin, Notice, Platform } from "obsidian";
 import { createPlatformIO, PlatformIO } from "./platform";
 import { ObsetyncApi } from "./api";
 import { ObsetyncSyncBase } from "./sync-base";
@@ -10,6 +10,10 @@ import { debugLog, crashLog, perfSpan } from "./debug-log";
 import { OperationCheckpoint } from "./operation-checkpoint";
 import type { WasmModule, WasmTree } from "./push";
 import { migrateLegacyDefaultIgnorePatterns } from "./ignore";
+import {
+    normalizePerfArchitecture,
+    perfTrace,
+} from "./perf-trace";
 
 // Static import of the wasm-bindgen --target web glue. esbuild inlines this
 // ES module into main.js at build time — no runtime `new Function(...)` or
@@ -44,6 +48,25 @@ export default class ObsetyncPlugin extends Plugin {
     private statusBarEl: HTMLElement | null = null;
 
     async onload(): Promise<void> {
+        const runtime = Platform.isMobile ? "mobile" : "desktop";
+        const detectedArchitecture = normalizePerfArchitecture(
+            Platform.isMobile
+                ? "arm64"
+                : (globalThis as any).process?.arch ??
+                    (globalThis.navigator as any)?.userAgentData?.architecture,
+        );
+        perfTrace.setProfile({
+            runtime,
+            architecture: detectedArchitecture,
+            wasmMode: "scalar",
+            hashConcurrency: 1,
+            readConcurrency: 4,
+            networkConcurrency: 8,
+            feedBytes: 65_536,
+            batchBytes: 0,
+            diffPageBytes: 0,
+        });
+
         // Capture every subsequent `[obsetync] …` console line into a ring
         // buffer so the "Show debug info" panel can surface them later,
         // especially on iOS where there's no easy way to see console output.
@@ -165,6 +188,10 @@ export default class ObsetyncPlugin extends Plugin {
         push(`WASM:              ${this.wasm ? "loaded" : "not loaded"}`);
         push(`Plugin id:         ${this.manifest.id}`);
         push(`Plugin version:    ${this.manifest.version}`);
+        push("");
+
+        push("--- Performance (aggregate, path-free) ---");
+        for (const line of perfTrace.formatDebug()) push(line);
         push("");
 
         push("--- Previous interruption ---");

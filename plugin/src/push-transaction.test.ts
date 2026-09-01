@@ -3,6 +3,7 @@ import {
     isReenrollmentRequiredError,
     reenrollmentRequired,
 } from "./transport-errors";
+import { PerfTrace } from "./perf-trace";
 
 (globalThis as any).window ??= globalThis;
 
@@ -130,6 +131,8 @@ async function failedRootRestoresCandidate(): Promise<void> {
 
 async function acceptedRootCommitsMetadata(): Promise<void> {
     const f = fixture();
+    const trace = new PerfTrace({ monitorEventLoop: false });
+    const operation = trace.begin("push");
     let baseWasIntactAtRequest = false;
     const api = {
         ensureTransportReady: async () => {},
@@ -141,13 +144,20 @@ async function acceptedRootCommitsMetadata(): Promise<void> {
 
     await push(api, f.io, f.syncBase, f.wasm, f.tree, "vault", [
         { action: "deleted", path: "gone.md" },
-    ], "base");
+    ], "base", undefined, operation);
+    operation.finish();
 
     check(baseWasIntactAtRequest, "sync-base committed before root acceptance");
     check(!f.entries.has("gone.md"), "accepted root did not commit sync-base deletion");
     check(f.treePaths().join(",") === "keep.md", "accepted candidate tree was rolled back");
     check(f.rebuildCalls() === 0, "accepted root unexpectedly rebuilt the tree");
     check(f.saves() === 1, "accepted root did not save sync-base exactly once");
+    const record = trace.recent()[0];
+    check(record.filesTotal === 1, "push trace lost total path count");
+    check(record.bytesTotal === 0, "push trace counted deletion bytes");
+    check(record.filesCompleted === 1, "push trace lost completed deletion");
+    check(record.phases.tree_update !== undefined, "push trace missed tree update");
+    check(record.phases.root_commit !== undefined, "push trace missed root commit");
 }
 
 async function failedRootDoesNotCommitUpsert(): Promise<void> {

@@ -38,6 +38,16 @@ import {
 } from "./scan-planner";
 import { isSafeVaultPath } from "./delta-validation";
 import { isReenrollmentRequiredError } from "./transport-errors";
+import {
+    perfSampleWeight,
+    perfTrace,
+    type PerfOperation,
+    type PerfOutcome,
+} from "./perf-trace";
+import {
+    buildReconcileContentIndex,
+    sumIndexedContentBytes,
+} from "./reconcile-content";
 
 export type SyncState = "idle" | "pulling" | "pushing" | "scanning" | "error";
 
@@ -485,6 +495,8 @@ export class ObsetyncSyncEngine {
             return { smallUploaded: 0, largeUploaded: 0, treeChunksUploaded: 0, bytes: 0 };
         }
         this.syncing = true;
+        const perf = perfTrace.begin("reconcile");
+        let perfOutcome: PerfOutcome = "success";
         const endSpan = perfSpan("sync.reconcile");
         const operationId = await this.operationCheckpoint?.begin(
             "reconcile",
@@ -494,15 +506,25 @@ export class ObsetyncSyncEngine {
             return await this._reconcileInner((message) => {
                 progress(message);
                 if (operationId) this.operationCheckpoint?.progress(operationId, message);
-            });
+            }, perf);
+        } catch (error) {
+            perfOutcome = this.stopped ? "cancelled" : "error";
+            throw error;
         } finally {
-            if (operationId) await this.operationCheckpoint?.complete(operationId);
-            endSpan();
-            this.syncing = false;
+            try {
+                if (operationId) await this.operationCheckpoint?.complete(operationId);
+            } finally {
+                perf.finish(perfOutcome);
+                endSpan();
+                this.syncing = false;
+            }
         }
     }
 
-    private async _reconcileInner(progress: (msg: string) => void): Promise<{
+    private async _reconcileInner(
+        progress: (msg: string) => void,
+        perf?: PerfOperation,
+    ): Promise<{
         smallUploaded: number;
         largeUploaded: number;
         treeChunksUploaded: number;
@@ -511,6 +533,7 @@ export class ObsetyncSyncEngine {
         // Populate the WASM tree from sync-base so wasm_tree_chunk_hashes
         // reflects the actual index-chunk set the server should have. Same
         // bootstrap push.ts does on first call.
+        const endEnumerate = perf?.phase("enumerate");
         if (!this.tree.root_hash_hex()) {
             const paths = this.syncBase.allPaths();
             if (paths.length > 0) {
@@ -528,31 +551,36 @@ export class ObsetyncSyncEngine {
         }
 
         // --- Partition sync-base: small files (whole blobs) vs large (manifests+chunks).
-        const smallHashToPath = new Map<string, string>(); // first path wins
-        const largeHashToPath = new Map<string, string>();
-        for (const path of this.syncBase.allPaths()) {
-            const entry = this.syncBase.getEntry(path)!;
-            if (entry.size >= LARGE_FILE_THRESHOLD) {
-                if (!largeHashToPath.has(entry.hash)) largeHashToPath.set(entry.hash, path);
-            } else {
-                if (!smallHashToPath.has(entry.hash)) smallHashToPath.set(entry.hash, path);
-            }
-        }
+        const contentIndex = buildReconcileContentIndex(
+            this.syncBase.allPaths().map((path) => {
+                const entry = this.syncBase.getEntry(path)!;
+                return { path, hash: entry.hash, size: entry.size };
+            }),
+            LARGE_FILE_THRESHOLD,
+        );
+        const { smallByHash, largeByHash } = contentIndex;
+        perf?.setWorkload({
+            filesTotal: contentIndex.filesTotal,
+            bytesTotal: contentIndex.bytesTotal,
+        });
+        endEnumerate?.();
 
         const CHECK_BATCH = 1000;
 
         // --- Step 1: which tree chunks (index) is the server missing?
         const treeHashes = this.wasm.wasm_tree_chunk_hashes(this.tree);
+        perf?.setWasmChunks({ reachable: treeHashes.length });
+        const endCheck = perf?.phase("check");
         const missingTreeChunks = treeHashes.length > 0
-            ? await this.api.checkChunks(treeHashes)
+            ? await this.api.checkChunks(treeHashes, perf)
             : [];
 
         // --- Step 2: which small-file contents is the server missing?
-        const smallHashes = [...smallHashToPath.keys()];
+        const smallHashes = [...smallByHash.keys()];
         const missingSmall: string[] = [];
         for (let i = 0; i < smallHashes.length; i += CHECK_BATCH) {
             const batch = smallHashes.slice(i, i + CHECK_BATCH);
-            const missing = await this.api.checkContent(batch);
+            const missing = await this.api.checkContent(batch, perf);
             missingSmall.push(...missing);
             progress(`reconcile: checked ${Math.min(i + CHECK_BATCH, smallHashes.length)}/${smallHashes.length}`);
         }
@@ -564,16 +592,20 @@ export class ObsetyncSyncEngine {
         // meant minutes of pointless disk reads and CPU — the "continuously
         // reuploading large files" symptom. The new bulk check lets us skip
         // straight past large files whose manifest is already on the server.
-        const largeHashes = [...largeHashToPath.keys()];
+        const largeHashes = [...largeByHash.keys()];
         const missingLargeManifests: string[] = [];
         for (let i = 0; i < largeHashes.length; i += CHECK_BATCH) {
             const batch = largeHashes.slice(i, i + CHECK_BATCH);
-            const missing = await this.api.checkManifests(batch);
+            const missing = await this.api.checkManifests(batch, perf);
             missingLargeManifests.push(...missing);
         }
+        endCheck?.();
 
         const totalMissing =
             missingTreeChunks.length + missingSmall.length + missingLargeManifests.length;
+        perf?.setWorkload({
+            filesNeeded: missingSmall.length + missingLargeManifests.length,
+        });
 
         console.log(
             `[obsetync] reconcile plan: ` +
@@ -583,6 +615,7 @@ export class ObsetyncSyncEngine {
         );
 
         if (totalMissing === 0) {
+            perf?.setWorkload({ bytesNeeded: 0 });
             progress("reconcile: server in parity");
             return { smallUploaded: 0, largeUploaded: 0, treeChunksUploaded: 0, bytes: 0 };
         }
@@ -600,39 +633,57 @@ export class ObsetyncSyncEngine {
         let largeUploaded = 0;
         let treeChunksUploaded = 0;
         let bytes = 0;
+        let contentBytesNeeded = sumIndexedContentBytes(missingSmall, smallByHash);
 
         // --- Step 3: upload missing tree (index) chunks.
+        const endTreeUpload = perf?.phase("tree_index_upload");
         for (const hash of missingTreeChunks) {
             const chunkBytes = this.wasm.wasm_tree_get_chunk(this.tree, hash);
             if (chunkBytes) {
-                await this.api.putChunk(hash, chunkBytes);
+                await this.api.putChunk(hash, chunkBytes, perf);
                 treeChunksUploaded++;
                 bytes += chunkBytes.length;
+                perf?.increment({ bytesTransferred: chunkBytes.length });
             }
         }
+        endTreeUpload?.();
 
         // --- Step 4: upload missing small-file content. Concurrent within
         // bounded batches to keep peak memory sane.
         const UPLOAD_CONCURRENCY = 4;
         for (let i = 0; i < missingSmall.length; i += UPLOAD_CONCURRENCY) {
             const batch = missingSmall.slice(i, i + UPLOAD_CONCURRENCY);
-            await Promise.all(batch.map(async hash => {
-                const path = smallHashToPath.get(hash);
-                if (!path) return;
+            const uploadedBytes = await Promise.all(batch.map(async hash => {
+                const source = smallByHash.get(hash);
+                if (!source) return 0;
+                const { path } = source;
                 try {
+                    const endRead = perf?.phase("read");
                     const data = await this.io.readFile(path);
+                    endRead?.();
                     // If content drifted since sync-base recorded it, skip — the next
                     // scan cycle will detect the change via hash mismatch and push
                     // the new version. Don't upload bytes under the WRONG hash.
+                    const endHash = perf?.phase("hash");
                     const actual = streamingHash(this.wasm, data);
-                    if (actual !== hash) return;
-                    await this.api.putContent(hash, data);
+                    endHash?.();
+                    if (actual !== hash) return 0;
+                    const endUpload = perf?.phase("upload");
+                    await this.api.putContent(hash, data, perf);
+                    endUpload?.();
                     smallUploaded++;
                     bytes += data.length;
+                    perf?.increment({
+                        filesCompleted: 1,
+                        bytesTransferred: data.length,
+                    });
+                    return data.length;
                 } catch (e) {
                     console.warn(`[obsetync] reconcile skipped ${path}:`, e);
+                    return 0;
                 }
             }));
+            perf?.observePeakBatchBytes(uploadedBytes.reduce((sum, n) => sum + n, 0));
             const done = Math.min(i + UPLOAD_CONCURRENCY, missingSmall.length);
             const msg = `reconcile: ${done}/${missingSmall.length} files · ${formatBytes(bytes)}`;
             progress(msg);
@@ -646,33 +697,58 @@ export class ObsetyncSyncEngine {
         // re-chunk + upload only the missing ones.
         let largeIdx = 0;
         for (const hash of missingLargeManifests) {
-            const path = largeHashToPath.get(hash);
-            if (!path) continue;
+            const source = largeByHash.get(hash);
+            if (!source) continue;
+            const { path } = source;
             largeIdx++;
             progress(`reconcile: large file ${largeIdx}/${missingLargeManifests.length}`);
             notice?.setMessage(`Re-uploading large file ${largeIdx}/${missingLargeManifests.length}`);
             try {
+                const endRead = perf?.phase("read");
                 const data = await this.io.readFile(path);
+                endRead?.();
+                perf?.observePeakBatchBytes(data.length);
+                const endChunk = perf?.phase("fastcdc");
                 const info = await chunkFileStreaming(this.wasm, data);
+                endChunk?.();
                 if (info.file_hash !== hash) continue; // drifted — scan will pick up
                 const chunkHashes = (info.chunks as any[]).map(c => c.hash);
+                const endChunkCheck = perf?.phase("check");
                 const missingChunks = chunkHashes.length > 0
-                    ? await this.api.checkContentChunks(chunkHashes)
+                    ? await this.api.checkContentChunks(chunkHashes, perf)
                     : [];
+                endChunkCheck?.();
                 const missingSet = new Set(missingChunks);
+                const accountedChunks = new Set<string>();
+                for (const chunk of info.chunks as any[]) {
+                    if (missingSet.has(chunk.hash) && !accountedChunks.has(chunk.hash)) {
+                        accountedChunks.add(chunk.hash);
+                        contentBytesNeeded += chunk.size;
+                    }
+                }
+                let fileBytesUploaded = 0;
                 for (const c of info.chunks as any[]) {
                     if (missingSet.has(c.hash)) {
                         const chunkData = data.subarray(c.offset, c.offset + c.size);
-                        await this.api.putContentChunk(c.hash, chunkData);
+                        const endUpload = perf?.phase("upload");
+                        await this.api.putContentChunk(c.hash, chunkData, perf);
+                        endUpload?.();
                         bytes += chunkData.length;
+                        fileBytesUploaded += chunkData.length;
                     }
                 }
+                const endManifestUpload = perf?.phase("upload");
                 await this.api.putManifest(hash, {
                     file_hash: hash,
                     total_size: info.total_size,
                     chunks: info.chunks,
-                });
+                }, perf);
+                endManifestUpload?.();
                 largeUploaded++;
+                perf?.increment({
+                    filesCompleted: 1,
+                    bytesTransferred: fileBytesUploaded,
+                });
             } catch (e) {
                 console.warn(`[obsetync] reconcile skipped large ${path}:`, e);
             }
@@ -685,6 +761,10 @@ export class ObsetyncSyncEngine {
             `${treeChunksUploaded} tree chunks, ${formatBytes(bytes)}`;
         console.log(`[obsetync] ${summary}`);
         progress(summary);
+
+        // Deduplication is a content metric. Merkle index chunks and manifests
+        // are transport overhead and intentionally stay out of bytesNeeded.
+        perf?.setWorkload({ bytesNeeded: contentBytesNeeded });
 
         return { smallUploaded, largeUploaded, treeChunksUploaded, bytes };
     }
@@ -713,6 +793,8 @@ export class ObsetyncSyncEngine {
         this.syncing = true;
         this.state = "scanning";
         this.onStatusUpdate("sync ⟳");
+        const perf = perfTrace.begin("scan");
+        let perfOutcome: PerfOutcome = "success";
         const notice = new Notice("Scanning vault...", 0);
         console.log("[obsetync] full scan started");
         const endSpan = perfSpan("scan.full");
@@ -723,6 +805,7 @@ export class ObsetyncSyncEngine {
         let scanFailed = false;
 
         try {
+            const endTree = perf.phase("tree_update");
             const entries = this.syncBase.allPaths().map((p) => {
                 const e = this.syncBase.getEntry(p)!;
                 return {
@@ -733,6 +816,7 @@ export class ObsetyncSyncEngine {
                 };
             });
             this.tree.build_from_entries(JSON.stringify(entries));
+            endTree();
             if (this.pushBlocked) {
                 console.log("[obsetync] full scan rebuilt the tree — push unblocked");
                 this.pushBlocked = false;
@@ -740,23 +824,41 @@ export class ObsetyncSyncEngine {
 
             // statBulk() reads all file stats from Obsidian's in-memory cache —
             // no async IPC calls, O(n) in-memory map construction.
+            const endStat = perf.phase("stat");
             const statMap = this.io.statBulk();
             // Optionally include .obsidian/ — vault.getFiles() hides it by design.
             if (this.syncObsidianConfig) {
                 const obsidianFiles = await this.io.listObsidianConfig();
                 for (const [p, s] of obsidianFiles) statMap.set(p, s);
             }
+            endStat();
             console.log(`[obsetync] full scan: ${statMap.size} files total`);
 
             // Phase 1: fast mtime+size filter (synchronous, no I/O).
+            const endEnumerate = perf.phase("enumerate");
             const toHash: Array<{ path: string; stat: { mtime: number; size: number } }> = [];
+            let visibleFiles = 0;
+            let visibleBytes = 0;
             for (const [path, stat] of statMap) {
                 if (this.isExcluded(path)) continue;
+                visibleFiles++;
+                visibleBytes += stat.size;
                 const base = this.syncBase.getEntry(path);
                 if (base && stat.mtime === base.mtime && stat.size === base.size) continue;
                 toHash.push({ path, stat });
             }
+            endEnumerate();
+            perf.setWorkload({ filesTotal: visibleFiles, bytesTotal: visibleBytes });
             console.log(`[obsetync] full scan: ${toHash.length} files need hashing`);
+            const hashableTotal = toHash.reduce(
+                (count, item) => count + (item.stat.size < LARGE_FILE_THRESHOLD ? 1 : 0),
+                0,
+            );
+            let hashOrdinal = 0;
+            const hashSampleWeights = toHash.map((item) => {
+                if (item.stat.size >= LARGE_FILE_THRESHOLD) return 0;
+                return perfSampleWeight(hashOrdinal++, hashableTotal);
+            });
 
             // Phase 2: read + hash in streaming batches. Only compact path
             // records accumulate; file bytes are released after each group.
@@ -774,6 +876,7 @@ export class ObsetyncSyncEngine {
             const FLUSH_BATCH = 500;
             let pending: FileChange[] = [];
             let totalChanges = 0;
+            let changedBytes = 0;
 
             const flushPending = async () => {
                 if (pending.length === 0) return;
@@ -783,15 +886,29 @@ export class ObsetyncSyncEngine {
 
             for (let i = 0; i < toHash.length; i += READ_CONCURRENCY) {
                 const batch = toHash.slice(i, i + READ_CONCURRENCY);
+                perf.observePeakBatchBytes(batch.reduce((sum, item) => {
+                    const residentBytes = this.io.getAbsolutePath(item.path)
+                        ? Math.min(item.stat.size, 65_536)
+                        : item.stat.size;
+                    return sum + residentBytes;
+                }, 0));
                 const results = await Promise.all(
-                    batch.map(async ({ path, stat }) => {
+                    batch.map(async ({ path, stat }, batchIndex) => {
                         const base = this.syncBase.getEntry(path);
                         if (stat.size >= LARGE_FILE_THRESHOLD) {
                             // Skip WASM hash — push.ts will hash during upload.
                             // We know it changed because it passed the mtime+size filter.
                             return { path, stat, hash: undefined as string | undefined, base };
                         }
-                        const hash = await hashFileStreaming(path, this.io, this.wasm);
+                        const itemIndex = i + batchIndex;
+                        const sampleWeight = hashSampleWeights[itemIndex];
+                        const hash = await hashFileStreaming(
+                            path,
+                            this.io,
+                            this.wasm,
+                            sampleWeight > 0 ? perf : undefined,
+                            sampleWeight,
+                        );
                         if (base && hash === base.hash) return null; // unchanged
                         return { path, stat, hash, base };
                     })
@@ -808,6 +925,7 @@ export class ObsetyncSyncEngine {
                     if (r.hash !== undefined) change.hash = r.hash;
                     pending.push(change);
                     totalChanges++;
+                    changedBytes += r.stat.size;
                 }
 
                 // Let Electron's audio/render callbacks run between every read group.
@@ -836,17 +954,27 @@ export class ObsetyncSyncEngine {
             await flushPending();
 
             // Phase 3: deletions — files in sync-base that no longer exist.
+            let deletedCount = 0;
             for (const path of this.syncBase.allPaths()) {
                 if (!statMap.has(path) && !this.isExcluded(path)) {
                     pending.push({ action: "deleted", path });
                     totalChanges++;
+                    deletedCount++;
                 }
             }
             await flushPending();
 
+            perf.setWorkload({
+                filesTotal: visibleFiles + deletedCount,
+                filesNeeded: totalChanges,
+                bytesNeeded: changedBytes,
+            });
+            perf.increment({ filesCompleted: visibleFiles + deletedCount });
+
             console.log(`[obsetync] full scan complete: ${totalChanges} changes`);
         } catch (error: any) {
             scanFailed = true;
+            perfOutcome = this.stopped ? "cancelled" : "error";
             if (bulkReviewWasRequired) this.bulkChangeReviewRequired = true;
             this.lastError = {
                 ts: Date.now(),
@@ -856,12 +984,16 @@ export class ObsetyncSyncEngine {
             console.error("[obsetync] full scan failed:", error);
             throw error;
         } finally {
-            if (operationId) await this.operationCheckpoint?.complete(operationId);
-            endSpan();
-            notice.hide();
-            this.syncing = false;
-            this.state = scanFailed ? "error" : "idle";
-            this.onStatusUpdate(scanFailed ? "sync ✗" : "sync ✓");
+            try {
+                if (operationId) await this.operationCheckpoint?.complete(operationId);
+            } finally {
+                perf.finish(perfOutcome);
+                endSpan();
+                notice.hide();
+                this.syncing = false;
+                this.state = scanFailed ? "error" : "idle";
+                this.onStatusUpdate(scanFailed ? "sync ✗" : "sync ✓");
+            }
         }
 
         // Publish once the scan has released exclusive ownership. push()
@@ -876,6 +1008,8 @@ export class ObsetyncSyncEngine {
         this.syncing = true;
         this.state = "pulling";
         this.onStatusUpdate("sync ↓");
+        const perf = perfTrace.begin("pull");
+        let perfOutcome: PerfOutcome = "success";
         const endSpan = perfSpan("sync.pull");
         const operationId = await this.operationCheckpoint?.begin(
             "pull",
@@ -926,6 +1060,7 @@ export class ObsetyncSyncEngine {
                 this.unsyncedLocalPaths(),
                 // Slice 2: never fetch ignored paths; untrack them if purged.
                 (p) => this.isExcluded(p),
+                perf,
             );
             if (result.newRootHash) {
                 this.localRootHash = result.newRootHash;
@@ -934,13 +1069,18 @@ export class ObsetyncSyncEngine {
             await this.adoptPullResult(result);
         } catch (e: any) {
             pullFailed = true;
+            perfOutcome = this.stopped ? "cancelled" : "error";
             console.error("[obsetync] pull error:", e);
             if (!this.stopped) this.recordSyncFailure("pull", e);
         } finally {
-            if (operationId) await this.operationCheckpoint?.complete(operationId);
-            endSpan();
-            noticeRef.n?.hide();
-            this.syncing = false;
+            try {
+                if (operationId) await this.operationCheckpoint?.complete(operationId);
+            } finally {
+                perf.finish(perfOutcome);
+                endSpan();
+                noticeRef.n?.hide();
+                this.syncing = false;
+            }
             if (!pullFailed && !this.stopped) {
                 this.state = "idle";
                 this.onStatusUpdate(
@@ -1231,6 +1371,8 @@ export class ObsetyncSyncEngine {
 
         this.syncing = true;
         this.state = "pushing";
+        const perf = perfTrace.begin("push");
+        let perfOutcome: PerfOutcome = "success";
         const endSpan = perfSpan("sync.push");
 
         // Atomically detach one coalesced snapshot. Files are materialized
@@ -1246,12 +1388,15 @@ export class ObsetyncSyncEngine {
 
         try {
             // Do this before materializing a potentially vault-sized queue.
-            await this.api.ensureTransportReady();
+            await this.api.ensureTransportReady(perf);
+            const endMaterialize = perf.phase("stat");
             const batch = sortByPriority(
                 await this.materializeDirtyChanges(queued),
                 this.syncPriority,
             );
+            endMaterialize();
             if (this.stopped) {
+                perfOutcome = "cancelled";
                 this.pendingChanges.restore(queued);
                 return;
             }
@@ -1300,7 +1445,8 @@ export class ObsetyncSyncEngine {
                     this.onStatusUpdate(text);
                     notice?.setMessage(text);
                     if (operationId) this.operationCheckpoint?.progress(operationId, text);
-                }
+                },
+                perf,
             );
             if (result.newRootHash) {
                 this.localRootHash = result.newRootHash;
@@ -1336,6 +1482,7 @@ export class ObsetyncSyncEngine {
             );
         } catch (e: any) {
             pushFailed = true;
+            perfOutcome = this.stopped ? "cancelled" : "error";
             console.error("[obsetync] push error:", e);
             this.pendingChanges.restore(queued);
             if (!this.stopped) {
@@ -1345,10 +1492,14 @@ export class ObsetyncSyncEngine {
                 );
             }
         } finally {
-            if (operationId) await this.operationCheckpoint?.complete(operationId);
-            endSpan();
-            notice?.hide();
-            this.syncing = false;
+            try {
+                if (operationId) await this.operationCheckpoint?.complete(operationId);
+            } finally {
+                perf.finish(perfOutcome);
+                endSpan();
+                notice?.hide();
+                this.syncing = false;
+            }
             if (!pushFailed && !this.stopped) {
                 this.state = "idle";
                 this.onStatusUpdate(
@@ -1500,81 +1651,159 @@ export class ObsetyncSyncEngine {
             return;
         }
 
-        // Filter candidates from in-memory cache — no async stat calls.
-        const allStats = this.io.statBulk();
-        if (this.syncObsidianConfig) {
-            const obsidianFiles = await this.io.listObsidianConfig();
-            for (const [p, s] of obsidianFiles) allStats.set(p, s);
-        }
-        const plan = planMetadataScan(
-            allStats,
-            this.syncBase.allPaths(),
-            (path) => this.syncBase.getEntry(path),
-            (path) => this.isExcluded(path),
-        );
-        if (metadataScanNeedsReview(plan, this.syncBase.entryCount())) {
-            const total = plan.toHash.length + plan.deleted.length;
-            console.warn(
-                `[obsetync] metadata scan found ${plan.toHash.length} ` +
-                `files need hashing and ${plan.deleted.length} look deleted ` +
-                `(${total} total changes)`,
-            );
-            this.requireBulkChangeReview("metadata scan", total, plan.deleted.length);
-            return;
-        }
-        const toHash = plan.toHash;
-        for (const path of plan.deleted) {
-            this.pendingChanges.add({ action: "deleted", path });
-        }
-
-        if (toHash.length === 0) {
-            if (plan.deleted.length > 0) await this.pushPending();
-            return;
-        }
-
-        const READ_CONCURRENCY = 4;
-        const notice =
-            toHash.length >= 20
-                ? new Notice(`Obsetync: checking ${toHash.length} recently-touched files…`, 0)
-                : null;
-        let found = plan.deleted.length;
-        for (let i = 0; i < toHash.length; i += READ_CONCURRENCY) {
-            const batch = toHash.slice(i, i + READ_CONCURRENCY);
-            const results = await Promise.all(
-                batch.map(async ({ path, stat }) => {
-                    const knownHash = this.syncBase.getHash(path);
-                    if (stat.size >= LARGE_FILE_THRESHOLD) {
-                        return { path, stat, hash: undefined as string | undefined, knownHash };
-                    }
-                    const hash = await hashFileStreaming(path, this.io, this.wasm);
-                    if (hash === knownHash) return null;
-                    return { path, stat, hash, knownHash };
-                })
-            );
-            for (const r of results) {
-                if (!r) continue;
-                found++;
-                const change: FileChange = {
-                    action: r.knownHash ? "modified" : "created",
-                    path: r.path,
-                    mtime: r.stat.mtime,
-                    size: r.stat.size,
-                };
-                if (r.hash !== undefined) change.hash = r.hash;
-                this.pendingChanges.add(change);
+        const perf = perfTrace.begin("scan");
+        let perfOutcome: PerfOutcome = "success";
+        let shouldPush = false;
+        try {
+            // Filter candidates from in-memory cache — no async stat calls.
+            const endStat = perf.phase("stat");
+            const allStats = this.io.statBulk();
+            if (this.syncObsidianConfig) {
+                const obsidianFiles = await this.io.listObsidianConfig();
+                for (const [p, s] of obsidianFiles) allStats.set(p, s);
             }
-            await yieldToUI();
-            const done = Math.min(i + READ_CONCURRENCY, toHash.length);
-            this.onStatusUpdate(`⟳ scan ${done}/${toHash.length}`);
-            notice?.setMessage(`Obsetync: metadata scan ${done}/${toHash.length} · ${found} changed`);
-            this.progressHeartbeat("mtimeScan", `${done}/${toHash.length}, ${found} changed`);
-        }
-        notice?.hide();
+            endStat();
 
-        if (found > 0) {
-            console.log(`[obsetync] metadata scan found ${found} unsynced changes`);
-            await this.pushPending();
+            let visibleFiles = 0;
+            let visibleBytes = 0;
+            for (const [path, stat] of allStats) {
+                if (this.isExcluded(path)) continue;
+                visibleFiles++;
+                visibleBytes += stat.size;
+            }
+
+            const endEnumerate = perf.phase("enumerate");
+            const plan = planMetadataScan(
+                allStats,
+                this.syncBase.allPaths(),
+                (path) => this.syncBase.getEntry(path),
+                (path) => this.isExcluded(path),
+            );
+            endEnumerate();
+            perf.setWorkload({ filesTotal: visibleFiles, bytesTotal: visibleBytes });
+
+            if (metadataScanNeedsReview(plan, this.syncBase.entryCount())) {
+                const total = plan.toHash.length + plan.deleted.length;
+                perf.setWorkload({
+                    filesTotal: visibleFiles + plan.deleted.length,
+                    filesNeeded: total,
+                    bytesNeeded: plan.toHash.reduce((sum, item) => sum + item.stat.size, 0),
+                });
+                perf.increment({ filesCompleted: visibleFiles + plan.deleted.length });
+                console.warn(
+                    `[obsetync] metadata scan found ${plan.toHash.length} ` +
+                    `files need hashing and ${plan.deleted.length} look deleted ` +
+                    `(${total} total changes)`,
+                );
+                this.requireBulkChangeReview("metadata scan", total, plan.deleted.length);
+                return;
+            }
+
+            for (const path of plan.deleted) {
+                this.pendingChanges.add({ action: "deleted", path });
+            }
+
+            let found = plan.deleted.length;
+            let changedBytes = 0;
+            if (plan.toHash.length > 0) {
+                const readConcurrency = 4;
+                const hashableTotal = plan.toHash.reduce(
+                    (count, item) =>
+                        count + (item.stat.size < LARGE_FILE_THRESHOLD ? 1 : 0),
+                    0,
+                );
+                let hashOrdinal = 0;
+                const hashSampleWeights = plan.toHash.map((item) => {
+                    if (item.stat.size >= LARGE_FILE_THRESHOLD) return 0;
+                    return perfSampleWeight(hashOrdinal++, hashableTotal);
+                });
+                const notice = plan.toHash.length >= 20
+                    ? new Notice(
+                        `Obsetync: checking ${plan.toHash.length} recently-touched files…`,
+                        0,
+                    )
+                    : null;
+                try {
+                    for (let i = 0; i < plan.toHash.length; i += readConcurrency) {
+                        const batch = plan.toHash.slice(i, i + readConcurrency);
+                        perf.observePeakBatchBytes(batch.reduce((sum, item) => {
+                            const residentBytes = this.io.getAbsolutePath(item.path)
+                                ? Math.min(item.stat.size, 65_536)
+                                : item.stat.size;
+                            return sum + residentBytes;
+                        }, 0));
+                        const results = await Promise.all(
+                            batch.map(async ({ path, stat }, batchIndex) => {
+                                const knownHash = this.syncBase.getHash(path);
+                                if (stat.size >= LARGE_FILE_THRESHOLD) {
+                                    return {
+                                        path,
+                                        stat,
+                                        hash: undefined as string | undefined,
+                                        knownHash,
+                                    };
+                                }
+                                const itemIndex = i + batchIndex;
+                                const sampleWeight = hashSampleWeights[itemIndex];
+                                const hash = await hashFileStreaming(
+                                    path,
+                                    this.io,
+                                    this.wasm,
+                                    sampleWeight > 0 ? perf : undefined,
+                                    sampleWeight,
+                                );
+                                if (hash === knownHash) return null;
+                                return { path, stat, hash, knownHash };
+                            }),
+                        );
+                        for (const result of results) {
+                            if (!result) continue;
+                            found++;
+                            changedBytes += result.stat.size;
+                            const change: FileChange = {
+                                action: result.knownHash ? "modified" : "created",
+                                path: result.path,
+                                mtime: result.stat.mtime,
+                                size: result.stat.size,
+                            };
+                            if (result.hash !== undefined) change.hash = result.hash;
+                            this.pendingChanges.add(change);
+                        }
+                        await yieldToUI();
+                        const done = Math.min(i + readConcurrency, plan.toHash.length);
+                        this.onStatusUpdate(`⟳ scan ${done}/${plan.toHash.length}`);
+                        notice?.setMessage(
+                            `Obsetync: metadata scan ${done}/${plan.toHash.length} ` +
+                            `· ${found} changed`,
+                        );
+                        this.progressHeartbeat(
+                            "mtimeScan",
+                            `${done}/${plan.toHash.length}, ${found} changed`,
+                        );
+                    }
+                } finally {
+                    notice?.hide();
+                }
+            }
+
+            perf.setWorkload({
+                filesTotal: visibleFiles + plan.deleted.length,
+                filesNeeded: found,
+                bytesNeeded: changedBytes,
+            });
+            perf.increment({ filesCompleted: visibleFiles + plan.deleted.length });
+            shouldPush = found > 0;
+            if (shouldPush) {
+                console.log(`[obsetync] metadata scan found ${found} unsynced changes`);
+            }
+        } catch (error) {
+            perfOutcome = this.stopped ? "cancelled" : "error";
+            throw error;
+        } finally {
+            perf.finish(perfOutcome);
         }
+
+        if (shouldPush) await this.pushPending();
     }
 
     /** Layer 1: attach live vault event listeners.

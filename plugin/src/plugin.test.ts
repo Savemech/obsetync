@@ -14,3 +14,5 @@ import "./secure.test";
 import "./scan-planner.test";
 import "./delta-validation.test";
 import "./push-transaction.test";
+import "./perf-trace.test";
+import "./reconcile-content.test";

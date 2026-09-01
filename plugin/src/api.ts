@@ -12,6 +12,7 @@ import {
     isReenrollmentRequiredError,
     reenrollmentRequired,
 } from "./transport-errors";
+import type { PerfOperation } from "./perf-trace";
 
 export interface FileDelta {
     action: "added" | "modified" | "deleted" | "renamed";
@@ -165,7 +166,7 @@ export class ObsetyncApi {
 
     /** Lazily establish the ObsetyncSecureChannel. Called before the first encrypted
      *  request; subsequent requests reuse the same shared secret. */
-    private async getChannel(): Promise<ObsetyncSecureChannel> {
+    private async getChannel(perf?: PerfOperation): Promise<ObsetyncSecureChannel> {
         if (this.channel && !this.channel.isStale()) return this.channel;
         if (this.channelPromise) return this.channelPromise;
         if (this.refreshPromise) await this.refreshPromise;
@@ -185,7 +186,7 @@ export class ObsetyncApi {
                 );
             }
             if (!state.esPub || Date.now() / 1000 >= state.esPubValidUntil - 3600) {
-                await this.refreshServerEphemeral();
+                await this.refreshServerEphemeral(perf);
                 state = persistence.get();
             }
             this.channel = await ObsetyncSecureChannel.create(
@@ -208,24 +209,24 @@ export class ObsetyncApi {
      * its candidate tree. This intentionally allocates no sequence and sends
      * no vault request; the first real request still authenticates normally.
      */
-    async ensureTransportReady(): Promise<void> {
-        await this.getChannel();
+    async ensureTransportReady(perf?: PerfOperation): Promise<void> {
+        await this.getChannel(perf);
     }
 
     // --- Root ---
 
-    async getRoot(vaultId: string): Promise<Uint8Array | null> {
+    async getRoot(vaultId: string, perf?: PerfOperation): Promise<Uint8Array | null> {
         const path = `/api/v1/root/${vaultId}`;
-        const res = await this.sealed("GET", path, new Uint8Array());
+        const res = await this.sealed("GET", path, new Uint8Array(), perf);
         if (res.status === 404) return null;
         if (!res.ok) throw new Error(`getRoot failed: ${res.status}`);
         return new Uint8Array(await res.arrayBuffer());
     }
 
     /** Recent root history for the rollback UI, newest first. */
-    async getHistory(vaultId: string): Promise<HistoryEntry[]> {
+    async getHistory(vaultId: string, perf?: PerfOperation): Promise<HistoryEntry[]> {
         const path = `/api/v1/history/${vaultId}`;
-        const res = await this.sealed("GET", path, new Uint8Array());
+        const res = await this.sealed("GET", path, new Uint8Array(), perf);
         if (!res.ok) throw new Error(`getHistory failed: ${res.status}`);
         const body = await res.json();
         return (body?.roots ?? []) as HistoryEntry[];
@@ -235,9 +236,18 @@ export class ObsetyncApi {
      *  The server validates the hash exists; devices converge on their next
      *  pull. Deliberately bypasses the stale-tree guard server-side — this
      *  is the explicit, human-initiated revert. */
-    async rollbackVault(vaultId: string, rootHash: string): Promise<void> {
+    async rollbackVault(
+        vaultId: string,
+        rootHash: string,
+        perf?: PerfOperation,
+    ): Promise<void> {
         const path = `/api/v1/rollback/${vaultId}`;
-        const res = await this.sealed("POST", path, new TextEncoder().encode(rootHash));
+        const res = await this.sealed(
+            "POST",
+            path,
+            new TextEncoder().encode(rootHash),
+            perf,
+        );
         if (!res.ok) throw new Error(`rollback failed: ${res.status}`);
     }
 
@@ -245,6 +255,7 @@ export class ObsetyncApi {
         vaultId: string,
         rootBytes: Uint8Array,
         parentHash: string,
+        perf?: PerfOperation,
     ): Promise<PushResult> {
         const path = `/api/v1/root/${vaultId}`;
         // Parent-root used to go as a header. With encryption the header would
@@ -254,18 +265,22 @@ export class ObsetyncApi {
         const body = new Uint8Array(header.length + rootBytes.length);
         body.set(header, 0);
         body.set(rootBytes, header.length);
-        const res = await this.sealed("PUT", path, body);
+        const res = await this.sealed("PUT", path, body, perf);
         if (!res.ok) throw new Error(`putRoot failed: ${res.status}`);
         return res.json();
     }
 
     // --- Diff ---
 
-    async getDiff(vaultId: string, deviceRootHash: string): Promise<FileDelta[] | null> {
+    async getDiff(
+        vaultId: string,
+        deviceRootHash: string,
+        perf?: PerfOperation,
+    ): Promise<FileDelta[] | null> {
         const path = `/api/v1/diff/${vaultId}`;
         // Same trick — device-root prepended to body instead of a header.
         const body = new TextEncoder().encode(deviceRootHash.padEnd(64, " "));
-        const res = await this.sealed("POST", path, body);
+        const res = await this.sealed("POST", path, body, perf);
         if (res.status === 304) return null;
         // 404 = vault has no root on the server yet (fresh server, first
         // push hasn't landed). Treat as "nothing to pull" and let the push
@@ -277,81 +292,99 @@ export class ObsetyncApi {
 
     // --- Index chunks ---
 
-    async getChunk(hash: string): Promise<Uint8Array> {
-        const res = await this.sealed("GET", `/api/v1/chunk/${hash}`, new Uint8Array());
+    async getChunk(hash: string, perf?: PerfOperation): Promise<Uint8Array> {
+        const res = await this.sealed("GET", `/api/v1/chunk/${hash}`, new Uint8Array(), perf);
         if (!res.ok) throw new Error(`getChunk ${hash}: ${res.status}`);
         return new Uint8Array(await res.arrayBuffer());
     }
 
-    async putChunk(hash: string, data: Uint8Array): Promise<void> {
-        const res = await this.sealed("PUT", `/api/v1/chunk/${hash}`, data);
+    async putChunk(hash: string, data: Uint8Array, perf?: PerfOperation): Promise<void> {
+        const res = await this.sealed("PUT", `/api/v1/chunk/${hash}`, data, perf);
         if (!res.ok) throw new Error(`putChunk ${hash}: ${res.status}`);
     }
 
-    async checkChunks(hashes: string[]): Promise<string[]> {
+    async checkChunks(hashes: string[], perf?: PerfOperation): Promise<string[]> {
         const body = new TextEncoder().encode(JSON.stringify(hashes));
-        const res = await this.sealed("POST", "/api/v1/chunks/check", body);
+        const res = await this.sealed("POST", "/api/v1/chunks/check", body, perf);
         if (!res.ok) throw new Error(`checkChunks: ${res.status}`);
         return (await res.json()).needed;
     }
 
     // --- Content (small files) ---
 
-    async getContent(hash: string): Promise<Uint8Array> {
-        const res = await this.sealed("GET", `/api/v1/content/${hash}`, new Uint8Array());
+    async getContent(hash: string, perf?: PerfOperation): Promise<Uint8Array> {
+        const res = await this.sealed("GET", `/api/v1/content/${hash}`, new Uint8Array(), perf);
         if (!res.ok) throw new Error(`getContent ${hash}: ${res.status}`);
         return new Uint8Array(await res.arrayBuffer());
     }
 
-    async putContent(hash: string, data: Uint8Array): Promise<void> {
-        const res = await this.sealed("PUT", `/api/v1/content/${hash}`, data);
+    async putContent(hash: string, data: Uint8Array, perf?: PerfOperation): Promise<void> {
+        const res = await this.sealed("PUT", `/api/v1/content/${hash}`, data, perf);
         if (!res.ok) throw new Error(`putContent ${hash}: ${res.status}`);
     }
 
-    async checkContent(hashes: string[]): Promise<string[]> {
+    async checkContent(hashes: string[], perf?: PerfOperation): Promise<string[]> {
         const body = new TextEncoder().encode(JSON.stringify(hashes));
-        const res = await this.sealed("POST", "/api/v1/content/check", body);
+        const res = await this.sealed("POST", "/api/v1/content/check", body, perf);
         if (!res.ok) throw new Error(`checkContent: ${res.status}`);
         return (await res.json()).needed;
     }
 
     // --- Content manifests (large files) ---
 
-    async getManifest(hash: string): Promise<FileManifest> {
-        const res = await this.sealed("GET", `/api/v1/content/manifest/${hash}`, new Uint8Array());
+    async getManifest(hash: string, perf?: PerfOperation): Promise<FileManifest> {
+        const res = await this.sealed(
+            "GET",
+            `/api/v1/content/manifest/${hash}`,
+            new Uint8Array(),
+            perf,
+        );
         if (!res.ok) throw new Error(`getManifest ${hash}: ${res.status}`);
         return res.json();
     }
 
-    async putManifest(hash: string, manifest: FileManifest): Promise<void> {
+    async putManifest(
+        hash: string,
+        manifest: FileManifest,
+        perf?: PerfOperation,
+    ): Promise<void> {
         const body = new TextEncoder().encode(JSON.stringify(manifest));
-        const res = await this.sealed("PUT", `/api/v1/content/manifest/${hash}`, body);
+        const res = await this.sealed("PUT", `/api/v1/content/manifest/${hash}`, body, perf);
         if (!res.ok) throw new Error(`putManifest ${hash}: ${res.status}`);
     }
 
-    async checkManifests(hashes: string[]): Promise<string[]> {
+    async checkManifests(hashes: string[], perf?: PerfOperation): Promise<string[]> {
         const body = new TextEncoder().encode(JSON.stringify(hashes));
-        const res = await this.sealed("POST", "/api/v1/content/manifests/check", body);
+        const res = await this.sealed("POST", "/api/v1/content/manifests/check", body, perf);
         if (!res.ok) throw new Error(`checkManifests: ${res.status}`);
         return (await res.json()).needed;
     }
 
     // --- Content sub-file chunks ---
 
-    async getContentChunk(hash: string): Promise<Uint8Array> {
-        const res = await this.sealed("GET", `/api/v1/content/chunk/${hash}`, new Uint8Array());
+    async getContentChunk(hash: string, perf?: PerfOperation): Promise<Uint8Array> {
+        const res = await this.sealed(
+            "GET",
+            `/api/v1/content/chunk/${hash}`,
+            new Uint8Array(),
+            perf,
+        );
         if (!res.ok) throw new Error(`getContentChunk ${hash}: ${res.status}`);
         return new Uint8Array(await res.arrayBuffer());
     }
 
-    async putContentChunk(hash: string, data: Uint8Array): Promise<void> {
-        const res = await this.sealed("PUT", `/api/v1/content/chunk/${hash}`, data);
+    async putContentChunk(
+        hash: string,
+        data: Uint8Array,
+        perf?: PerfOperation,
+    ): Promise<void> {
+        const res = await this.sealed("PUT", `/api/v1/content/chunk/${hash}`, data, perf);
         if (!res.ok) throw new Error(`putContentChunk ${hash}: ${res.status}`);
     }
 
-    async checkContentChunks(hashes: string[]): Promise<string[]> {
+    async checkContentChunks(hashes: string[], perf?: PerfOperation): Promise<string[]> {
         const body = new TextEncoder().encode(JSON.stringify(hashes));
-        const res = await this.sealed("POST", "/api/v1/content/chunks/check", body);
+        const res = await this.sealed("POST", "/api/v1/content/chunks/check", body, perf);
         if (!res.ok) throw new Error(`checkContentChunks: ${res.status}`);
         return (await res.json()).needed;
     }
@@ -407,22 +440,35 @@ export class ObsetyncApi {
      * server still routes correctly, but HTTP-level always POST avoids
      * issues with iOS's requestUrl not sending a body on GET.
      */
-    private async sealed(method: string, path: string, body: Uint8Array): Promise<FetchLike> {
+    private async sealed(
+        method: string,
+        path: string,
+        body: Uint8Array,
+        perf?: PerfOperation,
+    ): Promise<FetchLike> {
         let refreshed = false;
         let replayRecovered = false;
         for (;;) {
-            const channel = await this.getChannel();
+            const channel = await this.getChannel(perf);
             const sequence = await this.nextSequence();
             let response: FetchLike;
             try {
-                response = await this.sendEncrypted(channel, method, path, body, sequence);
+                response = await this.sendEncrypted(
+                    channel,
+                    method,
+                    path,
+                    body,
+                    sequence,
+                    perf,
+                );
             } catch (error) {
                 if (error instanceof ObsetyncSessionStaleError) {
                     if (!refreshed) {
                         refreshed = true;
                         if (this.channel === channel || this.channel === null) {
                             this.channel = null;
-                            await this.refreshServerEphemeral();
+                            perf?.increment({ retries: 1 });
+                            await this.refreshServerEphemeral(perf);
                         }
                         continue;
                     }
@@ -441,6 +487,7 @@ export class ObsetyncApi {
                 const error = await response.json().catch(() => null);
                 if (error?.error === "replay" && Number.isSafeInteger(error.last_seen_seq)) {
                     replayRecovered = true;
+                    perf?.increment({ retries: 1 });
                     await this.recoverSequence(error.last_seen_seq);
                     continue;
                 }
@@ -460,8 +507,20 @@ export class ObsetyncApi {
         path: string,
         body: Uint8Array,
         sequence: number,
+        perf?: PerfOperation,
     ): Promise<FetchLike> {
-        const wireBody = await channel.encryptRequest(method, path, body, sequence);
+        const endEncrypt = perf?.phase("encrypt");
+        let wireBody: Uint8Array;
+        try {
+            wireBody = await channel.encryptRequest(method, path, body, sequence);
+        } finally {
+            endEncrypt?.();
+        }
+        perf?.increment({
+            plaintextBytesSent: body.length,
+            wireBytesSent: wireBody.length,
+            requestCount: 1,
+        });
         const nonceReq = extractRequestNonce(wireBody);
         const params: RequestUrlParam = {
             url: `${this.serverUrl}${path}`,
@@ -473,7 +532,14 @@ export class ObsetyncApi {
             body: exactArrayBuffer(wireBody),
             throw: false,
         };
-        const wireResponse = await requestUrl(params);
+        const endNetwork = perf?.phase("network");
+        let wireResponse: Awaited<ReturnType<typeof requestUrl>>;
+        try {
+            wireResponse = await requestUrl(params);
+        } finally {
+            endNetwork?.();
+        }
+        perf?.increment({ wireBytesReceived: wireResponse.arrayBuffer.byteLength });
         if (wireResponse.status !== 200) {
             // Reverse proxies can still emit their own plaintext failures;
             // the application server itself always responds with wire 200.
@@ -485,13 +551,20 @@ export class ObsetyncApi {
             };
         }
 
-        const opened = await channel.decryptResponse(
-            method,
-            path,
-            nonceReq,
-            new Uint8Array(wireResponse.arrayBuffer),
-        );
+        const endDecrypt = perf?.phase("decrypt");
+        let opened: Awaited<ReturnType<ObsetyncSecureChannel["decryptResponse"]>>;
+        try {
+            opened = await channel.decryptResponse(
+                method,
+                path,
+                nonceReq,
+                new Uint8Array(wireResponse.arrayBuffer),
+            );
+        } finally {
+            endDecrypt?.();
+        }
         const plaintext = opened.body;
+        perf?.increment({ plaintextBytesReceived: plaintext.length });
         return {
             status: opened.status,
             ok: opened.status >= 200 && opened.status < 300,
@@ -503,9 +576,9 @@ export class ObsetyncApi {
         };
     }
 
-    private async refreshServerEphemeral(): Promise<void> {
+    private async refreshServerEphemeral(perf?: PerfOperation): Promise<void> {
         if (this.refreshPromise) return this.refreshPromise;
-        this.refreshPromise = this.refreshServerEphemeralOnce();
+        this.refreshPromise = this.refreshServerEphemeralOnce(perf);
         try {
             await this.refreshPromise;
         } finally {
@@ -513,7 +586,7 @@ export class ObsetyncApi {
         }
     }
 
-    private async refreshServerEphemeralOnce(): Promise<void> {
+    private async refreshServerEphemeralOnce(perf?: PerfOperation): Promise<void> {
         const persistence = this.requireTransportPersistence();
         const bootstrap = await ObsetyncSecureChannel.createBootstrap(
             this.serverBoxPubBase64,
@@ -526,6 +599,7 @@ export class ObsetyncApi {
                 "/api/v1/server-eph",
                 new Uint8Array(),
                 0,
+                perf,
             );
         } catch (error) {
             if (error instanceof ObsetyncSecureTransportError) {

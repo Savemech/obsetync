@@ -1,5 +1,6 @@
 import { pull } from "./pull";
 import type { FileDelta } from "./api";
+import { PerfTrace } from "./perf-trace";
 
 const check = (condition: unknown, message: string) => {
     if (!condition) throw new Error(message);
@@ -327,6 +328,8 @@ async function untrackedLocalCollisionIsPreservedBeforePullWrite(): Promise<void
 async function unchangedBaseIsReplacedWithoutConflictCopy(): Promise<void> {
     let moves = 0;
     let writes = 0;
+    const trace = new PerfTrace({ monitorEventLoop: false });
+    const operation = trace.begin("pull");
     const api = {
         getDiff: async () => [{
             action: "modified",
@@ -372,9 +375,30 @@ async function unchangedBaseIsReplacedWithoutConflictCopy(): Promise<void> {
         Hasher,
     } as any;
 
-    await pull(api, io, syncBase, "vault", "base-root", wasm, tree);
+    await pull(
+        api,
+        io,
+        syncBase,
+        "vault",
+        "base-root",
+        wasm,
+        tree,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        operation,
+    );
+    operation.finish();
     check(moves === 0, "unchanged sync base was preserved as a false conflict");
     check(writes === 1, "remote modification did not replace the unchanged base");
+    const record = trace.recent()[0];
+    check(record.filesTotal === 1, "pull trace lost delta count");
+    check(record.bytesTotal === 4, "pull trace lost delta bytes");
+    check(record.filesCompleted === 1, "pull trace lost applied file count");
+    check(record.bytesTransferred === 4, "pull trace lost downloaded bytes");
+    check(record.phases.download !== undefined, "pull trace missed download phase");
+    check(record.phases.apply !== undefined, "pull trace missed apply phase");
 }
 
 async function offlineEditSurvivesRemoteDelete(): Promise<void> {
@@ -468,7 +492,7 @@ void locallyEditedDeltaKeepsHonestBase()
     .then(unchangedBaseIsReplacedWithoutConflictCopy)
     .then(offlineEditSurvivesRemoteDelete)
     .then(unchangedBaseAllowsRemoteDelete)
-    .then(() => console.log("pull.test: 35 assertions passed"))
+    .then(() => console.log("pull.test: 41 assertions passed"))
     .catch((error) => {
         console.error(error);
         process.exitCode = 1;

@@ -4,6 +4,7 @@ import { ObsetyncSyncBase } from "./sync-base";
 import { hashFileStreaming, type WasmModule, type WasmTree } from "./push";
 import type { PullWriteExpectation } from "./pull-echo";
 import { conflictCopyPath } from "./conflict-path";
+import type { PerfOperation } from "./perf-trace";
 
 const CHUNK_THRESHOLD = 1_048_576; // 1MB
 const DOWNLOAD_CONCURRENCY = 6;
@@ -83,6 +84,7 @@ export async function pull(
      *  + tree) WITHOUT deleting disk, so a server-side purge of ignored paths
      *  converges the fleet while every device keeps its local copy. */
     isIgnored?: (path: string) => boolean,
+    perf?: PerfOperation,
 ): Promise<PullResult> {
     // --- First-time client: bulk-seed from the server ------------------
     //
@@ -92,17 +94,27 @@ export async function pull(
     // as our local root. Subsequent syncs hit the normal incremental path.
     if (!localRootHash) {
         onProgress?.("first sync: downloading all files from server...");
-        const deltas = await api.getDiff(vaultId, ZERO_ROOT);
+        const endCheck = perf?.phase("check");
+        let deltas: FileDelta[] | null;
+        try {
+            deltas = await api.getDiff(vaultId, ZERO_ROOT, perf);
+        } finally {
+            endCheck?.();
+        }
+        setDeltaWorkload(perf, deltas ?? []);
         if (!deltas || deltas.length === 0) {
+            perf?.setWorkload({ filesNeeded: 0, bytesNeeded: 0 });
             // An existing server can legitimately have a committed empty
             // root. Fetch and reproduce it instead of treating [] as "no
             // server": otherwise the first later local edit would push with
             // an empty parent and be rejected because a current root exists.
+            const endTree = perf?.phase("tree_update");
             const deltasHadMtime = rebaseTree(tree, syncBase, []);
+            endTree?.();
             let newRootHash: string | null = null;
             let newRootBytes: Uint8Array | null = null;
             try {
-                newRootBytes = await api.getRoot(vaultId);
+                newRootBytes = await api.getRoot(vaultId, perf);
                 if (newRootBytes && wasm) {
                     newRootHash = wasm.wasm_root_hash_from_bytes(newRootBytes) ?? null;
                 }
@@ -110,7 +122,12 @@ export async function pull(
                 console.warn("[obsetync] empty first-sync root fetch failed:", e);
             }
             syncBase.setLastSyncTimestamp(Date.now());
-            await syncBase.save();
+            const endCheckpoint = perf?.phase("checkpoint");
+            try {
+                await syncBase.save();
+            } finally {
+                endCheckpoint?.();
+            }
             onProgress?.("first sync: applied 0 files");
             return {
                 newRootHash,
@@ -131,23 +148,41 @@ export async function pull(
                 `untracked ${ignoredDeletes.length} ignored deletion(s)`,
             );
         }
-        const { deferred, downloaded, localDeferredCount } = await applyDeltas(
-            api,
-            io,
-            syncBase,
-            wasm,
-            kept,
-            onProgress,
-            skipPaths,
-            onWritesKnown,
-        );
+        const endApply = perf?.phase("apply");
+        let applyResult: Awaited<ReturnType<typeof applyDeltas>>;
+        try {
+            applyResult = await applyDeltas(
+                api,
+                io,
+                syncBase,
+                wasm,
+                kept,
+                onProgress,
+                skipPaths,
+                onWritesKnown,
+                perf,
+            );
+        } finally {
+            endApply?.();
+        }
+        const { deferred, downloaded, localDeferredCount, bytesDownloaded } = applyResult;
+        perf?.setWorkload({
+            filesNeeded: downloaded,
+            bytesNeeded: bytesDownloaded,
+        });
+        perf?.increment({
+            filesCompleted: kept.length - deferred.length,
+            bytesTransferred: bytesDownloaded,
+        });
 
         // Rebase: sync-base was just seeded with the full server state, so a
         // fresh bootstrap from it materializes the server's tree locally.
         // Deferred files never got a sync-base entry, so the bootstrap already
         // excludes them; filter the delta list too for the incremental branch.
         const appliedDeltas = excludeDeltas(kept, deferred).concat(ignoredDeletes);
+        const endTree = perf?.phase("tree_update");
         const deltasHadMtime = rebaseTree(tree, syncBase, appliedDeltas);
+        endTree?.();
 
         // Establish newRootHash + raw root bytes from the server's current
         // root. Caller persists the bytes to cached-root.bin so restart
@@ -155,7 +190,7 @@ export async function pull(
         let newRootHash: string | null = null;
         let newRootBytes: Uint8Array | null = null;
         try {
-            newRootBytes = await api.getRoot(vaultId);
+            newRootBytes = await api.getRoot(vaultId, perf);
             if (newRootBytes && wasm) {
                 newRootHash = wasm.wasm_root_hash_from_bytes(newRootBytes) ?? null;
             }
@@ -164,7 +199,12 @@ export async function pull(
         }
 
         syncBase.setLastSyncTimestamp(Date.now());
-        await syncBase.save();
+        const endCheckpoint = perf?.phase("checkpoint");
+        try {
+            await syncBase.save();
+        } finally {
+            endCheckpoint?.();
+        }
         onProgress?.(`first sync: applied ${kept.length - deferred.length} files`);
         return {
             newRootHash,
@@ -179,9 +219,17 @@ export async function pull(
     }
 
     onProgress?.("checking for remote changes...");
-    const deltas = await api.getDiff(vaultId, localRootHash);
+    const endCheck = perf?.phase("check");
+    let deltas: FileDelta[] | null;
+    try {
+        deltas = await api.getDiff(vaultId, localRootHash, perf);
+    } finally {
+        endCheck?.();
+    }
+    setDeltaWorkload(perf, deltas ?? []);
 
     if (!deltas || deltas.length === 0) {
+        perf?.setWorkload({ filesNeeded: 0, bytesNeeded: 0 });
         // Empty delta list can mean one of two things:
         //
         //   (a) Same root on both sides — the encrypted semantic status is
@@ -196,12 +244,17 @@ export async function pull(
         // (An earlier version advanced unconditionally here; combined with
         // the tree-less pull path it let sync state outrun reality.)
         syncBase.setLastSyncTimestamp(Date.now());
-        await syncBase.save();
+        const endCheckpoint = perf?.phase("checkpoint");
+        try {
+            await syncBase.save();
+        } finally {
+            endCheckpoint?.();
+        }
 
         let newRootHash: string | null = localRootHash;
         let newRootBytes: Uint8Array | null = null;
         try {
-            newRootBytes = await api.getRoot(vaultId);
+            newRootBytes = await api.getRoot(vaultId, perf);
             if (newRootBytes && wasm) {
                 newRootHash = wasm.wasm_root_hash_from_bytes(newRootBytes) ?? localRootHash;
             }
@@ -232,16 +285,32 @@ export async function pull(
             `untracked ${ignoredDeletes.length} ignored deletion(s)`,
         );
     }
-    const { deferred, downloaded, localDeferredCount } = await applyDeltas(
-        api,
-        io,
-        syncBase,
-        wasm,
-        kept,
-        onProgress,
-        skipPaths,
-        onWritesKnown,
-    );
+    const endApply = perf?.phase("apply");
+    let applyResult: Awaited<ReturnType<typeof applyDeltas>>;
+    try {
+        applyResult = await applyDeltas(
+            api,
+            io,
+            syncBase,
+            wasm,
+            kept,
+            onProgress,
+            skipPaths,
+            onWritesKnown,
+            perf,
+        );
+    } finally {
+        endApply?.();
+    }
+    const { deferred, downloaded, localDeferredCount, bytesDownloaded } = applyResult;
+    perf?.setWorkload({
+        filesNeeded: downloaded,
+        bytesNeeded: bytesDownloaded,
+    });
+    perf?.increment({
+        filesCompleted: kept.length - deferred.length,
+        bytesTransferred: bytesDownloaded,
+    });
 
     // Rebase the Merkle tree with the exact deltas just applied to disk +
     // sync-base. THE key invariant of the pull path: tree, sync-base, and
@@ -250,14 +319,16 @@ export async function pull(
     // Ignored deletions ARE included: they drop the leaf so the tree converges
     // with a server that purged them.
     const appliedDeltas = excludeDeltas(kept, deferred).concat(ignoredDeletes);
+    const endTree = perf?.phase("tree_update");
     const deltasHadMtime = rebaseTree(tree, syncBase, appliedDeltas);
+    endTree?.();
 
     // Extract the new root hash from the server's current root bytes so
     // subsequent incremental syncs know what to diff against.
     let newRootHash: string | null = localRootHash;
     let newRootBytes: Uint8Array | null = null;
     try {
-        newRootBytes = await api.getRoot(vaultId);
+        newRootBytes = await api.getRoot(vaultId, perf);
         if (newRootBytes && wasm) {
             newRootHash = wasm.wasm_root_hash_from_bytes(newRootBytes) ?? localRootHash;
         }
@@ -266,7 +337,12 @@ export async function pull(
     }
 
     syncBase.setLastSyncTimestamp(Date.now());
-    await syncBase.save();
+    const endCheckpoint = perf?.phase("checkpoint");
+    try {
+        await syncBase.save();
+    } finally {
+        endCheckpoint?.();
+    }
 
     return {
         newRootHash,
@@ -278,6 +354,30 @@ export async function pull(
         localDeferredCount,
         downloaded,
     };
+}
+
+function setDeltaWorkload(perf: PerfOperation | undefined, deltas: FileDelta[]): void {
+    perf?.setWorkload({
+        filesTotal: deltas.length,
+        bytesTotal: deltas.reduce(
+            (sum, delta) => sum + (delta.action === "deleted" ? 0 : delta.size ?? 0),
+            0,
+        ),
+    });
+}
+
+async function tracedHashFile(
+    path: string,
+    io: PlatformIO,
+    wasm: WasmModule,
+    perf?: PerfOperation,
+): Promise<string> {
+    const endHash = perf?.phase("hash");
+    try {
+        return await hashFileStreaming(path, io, wasm);
+    } finally {
+        endHash?.();
+    }
 }
 
 /** Drop the deferred (unfetched) deltas from a set before rebasing the tree,
@@ -456,7 +556,13 @@ async function applyDeltas(
     onProgress?: (msg: string) => void,
     skipPaths?: PullPathGuard,
     onWritesKnown?: (writes: PullWriteExpectation[]) => void,
-): Promise<{ deferred: FileDelta[]; downloaded: number; localDeferredCount: number }> {
+    perf?: PerfOperation,
+): Promise<{
+    deferred: FileDelta[];
+    downloaded: number;
+    localDeferredCount: number;
+    bytesDownloaded: number;
+}> {
     const renames: FileDelta[] = [];
     const deletions: FileDelta[] = [];
     const modifications: FileDelta[] = [];
@@ -541,7 +647,7 @@ async function applyDeltas(
                         continue;
                     }
                     try {
-                        if (await hashFileStreaming(delta.old_path, io, wasm!) !== delta.hash) {
+                        if (await tracedHashFile(delta.old_path, io, wasm!, perf) !== delta.hash) {
                             deferLocal(delta);
                             continue;
                         }
@@ -596,7 +702,7 @@ async function applyDeltas(
                     if (canHashTarget) {
                         try {
                             targetVerified =
-                                await hashFileStreaming(delta.path, io, wasm!) === delta.hash;
+                                await tracedHashFile(delta.path, io, wasm!, perf) === delta.hash;
                         } catch {
                             targetVerified = false;
                         }
@@ -633,7 +739,12 @@ async function applyDeltas(
             // Rename is the only non-idempotent metadata operation. Persist it
             // immediately so a renderer kill never asks the next run to rename
             // an already-moved source again.
-            await syncBase.checkpoint();
+            const endCheckpoint = perf?.phase("checkpoint");
+            try {
+                await syncBase.checkpoint();
+            } finally {
+                endCheckpoint?.();
+            }
             if (markerPath) await safeDelete(io, markerPath);
         } else {
             deferLocal(delta);
@@ -650,7 +761,7 @@ async function applyDeltas(
         // plugin was unloaded therefore has no journal row yet; compare disk
         // with the honest sync base before honoring a remote delete. The
         // later metadata audit will queue a deferred local version for merge.
-        if (!(await diskStillMatchesDeleteBase(io, syncBase, wasm, delta.path))) {
+        if (!(await diskStillMatchesDeleteBase(io, syncBase, wasm, delta.path, perf))) {
             console.warn(
                 `[obsetync] deferred remote delete for locally changed ${delta.path}`,
             );
@@ -667,7 +778,12 @@ async function applyDeltas(
         appliedDeletions++;
     }
     if (appliedDeletions > 0) {
-        await syncBase.checkpoint();
+        const endCheckpoint = perf?.phase("checkpoint");
+        try {
+            await syncBase.checkpoint();
+        } finally {
+            endCheckpoint?.();
+        }
     }
 
     const stats: ApplyStats = {
@@ -697,6 +813,7 @@ async function applyDeltas(
                 delta,
                 stats,
                 () => shouldSkip(delta),
+                perf,
             ))
         );
         results.forEach((r, j) => {
@@ -705,7 +822,12 @@ async function applyDeltas(
         });
         // Persist every completed batch as a tiny WAL append. A process kill
         // resumes from here without re-hashing all already-applied files.
-        await syncBase.checkpoint();
+        const endCheckpoint = perf?.phase("checkpoint");
+        try {
+            await syncBase.checkpoint();
+        } finally {
+            endCheckpoint?.();
+        }
         completed += batch.length;
         // One tick per batch: position, what was verified-for-free vs actually
         // downloaded, bytes moved, deferred count, and the current rate —
@@ -749,12 +871,18 @@ async function applyDeltas(
                     delta,
                     stats,
                     () => shouldSkip(delta),
+                    perf,
                 );
                 if (!applied) {
                     deferLocal(delta);
                     continue;
                 }
-                await syncBase.checkpoint();
+                const endCheckpoint = perf?.phase("checkpoint");
+                try {
+                    await syncBase.checkpoint();
+                } finally {
+                    endCheckpoint?.();
+                }
             } catch (e) {
                 unfetched.push(delta);
                 console.warn(`[obsetync] pull: deferring ${delta.path}: ${String((e as any)?.message ?? e)}`);
@@ -782,6 +910,7 @@ async function applyDeltas(
         deferred: locallyDeferred.concat(unfetched),
         downloaded: stats.downloaded,
         localDeferredCount: locallyDeferred.length,
+        bytesDownloaded: stats.bytesDownloaded,
     };
 }
 
@@ -802,6 +931,7 @@ async function diskStillMatchesDeleteBase(
     syncBase: ObsetyncSyncBase,
     wasm: WasmModule | null,
     path: string,
+    perf?: PerfOperation,
 ): Promise<boolean> {
     const stat = await io.stat(path);
     if (!stat) return true;
@@ -813,7 +943,7 @@ async function diskStillMatchesDeleteBase(
         stat.size < CHUNK_THRESHOLD || io.getAbsolutePath(path) !== null;
     if (!wasm || !canHashWithoutLargeMobileRead) return false;
     try {
-        return await hashFileStreaming(path, io, wasm) === base.hash;
+        return await tracedHashFile(path, io, wasm, perf) === base.hash;
     } catch {
         return false;
     }
@@ -827,6 +957,7 @@ async function applyContentDelta(
     delta: FileDelta,
     stats: ApplyStats,
     shouldDefer?: () => boolean,
+    perf?: PerfOperation,
 ): Promise<boolean> {
     if (!delta.hash) return true;
     if (shouldDefer?.()) return false;
@@ -883,7 +1014,7 @@ async function applyContentDelta(
             stat.size < CHUNK_THRESHOLD || io.getAbsolutePath(delta.path) !== null;
         if (wasm && canHashLocallyWithoutLargeMobileRead) {
             try {
-                const actualHash = await hashFileStreaming(delta.path, io, wasm);
+                const actualHash = await tracedHashFile(delta.path, io, wasm, perf);
                 if (actualHash === delta.hash) {
                     if (shouldDefer?.()) return false;
                     syncBase.setEntry(
@@ -928,14 +1059,28 @@ async function applyContentDelta(
                 wasm,
                 shouldDefer,
                 preserveExisting,
+                perf,
             );
         } catch (error) {
             if (error instanceof LocalEditDuringPull) return false;
             throw error;
         }
     } else {
-        const data = await api.getContent(delta.hash);
-        if (!wasm || wasm.wasm_hash(data).toLowerCase() !== delta.hash.toLowerCase()) {
+        const endDownload = perf?.phase("download");
+        let data: Uint8Array;
+        try {
+            data = await api.getContent(delta.hash, perf);
+        } finally {
+            endDownload?.();
+        }
+        const endHash = perf?.phase("hash");
+        let actualHash: string | null = null;
+        try {
+            actualHash = wasm ? wasm.wasm_hash(data).toLowerCase() : null;
+        } finally {
+            endHash?.();
+        }
+        if (!actualHash || actualHash !== delta.hash.toLowerCase()) {
             throw new Error(`small-file content hash mismatch for ${delta.path}`);
         }
         if (shouldDefer?.()) return false;
@@ -1097,11 +1242,25 @@ export async function applyLargeFile(
     wasm: WasmModule | null,
     shouldAbort?: () => boolean,
     preserveExisting = false,
+    perf?: PerfOperation,
 ): Promise<void> {
     if (shouldAbort?.()) throw new LocalEditDuringPull();
     if (!wasm) throw new Error("WASM hash verifier unavailable for large file");
-    const manifest = validateManifest(await api.getManifest(hash), hash, expectedSize);
-    const pathHash = wasm.wasm_hash(new TextEncoder().encode(path)).slice(0, 16);
+    const endManifestDownload = perf?.phase("download");
+    let rawManifest: FileManifest;
+    try {
+        rawManifest = await api.getManifest(hash, perf);
+    } finally {
+        endManifestDownload?.();
+    }
+    const manifest = validateManifest(rawManifest, hash, expectedSize);
+    const endPathHash = perf?.phase("hash");
+    let pathHash: string;
+    try {
+        pathHash = wasm.wasm_hash(new TextEncoder().encode(path)).slice(0, 16);
+    } finally {
+        endPathHash?.();
+    }
     const transferKey = `${hash.toLowerCase()}-${pathHash}`;
     const stagingPath = `${TRANSFER_DIR}/${transferKey}.part`;
     const checkpointPath = `${TRANSFER_DIR}/${transferKey}.checkpoint.json`;
@@ -1135,7 +1294,12 @@ export async function applyLargeFile(
             nextChunk: 0,
             bytesWritten: 0,
         };
-        await writeLargeCheckpoint(io, checkpointPath, checkpoint);
+        const endCheckpoint = perf?.phase("checkpoint");
+        try {
+            await writeLargeCheckpoint(io, checkpointPath, checkpoint);
+        } finally {
+            endCheckpoint?.();
+        }
     }
 
     // A fresh transfer can prove the manifest's ordered concatenation while
@@ -1148,13 +1312,25 @@ export async function applyLargeFile(
         for (let index = checkpoint!.nextChunk; index < manifest.chunks.length; index++) {
             if (shouldAbort?.()) throw new LocalEditDuringPull();
             const chunk = manifest.chunks[index];
-            const data = await api.getContentChunk(chunk.hash);
+            const endDownload = perf?.phase("download");
+            let data: Uint8Array;
+            try {
+                data = await api.getContentChunk(chunk.hash, perf);
+            } finally {
+                endDownload?.();
+            }
             if (data.length !== chunk.size) {
                 throw new Error(`large-file chunk ${index} length mismatch`);
             }
-            const actualHash = wholeHasher
-                ? wholeHasher.update_and_hash(data)
-                : wasm.wasm_hash(data);
+            const endHash = perf?.phase("hash");
+            let actualHash: string;
+            try {
+                actualHash = wholeHasher
+                    ? wholeHasher.update_and_hash(data)
+                    : wasm.wasm_hash(data);
+            } finally {
+                endHash?.();
+            }
             if (actualHash.toLowerCase() !== chunk.hash.toLowerCase()) {
                 throw new Error(`large-file chunk ${index} hash mismatch`);
             }
@@ -1164,7 +1340,12 @@ export async function applyLargeFile(
                 nextChunk: index + 1,
                 bytesWritten: chunk.offset + chunk.size,
             };
-            await writeLargeCheckpoint(io, checkpointPath, checkpoint);
+            const endCheckpoint = perf?.phase("checkpoint");
+            try {
+                await writeLargeCheckpoint(io, checkpointPath, checkpoint);
+            } finally {
+                endCheckpoint?.();
+            }
             // One chunk at a time bounds live plaintext to ~4 MiB; yielding also
             // keeps old WKWebView render/watchdog queues responsive.
             await new Promise<void>((resolve) => globalThis.setTimeout(resolve, 0));

@@ -1,6 +1,7 @@
 import { ObsetyncApi } from "./api";
 import { PlatformIO } from "./platform";
 import { ObsetyncSyncBase } from "./sync-base";
+import type { PerfOperation } from "./perf-trace";
 
 /** Streaming Blake3 hasher — feed in 64 KB chunks, call finalize(), then free(). */
 export interface WasmHasher {
@@ -116,28 +117,46 @@ export async function push(
      *  current root while the tree is stale) turns a divergence into a
      *  "fast-forward" that reverts the whole vault — incident 2026-07-13. */
     baseRootHash: string | null,
-    onProgress?: (msg: string) => void
+    onProgress?: (msg: string) => void,
+    perf?: PerfOperation,
 ): Promise<{ newRootHash: string | null; conflicts: any[] }> {
+    perf?.setWorkload({ filesTotal: changes.length });
     if (changes.length === 0) {
+        perf?.setWorkload({
+            bytesTotal: 0,
+            filesNeeded: 0,
+            bytesNeeded: 0,
+        });
         return { newRootHash: tree.root_hash_hex(), conflicts: [] };
     }
 
     // Fail terminal enrollment/transport mismatches before hashing thousands
     // of files or touching the candidate tree. Authentication is still
     // checked by the first real request; this resolves the local v2 channel.
-    await api.ensureTransportReady();
+    const endPreflight = perf?.phase("check");
+    try {
+        await api.ensureTransportReady(perf);
+    } finally {
+        endPreflight?.();
+    }
 
     // This immutable snapshot is both the bootstrap source and the rollback
     // source. sync-base itself is not mutated until putRoot succeeds.
-    const baseEntries = syncBase.allPaths().map((path) => {
-        const entry = syncBase.getEntry(path)!;
-        return {
-            path,
-            hash: entry.hash,
-            mtime_ms: syncBase.getTreeMtime(path) ?? entry.mtime,
-            size: entry.size,
-        };
-    });
+    const endEnumerate = perf?.phase("enumerate");
+    let baseEntries: Array<{ path: string; hash: string; mtime_ms: number; size: number }>;
+    try {
+        baseEntries = syncBase.allPaths().map((path) => {
+            const entry = syncBase.getEntry(path)!;
+            return {
+                path,
+                hash: entry.hash,
+                mtime_ms: syncBase.getTreeMtime(path) ?? entry.mtime,
+                size: entry.size,
+            };
+        });
+    } finally {
+        endEnumerate?.();
+    }
     let treeMutated = false;
     let rootAccepted = false;
 
@@ -150,7 +169,12 @@ export async function push(
     // build_from_entries is O(n log n) in WASM — one call vs N×prefix with a loop.
     if (!tree.root_hash_hex()) {
         // treeMtime keeps pulled leaf metadata byte-identical to the server.
-        tree.build_from_entries(JSON.stringify(baseEntries));
+        const endTree = perf?.phase("tree_update");
+        try {
+            tree.build_from_entries(JSON.stringify(baseEntries));
+        } finally {
+            endTree?.();
+        }
     }
 
     const deleted    = changes.filter(c => c.action === "deleted");
@@ -165,11 +189,19 @@ export async function push(
     // ONE delete_batch call for all deletions → O(N+prefix) not O(N×prefix).
     if (deleted.length > 0) {
         treeMutated = true;
-        tree.delete_batch(JSON.stringify(deleted.map(c => c.path)));
+        const endTree = perf?.phase("tree_update");
+        try {
+            tree.delete_batch(JSON.stringify(deleted.map(c => c.path)));
+        } finally {
+            endTree?.();
+        }
     }
 
     let processed = deleted.length;
+    perf?.increment({ filesCompleted: deleted.length });
     let uploadedBytes = 0;
+    let neededFiles = 0;
+    let neededBytes = 0;
     const startTime = Date.now();
     // Collected here; applied in ONE update_batch call after all content batches.
     const allTreeUpdates: { path: string; hash: string; mtime_ms: number; size: number }[] = [];
@@ -230,14 +262,28 @@ export async function push(
             if (needRead.length === 0) continue;
 
             // Read files in parallel.
-            const reads = await Promise.all(needRead.map(async c => ({
-                change: c,
-                data: c.data ?? await io.readFile(c.path),
-            })));
+            const endRead = perf?.phase("read");
+            let reads: Array<{ change: FileChange; data: Uint8Array }>;
+            try {
+                reads = await Promise.all(needRead.map(async c => ({
+                    change: c,
+                    data: c.data ?? await io.readFile(c.path),
+                })));
+            } finally {
+                endRead?.();
+            }
+            const residentReadBytes = reads.reduce((sum, row) => sum + row.data.length, 0);
+            perf?.observePeakBatchBytes(residentReadBytes);
 
             // Large files — wasm_chunk_file hashes internally.
             for (const { change, data } of reads.filter(r => wasm.wasm_should_chunk(r.data.length))) {
-                const chunkInfo = await chunkFileStreaming(wasm, data);
+                const endChunk = perf?.phase("fastcdc");
+                let chunkInfo: any;
+                try {
+                    chunkInfo = await chunkFileStreaming(wasm, data);
+                } finally {
+                    endChunk?.();
+                }
                 change.hash = chunkInfo.file_hash;
                 batchFiles.push(new ObsetyncBatchFile(
                     change,
@@ -262,6 +308,7 @@ export async function push(
 
             // Concatenate all unknown-hash small files → ONE WASM boundary crossing.
             const totalBytes = unknownSmall.reduce((s, r) => s + r.data.length, 0);
+            perf?.observePeakBatchBytes(residentReadBytes + totalBytes);
             const flat    = new Uint8Array(totalBytes);
             const offsets = new Uint32Array(unknownSmall.length);
             const sizes   = new Uint32Array(unknownSmall.length);
@@ -272,7 +319,13 @@ export async function push(
                 sizes[j]   = unknownSmall[j].data.length;
                 off       += unknownSmall[j].data.length;
             }
-            const hashes = wasm.wasm_hash_batch(flat, offsets, sizes);
+            const endHash = perf?.phase("hash");
+            let hashes: string[];
+            try {
+                hashes = wasm.wasm_hash_batch(flat, offsets, sizes);
+            } finally {
+                endHash?.();
+            }
             // flat, offsets, sizes go out of scope → GC-eligible.
 
             for (let j = 0; j < unknownSmall.length; j++) {
@@ -296,13 +349,39 @@ export async function push(
             .filter(f => f.chunkInfo)
             .flatMap(f => (f.chunkInfo.chunks as any[]).map((c: any) => c.hash));
 
-        const [neededSmall, neededChunks] = await Promise.all([
-            smallHashes.length > 0    ? api.checkContent(smallHashes)             : Promise.resolve([]),
-            allChunkHashes.length > 0 ? api.checkContentChunks(allChunkHashes)    : Promise.resolve([]),
-        ]);
+        const endCheck = perf?.phase("check");
+        let neededSmall: string[];
+        let neededChunks: string[];
+        try {
+            [neededSmall, neededChunks] = await Promise.all([
+                smallHashes.length > 0
+                    ? api.checkContent(smallHashes, perf)
+                    : Promise.resolve([]),
+                allChunkHashes.length > 0
+                    ? api.checkContentChunks(allChunkHashes, perf)
+                    : Promise.resolve([]),
+            ]);
+        } finally {
+            endCheck?.();
+        }
 
         const neededSmallSet  = new Set(neededSmall);
         const neededChunksSet = new Set(neededChunks);
+        for (const file of batchFiles) {
+            if (file.chunkInfo) {
+                let missingForFile = 0;
+                for (const chunk of file.chunkInfo.chunks as any[]) {
+                    if (neededChunksSet.has(chunk.hash)) missingForFile += chunk.size;
+                }
+                if (missingForFile > 0) {
+                    neededFiles++;
+                    neededBytes += missingForFile;
+                }
+            } else if (file.change.hash && neededSmallSet.has(file.change.hash)) {
+                neededFiles++;
+                neededBytes += file.size;
+            }
+        }
 
         // ------------------------------------------------------------------
         // C. Upload missing content. Collect tree updates.
@@ -316,24 +395,51 @@ export async function push(
                             chunk.offset,
                             chunk.offset + chunk.size,
                         );
-                        await api.putContentChunk(chunk.hash, chunkData);
+                        const endUpload = perf?.phase("upload");
+                        try {
+                            await api.putContentChunk(chunk.hash, chunkData, perf);
+                        } finally {
+                            endUpload?.();
+                        }
                         fileBytesUploaded += chunkData.length;
                     }
                 }
-                await api.putManifest(change.hash!, {
-                    file_hash:  change.hash!,
-                    total_size: chunkInfo.total_size,
-                    chunks:     chunkInfo.chunks,
-                });
+                const endManifest = perf?.phase("upload");
+                try {
+                    await api.putManifest(change.hash!, {
+                        file_hash:  change.hash!,
+                        total_size: chunkInfo.total_size,
+                        chunks:     chunkInfo.chunks,
+                    }, perf);
+                } finally {
+                    endManifest?.();
+                }
                 uploadedBytes += fileBytesUploaded;
+                perf?.increment({ bytesTransferred: fileBytesUploaded });
             } else if (change.hash && neededSmallSet.has(change.hash)) {
                 // Re-read the file — only done for the small fraction the server needs.
-                const data = change.data ?? (await io.readFile(change.path));
-                await api.putContent(change.hash, data);
+                let data = change.data;
+                if (!data) {
+                    const endRead = perf?.phase("read");
+                    try {
+                        data = await io.readFile(change.path);
+                    } finally {
+                        endRead?.();
+                    }
+                }
+                perf?.observePeakBatchBytes(data.length);
+                const endUpload = perf?.phase("upload");
+                try {
+                    await api.putContent(change.hash, data, perf);
+                } finally {
+                    endUpload?.();
+                }
                 uploadedBytes += data.length;
+                perf?.increment({ bytesTransferred: data.length });
             }
 
             processed++;
+            perf?.increment({ filesCompleted: 1 });
             onProgress?.(`↑ ${processed}/${total} ${throughput(processed, uploadedBytes, startTime)}`);
 
             // Queue tree update — applied in ONE update_batch after all batches.
@@ -351,8 +457,18 @@ export async function push(
     const beforeFiles = tree.total_files();
     if (allTreeUpdates.length > 0) {
         treeMutated = true;
-        tree.update_batch(JSON.stringify(allTreeUpdates));
+        const endTree = perf?.phase("tree_update");
+        try {
+            tree.update_batch(JSON.stringify(allTreeUpdates));
+        } finally {
+            endTree?.();
+        }
     }
+    perf?.setWorkload({
+        bytesTotal: allTreeUpdates.reduce((sum, update) => sum + update.size, 0),
+        filesNeeded: neededFiles,
+        bytesNeeded: neededBytes,
+    });
     const afterRoot = tree.root_hash_hex();
     const afterFiles = tree.total_files();
     // Diagnostic: if batch > 0 but root didn't move, or file count didn't grow
@@ -373,9 +489,16 @@ export async function push(
     // Upload index chunks (LeafChunk, InternalNode) accumulated in MemoryChunkStore.
     // Server needs these to walk the tree during merge/diff.
     const chunkHashes = wasm.wasm_tree_chunk_hashes(tree);
+    perf?.setWasmChunks({ after: chunkHashes.length });
     if (chunkHashes.length > 0) {
         onProgress?.(`↑ checking ${chunkHashes.length} index chunks...`);
-        const neededChunks = await api.checkChunks(chunkHashes);
+        const endCheck = perf?.phase("check");
+        let neededChunks: string[];
+        try {
+            neededChunks = await api.checkChunks(chunkHashes, perf);
+        } finally {
+            endCheck?.();
+        }
         if (neededChunks.length > 0) {
             onProgress?.(`↑ uploading ${neededChunks.length} index chunks...`);
             // Thousands of simultaneous encrypted requests retain thousands
@@ -384,10 +507,15 @@ export async function push(
             const INDEX_UPLOAD_CONCURRENCY = 8;
             for (let i = 0; i < neededChunks.length; i += INDEX_UPLOAD_CONCURRENCY) {
                 const batch = neededChunks.slice(i, i + INDEX_UPLOAD_CONCURRENCY);
-                await Promise.all(batch.map(hash => {
-                    const bytes = wasm.wasm_tree_get_chunk(tree, hash);
-                    return bytes ? api.putChunk(hash, bytes) : Promise.resolve();
-                }));
+                const endIndexUpload = perf?.phase("tree_index_upload");
+                try {
+                    await Promise.all(batch.map(hash => {
+                        const bytes = wasm.wasm_tree_get_chunk(tree, hash);
+                        return bytes ? api.putChunk(hash, bytes, perf) : Promise.resolve();
+                    }));
+                } finally {
+                    endIndexUpload?.();
+                }
                 await yieldToUI();
             }
         }
@@ -408,7 +536,13 @@ export async function push(
     );
 
     onProgress?.("↑ pushing root...");
-    const result = await api.putRoot(vaultId, rootBytes, parentHash);
+    const endRootCommit = perf?.phase("root_commit");
+    let result: Awaited<ReturnType<ObsetyncApi["putRoot"]>>;
+    try {
+        result = await api.putRoot(vaultId, rootBytes, parentHash, perf);
+    } finally {
+        endRootCommit?.();
+    }
     rootAccepted = true;
 
     // Commit local metadata only after the server accepted this root. A
@@ -419,7 +553,12 @@ export async function push(
     }
 
     syncBase.setLastSyncTimestamp(Date.now());
-    await syncBase.save();
+    const endCheckpoint = perf?.phase("checkpoint");
+    try {
+        await syncBase.save();
+    } finally {
+        endCheckpoint?.();
+    }
 
     return {
         newRootHash: result.root_hash,
@@ -428,7 +567,12 @@ export async function push(
     } catch (error) {
         if (treeMutated && !rootAccepted) {
             try {
-                tree.build_from_entries(JSON.stringify(baseEntries));
+                const endTree = perf?.phase("tree_update");
+                try {
+                    tree.build_from_entries(JSON.stringify(baseEntries));
+                } finally {
+                    endTree?.();
+                }
                 console.warn("[obsetync] failed push rolled candidate tree back to sync-base");
             } catch (rollbackError) {
                 console.error("[obsetync] failed to roll candidate tree back:", rollbackError);
@@ -489,31 +633,64 @@ export async function hashFileStreaming(
     path: string,
     io: PlatformIO,
     wasm: WasmModule,
+    perf?: PerfOperation,
+    perfWeight = 1,
 ): Promise<string> {
     const absPath = io.getAbsolutePath(path);
     if (absPath) {
         const fs = (globalThis as any).require?.('fs') as typeof import('fs') | undefined;
         if (fs?.createReadStream) {
             const hasher = new wasm.Hasher();
+            const now = () => globalThis.performance?.now?.() ?? Date.now();
+            const started = perf ? now() : 0;
+            let hashMs = 0;
             try {
                 await new Promise<void>((resolve, reject) => {
                     fs.createReadStream(absPath, { highWaterMark: 65536 })
                         .on('data', (chunk: Buffer | string) => {
                             const buf = chunk as Buffer;
-                            hasher.update(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength));
+                            if (perf) {
+                                const hashStarted = now();
+                                hasher.update(new Uint8Array(
+                                    buf.buffer,
+                                    buf.byteOffset,
+                                    buf.byteLength,
+                                ));
+                                hashMs += Math.max(0, now() - hashStarted);
+                            } else {
+                                hasher.update(new Uint8Array(
+                                    buf.buffer,
+                                    buf.byteOffset,
+                                    buf.byteLength,
+                                ));
+                            }
                         })
                         .on('end', resolve)
                         .on('error', reject);
                 });
-                return hasher.finalize();
+                const finalizeStarted = perf ? now() : 0;
+                const result = hasher.finalize();
+                if (perf) {
+                    hashMs += Math.max(0, now() - finalizeStarted);
+                    const totalMs = Math.max(0, now() - started);
+                    perf.addPhase("hash", hashMs * perfWeight);
+                    perf.addPhase("read", Math.max(0, totalMs - hashMs) * perfWeight);
+                }
+                return result;
             } finally {
                 hasher.free();
             }
         }
     }
     // Mobile / no-fs fallback.
+    const now = () => globalThis.performance?.now?.() ?? Date.now();
+    const readStarted = perf ? now() : 0;
     const data = await io.readFile(path);
-    return streamingHash(wasm, data);
+    if (perf) perf.addPhase("read", Math.max(0, now() - readStarted) * perfWeight);
+    const hashStarted = perf ? now() : 0;
+    const result = streamingHash(wasm, data);
+    if (perf) perf.addPhase("hash", Math.max(0, now() - hashStarted) * perfWeight);
+    return result;
 }
 
 function throughput(files: number, bytes: number, startMs: number): string {
