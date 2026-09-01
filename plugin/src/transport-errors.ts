@@ -20,3 +20,22 @@ export function isReenrollmentRequiredError(error: unknown): boolean {
 export function reenrollmentRequired(message: string): ObsetyncReenrollmentRequiredError {
     return new ObsetyncReenrollmentRequiredError(message);
 }
+
+/** The enrolled device is valid, but its running plugin lacks the active
+ *  vault data format. This must never be presented as an enrollment failure. */
+export class ObsetyncUpgradeRequiredError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "ObsetyncUpgradeRequiredError";
+    }
+}
+
+export function isUpgradeRequiredError(error: unknown): boolean {
+    if (error instanceof ObsetyncUpgradeRequiredError) return true;
+    const message = error instanceof Error ? error.message : String(error ?? "");
+    return /upgrade required|update\/reload the Obsetync plugin/i.test(message);
+}
+
+export function upgradeRequired(message: string): ObsetyncUpgradeRequiredError {
+    return new ObsetyncUpgradeRequiredError(message);
+}

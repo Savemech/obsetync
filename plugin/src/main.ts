@@ -263,6 +263,7 @@ export default class ObsetyncPlugin extends Plugin {
                 push(`Push blocked:      ${this.syncEngine.isPushBlocked() ? "YES — run Full Rescan" : "no"}`);
                 push(`Re-enroll needed:  ${this.syncEngine.isReenrollmentRequired() ? "YES — automatic sync paused" : "no"}`);
                 push(`Bulk change review: ${this.syncEngine.isBulkChangeReviewRequired() ? "YES — run Full Rescan to confirm" : "no"}`);
+                push(`Tree format:       v${this.tree?.tree_version?.() ?? "?"}`);
                 push(`Tree root hash:    ${trunc(treeRoot, 24)}`);
                 push(`Tree base root:    ${trunc(baseRoot, 24)}`);
                 push(`Last server root:  ${trunc(serverRoot, 24)}`);
@@ -339,13 +340,20 @@ export default class ObsetyncPlugin extends Plugin {
             }
             if (this.settings.vaultId) {
                 try {
+                    const tree = await this.api.negotiateTreeVersion(this.settings.vaultId);
+                    push(
+                        `  Tree protocol:    v${tree.currentVersion} · ${tree.activation} · ` +
+                        `fleet ${tree.readyDevices}/${tree.enrolledDevices}`,
+                    );
                     push(`getRoot("${this.settings.vaultId}") → ...`);
                     const rootBytes = await this.api.getRoot(this.settings.vaultId);
                     if (rootBytes === null) {
                         push(`  Server has no vault with this ID.`);
                     } else {
                         const hash = this.wasm?.wasm_root_hash_from_bytes(rootBytes) ?? null;
+                        const version = this.wasm?.wasm_root_version_from_bytes(rootBytes) ?? null;
                         push(`  Server root hash: ${trunc(hash, 24)}`);
+                        push(`  Server tree:      v${version ?? "?"}`);
                         push(`  Root bytes:       ${rootBytes.length} B`);
                     }
                 } catch (e: any) {
@@ -513,6 +521,16 @@ export default class ObsetyncPlugin extends Plugin {
             },
             Platform.isMobile ? "mobile" : "desktop",
         );
+        // Capability I/O overlaps WASM compilation/worker startup. The result
+        // selects the active tree format before the engine can build a local
+        // candidate; failure remains retryable through the normal first root
+        // request and never falls back by mutating enrollment state.
+        const treeNegotiationPending = this.api
+            .negotiateTreeVersion(this.settings.vaultId)
+            .then(
+                (result) => ({ result, error: null as unknown }),
+                (error) => ({ result: null, error }),
+            );
 
         // Load the bundled WASM module. Sync must fail closed if this cannot
         // initialize: development hash stubs are not content-address compatible
@@ -547,14 +565,36 @@ export default class ObsetyncPlugin extends Plugin {
         // ChunkError::NotFound. The tree always bootstraps from sync-base on first push
         // (push.ts: if (!tree.root_hash_hex())), which correctly populates the full store.
         let cachedRootHash: string | null = null;
+        let cachedTreeVersion: 1 | 2 = 1;
         const cachedRoot = await this.loadCachedRoot();
         if (cachedRoot) {
             try {
                 cachedRootHash = this.wasm.wasm_root_hash_from_bytes(cachedRoot) ?? null;
+                const version = this.wasm.wasm_root_version_from_bytes(cachedRoot);
+                if (version !== 1 && version !== 2) {
+                    throw new Error(`unsupported cached tree version ${version}`);
+                }
+                cachedTreeVersion = version;
+                this.tree.set_tree_version(version);
                 console.log("[obsetync] cached root hash:", cachedRootHash?.slice(0, 12));
             } catch (e) {
                 console.warn("[obsetync] failed to read cached root hash:", e);
             }
+        }
+        const negotiatedTree = await treeNegotiationPending;
+        if (negotiatedTree.result) {
+            this.tree.set_tree_version(negotiatedTree.result.currentVersion);
+            console.log(
+                `[obsetync] Tree v${negotiatedTree.result.currentVersion} negotiated ` +
+                `(${negotiatedTree.result.activation}, fleet ` +
+                `${negotiatedTree.result.readyDevices}/${negotiatedTree.result.enrolledDevices})`,
+            );
+        } else {
+            this.tree.set_tree_version(cachedTreeVersion);
+            console.warn(
+                `[obsetync] Tree negotiation deferred; using cached/default v${cachedTreeVersion}:`,
+                negotiatedTree.error,
+            );
         }
 
         // Create sync engine.

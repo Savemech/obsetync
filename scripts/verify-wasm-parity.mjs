@@ -94,10 +94,111 @@ if (
     throw new Error("scalar/SIMD batch hash mismatch");
 }
 
+function deterministicTreeEntries(count) {
+    const rows = [];
+    for (let index = 0; index < count; index++) {
+        const path = `notes/${String(index % 17).padStart(2, "0")}/${String(index).padStart(6, "0")}.md`;
+        rows.push({
+            path,
+            hash: scalar.wasm_hash(deterministicPayload(128 + (index % 257))),
+            mtime_ms: 1_700_000_000_000 + index,
+            size: 128 + (index % 257),
+        });
+    }
+    return rows;
+}
+
+function treeV2State(module, entries) {
+    const tree = new module.WasmTree("parity-vault", "parity-device");
+    tree.set_tree_version(2);
+    if (tree.tree_version() !== 2) {
+        tree.free();
+        throw new Error("WasmTree did not select Tree v2");
+    }
+    tree.build_from_entries(JSON.stringify(entries));
+    const rootBytes = tree.root_bytes();
+    if (!rootBytes || module.wasm_root_version_from_bytes(rootBytes) !== 2) {
+        tree.free();
+        throw new Error("WasmTree emitted a non-v2 persisted root");
+    }
+    return tree;
+}
+
+function assertTreeParity(left, right, phase) {
+    if (left.root_hash_hex() !== right.root_hash_hex()) {
+        throw new Error(`scalar/SIMD Tree v2 root mismatch after ${phase}`);
+    }
+    if (left.total_files() !== right.total_files()) {
+        throw new Error(`scalar/SIMD Tree v2 count mismatch after ${phase}`);
+    }
+    const leftChunks = JSON.stringify(scalar.wasm_tree_committed_chunk_hashes(left));
+    const rightChunks = JSON.stringify(simd.wasm_tree_committed_chunk_hashes(right));
+    if (leftChunks !== rightChunks) {
+        throw new Error(`scalar/SIMD Tree v2 graph mismatch after ${phase}`);
+    }
+}
+
+const treeEntries = deterministicTreeEntries(2_048);
+const scalarTree = treeV2State(scalar, treeEntries);
+const simdTree = treeV2State(simd, treeEntries);
+try {
+    assertTreeParity(scalarTree, simdTree, "rebuild");
+
+    const replacement = [{
+        ...treeEntries[1_024],
+        hash: scalar.wasm_hash(deterministicPayload(8_193)),
+        mtime_ms: 1_800_000_000_000,
+        size: 8_193,
+    }];
+    for (const tree of [scalarTree, simdTree]) {
+        tree.begin_candidate();
+        tree.candidate_update_batch(JSON.stringify(replacement));
+        tree.candidate_delete_batch(JSON.stringify([treeEntries[7].path, treeEntries[1_777].path]));
+    }
+    if (scalarTree.candidate_root_hash_hex() !== simdTree.candidate_root_hash_hex()) {
+        throw new Error("scalar/SIMD Tree v2 candidate mismatch");
+    }
+    scalarTree.commit_candidate();
+    simdTree.commit_candidate();
+    assertTreeParity(scalarTree, simdTree, "candidate commit");
+
+    const committed = scalarTree.root_hash_hex();
+    for (const tree of [scalarTree, simdTree]) {
+        tree.begin_candidate();
+        tree.candidate_delete_batch(JSON.stringify([treeEntries[42].path]));
+        tree.abort_candidate();
+    }
+    assertTreeParity(scalarTree, simdTree, "candidate abort");
+    if (scalarTree.root_hash_hex() !== committed) {
+        throw new Error("Tree v2 abort changed the committed root");
+    }
+
+    const transitionedEntries = treeEntries
+        .filter((entry) => entry.path !== treeEntries[7].path && entry.path !== treeEntries[1_777].path)
+        .map((entry) => entry.path === replacement[0].path ? replacement[0] : entry);
+    for (const tree of [scalarTree, simdTree]) {
+        tree.rebuild_from_entries_in_version(1, JSON.stringify(transitionedEntries));
+        if (tree.tree_version() !== 1) throw new Error("live Tree v2→v1 rebuild failed");
+    }
+    assertTreeParity(scalarTree, simdTree, "live v2→v1 rebuild");
+    for (const tree of [scalarTree, simdTree]) {
+        tree.rebuild_from_entries_in_version(2, JSON.stringify(transitionedEntries));
+        if (tree.tree_version() !== 2) throw new Error("live Tree v1→v2 rebuild failed");
+    }
+    assertTreeParity(scalarTree, simdTree, "live v1→v2 rebuild");
+    if (scalarTree.root_hash_hex() !== committed) {
+        throw new Error("live Tree format roundtrip changed semantic v2 root");
+    }
+} finally {
+    scalarTree.free();
+    simdTree.free();
+}
+
 console.log(JSON.stringify({
     scalar_bytes: scalarBytes.length,
     simd_bytes: simdBytes.length,
     payload_bytes: large.length,
     feed_sizes_tested: feedSizes.length,
+    tree_v2_entries: treeEntries.length,
     parity: true,
 }));

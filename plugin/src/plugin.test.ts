@@ -24,3 +24,5 @@ import "./hash-runtime.test";
 import "./bulk-codec.test";
 import "./ws-data-codec.test";
 import "./ws-data.test";
+import "./tree-negotiation.test";
+import "./tree-format.test";

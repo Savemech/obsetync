@@ -1,7 +1,9 @@
 import { push } from "./push";
 import {
     isReenrollmentRequiredError,
+    isUpgradeRequiredError,
     reenrollmentRequired,
+    upgradeRequired,
 } from "./transport-errors";
 import { PerfTrace } from "./perf-trace";
 import { HashWorkerFileDriftError } from "./desktop-hash-workers";
@@ -149,6 +151,14 @@ async function terminalPreflightDoesNotMutate(): Promise<void> {
     check(
         !isReenrollmentRequiredError(new Error("temporary network failure")),
         "transient error was classified as terminal",
+    );
+    const upgrade = upgradeRequired(
+        "upgrade required: update/reload the Obsetync plugin; enrollment remains valid",
+    );
+    check(isUpgradeRequiredError(upgrade), "HTTP 426 upgrade lost its classification");
+    check(
+        !isReenrollmentRequiredError(upgrade),
+        "HTTP 426 upgrade was incorrectly classified as re-enrollment",
     );
     check(f.deleteCalls() === 0, "terminal preflight mutated the tree");
     check(f.beginCalls() === 0, "terminal preflight opened a candidate");

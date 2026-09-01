@@ -47,6 +47,7 @@ import {
 } from "./scan-planner";
 import { isSafeVaultPath } from "./delta-validation";
 import { isReenrollmentRequiredError } from "./transport-errors";
+import { alignTreeFormatFromRoot } from "./tree-format";
 import {
     perfSampleWeight,
     perfTrace,
@@ -1142,6 +1143,24 @@ export class ObsetyncSyncEngine {
                 (p) => this.isExcluded(p),
                 perf,
             );
+            if (result.newRootBytes && this.wasm && this.tree) {
+                const alignment = alignTreeFormatFromRoot(
+                    this.wasm,
+                    this.tree,
+                    this.syncBase,
+                    result.newRootBytes,
+                );
+                this.api.observeTreeVersion(this.vaultId, alignment.version);
+                if (alignment.changed) {
+                    result.treeParity = result.newRootHash
+                        ? this.getTreeRootHash() === result.newRootHash
+                        : null;
+                    console.warn(
+                        `[obsetync] rebuilt local Merkle graph as Tree v${alignment.version} ` +
+                        "after authenticated server format transition",
+                    );
+                }
+            }
             if (result.newRootHash) {
                 this.localRootHash = result.newRootHash;
                 this.lastPullServerRoot = result.newRootHash;

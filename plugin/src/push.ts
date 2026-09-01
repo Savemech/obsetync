@@ -43,6 +43,7 @@ export interface WasmModule {
     wasm_tree_candidate_chunk_hashes(tree: any): string[];
     wasm_tree_new_candidate_chunk_hashes(tree: any): string[];
     wasm_root_hash_from_bytes(bytes: Uint8Array): string | undefined;
+    wasm_root_version_from_bytes(bytes: Uint8Array): number | undefined;
     /** Streaming Blake3 hasher. Peak WASM heap = feed size, not file size. */
     Hasher: new () => WasmHasher;
     WasmChunker: new () => WasmChunker;
@@ -58,6 +59,9 @@ export interface WasmModule {
 }
 
 export interface WasmTree {
+    set_tree_version(version: number): void;
+    tree_version(): number;
+    rebuild_from_entries_in_version(version: number, entriesJson: string): void;
     load_root(rootBytes: Uint8Array): void;
     root_hash_hex(): string | null;
     root_bytes(): Uint8Array | null;

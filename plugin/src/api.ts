@@ -12,7 +12,9 @@ import { validateFileDeltas } from "./delta-validation";
 import { exactArrayBuffer } from "./binary";
 import {
     isReenrollmentRequiredError,
+    isUpgradeRequiredError,
     reenrollmentRequired,
+    upgradeRequired,
 } from "./transport-errors";
 import type { PerfOperation } from "./perf-trace";
 import {
@@ -45,9 +47,14 @@ import {
     type DiffPage,
     type DiffPageLimits,
 } from "./diff-page-codec";
+import {
+    decodeTreeNegotiation,
+    type TreeNegotiation,
+} from "./tree-negotiation";
 
 export { BulkObjectKind, type BulkUploadRecord } from "./bulk-codec";
 export type { DiffPage } from "./diff-page-codec";
+export type { TreeNegotiation } from "./tree-negotiation";
 
 export interface FileDelta {
     action: "added" | "modified" | "deleted" | "renamed";
@@ -81,6 +88,7 @@ export interface HistoryEntry {
     created_ms: number;
     device_id: string;
     total_files: number;
+    tree_version?: 1 | 2;
     current: boolean;
 }
 
@@ -159,6 +167,12 @@ export class ObsetyncApi {
     private diffPageLimits: DiffPageLimits | null | undefined;
     private wsDataLane: ObsetyncWsDataLane | null = null;
     private wsDataFallbackLogAfter = 0;
+    private channelGeneration = 0;
+    private readonly treeNegotiations = new Map<
+        string,
+        { generation: number; result: TreeNegotiation }
+    >();
+    private readonly treeNegotiationPromises = new Map<string, Promise<TreeNegotiation>>();
     private readonly sequences: DurableSequenceAllocator;
 
     constructor(
@@ -243,6 +257,7 @@ export class ObsetyncApi {
                 state.esPub,
                 state.esPubValidUntil,
             );
+            this.channelGeneration++;
             return this.channel;
         })();
         try {
@@ -261,11 +276,123 @@ export class ObsetyncApi {
         await this.getChannel(perf);
     }
 
+    /** Report Tree v2 support over the exact HTTP crypto session and learn the
+     *  vault's active root format. Old servers either lack the endpoint or omit
+     *  the personalized `tree` block; both safely resolve to v1. */
+    async negotiateTreeVersion(
+        vaultId: string,
+        perf?: PerfOperation,
+        force = false,
+    ): Promise<TreeNegotiation> {
+        await this.getChannel(perf);
+        const generation = this.channelGeneration;
+        const cached = this.treeNegotiations.get(vaultId);
+        if (!force && cached?.generation === generation) return cached.result;
+        const pending = this.treeNegotiationPromises.get(vaultId);
+        if (!force && pending) return pending;
+
+        const promise = (async (): Promise<TreeNegotiation> => {
+            const report = new TextEncoder().encode(JSON.stringify({
+                protocol_version: 1,
+                vault_id: vaultId,
+                capabilities: ["tree-v2"],
+            }));
+            const response = await this.sealed(
+                "POST",
+                "/api/v1/capabilities",
+                report,
+                perf,
+            );
+            let result: TreeNegotiation;
+            if (response.status === 404 || response.status === 405) {
+                result = {
+                    currentVersion: 1,
+                    fleetReady: false,
+                    readyDevices: 0,
+                    enrolledDevices: 0,
+                    activation: "blocked",
+                };
+            } else {
+                if (!response.ok) {
+                    throw new Error(`tree capability negotiation failed: ${response.status}`);
+                }
+                const bundle = await response.json();
+                this.applyCapabilityBundle(bundle);
+                result = decodeTreeNegotiation(bundle);
+            }
+            // `sealed` used the current channel synchronously; still fail
+            // closed if a future refactor swaps it while the request awaits.
+            if (this.channelGeneration === generation) {
+                this.treeNegotiations.set(vaultId, { generation, result });
+            }
+            return result;
+        })();
+        this.treeNegotiationPromises.set(vaultId, promise);
+        try {
+            return await promise;
+        } finally {
+            if (this.treeNegotiationPromises.get(vaultId) === promise) {
+                this.treeNegotiationPromises.delete(vaultId);
+            }
+        }
+    }
+
+    getTreeNegotiation(vaultId: string): TreeNegotiation | null {
+        const cached = this.treeNegotiations.get(vaultId);
+        return cached?.generation === this.channelGeneration ? cached.result : null;
+    }
+
+    /** The root envelope is authenticated by the sealed response and is the
+     *  authoritative format observation. Keep the capability cache coherent
+     *  when an admin switches a live vault after this channel negotiated. */
+    observeTreeVersion(vaultId: string, currentVersion: 1 | 2): void {
+        const cached = this.getTreeNegotiation(vaultId) ?? {
+            currentVersion: 1 as const,
+            fleetReady: false,
+            readyDevices: 0,
+            enrolledDevices: 0,
+            activation: "blocked" as const,
+        };
+        if (cached.currentVersion === currentVersion) return;
+        this.treeNegotiations.set(vaultId, {
+            generation: this.channelGeneration,
+            result: {
+                ...cached,
+                currentVersion,
+                activation: currentVersion === 2
+                    ? "active"
+                    : cached.fleetReady ? "eligible" : "blocked",
+            },
+        });
+    }
+
     // --- Root ---
+
+    private async treeSealed(
+        vaultId: string,
+        method: string,
+        path: string,
+        body: Uint8Array,
+        perf?: PerfOperation,
+    ): Promise<FetchLike> {
+        await this.negotiateTreeVersion(vaultId, perf);
+        try {
+            return await this.sealed(method, path, body, perf);
+        } catch (error) {
+            if (!isUpgradeRequiredError(error)) throw error;
+            // The server may have restarted and intentionally forgotten its
+            // process-local session proof while this client's channel stayed
+            // alive. Re-report once on the same authenticated channel. A real
+            // format mismatch still returns 426 on the one retry.
+            this.treeNegotiations.delete(vaultId);
+            await this.negotiateTreeVersion(vaultId, perf, true);
+            return await this.sealed(method, path, body, perf);
+        }
+    }
 
     async getRoot(vaultId: string, perf?: PerfOperation): Promise<Uint8Array | null> {
         const path = `/api/v1/root/${vaultId}`;
-        const res = await this.sealed("GET", path, new Uint8Array(), perf);
+        const res = await this.treeSealed(vaultId, "GET", path, new Uint8Array(), perf);
         if (res.status === 404) return null;
         if (!res.ok) throw new Error(`getRoot failed: ${res.status}`);
         return new Uint8Array(await res.arrayBuffer());
@@ -278,7 +405,7 @@ export class ObsetyncApi {
         perf?: PerfOperation,
     ): Promise<Uint8Array | null> {
         const path = `/api/v1/root/${vaultId}/${rootHash}`;
-        const res = await this.sealed("GET", path, new Uint8Array(), perf);
+        const res = await this.treeSealed(vaultId, "GET", path, new Uint8Array(), perf);
         if (res.status === 404) return null;
         if (!res.ok) throw new Error(`getRootAt failed: ${res.status}`);
         return new Uint8Array(await res.arrayBuffer());
@@ -287,7 +414,7 @@ export class ObsetyncApi {
     /** Recent root history for the rollback UI, newest first. */
     async getHistory(vaultId: string, perf?: PerfOperation): Promise<HistoryEntry[]> {
         const path = `/api/v1/history/${vaultId}`;
-        const res = await this.sealed("GET", path, new Uint8Array(), perf);
+        const res = await this.treeSealed(vaultId, "GET", path, new Uint8Array(), perf);
         if (!res.ok) throw new Error(`getHistory failed: ${res.status}`);
         const body = await res.json();
         return (body?.roots ?? []) as HistoryEntry[];
@@ -303,7 +430,8 @@ export class ObsetyncApi {
         perf?: PerfOperation,
     ): Promise<void> {
         const path = `/api/v1/rollback/${vaultId}`;
-        const res = await this.sealed(
+        const res = await this.treeSealed(
+            vaultId,
             "POST",
             path,
             new TextEncoder().encode(rootHash),
@@ -326,7 +454,7 @@ export class ObsetyncApi {
         const body = new Uint8Array(header.length + rootBytes.length);
         body.set(header, 0);
         body.set(rootBytes, header.length);
-        const res = await this.sealed("PUT", path, body, perf);
+        const res = await this.treeSealed(vaultId, "PUT", path, body, perf);
         if (!res.ok) throw new Error(`putRoot failed: ${res.status}`);
         return res.json();
     }
@@ -341,7 +469,7 @@ export class ObsetyncApi {
         const path = `/api/v1/diff/${vaultId}`;
         // Same trick — device-root prepended to body instead of a header.
         const body = new TextEncoder().encode(deviceRootHash.padEnd(64, " "));
-        const res = await this.sealed("POST", path, body, perf);
+        const res = await this.treeSealed(vaultId, "POST", path, body, perf);
         if (res.status === 304) return null;
         // 404 = vault has no root on the server yet (fresh server, first
         // push hasn't landed). Treat as "nothing to pull" and let the push
@@ -367,7 +495,7 @@ export class ObsetyncApi {
         perf?.setDiffPageBytes(limits.maxBytes);
         const path = `/api/v1/diff-page/${vaultId}`;
         const request = encodeDiffPageRequest(fromRootHash, toRootHash, cursor, limits);
-        const response = await this.sealed("POST", path, request, perf);
+        const response = await this.treeSealed(vaultId, "POST", path, request, perf);
         if (response.status === 404) return null;
         if (!response.ok) throw new Error(`getDiffPage failed: ${response.status}`);
         const bytes = new Uint8Array(await response.arrayBuffer());
@@ -1028,6 +1156,15 @@ export class ObsetyncApi {
             if (response.status === 401 || response.status === 403) {
                 throw reenrollmentRequired(
                     `server rejected this device (${response.status}) — re-enroll device`,
+                );
+            }
+            if (response.status === 426) {
+                const message = new TextDecoder().decode(
+                    new Uint8Array(await response.arrayBuffer()),
+                ).trim();
+                throw upgradeRequired(
+                    message ||
+                    "server requires a newer Obsetync plugin; enrollment remains valid",
                 );
             }
             return response;
