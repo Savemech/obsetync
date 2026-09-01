@@ -189,6 +189,16 @@ every content address (and full manifest semantics) before storage or
 application. Packs are idempotent, mixed ACKs are legal, and progress moves only
 after stored/already-present ACKs.
 
+The server feeds both bulk uploads and stable single-object uploads into one
+bounded dedicated storage writer. A whole accepted group is appended to a
+checksummed journal and crosses exactly one `fdatasync` before any success ACK
+can be returned. Loose files are atomic read mirrors, not the durability
+boundary: startup replays every complete journal group before opening the API,
+and truncates an incomplete final group to its previous complete boundary.
+Corruption inside a complete group fails startup closed. Queue exhaustion maps
+to the retryable storage status (or HTTP 503 on a legacy endpoint), preserving
+backpressure without weakening idempotent retry semantics.
+
 ## Replay protection and concurrency
 
 Ordinary requests carry a positive per-device sequence. A sequence is

@@ -15,7 +15,7 @@ C4Component
     ContainerDb_Ext(device_store, "Device & Enrollment Store", "Filesystem", "Bearer token index, device records, enrollment codes.")
 
     Container_Boundary(b_server, "Sync Server · Rust · axum") {
-        Component(app_state, "AppState", "state.rs · Arc<AppState>", "Shared state: StorageLayout, VaultStore, static X25519 key bytes, rotating in-memory transport keys, durable SequenceTracker, per-vault write locks, notify/presence state, and uptime.")
+        Component(app_state, "AppState", "state.rs · Arc<AppState>", "Shared state: StorageLayout, VaultStore, bounded StorageWriter, static X25519 key bytes, rotating in-memory transport keys, durable SequenceTracker, per-vault write locks, notify/presence state, and uptime.")
 
         Component(secure_envelope, "SecureEnvelope", "api.rs · axum middleware", "Accepts wire POST only, opens wire v2, validates bearer/revocation and durable sequence before the handler, then encrypts semantic status + body under outer HTTP 200. Pre-open failures collapse to one 256-zero decoy; credential-free bootstrap is endpoint-scoped.")
 
@@ -35,6 +35,8 @@ C4Component
 
         Component(storage, "StorageLayout + VaultStore", "storage.rs", "Central path derivation maps unsafe identifiers to non-aliasing in-namespace names. Content/root objects use same-directory unique temps, fsync, atomic promotion, and directory sync. Check/read paths re-hash content-addressed objects so corruption becomes a normal re-upload instead of permanent false presence.")
 
+        Component(storage_writer, "StorageWriter", "storage_writer.rs · dedicated OS thread", "Bounds queued plaintext to 64 MiB, verifies and deduplicates immutable objects, appends checksummed groups to a recovery journal, performs one fdatasync per group, then atomically publishes loose mirrors and resolves ACK waiters.")
+
         Component(sync_core_bridge, "SyncCoreBridge", "bridge.rs · sync_core (native)", "Bounded async wrappers that offload sync-core operations to spawn_blocking with a LocalSet. run_validate_root iteratively walks untrusted index nodes and proves version, count, path order/scope, prefix placement, and numeric bounds before history/current mutation. run_diff and run_merge then operate through DiskChunkStore.")
     }
 
@@ -48,7 +50,8 @@ C4Component
     Rel(secure_envelope, sequence_tracker, "Consumes authenticated sequence before handler")
 
     Rel(sync_router, app_state, "Reads layout and vaults for all handler operations")
-    Rel(sync_router, storage, "Read / write blobs, chunks, manifests, index nodes, vault roots")
+    Rel(sync_router, storage_writer, "Enqueue verified immutable objects; await durable per-object results")
+    Rel(sync_router, storage, "Read blobs, chunks, manifests, index nodes, and vault roots")
     Rel(sync_router, sync_core_bridge, "run_diff() on POST /diff · run_merge() on PUT /root when roots diverge")
 
     Rel(admin_router, app_state, "Reads layout, vaults, started_at")
@@ -59,6 +62,9 @@ C4Component
     Rel(enrollment_mgr, device_registry, "register_device() — writes permanent bearer token + device record on successful claim")
 
     Rel(sync_core_bridge, storage, "DiskChunkStore: reads index/{hash} nodes for diff and merge traversal")
+
+    Rel(storage_writer, storage, "Derive object paths; atomically publish journal-backed loose mirrors")
+    Rel(storage_writer, content_store, "Append and fdatasync recovery groups; materialize mirrors")
 
     Rel(storage, content_store, "Read / write via std::fs — blobs, manifests, chunks, index nodes, vault roots")
     Rel(storage, device_store, "Read / write via std::fs — device records, token index, enrollment files")
@@ -82,6 +88,7 @@ C4Component
 | **DeviceRegistry** | `devices.rs` | Every function is a direct filesystem operation. `lookup_token` is intentionally O(1): it reads one file at `devices/tokens/{token}` and gets back the `device_id`. `is_revoked` checks for the existence of a `revoked` sentinel file — no locking, no DB. `touch_last_seen` is throttled (30-second minimum gap) so a large push that triggers hundreds of route calls doesn't rewrite `device.json` hundreds of times. |
 | **EnrollmentManager** | `enrollment.rs` | Generates a human-readable code like `AXBR-7742` (4 uppercase letters + hyphen + 4 digits) to avoid ambiguous characters. The bearer token is 32 cryptographically random bytes (hex-encoded, 64 chars). The enrollment file is deleted on both successful and failed claim attempts — codes cannot be retried. The admin UI's `/admin/enrollment/{code}` route is what the user opens on their phone; the Obsidian plugin's enrollment flow calls this same endpoint. |
 | **StorageLayout + VaultStore** | `storage.rs` | Derives all paths and prevents untrusted IDs from escaping their namespace; unsafe names are mapped under a `~` prefix that no literal safe identifier can use. Blobs and root history use same-directory temp files, file `fsync`, atomic rename, and directory `fsync`. Corrupt objects are replaceable, while the first valid metadata recorded for an existing semantic root is immutable. `current` is the small mutable root pointer. Hash-aware checks and reads treat corrupted content/index objects as missing or reject them closed. |
+| **StorageWriter** | `storage_writer.rs` | A dedicated blocking thread owns the immutable-object journal. The API has a 64 MiB byte reservation and bounded message channel; full queues fail immediately with retryable backpressure. Valid records are deduplicated, appended as a checksummed group, and acknowledged only after one `fdatasync`. Atomic loose mirrors are published afterward without per-object barriers. Startup replays complete groups, recreates missing mirrors, truncates only a torn final group, and rejects corruption in a complete group. This transitional read backend is replaced by indexed segments in the next storage slice. |
 | **SyncCoreBridge** | `bridge.rs` | An async shim around `!Send` sync-core futures using `spawn_blocking`, a current-thread runtime, and `LocalSet`. Besides diff/merge, `run_validate_root` performs an iterative, allocation-bounded traversal of an uploaded root: it validates all node types and prefixes, strict path order and vault-relative path safety, declared file count, JS-safe metadata, and global node/entry limits. The shared loader explicitly path-sorts flattened entries, including internal nodes with more than ten lexicographically named children. |
 
 ---

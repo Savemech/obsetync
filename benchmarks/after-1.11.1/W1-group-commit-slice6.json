@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "runtime": {
+    "platform": "linux-wsl2",
+    "architecture": "x86_64",
+    "kernel": "6.18.33.2-microsoft-standard-WSL2",
+    "rustc": "1.95.0",
+    "cpu": "AMD Ryzen 9 5950X 16-Core Processor",
+    "filesystem_location": "/tmp"
+  },
+  "workload": {
+    "id": "W1",
+    "files": 100000,
+    "bytes": 870400000,
+    "size_distribution": "deterministic round-robin 1..16 KiB",
+    "objects_per_group": 256,
+    "groups": 391
+  },
+  "measurement": {
+    "command": "cargo test -p sync-server --release benchmark_w1_group_commit -- --ignored --nocapture",
+    "scope": "direct production StorageWriter; excludes HTTP, AEAD, and tempdir cleanup",
+    "includes": [
+      "payload construction",
+      "server-side BLAKE3 verification",
+      "checksummed journal append",
+      "fdatasync wait",
+      "atomic loose-mirror publication"
+    ],
+    "elapsed_ms": 11630.637,
+    "files_per_second": 8597.982,
+    "mib_per_second": 71.370
+  },
+  "durability": {
+    "fdatasyncs": 391,
+    "legacy_loose_file_and_directory_syncs": 200000,
+    "barrier_reduction_ratio": 511.5089514066496,
+    "pack_appends": 100000,
+    "journal_payload_bytes": 870400000,
+    "loose_writes_with_individual_fsync": 0
+  },
+  "bounds": {
+    "queue_bytes": 67108864,
+    "queue_messages": 64,
+    "group_target_bytes": 16777216,
+    "group_latency_ms": 5,
+    "observed_queue_peak_objects": 256,
+    "final_queue_depth_objects": 0
+  },
+  "invariants": {
+    "all_object_hashes_verified_before_append": true,
+    "success_ack_only_after_group_fdatasync": true,
+    "one_fdatasync_per_nonempty_group": true,
+    "retry_is_content_addressed_and_idempotent": true,
+    "torn_tail_recovery_tested": true,
+    "post_sync_recovery_tested": true,
+    "committed_corruption_fails_closed": true
+  }
+}

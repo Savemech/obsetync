@@ -44,6 +44,16 @@ under the 2 MiB mobile budget: 128.4x and 123.9x fewer requests respectively.
 Every planned pack stays within the authenticated byte/count caps; the planner
 does not materialize aggregate bodies while calculating those boundaries.
 
+`W1-group-commit-slice6.json` sends those 100,000 W1 objects through the
+production dedicated storage writer in 256-object batches. The fresh `/tmp`
+run includes deterministic payload construction, server-side BLAKE3
+verification, an 870.4 MB journal append, 100,000 atomic loose-mirror
+publications, and every durability wait. It completes in 11.63 seconds at
+8,598 files/s and 71.37 MiB/s with exactly 391 `fdatasync` calls—one per group,
+instead of the legacy loose writer's 200,000 file-plus-directory barriers.
+Crash tests separately cover torn tails, post-sync/pre-publication recovery,
+partial publication, corrupt committed groups, and response loss after publish.
+
 This Linux/x86_64 run is implementation evidence, not the final cross-hardware
 release report. A17, M1, Snapdragon, cold/warm cache, power, and network fields
 are added by the final hardware gate.
