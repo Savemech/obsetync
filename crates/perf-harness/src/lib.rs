@@ -384,6 +384,50 @@ pub struct DiffPageBenchmarkReport {
     pub client_retention_model: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreeV2BenchmarkReport {
+    pub schema_version: u8,
+    pub harness_version: String,
+    pub operating_system: String,
+    pub architecture: String,
+    pub entries: u64,
+    pub iterations: u64,
+    pub scenarios: Vec<TreeV2BenchmarkScenario>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreeV2BenchmarkScenario {
+    pub name: String,
+    pub median_update_speedup: f64,
+    pub median_diff_speedup: f64,
+    pub max_v2_entries_loaded: u64,
+    pub max_v2_new_reachable_nodes: u64,
+    pub all_semantic_states_match: bool,
+    pub all_deltas_match: bool,
+    pub all_v2_churn_bounded: bool,
+    pub measurements: Vec<TreeV2BenchmarkIteration>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreeV2BenchmarkIteration {
+    pub v1_update_ns: u64,
+    pub v2_update_ns: u64,
+    pub update_speedup: f64,
+    pub v1_diff_ns: u64,
+    pub v2_diff_ns: u64,
+    pub diff_speedup: f64,
+    pub v1_diff_entries_materialized: u64,
+    pub v2_diff_entries_materialized: u64,
+    pub v1_new_reachable_nodes: u64,
+    pub v2_new_reachable_nodes: u64,
+    pub v2_leaves_loaded: u64,
+    pub v2_entries_loaded: u64,
+    pub v2_replacement_leaves: u64,
+    pub semantic_state_matches: bool,
+    pub deltas_match: bool,
+    pub v2_churn_bounded: bool,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum HarnessError {
     #[error("invalid scale {0:?}; expected a decimal in (0, 1] with at most six digits")]
@@ -1026,6 +1070,276 @@ pub fn benchmark_diff_pages(
     })
 }
 
+/// Compare Tree v1 and the isolated Tree v2 prototype on W5-shaped local
+/// changes. Construction, graph accounting, and semantic audits are outside
+/// the timed regions; update and diff timings cover production algorithms.
+pub async fn benchmark_tree_v2(
+    entries: usize,
+    iterations: usize,
+) -> Result<TreeV2BenchmarkReport, HarnessError> {
+    const MAX_ENTRIES: usize = 1_000_000;
+    if !(10_000..=MAX_ENTRIES).contains(&entries) || iterations == 0 || iterations > 100 {
+        return Err(HarnessError::ManifestMismatch(
+            "Tree v2 benchmark expects 10,000..=1,000,000 entries and 1..=100 iterations".into(),
+        ));
+    }
+    let initial: Vec<_> = (0..entries)
+        .map(|index| benchmark_tree_entry(&format!("wide/{index:08}.md"), index as u64 + 1))
+        .collect();
+    let scenario_names = ["modify-middle", "insert-near-start", "delete-anchor"];
+    let mut scenarios = Vec::with_capacity(scenario_names.len());
+
+    for scenario_name in scenario_names {
+        let mut measurements = Vec::with_capacity(iterations);
+        for iteration in 0..iterations {
+            let v1_store = sync_core::store::MemoryChunkStore::new();
+            let v1_before = sync_core::tree::build_tree(
+                &v1_store,
+                initial.clone(),
+                "tree-v2-benchmark",
+                "perf-harness",
+            )
+            .await
+            .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+            let v2_store = sync_core::store::MemoryChunkStore::new();
+            let v2_before = sync_core::tree_v2::build_tree(&v2_store, initial.clone())
+                .await
+                .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+            let v2_ranges = sync_core::tree_v2::leaf_ranges(&v2_store, &v2_before)
+                .await
+                .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+
+            let revision = 10_000_000 + iteration as u64;
+            let (changed, deleted) = match scenario_name {
+                "modify-middle" => (
+                    vec![benchmark_tree_entry(
+                        &format!("wide/{:08}.md", entries / 2),
+                        revision,
+                    )],
+                    Vec::new(),
+                ),
+                "insert-near-start" => (
+                    vec![benchmark_tree_entry("wide/00000000-added.md", revision)],
+                    Vec::new(),
+                ),
+                "delete-anchor" => {
+                    let anchor = v2_ranges
+                        .get(1)
+                        .or_else(|| v2_ranges.first())
+                        .ok_or_else(|| HarnessError::ManifestMismatch("v2 has no leaves".into()))?
+                        .max_path
+                        .clone();
+                    (Vec::new(), vec![anchor])
+                }
+                _ => unreachable!(),
+            };
+
+            let v1_before_reachable = sync_core::transactional_tree::mark_reachable_chunks(
+                &v1_store,
+                std::iter::once(&v1_before),
+            )
+            .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+            let v2_before_reachable = sync_core::tree_v2::reachable_hashes(&v2_store, &v2_before)
+                .await
+                .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+
+            let (v1_after, v1_update_ns, v2_after, v2_stats, v2_update_ns) = if iteration % 2 == 0 {
+                let started = Instant::now();
+                let v1 = sync_core::tree::update_tree(&v1_store, &v1_before, &changed, &deleted)
+                    .await
+                    .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+                let v1_ns = elapsed_ns(started.elapsed());
+                let started = Instant::now();
+                let (v2, stats) =
+                    sync_core::tree_v2::update_tree(&v2_store, &v2_before, &changed, &deleted)
+                        .await
+                        .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+                let v2_ns = elapsed_ns(started.elapsed());
+                (v1, v1_ns, v2, stats, v2_ns)
+            } else {
+                let started = Instant::now();
+                let (v2, stats) =
+                    sync_core::tree_v2::update_tree(&v2_store, &v2_before, &changed, &deleted)
+                        .await
+                        .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+                let v2_ns = elapsed_ns(started.elapsed());
+                let started = Instant::now();
+                let v1 = sync_core::tree::update_tree(&v1_store, &v1_before, &changed, &deleted)
+                    .await
+                    .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+                let v1_ns = elapsed_ns(started.elapsed());
+                (v1, v1_ns, v2, stats, v2_ns)
+            };
+
+            let (v1_diff, v1_diff_ns, v2_diff, v2_diff_ns) = if iteration % 2 == 0 {
+                let started = Instant::now();
+                let v2 =
+                    sync_core::tree_v2::compute_deltas_with_stats(&v2_store, &v2_before, &v2_after)
+                        .await
+                        .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+                let v2_ns = elapsed_ns(started.elapsed());
+                let started = Instant::now();
+                let v1 =
+                    sync_core::diff::compute_deltas_with_stats(&v1_store, &v1_before, &v1_after)
+                        .await
+                        .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+                let v1_ns = elapsed_ns(started.elapsed());
+                (v1, v1_ns, v2, v2_ns)
+            } else {
+                let started = Instant::now();
+                let v1 =
+                    sync_core::diff::compute_deltas_with_stats(&v1_store, &v1_before, &v1_after)
+                        .await
+                        .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+                let v1_ns = elapsed_ns(started.elapsed());
+                let started = Instant::now();
+                let v2 =
+                    sync_core::tree_v2::compute_deltas_with_stats(&v2_store, &v2_before, &v2_after)
+                        .await
+                        .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+                let v2_ns = elapsed_ns(started.elapsed());
+                (v1, v1_ns, v2, v2_ns)
+            };
+
+            let v1_after_reachable = sync_core::transactional_tree::mark_reachable_chunks(
+                &v1_store,
+                std::iter::once(&v1_after),
+            )
+            .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+            let v2_after_reachable = sync_core::tree_v2::reachable_hashes(&v2_store, &v2_after)
+                .await
+                .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+            let v1_new_reachable_nodes =
+                v1_after_reachable.difference(&v1_before_reachable).count() as u64;
+            let v2_new_reachable_nodes =
+                v2_after_reachable.difference(&v2_before_reachable).count() as u64;
+
+            let mut expected: BTreeMap<String, sync_core::chunk::FileEntry> = initial
+                .iter()
+                .cloned()
+                .map(|entry| (entry.path.clone(), entry))
+                .collect();
+            for path in &deleted {
+                expected.remove(path);
+            }
+            for entry in &changed {
+                expected.insert(entry.path.clone(), entry.clone());
+            }
+            let expected_entries: Vec<_> = expected.into_values().collect();
+            let mut v1_entries = Vec::new();
+            for (_, hash) in &v1_after.children {
+                v1_entries.extend(
+                    sync_core::tree::load_all_entries(&v1_store, hash)
+                        .await
+                        .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?,
+                );
+            }
+            v1_entries.sort();
+            let v2_entries = sync_core::tree_v2::load_all_entries(&v2_store, &v2_after)
+                .await
+                .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+            let oracle_store = sync_core::store::MemoryChunkStore::new();
+            let oracle = sync_core::tree_v2::build_tree(&oracle_store, expected_entries.clone())
+                .await
+                .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+            let semantic_state_matches = v1_entries == expected_entries
+                && v2_entries == expected_entries
+                && v2_after.hash() == oracle.hash();
+            let deltas_match = v1_diff.deltas == v2_diff.deltas;
+            let churn_limit = v2_stats
+                .replacement_leaves
+                .saturating_add(2 * (u64::from(v2_after.height()) + 1));
+            let v2_churn_bounded = v2_new_reachable_nodes <= churn_limit
+                && v2_stats.entries_loaded <= 64 * sync_core::tree_v2::MAX_LEAF_ENTRIES as u64;
+
+            measurements.push(TreeV2BenchmarkIteration {
+                v1_update_ns,
+                v2_update_ns,
+                update_speedup: v1_update_ns as f64 / v2_update_ns.max(1) as f64,
+                v1_diff_ns,
+                v2_diff_ns,
+                diff_speedup: v1_diff_ns as f64 / v2_diff_ns.max(1) as f64,
+                v1_diff_entries_materialized: v1_diff.stats.entries_materialized,
+                v2_diff_entries_materialized: v2_diff.stats.entries_materialized,
+                v1_new_reachable_nodes,
+                v2_new_reachable_nodes,
+                v2_leaves_loaded: v2_stats.leaves_loaded,
+                v2_entries_loaded: v2_stats.entries_loaded,
+                v2_replacement_leaves: v2_stats.replacement_leaves,
+                semantic_state_matches,
+                deltas_match,
+                v2_churn_bounded,
+            });
+        }
+
+        let median_update_speedup = median_f64(
+            measurements
+                .iter()
+                .map(|measurement| measurement.update_speedup)
+                .collect(),
+        );
+        let median_diff_speedup = median_f64(
+            measurements
+                .iter()
+                .map(|measurement| measurement.diff_speedup)
+                .collect(),
+        );
+        let all_semantic_states_match = measurements
+            .iter()
+            .all(|measurement| measurement.semantic_state_matches);
+        let all_deltas_match = measurements
+            .iter()
+            .all(|measurement| measurement.deltas_match);
+        let all_v2_churn_bounded = measurements
+            .iter()
+            .all(|measurement| measurement.v2_churn_bounded);
+        if !all_semantic_states_match || !all_deltas_match || !all_v2_churn_bounded {
+            return Err(HarnessError::ManifestMismatch(format!(
+                "Tree v2 {scenario_name} failed semantic/diff/churn gate"
+            )));
+        }
+        scenarios.push(TreeV2BenchmarkScenario {
+            name: scenario_name.to_owned(),
+            median_update_speedup,
+            median_diff_speedup,
+            max_v2_entries_loaded: measurements
+                .iter()
+                .map(|measurement| measurement.v2_entries_loaded)
+                .max()
+                .unwrap_or(0),
+            max_v2_new_reachable_nodes: measurements
+                .iter()
+                .map(|measurement| measurement.v2_new_reachable_nodes)
+                .max()
+                .unwrap_or(0),
+            all_semantic_states_match,
+            all_deltas_match,
+            all_v2_churn_bounded,
+            measurements,
+        });
+    }
+
+    Ok(TreeV2BenchmarkReport {
+        schema_version: 1,
+        harness_version: env!("CARGO_PKG_VERSION").to_owned(),
+        operating_system: std::env::consts::OS.to_owned(),
+        architecture: std::env::consts::ARCH.to_owned(),
+        entries: entries as u64,
+        iterations: iterations as u64,
+        scenarios,
+    })
+}
+
+fn median_f64(mut values: Vec<f64>) -> f64 {
+    values.sort_by(|left, right| left.total_cmp(right));
+    let middle = values.len() / 2;
+    if values.len().is_multiple_of(2) {
+        (values[middle - 1] + values[middle]) / 2.0
+    } else {
+        values[middle]
+    }
+}
+
 async fn legacy_prefix_update(
     store: &sync_core::store::MemoryChunkStore,
     root: &sync_core::chunk::RootNode,
@@ -1457,5 +1771,21 @@ mod tests {
         assert!(report.every_page_within_cap);
         assert!(report.max_plain_page_bytes <= report.page_cap_bytes);
         assert!(report.max_page_records <= report.record_cap);
+    }
+
+    #[tokio::test]
+    async fn tree_v2_benchmark_proves_semantics_and_bounded_work() {
+        let report = benchmark_tree_v2(10_000, 1).await.unwrap();
+        assert_eq!(report.scenarios.len(), 3);
+        assert!(report.scenarios.iter().all(|scenario| {
+            scenario.all_semantic_states_match
+                && scenario.all_deltas_match
+                && scenario.all_v2_churn_bounded
+                && scenario.max_v2_entries_loaded < report.entries
+                && scenario.measurements.iter().all(|measurement| {
+                    measurement.v2_diff_entries_materialized
+                        < measurement.v1_diff_entries_materialized
+                })
+        }));
     }
 }

@@ -101,6 +101,18 @@ snapshot tests, and cold-renderer recovery before and after the final cursor
 cover the semantic and crash gates. Tree v1 still recomputes a materialized
 delta on each page; the Tree v2 slices replace that server-side producer.
 
+`W5-tree-v2-slice11.json` compares Tree v1 with the isolated path-CDC range-tree
+prototype over 100,000 paths and three alternating-order runs per scenario.
+Every incremental v2 root equals a fresh canonical rebuild, every v1/v2 delta
+matches exactly, and every churn bound passes. Median update speedups are 93.58x
+for a content edit, 95.34x for an insertion near the beginning, and 40.62x when
+deleting a natural boundary. Median recursive-diff speedups are 143.34x, 154.18x,
+and 43.87x. V2 loads at most 1,729 entries for an update and materializes at most
+3,457 diff records, versus roughly 200,000 records in Tree v1. The disruptive
+insert/delete cases create only 3/4 new reachable v2 nodes instead of 102/100 v1
+nodes. This passes the Slice 11 gain/churn gate and selects the range-tree design
+over the radix fallback; production root migration remains isolated to Slice 12.
+
 This Linux/x86_64 run is implementation evidence, not the final cross-hardware
 release report. A17, M1, Snapdragon, cold/warm cache, power, and network fields
 are added by the final hardware gate.

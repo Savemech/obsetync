@@ -79,6 +79,25 @@ through the production Rust codec, and fails instead of writing a report if a
 page exceeds either cap, a cursor stops making progress, or the final record
 count differs from the input.
 
+Compare the production Tree v1 algorithms with the isolated path-CDC range
+Tree v2 prototype on 100,000 ordered paths:
+
+```bash
+cargo run -p perf-harness --release -- tree-v2-bench \
+  --entries 100000 --iterations 3 \
+  --output reports/W5-tree-v2.json
+```
+
+The three scenarios modify an existing path, insert near the beginning, and
+delete a natural v2 boundary. Initial construction, reachable-graph accounting,
+and semantic oracle rebuilds are outside the timed regions; update/diff order
+alternates between iterations. The command refuses to produce a report unless
+Tree v1, incremental v2, and a fresh flat-state v2 rebuild agree, v1/v2 deltas
+are identical, and v2 entry loading plus reachable-node churn stay bounded.
+Timing fields are evidence rather than a CI threshold; deterministic tests gate
+the corresponding reduction in materialized records without depending on host
+load.
+
 ## Workload semantics
 
 - W1: 100,000 Markdown files, each 1–16 KiB.

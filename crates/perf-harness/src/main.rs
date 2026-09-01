@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use perf_harness::{
-    apply_operation, benchmark, benchmark_diff_pages, benchmark_prefix_merge, materialize, verify,
-    MaterializeOptions, Scale, WorkloadId, WorkloadPlan,
+    apply_operation, benchmark, benchmark_diff_pages, benchmark_prefix_merge, benchmark_tree_v2,
+    materialize, verify, MaterializeOptions, Scale, WorkloadId, WorkloadPlan,
 };
 use std::path::PathBuf;
 
@@ -97,6 +97,16 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Compare Tree v1 with the path-CDC range Tree v2 prototype.
+    TreeV2Bench {
+        #[arg(long, default_value_t = 100_000)]
+        entries: usize,
+        #[arg(long, default_value_t = 3)]
+        iterations: usize,
+        /// Optional JSON report path; stdout is used when omitted.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -167,6 +177,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             output,
         } => {
             let report = benchmark_diff_pages(records, page_bytes, page_records)?;
+            if let Some(path) = output {
+                let file = std::fs::File::create(path)?;
+                serde_json::to_writer_pretty(std::io::BufWriter::new(file), &report)?;
+                return Ok(());
+            }
+            serde_json::to_value(report)?
+        }
+        Command::TreeV2Bench {
+            entries,
+            iterations,
+            output,
+        } => {
+            let report = benchmark_tree_v2(entries, iterations).await?;
             if let Some(path) = output {
                 let file = std::fs::File::create(path)?;
                 serde_json::to_writer_pretty(std::io::BufWriter::new(file), &report)?;
