@@ -6,7 +6,7 @@ use axum::{
     http::{Method, StatusCode},
     response::{Html, IntoResponse, Redirect},
     routing::{get, post},
-    Router,
+    Json, Router,
 };
 use sync_core::hash::hash_to_hex;
 use tower_http::cors::CorsLayer;
@@ -31,6 +31,7 @@ pub fn admin_router(state: SharedState) -> Router {
             post(approve_deletion),
         )
         .route("/admin/vaults", get(vault_list))
+        .route("/admin/api/performance", get(api_performance))
         .route("/admin/vaults/{vault_id}", get(vault_detail))
         .route("/admin/vaults/{vault_id}/rollback", post(rollback_vault))
         .route("/admin/vaults/{vault_id}/purge", post(purge_vault))
@@ -51,6 +52,15 @@ pub fn admin_router(state: SharedState) -> Router {
         .route("/admin/enrollment/{code}", get(claim_enrollment))
         .layer(cors)
         .with_state(state)
+}
+
+/// Aggregate process telemetry only. The snapshot schema has no identifier,
+/// path, hash, token, or payload fields, so it is safe to copy into a debug
+/// report without exposing vault contents.
+async fn api_performance(
+    State(state): State<SharedState>,
+) -> Json<crate::perf::ServerPerfSnapshot> {
+    Json(state.perf.snapshot())
 }
 
 // --- Dashboard ---

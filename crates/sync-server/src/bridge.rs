@@ -241,6 +241,16 @@ pub async fn run_diff(
     from_root: RootNode,
     to_root: RootNode,
 ) -> Result<Vec<FileDelta>, String> {
+    Ok(run_diff_with_stats(index_base, from_root, to_root)
+        .await?
+        .deltas)
+}
+
+pub async fn run_diff_with_stats(
+    index_base: PathBuf,
+    from_root: RootNode,
+    to_root: RootNode,
+) -> Result<sync_core::diff::DiffResult, String> {
     tokio::task::spawn_blocking(move || {
         let store = DiskChunkStore::new(&index_base);
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -249,7 +259,7 @@ pub async fn run_diff(
             .map_err(|e| e.to_string())?;
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async {
-            sync_core::diff::compute_deltas(&store, &from_root, &to_root)
+            sync_core::diff::compute_deltas_with_stats(&store, &from_root, &to_root)
                 .await
                 .map_err(|e| e.to_string())
         })

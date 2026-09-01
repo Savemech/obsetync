@@ -1,9 +1,13 @@
 use crate::bridge;
 use crate::devices;
 use crate::error::ServerError;
+use crate::perf::{DiffSample, RequestPhase, ServerPerfCounters};
 use crate::secure;
 use crate::state::SharedState;
-use crate::storage::{blob_exists, blob_matches_hash, read_blob, write_blob, StorageLayout};
+use crate::storage::{
+    blob_exists_measured, blob_matches_hash_measured, read_blob_measured, write_blob_measured,
+    StorageLayout,
+};
 use axum::{
     body::Body,
     extract::{Path, Request, State},
@@ -215,9 +219,14 @@ async fn secure_envelope(
 ) -> Response {
     let path = request.uri().path().to_owned();
     let started = std::time::Instant::now();
+    state.perf.request_started();
+    state
+        .perf
+        .record_request_phase(RequestPhase::QueueWait, std::time::Duration::ZERO);
     if request.method() != Method::POST {
+        state.perf.record_request_error();
         tracing::warn!(path = %path, "transport-v2 request used a non-POST wire method");
-        return decrypt_failure_decoy();
+        return decrypt_failure_decoy(state.perf.as_ref());
     }
     let Some(method) = request
         .headers()
@@ -225,31 +234,46 @@ async fn secure_envelope(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<Method>().ok())
     else {
+        state.perf.record_request_error();
         tracing::warn!(path = %path, "transport-v2 request omitted/invalidated semantic method");
-        return decrypt_failure_decoy();
+        return decrypt_failure_decoy(state.perf.as_ref());
     };
 
     let (mut parts, body) = request.into_parts();
     let body_bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(_) => {
+            state.perf.record_request_error();
             tracing::warn!(method = %method, path = %path, "transport-v2 request body unavailable");
-            return decrypt_failure_decoy();
+            return decrypt_failure_decoy(state.perf.as_ref());
         }
     };
+    state
+        .perf
+        .record_wire_request_bytes(body_bytes.len() as u64);
     let server_private = StaticSecret::from(state.server_priv_bytes);
+    let envelope_started = std::time::Instant::now();
     let decrypted_result = {
         let eph = state.eph.read().expect("eph state poisoned");
         secure::decrypt_request(&body_bytes, &server_private, &eph, method.as_str(), &path)
     };
+    let envelope_elapsed = envelope_started.elapsed();
+    state
+        .perf
+        .record_request_phase(RequestPhase::EnvelopeOpen, envelope_elapsed);
     let mut decrypted = match decrypted_result {
         Ok(value) => value,
         Err(error) => {
+            state.perf.record_request_error();
             tracing::warn!(method = %method, path = %path, reason = %error, "transport-v2 envelope rejected");
-            return decrypt_failure_decoy();
+            return decrypt_failure_decoy(state.perf.as_ref());
         }
     };
+    state
+        .perf
+        .record_plaintext_request_bytes(decrypted.inner_body.len() as u64);
 
+    let auth_started = std::time::Instant::now();
     let device_short = if decrypted.mode == secure::TransportMode::Bootstrap {
         // This read-only endpoint intentionally carries no bearer or sequence:
         // putting a credential inside the single-DH bootstrap would expose it
@@ -259,6 +283,10 @@ async fn secure_envelope(
         let device_id = match devices::lookup_token(&state.layout, &decrypted.bearer_token) {
             Some(device_id) => device_id,
             None => {
+                state
+                    .perf
+                    .record_request_phase(RequestPhase::TokenReplay, auth_started.elapsed());
+                state.perf.record_request_error();
                 tracing::warn!(method = %method, path = %path, "transport-v2 unknown bearer");
                 return encrypted_semantic_response(
                     &decrypted,
@@ -266,11 +294,16 @@ async fn secure_envelope(
                     br#"{"error":"unknown_bearer"}"#,
                     &method,
                     &path,
+                    state.perf.as_ref(),
                 );
             }
         };
         let device_short = device_id[..device_id.len().min(12)].to_owned();
         if devices::is_revoked(&state.layout, &device_id) {
+            state
+                .perf
+                .record_request_phase(RequestPhase::TokenReplay, auth_started.elapsed());
+            state.perf.record_request_error();
             tracing::warn!(device = %device_short, method = %method, path = %path, "revoked device attempted request");
             return encrypted_semantic_response(
                 &decrypted,
@@ -278,6 +311,7 @@ async fn secure_envelope(
                 br#"{"error":"revoked"}"#,
                 &method,
                 &path,
+                state.perf.as_ref(),
             );
         }
 
@@ -293,15 +327,24 @@ async fn secure_envelope(
                 })
                 .to_string();
                 tracing::warn!(device = %device_short, sequence = decrypted.sequence, greatest_seen, "transport-v2 replay rejected");
+                state
+                    .perf
+                    .record_request_phase(RequestPhase::TokenReplay, auth_started.elapsed());
+                state.perf.record_request_error();
                 return encrypted_semantic_response(
                     &decrypted,
                     StatusCode::UNAUTHORIZED,
                     body.as_bytes(),
                     &method,
                     &path,
+                    state.perf.as_ref(),
                 );
             }
             Err(error) => {
+                state
+                    .perf
+                    .record_request_phase(RequestPhase::TokenReplay, auth_started.elapsed());
+                state.perf.record_request_error();
                 tracing::error!(device = %device_short, reason = %error, "anti-replay state persistence failed");
                 return encrypted_semantic_response(
                     &decrypted,
@@ -309,6 +352,7 @@ async fn secure_envelope(
                     br#"{"error":"anti_replay_unavailable"}"#,
                     &method,
                     &path,
+                    state.perf.as_ref(),
                 );
             }
         }
@@ -316,6 +360,10 @@ async fn secure_envelope(
         parts.extensions.insert(DeviceIdExt(device_id));
         device_short
     };
+    let auth_elapsed = auth_started.elapsed();
+    state
+        .perf
+        .record_request_phase(RequestPhase::TokenReplay, auth_elapsed);
 
     parts.method = method.clone();
     let inner_body_len = decrypted.inner_body.len();
@@ -324,6 +372,7 @@ async fn secure_envelope(
     inner_request
         .headers_mut()
         .remove(axum::http::header::CONTENT_LENGTH);
+    let handler_started = std::time::Instant::now();
     let inner_response = next.run(inner_request).await;
     let semantic_status = inner_response.status();
     let (_, response_body) = inner_response.into_parts();
@@ -335,6 +384,10 @@ async fn secure_envelope(
         match axum::body::to_bytes(response_body, MAX_BODY_BYTES).await {
             Ok(bytes) => bytes,
             Err(_) => {
+                state
+                    .perf
+                    .record_request_phase(RequestPhase::Handler, handler_started.elapsed());
+                state.perf.record_request_error();
                 tracing::error!(device = %device_short, method = %method, path = %path, "handler response body unavailable");
                 return encrypted_semantic_response(
                     &decrypted,
@@ -342,10 +395,18 @@ async fn secure_envelope(
                     br#"{"error":"internal"}"#,
                     &method,
                     &path,
+                    state.perf.as_ref(),
                 );
             }
         }
     };
+    let handler_elapsed = handler_started.elapsed();
+    state
+        .perf
+        .record_request_phase(RequestPhase::Handler, handler_elapsed);
+    if !semantic_status.is_success() {
+        state.perf.record_request_error();
+    }
 
     tracing::debug!(
         device = %device_short,
@@ -355,10 +416,20 @@ async fn secure_envelope(
         status = semantic_status.as_u16(),
         in_body = inner_body_len,
         out_body = response_bytes.len(),
+        envelope_open_us = envelope_elapsed.as_micros() as u64,
+        token_replay_us = auth_elapsed.as_micros() as u64,
+        handler_us = handler_elapsed.as_micros() as u64,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "transport-v2 sync request"
     );
-    encrypted_semantic_response(&decrypted, semantic_status, &response_bytes, &method, &path)
+    encrypted_semantic_response(
+        &decrypted,
+        semantic_status,
+        &response_bytes,
+        &method,
+        &path,
+        state.perf.as_ref(),
+    )
 }
 
 fn encrypted_semantic_response(
@@ -367,7 +438,9 @@ fn encrypted_semantic_response(
     body: &[u8],
     method: &Method,
     path: &str,
+    perf: &ServerPerfCounters,
 ) -> Response {
+    let seal_started = std::time::Instant::now();
     match secure::encrypt_response(
         status.as_u16(),
         body,
@@ -377,20 +450,32 @@ fn encrypted_semantic_response(
         path,
         &request.nonce_req,
     ) {
-        Ok(encrypted) => (
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-            encrypted,
-        )
-            .into_response(),
+        Ok(encrypted) => {
+            let seal_elapsed = seal_started.elapsed();
+            perf.record_request_phase(RequestPhase::ResponseSeal, seal_elapsed);
+            perf.record_response_bytes(encrypted.len() as u64, body.len() as u64);
+            tracing::trace!(
+                response_seal_us = seal_elapsed.as_micros() as u64,
+                "transport-v2 response sealed"
+            );
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                encrypted,
+            )
+                .into_response()
+        }
         Err(error) => {
+            perf.record_request_phase(RequestPhase::ResponseSeal, seal_started.elapsed());
+            perf.record_response_seal_failure();
             tracing::error!(reason = %error, "transport-v2 response encryption failed");
-            decrypt_failure_decoy()
+            decrypt_failure_decoy(perf)
         }
     }
 }
 
-fn decrypt_failure_decoy() -> Response {
+fn decrypt_failure_decoy(perf: &ServerPerfCounters) -> Response {
+    perf.record_response_bytes(256, 0);
     (
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
@@ -967,9 +1052,15 @@ async fn put_root(
         .map_err(|e| ServerError::BadRequest(format!("invalid root structure: {}", e)))?;
     for entry in &entries {
         let present = if sync_core::fastcdc_chunker::should_chunk(entry.size_bytes) {
-            blob_exists(&state.layout.content_manifest_path(&entry.hash))
+            blob_exists_measured(
+                &state.layout.content_manifest_path(&entry.hash),
+                state.perf.as_ref(),
+            )
         } else {
-            blob_exists(&state.layout.content_blob_path(&entry.hash))
+            blob_exists_measured(
+                &state.layout.content_blob_path(&entry.hash),
+                state.perf.as_ref(),
+            )
         };
         if !present {
             return Err(ServerError::BadRequest(format!(
@@ -1200,6 +1291,7 @@ async fn post_diff(
     Path(vault_id): Path<String>,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
+    let diff_started = std::time::Instant::now();
     // device_root hash rides in the first 64 bytes of the encrypted body
     // (ASCII hex, space-padded) so it's covered by the AEAD envelope
     // rather than being tamperable in an HTTP header.
@@ -1222,6 +1314,14 @@ async fn post_diff(
 
     // Same root — no changes.
     if device_root_hash == current_hash {
+        state.perf.record_diff(DiffSample {
+            nodes_visited: 1,
+            nodes_skipped: 1,
+            entries_materialized: 0,
+            serialized_bytes: 2,
+            pages: 1,
+            elapsed: diff_started.elapsed(),
+        });
         tracing::debug!(
             vault = %vault_id,
             root  = %&hash_to_hex(&current_hash)[..16],
@@ -1267,9 +1367,11 @@ async fn post_diff(
 
     // Compute deltas via bridge.
     let index_base = state.layout.base.join("index");
-    let deltas = bridge::run_diff(index_base, from_root, to_root)
+    let diff_result = bridge::run_diff_with_stats(index_base, from_root, to_root)
         .await
         .map_err(|e| ServerError::Internal(format!("diff failed: {}", e)))?;
+    let compute_elapsed = diff_started.elapsed();
+    let deltas = diff_result.deltas;
 
     tracing::info!(
         vault = %vault_id,
@@ -1285,6 +1387,15 @@ async fn post_diff(
     // interpolate `delta.hash` into URLs like `/api/v1/content/{hash}`.
     let wire_deltas: Vec<WireDelta> = deltas.iter().map(WireDelta::from).collect();
     let json = serde_json::to_string(&wire_deltas)?;
+    state.perf.record_request_objects(deltas.len() as u64);
+    state.perf.record_diff(DiffSample {
+        nodes_visited: diff_result.stats.nodes_visited,
+        nodes_skipped: diff_result.stats.nodes_skipped,
+        entries_materialized: diff_result.stats.entries_materialized,
+        serialized_bytes: json.len() as u64,
+        pages: 1,
+        elapsed: compute_elapsed,
+    });
     Ok((StatusCode::OK, json))
 }
 
@@ -1371,9 +1482,15 @@ async fn get_chunk(
     let hash =
         hex_to_hash(&hash_hex).map_err(|_| ServerError::BadRequest("invalid hash".into()))?;
     let path = state.layout.index_path(&hash);
-    let data = read_blob(&path)
+    let data = read_blob_measured(&path, state.perf.as_ref())
         .ok_or_else(|| ServerError::NotFound(format!("chunk {} not found", hash_hex)))?;
-    if hash_bytes(&data) != hash {
+    let hash_started = std::time::Instant::now();
+    let matches = hash_bytes(&data) == hash;
+    state
+        .perf
+        .record_hash_check(data.len() as u64, hash_started.elapsed(), matches);
+    state.perf.record_request_objects(1);
+    if !matches {
         return Err(ServerError::Internal(format!(
             "index chunk {} failed content-address validation",
             hash_hex
@@ -1389,7 +1506,11 @@ async fn put_chunk(
 ) -> Result<impl IntoResponse, ServerError> {
     let expected =
         hex_to_hash(&hash_hex).map_err(|_| ServerError::BadRequest("invalid hash".into()))?;
+    let hash_started = std::time::Instant::now();
     let actual = hash_bytes(&body);
+    state
+        .perf
+        .record_hash_verify(body.len() as u64, hash_started.elapsed());
     if expected != actual {
         return Err(ServerError::BadRequest(format!(
             "hash mismatch: expected {}, got {}",
@@ -1398,7 +1519,8 @@ async fn put_chunk(
         )));
     }
     let path = state.layout.index_path(&expected);
-    write_blob(&path, &body)?;
+    write_blob_measured(&path, &body, state.perf.as_ref())?;
+    state.perf.record_request_objects(1);
     tracing::debug!(
         hash = %&hash_hex[..hash_hex.len().min(16)],
         bytes = body.len(),
@@ -1413,11 +1535,18 @@ async fn post_chunks_check(
 ) -> Result<impl IntoResponse, ServerError> {
     let hashes: Vec<String> = serde_json::from_slice(&body)
         .map_err(|e| ServerError::BadRequest(format!("expected JSON array of hashes: {}", e)))?;
+    state.perf.record_request_objects(hashes.len() as u64);
     let needed: Vec<String> = hashes
         .into_iter()
         .filter(|h| {
             hex_to_hash(h)
-                .map(|hash| !blob_matches_hash(&state.layout.index_path(&hash), &hash))
+                .map(|hash| {
+                    !blob_matches_hash_measured(
+                        &state.layout.index_path(&hash),
+                        &hash,
+                        state.perf.as_ref(),
+                    )
+                })
                 .unwrap_or(false)
         })
         .collect();
@@ -1433,9 +1562,15 @@ async fn get_content(
     let hash =
         hex_to_hash(&hash_hex).map_err(|_| ServerError::BadRequest("invalid hash".into()))?;
     let path = state.layout.content_blob_path(&hash);
-    let data = read_blob(&path)
+    let data = read_blob_measured(&path, state.perf.as_ref())
         .ok_or_else(|| ServerError::NotFound(format!("content {} not found", hash_hex)))?;
-    if hash_bytes(&data) != hash {
+    let hash_started = std::time::Instant::now();
+    let matches = hash_bytes(&data) == hash;
+    state
+        .perf
+        .record_hash_check(data.len() as u64, hash_started.elapsed(), matches);
+    state.perf.record_request_objects(1);
+    if !matches {
         return Err(ServerError::Internal(format!(
             "content {} failed content-address validation",
             hash_hex
@@ -1451,12 +1586,17 @@ async fn put_content(
 ) -> Result<impl IntoResponse, ServerError> {
     let expected =
         hex_to_hash(&hash_hex).map_err(|_| ServerError::BadRequest("invalid hash".into()))?;
+    let hash_started = std::time::Instant::now();
     let actual = hash_bytes(&body);
+    state
+        .perf
+        .record_hash_verify(body.len() as u64, hash_started.elapsed());
     if expected != actual {
         return Err(ServerError::BadRequest("hash mismatch".into()));
     }
     let path = state.layout.content_blob_path(&expected);
-    write_blob(&path, &body)?;
+    write_blob_measured(&path, &body, state.perf.as_ref())?;
+    state.perf.record_request_objects(1);
     tracing::debug!(
         hash = %&hash_hex[..hash_hex.len().min(16)],
         bytes = body.len(),
@@ -1471,11 +1611,18 @@ async fn post_content_check(
 ) -> Result<impl IntoResponse, ServerError> {
     let hashes: Vec<String> = serde_json::from_slice(&body)
         .map_err(|e| ServerError::BadRequest(format!("expected JSON array of hashes: {}", e)))?;
+    state.perf.record_request_objects(hashes.len() as u64);
     let needed: Vec<String> = hashes
         .into_iter()
         .filter(|h| {
             hex_to_hash(h)
-                .map(|hash| !blob_matches_hash(&state.layout.content_blob_path(&hash), &hash))
+                .map(|hash| {
+                    !blob_matches_hash_measured(
+                        &state.layout.content_blob_path(&hash),
+                        &hash,
+                        state.perf.as_ref(),
+                    )
+                })
                 .unwrap_or(false)
         })
         .collect();
@@ -1556,22 +1703,29 @@ fn validate_content_manifest(
     layout: &StorageLayout,
     expected_file_hash: &FileHash,
     manifest: &WireContentManifest,
+    perf: &crate::perf::ServerPerfCounters,
 ) -> Result<(), ServerError> {
     let chunk_hashes = validate_content_manifest_structure(expected_file_hash, manifest)
         .map_err(ServerError::BadRequest)?;
     let mut full_hasher = blake3::Hasher::new();
     for (index, (chunk, chunk_hash)) in manifest.chunks.iter().zip(chunk_hashes.iter()).enumerate()
     {
-        let bytes = read_blob(&layout.content_chunk_path(chunk_hash)).ok_or_else(|| {
-            ServerError::BadRequest(format!("manifest chunk {} is missing", index))
-        })?;
-        if bytes.len() != chunk.size as usize || hash_bytes(&bytes) != *chunk_hash {
+        let bytes =
+            read_blob_measured(&layout.content_chunk_path(chunk_hash), perf).ok_or_else(|| {
+                ServerError::BadRequest(format!("manifest chunk {} is missing", index))
+            })?;
+        let hash_started = std::time::Instant::now();
+        let chunk_matches = hash_bytes(&bytes) == *chunk_hash;
+        perf.record_hash_check(bytes.len() as u64, hash_started.elapsed(), chunk_matches);
+        if bytes.len() != chunk.size as usize || !chunk_matches {
             return Err(ServerError::BadRequest(format!(
                 "manifest chunk {} failed size/hash validation",
                 index
             )));
         }
+        let full_hash_started = std::time::Instant::now();
         full_hasher.update(&bytes);
+        perf.record_hash_verify(bytes.len() as u64, full_hash_started.elapsed());
     }
 
     if full_hasher.finalize().as_bytes() != expected_file_hash {
@@ -1589,21 +1743,21 @@ async fn get_manifest(
     let hash =
         hex_to_hash(&hash_hex).map_err(|_| ServerError::BadRequest("invalid hash".into()))?;
     let path = state.layout.content_manifest_path(&hash);
-    let data = read_blob(&path)
+    let data = read_blob_measured(&path, state.perf.as_ref())
         .ok_or_else(|| ServerError::NotFound(format!("manifest {} not found", hash_hex)))?;
     let manifest: WireContentManifest = serde_json::from_slice(&data)
         .map_err(|e| ServerError::Internal(format!("corrupt manifest {}: {}", hash_hex, e)))?;
     let chunk_hashes = validate_content_manifest_structure(&hash, &manifest)
         .map_err(|e| ServerError::Internal(format!("corrupt manifest {}: {}", hash_hex, e)))?;
-    if chunk_hashes
-        .iter()
-        .any(|chunk| !blob_exists(&state.layout.content_chunk_path(chunk)))
-    {
+    if chunk_hashes.iter().any(|chunk| {
+        !blob_exists_measured(&state.layout.content_chunk_path(chunk), state.perf.as_ref())
+    }) {
         return Err(ServerError::Internal(format!(
             "manifest {} references a missing chunk",
             hash_hex,
         )));
     }
+    state.perf.record_request_objects(1);
     Ok((
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -1619,12 +1773,13 @@ async fn put_manifest(
     let hash =
         hex_to_hash(&hash_hex).map_err(|_| ServerError::BadRequest("invalid hash".into()))?;
     let manifest: WireContentManifest = serde_json::from_slice(&body)?;
-    validate_content_manifest(&state.layout, &hash, &manifest)?;
+    validate_content_manifest(&state.layout, &hash, &manifest, state.perf.as_ref())?;
     // Store a canonical representation only after all referenced bytes and
     // the full-file content address have been verified.
     let encoded = serde_json::to_vec(&manifest)?;
     let path = state.layout.content_manifest_path(&hash);
-    write_blob(&path, &encoded)?;
+    write_blob_measured(&path, &encoded, state.perf.as_ref())?;
+    state.perf.record_request_objects(1);
     tracing::debug!(
         hash = %&hash_hex[..hash_hex.len().min(16)],
         bytes = encoded.len(),
@@ -1642,9 +1797,15 @@ async fn get_content_chunk(
     let hash =
         hex_to_hash(&hash_hex).map_err(|_| ServerError::BadRequest("invalid hash".into()))?;
     let path = state.layout.content_chunk_path(&hash);
-    let data = read_blob(&path)
+    let data = read_blob_measured(&path, state.perf.as_ref())
         .ok_or_else(|| ServerError::NotFound(format!("content chunk {} not found", hash_hex)))?;
-    if hash_bytes(&data) != hash {
+    let hash_started = std::time::Instant::now();
+    let matches = hash_bytes(&data) == hash;
+    state
+        .perf
+        .record_hash_check(data.len() as u64, hash_started.elapsed(), matches);
+    state.perf.record_request_objects(1);
+    if !matches {
         return Err(ServerError::Internal(format!(
             "content chunk {} failed content-address validation",
             hash_hex
@@ -1660,12 +1821,17 @@ async fn put_content_chunk(
 ) -> Result<impl IntoResponse, ServerError> {
     let expected =
         hex_to_hash(&hash_hex).map_err(|_| ServerError::BadRequest("invalid hash".into()))?;
+    let hash_started = std::time::Instant::now();
     let actual = hash_bytes(&body);
+    state
+        .perf
+        .record_hash_verify(body.len() as u64, hash_started.elapsed());
     if expected != actual {
         return Err(ServerError::BadRequest("hash mismatch".into()));
     }
     let path = state.layout.content_chunk_path(&expected);
-    write_blob(&path, &body)?;
+    write_blob_measured(&path, &body, state.perf.as_ref())?;
+    state.perf.record_request_objects(1);
     tracing::debug!(
         hash = %&hash_hex[..hash_hex.len().min(16)],
         bytes = body.len(),
@@ -1680,19 +1846,24 @@ async fn post_manifests_check(
 ) -> Result<impl IntoResponse, ServerError> {
     let hashes: Vec<String> = serde_json::from_slice(&body)
         .map_err(|e| ServerError::BadRequest(format!("expected JSON array of hashes: {}", e)))?;
+    state.perf.record_request_objects(hashes.len() as u64);
     let needed: Vec<String> = hashes
         .into_iter()
         .filter(|h| {
             hex_to_hash(h)
-                .map(|hash| !stored_manifest_is_usable(&state.layout, &hash))
+                .map(|hash| !stored_manifest_is_usable(&state.layout, &hash, state.perf.as_ref()))
                 .unwrap_or(false)
         })
         .collect();
     Ok(axum::Json(serde_json::json!({ "needed": needed })))
 }
 
-fn stored_manifest_is_usable(layout: &StorageLayout, file_hash: &FileHash) -> bool {
-    let Some(data) = read_blob(&layout.content_manifest_path(file_hash)) else {
+fn stored_manifest_is_usable(
+    layout: &StorageLayout,
+    file_hash: &FileHash,
+    perf: &crate::perf::ServerPerfCounters,
+) -> bool {
+    let Some(data) = read_blob_measured(&layout.content_manifest_path(file_hash), perf) else {
         return false;
     };
     let Ok(manifest) = serde_json::from_slice::<WireContentManifest>(&data) else {
@@ -1701,7 +1872,7 @@ fn stored_manifest_is_usable(layout: &StorageLayout, file_hash: &FileHash) -> bo
     validate_content_manifest_structure(file_hash, &manifest).is_ok_and(|chunk_hashes| {
         chunk_hashes
             .iter()
-            .all(|chunk| blob_exists(&layout.content_chunk_path(chunk)))
+            .all(|chunk| blob_exists_measured(&layout.content_chunk_path(chunk), perf))
     })
 }
 
@@ -1711,11 +1882,18 @@ async fn post_content_chunks_check(
 ) -> Result<impl IntoResponse, ServerError> {
     let hashes: Vec<String> = serde_json::from_slice(&body)
         .map_err(|e| ServerError::BadRequest(format!("expected JSON array of hashes: {}", e)))?;
+    state.perf.record_request_objects(hashes.len() as u64);
     let needed: Vec<String> = hashes
         .into_iter()
         .filter(|h| {
             hex_to_hash(h)
-                .map(|hash| !blob_matches_hash(&state.layout.content_chunk_path(&hash), &hash))
+                .map(|hash| {
+                    !blob_matches_hash_measured(
+                        &state.layout.content_chunk_path(&hash),
+                        &hash,
+                        state.perf.as_ref(),
+                    )
+                })
                 .unwrap_or(false)
         })
         .collect();
@@ -1882,6 +2060,21 @@ mod integration_tests {
             RESPONSE_HEADER_LEN + TAG_LEN
         );
         assert_eq!(body[0], WIRE_VERSION, "envelope wire version byte");
+
+        let perf = env.state.perf.snapshot();
+        assert_eq!(perf.requests.total, 1);
+        assert_eq!(perf.requests.errors, 0);
+        assert_eq!(perf.requests.objects, 1);
+        assert_eq!(perf.requests.plaintext_bytes_in, payload.len() as u64);
+        assert_eq!(perf.requests.plaintext_bytes_out, 0);
+        assert!(perf.requests.wire_bytes_in > perf.requests.plaintext_bytes_in);
+        assert!(perf.requests.wire_bytes_out > 0);
+        assert!(perf.requests.envelope_open_ns > 0);
+        assert!(perf.requests.token_replay_ns > 0);
+        assert!(perf.requests.handler_ns > 0);
+        assert!(perf.requests.response_seal_ns > 0);
+        assert_eq!(perf.storage.loose_writes, 1);
+        assert_eq!(perf.storage.fdatasyncs, 2);
     }
 
     /// Wire-POST + `X-Obsetync-Method: PUT` used to hit MethodRouter's 405

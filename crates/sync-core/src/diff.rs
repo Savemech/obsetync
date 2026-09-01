@@ -38,6 +38,22 @@ pub enum FileDelta {
     },
 }
 
+/// Aggregate traversal accounting for performance diagnostics. A "node"
+/// here is a root or top-level child subtree considered by the v1 diff. Tree
+/// v2 will refine this naturally to every recursively compared Merkle node.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiffStats {
+    pub nodes_visited: u64,
+    pub nodes_skipped: u64,
+    pub entries_materialized: u64,
+}
+
+#[derive(Debug)]
+pub struct DiffResult {
+    pub deltas: Vec<FileDelta>,
+    pub stats: DiffStats,
+}
+
 /// Compute explicit file-level deltas between two roots.
 /// Walks both trees, compares leaf entries, returns a list of changes.
 /// O(changed subtrees * entries per chunk), not O(total files).
@@ -46,8 +62,26 @@ pub async fn compute_deltas<S: ChunkStore>(
     from_root: &RootNode,
     to_root: &RootNode,
 ) -> Result<Vec<FileDelta>, ChunkError> {
+    Ok(compute_deltas_with_stats(store, from_root, to_root)
+        .await?
+        .deltas)
+}
+
+pub async fn compute_deltas_with_stats<S: ChunkStore>(
+    store: &S,
+    from_root: &RootNode,
+    to_root: &RootNode,
+) -> Result<DiffResult, ChunkError> {
+    let mut stats = DiffStats {
+        nodes_visited: 1,
+        ..DiffStats::default()
+    };
     if from_root.hash() == to_root.hash() {
-        return Ok(vec![]);
+        stats.nodes_skipped = 1;
+        return Ok(DiffResult {
+            deltas: vec![],
+            stats,
+        });
     }
 
     // root.children is Vec<(String, FileHash)> sorted by prefix (BTreeMap order preserved).
@@ -60,6 +94,7 @@ pub async fn compute_deltas<S: ChunkStore>(
     let mut j = 0;
 
     while i < from_children.len() && j < to_children.len() {
+        stats.nodes_visited += 1;
         let (from_prefix, from_hash) = &from_children[i];
         let (to_prefix, to_hash) = &to_children[j];
 
@@ -68,7 +103,10 @@ pub async fn compute_deltas<S: ChunkStore>(
                 if from_hash != to_hash {
                     let from_entries = load_all_entries(store, from_hash).await?;
                     let to_entries = load_all_entries(store, to_hash).await?;
+                    stats.entries_materialized += (from_entries.len() + to_entries.len()) as u64;
                     diff_entries(&from_entries, &to_entries, &mut raw_deltas);
+                } else {
+                    stats.nodes_skipped += 1;
                 }
                 i += 1;
                 j += 1;
@@ -76,6 +114,7 @@ pub async fn compute_deltas<S: ChunkStore>(
             std::cmp::Ordering::Less => {
                 // prefix exists only in from — entire directory deleted
                 let entries = load_all_entries(store, from_hash).await?;
+                stats.entries_materialized += entries.len() as u64;
                 for e in entries {
                     raw_deltas.push(FileDelta::Deleted {
                         path: e.path,
@@ -87,6 +126,7 @@ pub async fn compute_deltas<S: ChunkStore>(
             std::cmp::Ordering::Greater => {
                 // prefix exists only in to — entire directory added
                 let entries = load_all_entries(store, to_hash).await?;
+                stats.entries_materialized += entries.len() as u64;
                 for e in entries {
                     raw_deltas.push(FileDelta::Added {
                         path: e.path,
@@ -102,7 +142,9 @@ pub async fn compute_deltas<S: ChunkStore>(
 
     // Remaining from_children = entire directories deleted.
     for (_, hash) in &from_children[i..] {
+        stats.nodes_visited += 1;
         let entries = load_all_entries(store, hash).await?;
+        stats.entries_materialized += entries.len() as u64;
         for e in entries {
             raw_deltas.push(FileDelta::Deleted {
                 path: e.path,
@@ -113,7 +155,9 @@ pub async fn compute_deltas<S: ChunkStore>(
 
     // Remaining to_children = entire directories added.
     for (_, hash) in &to_children[j..] {
+        stats.nodes_visited += 1;
         let entries = load_all_entries(store, hash).await?;
+        stats.entries_materialized += entries.len() as u64;
         for e in entries {
             raw_deltas.push(FileDelta::Added {
                 path: e.path,
@@ -125,7 +169,7 @@ pub async fn compute_deltas<S: ChunkStore>(
     }
 
     let deltas = detect_renames(raw_deltas);
-    Ok(deltas)
+    Ok(DiffResult { deltas, stats })
 }
 
 /// Diff two sorted entry lists and produce raw deltas.
@@ -276,6 +320,41 @@ mod tests {
 
         let deltas = compute_deltas(&store, &root, &root).await.unwrap();
         assert!(deltas.is_empty());
+    }
+
+    #[tokio::test]
+    async fn diff_stats_count_skipped_subtrees_and_materialized_entries() {
+        let store = MemoryChunkStore::new();
+        let root1 = build_tree(
+            &store,
+            vec![
+                make_entry("notes/a.md", "same"),
+                make_entry("photos/a.jpg", "old"),
+            ],
+            "v",
+            "d",
+        )
+        .await
+        .unwrap();
+        let root2 = build_tree(
+            &store,
+            vec![
+                make_entry("notes/a.md", "same"),
+                make_entry("photos/a.jpg", "new"),
+            ],
+            "v",
+            "d",
+        )
+        .await
+        .unwrap();
+
+        let result = compute_deltas_with_stats(&store, &root1, &root2)
+            .await
+            .unwrap();
+        assert_eq!(result.deltas.len(), 1);
+        assert!(result.stats.nodes_visited >= 3);
+        assert_eq!(result.stats.nodes_skipped, 1);
+        assert_eq!(result.stats.entries_materialized, 2);
     }
 
     #[tokio::test]

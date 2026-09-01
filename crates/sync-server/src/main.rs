@@ -10,6 +10,7 @@ mod eph_rotation;
 mod error;
 mod guard;
 mod ignore_match;
+mod perf;
 mod secure;
 mod seq_tracker;
 mod state;

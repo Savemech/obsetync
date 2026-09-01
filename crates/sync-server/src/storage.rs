@@ -1,5 +1,8 @@
+use crate::perf::ServerPerfCounters;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
 use sync_core::chunk::RootNode;
 use sync_core::hash::{hash_to_hex, hex_to_hash, FileHash};
 
@@ -160,17 +163,30 @@ fn storage_component(value: &str) -> String {
 /// Read/write vault root state.
 pub struct VaultStore {
     layout: StorageLayout,
+    perf: Option<Arc<ServerPerfCounters>>,
 }
 
 impl VaultStore {
+    #[cfg(test)]
     pub fn new(layout: StorageLayout) -> Self {
-        Self { layout }
+        Self { layout, perf: None }
+    }
+
+    pub fn with_perf(layout: StorageLayout, perf: Arc<ServerPerfCounters>) -> Self {
+        Self {
+            layout,
+            perf: Some(perf),
+        }
     }
 
     /// Get the current root hash for a vault. Returns None if vault doesn't exist.
     pub fn get_current_root(&self, vault_id: &str) -> Option<FileHash> {
         let path = self.layout.vault_current_path(vault_id);
+        let started = Instant::now();
         let hex = std::fs::read_to_string(&path).ok()?;
+        if let Some(perf) = &self.perf {
+            perf.record_loose_read(hex.len() as u64, started.elapsed());
+        }
         hex_to_hash(hex.trim()).ok()
     }
 
@@ -179,11 +195,17 @@ impl VaultStore {
         self.layout.ensure_vault(vault_id)?;
         let path = self.layout.vault_current_path(vault_id);
         let tmp = path.with_extension("tmp");
+        let write_started = Instant::now();
         let mut file = std::fs::File::create(&tmp)?;
         file.write_all(hash_to_hex(hash).as_bytes())?;
+        let write_elapsed = write_started.elapsed();
+        let durability_started = Instant::now();
         file.sync_all()?;
         std::fs::rename(&tmp, &path)?;
         std::fs::File::open(path.parent().expect("current root has parent"))?.sync_all()?;
+        if let Some(perf) = &self.perf {
+            perf.record_loose_write(64, write_elapsed, durability_started.elapsed(), 2);
+        }
         Ok(())
     }
 
@@ -201,19 +223,19 @@ impl VaultStore {
         // set, not created_ms/device/parent metadata. History is therefore a
         // set of unique states: once valid metadata has been recorded for a
         // semantic root, a replay of the same state must not rewrite it.
-        if std::fs::read(&path).is_ok_and(|existing| {
+        if read_blob_with_optional_perf(&path, self.perf.as_deref()).is_some_and(|existing| {
             RootNode::deserialize(&existing)
                 .is_ok_and(|root| root.vault_id == vault_id && root.hash() == *hash)
         }) {
             return Ok(());
         }
-        write_blob(&path, data)
+        write_blob_with_optional_perf(&path, data, self.perf.as_deref())
     }
 
     /// Load a root node's bytes from history.
     pub fn get_root(&self, vault_id: &str, hash: &FileHash) -> Option<Vec<u8>> {
         let path = self.layout.vault_root_path(vault_id, hash);
-        std::fs::read(&path).ok()
+        read_blob_with_optional_perf(&path, self.perf.as_deref())
     }
 
     /// Check if a vault exists (has at least one root).
@@ -224,14 +246,45 @@ impl VaultStore {
 }
 
 /// Helper: read a content-addressed blob from a path.
+#[cfg(test)]
 pub fn read_blob(path: &Path) -> Option<Vec<u8>> {
-    std::fs::read(path).ok()
+    read_blob_with_optional_perf(path, None)
+}
+
+pub fn read_blob_measured(path: &Path, perf: &ServerPerfCounters) -> Option<Vec<u8>> {
+    read_blob_with_optional_perf(path, Some(perf))
+}
+
+fn read_blob_with_optional_perf(path: &Path, perf: Option<&ServerPerfCounters>) -> Option<Vec<u8>> {
+    let started = Instant::now();
+    let bytes = std::fs::read(path).ok()?;
+    if let Some(perf) = perf {
+        perf.record_loose_read(bytes.len() as u64, started.elapsed());
+    }
+    Some(bytes)
 }
 
 /// Write an immutable/content-addressed object without ever exposing a partial
 /// final file. The temp file lives in the same directory so rename is an
 /// atomic namespace operation; file and directory are synced before success.
+#[cfg(test)]
 pub fn write_blob(path: &Path, data: &[u8]) -> Result<(), std::io::Error> {
+    write_blob_with_optional_perf(path, data, None)
+}
+
+pub fn write_blob_measured(
+    path: &Path,
+    data: &[u8],
+    perf: &ServerPerfCounters,
+) -> Result<(), std::io::Error> {
+    write_blob_with_optional_perf(path, data, Some(perf))
+}
+
+fn write_blob_with_optional_perf(
+    path: &Path,
+    data: &[u8],
+    perf: Option<&ServerPerfCounters>,
+) -> Result<(), std::io::Error> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "blob path has no parent")
     })?;
@@ -240,8 +293,14 @@ pub fn write_blob(path: &Path, data: &[u8]) -> Result<(), std::io::Error> {
     // Concurrent writers of the same address are common and harmless. Avoid
     // replacing a complete identical object (especially on Windows, where
     // rename-over-existing is not portable).
-    if std::fs::read(path).is_ok_and(|existing| existing == data) {
-        return Ok(());
+    let existing_started = Instant::now();
+    if let Ok(existing) = std::fs::read(path) {
+        if let Some(perf) = perf {
+            perf.record_loose_read(existing.len() as u64, existing_started.elapsed());
+        }
+        if existing == data {
+            return Ok(());
+        }
     }
 
     let tmp = path.with_extension(format!(
@@ -249,20 +308,31 @@ pub fn write_blob(path: &Path, data: &[u8]) -> Result<(), std::io::Error> {
         std::process::id(),
         rand::random::<u64>()
     ));
+    let write_started = Instant::now();
     let mut file = std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
         .open(&tmp)?;
-    if let Err(error) = file.write_all(data).and_then(|_| file.sync_all()) {
+    if let Err(error) = file.write_all(data) {
         let _ = std::fs::remove_file(&tmp);
         return Err(error);
     }
+    let write_elapsed = write_started.elapsed();
+    let durability_started = Instant::now();
+    if let Err(error) = file.sync_all() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    let mut durability_elapsed = durability_started.elapsed();
     drop(file);
 
     if let Err(rename_error) = std::fs::rename(&tmp, path) {
         // Another writer may have won while our temp was being synced.
         if std::fs::read(path).is_ok_and(|existing| existing == data) {
             let _ = std::fs::remove_file(&tmp);
+            if let Some(perf) = perf {
+                perf.record_loose_write(data.len() as u64, write_elapsed, durability_elapsed, 1);
+            }
             return Ok(());
         }
 
@@ -292,28 +362,79 @@ pub fn write_blob(path: &Path, data: &[u8]) -> Result<(), std::io::Error> {
             let _ = std::fs::remove_file(&backup);
         }
     }
+    let parent_sync_started = Instant::now();
     std::fs::File::open(parent)?.sync_all()?;
+    durability_elapsed += parent_sync_started.elapsed();
+    if let Some(perf) = perf {
+        perf.record_loose_write(data.len() as u64, write_elapsed, durability_elapsed, 2);
+    }
     Ok(())
 }
 
 /// Helper: check if a content-addressed blob exists.
+#[cfg(test)]
 pub fn blob_exists(path: &Path) -> bool {
     path.exists()
+}
+
+pub fn blob_exists_measured(path: &Path, perf: &ServerPerfCounters) -> bool {
+    let exists = path.exists();
+    perf.record_index_lookup(exists);
+    exists
 }
 
 /// Verify that an object still matches the content address encoded by its
 /// path. Check endpoints use this for the small set of objects a changed
 /// batch wants to reuse, allowing pre-atomic-write partials or disk damage to
 /// be repaired by a normal re-upload instead of becoming permanently stuck.
+#[cfg(test)]
 pub fn blob_matches_hash(path: &Path, expected: &FileHash) -> bool {
     std::fs::read(path).is_ok_and(|bytes| sync_core::hash::hash_bytes(&bytes) == *expected)
+}
+
+pub fn blob_matches_hash_measured(
+    path: &Path,
+    expected: &FileHash,
+    perf: &ServerPerfCounters,
+) -> bool {
+    let Some(bytes) = read_blob_measured(path, perf) else {
+        perf.record_index_lookup(false);
+        return false;
+    };
+    perf.record_index_lookup(true);
+    let started = Instant::now();
+    let matched = sync_core::hash::hash_bytes(&bytes) == *expected;
+    perf.record_hash_check(bytes.len() as u64, started.elapsed(), matched);
+    matched
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::perf::ServerPerfCounters;
     use sync_core::hash::hash_bytes;
     use tempfile::tempdir;
+
+    #[test]
+    fn measured_blob_io_updates_aggregate_counters() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("objects/blob");
+        let perf = ServerPerfCounters::default();
+        let expected = hash_bytes(b"measured");
+
+        write_blob_measured(&path, b"measured", &perf).unwrap();
+        assert_eq!(read_blob_measured(&path, &perf).unwrap(), b"measured");
+        assert!(blob_matches_hash_measured(&path, &expected, &perf));
+
+        let snapshot = perf.snapshot();
+        assert_eq!(snapshot.storage.loose_writes, 1);
+        assert_eq!(snapshot.storage.bytes_written, 8);
+        assert_eq!(snapshot.storage.fdatasyncs, 2);
+        assert_eq!(snapshot.storage.loose_reads, 2);
+        assert_eq!(snapshot.storage.bytes_read, 16);
+        assert_eq!(snapshot.storage.bytes_rehashed, 8);
+        assert_eq!(snapshot.storage.corrupted_records, 0);
+    }
 
     #[test]
     fn init_directories_creates_full_layout() {

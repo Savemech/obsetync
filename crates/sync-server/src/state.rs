@@ -1,6 +1,7 @@
 use crate::box_key;
 use crate::config::ServerConfig;
 use crate::eph_rotation::{self, EphState};
+use crate::perf::ServerPerfCounters;
 use crate::secure::KEY_LEN;
 use crate::seq_tracker::SequenceTracker;
 use crate::storage::{StorageLayout, VaultStore};
@@ -24,6 +25,9 @@ pub struct AppState {
     pub eph: Arc<RwLock<EphState>>,
     /// Durable sliding anti-replay window per enrolled device.
     pub sequences: SequenceTracker,
+    /// Aggregate-only process metrics exposed by the local admin endpoint.
+    /// Inputs intentionally cannot carry vault paths, hashes, or identities.
+    pub perf: Arc<ServerPerfCounters>,
     /// Wall-clock monotonic start time — used by the admin dashboard to show
     /// uptime. Instant is Copy, so reading from Arc<AppState> needs no lock.
     pub started_at: Instant,
@@ -50,7 +54,8 @@ pub struct AppState {
 impl AppState {
     pub fn new(config: ServerConfig) -> Self {
         let layout = StorageLayout::new(&config.data_dir);
-        let vaults = VaultStore::new(layout.clone());
+        let perf = Arc::new(ServerPerfCounters::default());
+        let vaults = VaultStore::with_perf(layout.clone(), Arc::clone(&perf));
 
         // Require the box keypair to exist at startup. `init` creates it; if
         // it's missing the server is misconfigured.
@@ -68,6 +73,7 @@ impl AppState {
             server_priv_bytes: priv_bytes,
             eph: Arc::new(RwLock::new(eph)),
             sequences,
+            perf,
             started_at: Instant::now(),
             vault_locks: StdMutex::new(HashMap::new()),
             notifiers: StdMutex::new(HashMap::new()),
