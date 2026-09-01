@@ -1,9 +1,7 @@
-use std::path::PathBuf;
+use crate::storage_writer::StorageWriter;
 use sync_core::chunk::RootNode;
-use sync_core::content_store::DiskContentStore;
 use sync_core::diff::FileDelta;
 use sync_core::merge::MergeResult;
-use sync_core::store::DiskChunkStore;
 
 const MAX_ROOT_FILES: u64 = 5_000_000;
 const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
@@ -11,26 +9,22 @@ const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 /// Run sync-core's `merge_trees` in a blocking task with a LocalSet
 /// to handle the `!Send` futures from `ChunkStore` trait.
 ///
-/// `content_base` is the small-blob content root (`<data>/content`) — the
-/// merge reads base/A/B file bytes from it for content-level text merges
-/// and writes merged blobs back so pullers can fetch them by hash.
+/// The same packed store supplies index nodes and small-file bytes. Merged
+/// index/content objects return through its single durable writer.
 pub async fn run_merge(
-    index_base: PathBuf,
-    content_base: PathBuf,
+    store: StorageWriter,
     base: RootNode,
     side_a: RootNode,
     side_b: RootNode,
 ) -> Result<MergeResult, String> {
     tokio::task::spawn_blocking(move || {
-        let store = DiskChunkStore::new(&index_base);
-        let content = DiskContentStore::new(&content_base);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| e.to_string())?;
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async {
-            sync_core::merge::merge_trees(&store, &content, &base, &side_a, &side_b)
+            sync_core::merge::merge_trees(&store, &store, &base, &side_a, &side_b)
                 .await
                 .map_err(|e| e.to_string())
         })
@@ -43,11 +37,10 @@ pub async fn run_merge(
 /// in a blocking task with a LocalSet — used by the admin export to
 /// materialize a snapshot without touching merge/diff logic.
 pub async fn run_list_entries(
-    index_base: PathBuf,
+    store: StorageWriter,
     root: RootNode,
 ) -> Result<Vec<sync_core::chunk::FileEntry>, String> {
     tokio::task::spawn_blocking(move || {
-        let store = DiskChunkStore::new(&index_base);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -77,7 +70,7 @@ pub async fn run_list_entries(
 /// through the same loader as admin export; structural checks are layered in
 /// by the root-validation regression tests below.
 pub async fn run_validate_root(
-    index_base: PathBuf,
+    store: StorageWriter,
     root: RootNode,
 ) -> Result<Vec<sync_core::chunk::FileEntry>, String> {
     tokio::task::spawn_blocking(move || {
@@ -97,7 +90,6 @@ pub async fn run_validate_root(
             return Err("empty root has child nodes".to_string());
         }
 
-        let store = DiskChunkStore::new(&index_base);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -201,12 +193,11 @@ fn valid_top_level_prefix(prefix: &str) -> bool {
 /// `(new_root, removed, kept)`. Reuses the same flatten-then-rebuild path as
 /// export + build_tree, so it can't desync from how roots are normally built.
 pub async fn run_purge(
-    index_base: PathBuf,
+    store: StorageWriter,
     root: RootNode,
     patterns: Vec<String>,
 ) -> Result<(RootNode, usize, usize), String> {
     tokio::task::spawn_blocking(move || {
-        let store = DiskChunkStore::new(&index_base);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -237,22 +228,19 @@ pub async fn run_purge(
 
 /// Run sync-core's `compute_deltas` in a blocking task with a LocalSet.
 pub async fn run_diff(
-    index_base: PathBuf,
+    store: StorageWriter,
     from_root: RootNode,
     to_root: RootNode,
 ) -> Result<Vec<FileDelta>, String> {
-    Ok(run_diff_with_stats(index_base, from_root, to_root)
-        .await?
-        .deltas)
+    Ok(run_diff_with_stats(store, from_root, to_root).await?.deltas)
 }
 
 pub async fn run_diff_with_stats(
-    index_base: PathBuf,
+    store: StorageWriter,
     from_root: RootNode,
     to_root: RootNode,
 ) -> Result<sync_core::diff::DiffResult, String> {
     tokio::task::spawn_blocking(move || {
-        let store = DiskChunkStore::new(&index_base);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -271,9 +259,11 @@ pub async fn run_diff_with_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::perf::ServerPerfCounters;
+    use crate::storage::StorageLayout;
+    use std::sync::Arc;
     use sync_core::chunk::FileEntry;
     use sync_core::hash::hash_bytes;
-    use sync_core::store::DiskChunkStore;
     use sync_core::tree::build_tree;
     use tempfile::tempdir;
 
@@ -284,9 +274,14 @@ mod tests {
     /// Build a tree on a temp index dir. Uses spawn_blocking + a fresh
     /// current-thread runtime so it composes cleanly inside the outer
     /// `#[tokio::test]` (multi-threaded) runtime that drives the test.
-    async fn build_tree_on_disk(dir: PathBuf, entries: Vec<FileEntry>) -> RootNode {
+    fn test_writer(path: &std::path::Path) -> StorageWriter {
+        let layout = StorageLayout::new(path);
+        layout.init_directories().unwrap();
+        StorageWriter::start(layout, Arc::new(ServerPerfCounters::default())).unwrap()
+    }
+
+    async fn build_tree_on_store(store: StorageWriter, entries: Vec<FileEntry>) -> RootNode {
         tokio::task::spawn_blocking(move || {
-            let store = DiskChunkStore::new(&dir);
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -303,24 +298,23 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn run_diff_on_identical_roots_returns_empty() {
         let dir = tempdir().unwrap();
-        let root =
-            build_tree_on_disk(dir.path().to_path_buf(), vec![make_entry("a.md", "x")]).await;
-        let deltas = run_diff(dir.path().to_path_buf(), root.clone(), root)
-            .await
-            .unwrap();
+        let store = test_writer(dir.path());
+        let root = build_tree_on_store(store.clone(), vec![make_entry("a.md", "x")]).await;
+        let deltas = run_diff(store, root.clone(), root).await.unwrap();
         assert!(deltas.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn run_diff_detects_addition() {
         let dir = tempdir().unwrap();
-        let r1 = build_tree_on_disk(dir.path().to_path_buf(), vec![make_entry("a.md", "x")]).await;
-        let r2 = build_tree_on_disk(
-            dir.path().to_path_buf(),
+        let store = test_writer(dir.path());
+        let r1 = build_tree_on_store(store.clone(), vec![make_entry("a.md", "x")]).await;
+        let r2 = build_tree_on_store(
+            store.clone(),
             vec![make_entry("a.md", "x"), make_entry("b.md", "y")],
         )
         .await;
-        let deltas = run_diff(dir.path().to_path_buf(), r1, r2).await.unwrap();
+        let deltas = run_diff(store, r1, r2).await.unwrap();
         assert_eq!(deltas.len(), 1);
         assert!(matches!(
             &deltas[0],
@@ -331,32 +325,26 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn root_validation_rejects_false_file_count() {
         let dir = tempdir().unwrap();
-        let mut root =
-            build_tree_on_disk(dir.path().to_path_buf(), vec![make_entry("a.md", "x")]).await;
+        let store = test_writer(dir.path());
+        let mut root = build_tree_on_store(store.clone(), vec![make_entry("a.md", "x")]).await;
         root.total_files = 999;
-        assert!(run_validate_root(dir.path().to_path_buf(), root)
-            .await
-            .is_err());
+        assert!(run_validate_root(store, root).await.is_err());
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn root_validation_rejects_unsafe_entry_path() {
         let dir = tempdir().unwrap();
-        let root = build_tree_on_disk(
-            dir.path().to_path_buf(),
-            vec![make_entry("../outside.md", "x")],
-        )
-        .await;
-        assert!(run_validate_root(dir.path().to_path_buf(), root)
-            .await
-            .is_err());
+        let store = test_writer(dir.path());
+        let root = build_tree_on_store(store.clone(), vec![make_entry("../outside.md", "x")]).await;
+        assert!(run_validate_root(store, root).await.is_err());
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn root_validation_accepts_root_files_with_directory_prefixes() {
         let dir = tempdir().unwrap();
-        let root = build_tree_on_disk(
-            dir.path().to_path_buf(),
+        let store = test_writer(dir.path());
+        let root = build_tree_on_store(
+            store.clone(),
             vec![
                 make_entry("seed.md", "seed"),
                 make_entry("notes/x.md", "x"),
@@ -365,29 +353,18 @@ mod tests {
         )
         .await;
 
-        let entries = run_validate_root(dir.path().to_path_buf(), root)
-            .await
-            .unwrap();
+        let entries = run_validate_root(store, root).await.unwrap();
         assert_eq!(entries.len(), 3);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn run_merge_passes_through_to_sync_core() {
         let dir = tempdir().unwrap();
-        let base =
-            build_tree_on_disk(dir.path().to_path_buf(), vec![make_entry("a.md", "x")]).await;
-        let side_a =
-            build_tree_on_disk(dir.path().to_path_buf(), vec![make_entry("a.md", "y")]).await;
+        let store = test_writer(dir.path());
+        let base = build_tree_on_store(store.clone(), vec![make_entry("a.md", "x")]).await;
+        let side_a = build_tree_on_store(store.clone(), vec![make_entry("a.md", "y")]).await;
         let side_b = base.clone();
-        let result = run_merge(
-            dir.path().to_path_buf(),
-            dir.path().join("content"),
-            base,
-            side_a,
-            side_b,
-        )
-        .await
-        .unwrap();
+        let result = run_merge(store, base, side_a, side_b).await.unwrap();
         assert!(result.file_conflicts.is_empty());
         assert_eq!(result.new_root.total_files, 1);
     }
@@ -395,8 +372,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn run_purge_removes_matched_subtree_and_keeps_real_notes() {
         let dir = tempdir().unwrap();
-        let root = build_tree_on_disk(
-            dir.path().to_path_buf(),
+        let store = test_writer(dir.path());
+        let root = build_tree_on_store(
+            store.clone(),
             vec![
                 make_entry("notes/a.md", "x"),
                 make_entry("proj/target/debug/lib.rmeta", "junk1"),
@@ -407,10 +385,9 @@ mod tests {
         )
         .await;
 
-        let (new_root, removed, kept) =
-            run_purge(dir.path().to_path_buf(), root, vec!["target/".to_string()])
-                .await
-                .unwrap();
+        let (new_root, removed, kept) = run_purge(store.clone(), root, vec!["target/".to_string()])
+            .await
+            .unwrap();
 
         // The two files under a `target/` dir go; the real note that merely has
         // "target" in its name stays, as do the other real files.
@@ -418,9 +395,7 @@ mod tests {
         assert_eq!(kept, 3);
         assert_eq!(new_root.total_files, 3);
 
-        let entries = run_list_entries(dir.path().to_path_buf(), new_root)
-            .await
-            .unwrap();
+        let entries = run_list_entries(store, new_root).await.unwrap();
         let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
         assert!(paths.contains(&"notes/a.md"));
         assert!(paths.contains(&"proj/src/main.rs"));
@@ -431,18 +406,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn run_purge_no_match_removes_nothing() {
         let dir = tempdir().unwrap();
-        let root = build_tree_on_disk(
-            dir.path().to_path_buf(),
+        let store = test_writer(dir.path());
+        let root = build_tree_on_store(
+            store.clone(),
             vec![make_entry("a.md", "x"), make_entry("b.md", "y")],
         )
         .await;
-        let (_new, removed, kept) = run_purge(
-            dir.path().to_path_buf(),
-            root,
-            vec!["node_modules/".to_string()],
-        )
-        .await
-        .unwrap();
+        let (_new, removed, kept) = run_purge(store, root, vec!["node_modules/".to_string()])
+            .await
+            .unwrap();
         assert_eq!(removed, 0);
         assert_eq!(kept, 2);
     }
@@ -450,21 +422,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn run_merge_returns_conflicts_for_divergent_edits() {
         let dir = tempdir().unwrap();
-        let base =
-            build_tree_on_disk(dir.path().to_path_buf(), vec![make_entry("a.md", "x")]).await;
-        let side_a =
-            build_tree_on_disk(dir.path().to_path_buf(), vec![make_entry("a.md", "side-a")]).await;
-        let side_b =
-            build_tree_on_disk(dir.path().to_path_buf(), vec![make_entry("a.md", "side-b")]).await;
-        let result = run_merge(
-            dir.path().to_path_buf(),
-            dir.path().join("content"),
-            base,
-            side_a,
-            side_b,
-        )
-        .await
-        .unwrap();
+        let store = test_writer(dir.path());
+        let base = build_tree_on_store(store.clone(), vec![make_entry("a.md", "x")]).await;
+        let side_a = build_tree_on_store(store.clone(), vec![make_entry("a.md", "side-a")]).await;
+        let side_b = build_tree_on_store(store.clone(), vec![make_entry("a.md", "side-b")]).await;
+        let result = run_merge(store, base, side_a, side_b).await.unwrap();
         assert_eq!(result.file_conflicts.len(), 1);
         assert_eq!(result.file_conflicts[0].path, "a.md");
     }

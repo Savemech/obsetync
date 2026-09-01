@@ -35,11 +35,11 @@
 //!                                 throttled by the percentage (default: 200)
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use crate::storage_writer::StorageWriter;
 use sync_core::chunk::RootNode;
-use sync_core::store::DiskChunkStore;
+use sync_core::store::ChunkStore;
 use sync_core::tree::load_all_entries;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,12 +146,11 @@ impl GuardScan {
 /// Runs on a blocking thread with a LocalSet because sync-core's store
 /// futures are `!Send` — same pattern as `bridge::run_merge`.
 pub async fn scan(
-    index_base: PathBuf,
+    store: StorageWriter,
     current: RootNode,
     candidate: RootNode,
 ) -> Result<GuardScan, String> {
     tokio::task::spawn_blocking(move || {
-        let store = DiskChunkStore::new(&index_base);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -168,8 +167,8 @@ pub async fn scan(
     .map_err(|e| format!("join error: {}", e))?
 }
 
-async fn scan_inner(
-    store: &DiskChunkStore,
+async fn scan_inner<S: ChunkStore>(
+    store: &S,
     current: &RootNode,
     candidate: &RootNode,
     skew_ms: u64,
@@ -251,6 +250,9 @@ fn compare_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::perf::ServerPerfCounters;
+    use crate::storage::StorageLayout;
+    use std::sync::Arc;
     use sync_core::chunk::FileEntry;
     use sync_core::hash::hash_bytes;
     use sync_core::tree::build_tree;
@@ -265,9 +267,14 @@ mod tests {
         FileEntry::new(path.into(), hash_bytes(content.as_bytes()), mtime, 10)
     }
 
-    async fn build_on_disk(dir: PathBuf, entries: Vec<FileEntry>) -> RootNode {
+    fn test_writer(path: &std::path::Path) -> StorageWriter {
+        let layout = StorageLayout::new(path);
+        layout.init_directories().unwrap();
+        StorageWriter::start(layout, Arc::new(ServerPerfCounters::default())).unwrap()
+    }
+
+    async fn build_on_store(store: StorageWriter, entries: Vec<FileEntry>) -> RootNode {
         tokio::task::spawn_blocking(move || {
-            let store = DiskChunkStore::new(&dir);
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -284,9 +291,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn stale_tree_shows_regressions_and_deletions() {
         let dir = tempdir().unwrap();
+        let store = test_writer(dir.path());
         // Current: three recent files.
-        let current = build_on_disk(
-            dir.path().to_path_buf(),
+        let current = build_on_store(
+            store.clone(),
             vec![
                 entry("n/a.md", "a-v2", T0),
                 entry("n/b.md", "b-v2", T0),
@@ -296,8 +304,8 @@ mod tests {
         .await;
         // Candidate: stale tree — 2-day-old content for a/b (well past any
         // clock-skew allowance), c missing. The incident signature.
-        let candidate = build_on_disk(
-            dir.path().to_path_buf(),
+        let candidate = build_on_store(
+            store.clone(),
             vec![
                 entry("n/a.md", "a-v1", T0 - 2 * DAY),
                 entry("n/b.md", "b-v1", T0 - 2 * DAY),
@@ -305,9 +313,7 @@ mod tests {
         )
         .await;
 
-        let scan = scan(dir.path().to_path_buf(), current, candidate)
-            .await
-            .unwrap();
+        let scan = scan(store, current, candidate).await.unwrap();
         assert_eq!(scan.content_changes, 2);
         assert_eq!(scan.mtime_regressions, 2);
         assert_eq!(scan.deletions, 1);
@@ -325,14 +331,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn forward_edits_do_not_trigger() {
         let dir = tempdir().unwrap();
-        let current = build_on_disk(
-            dir.path().to_path_buf(),
+        let store = test_writer(dir.path());
+        let current = build_on_store(
+            store.clone(),
             vec![entry("n/a.md", "a-v1", T0), entry("n/b.md", "b", T0)],
         )
         .await;
         // Candidate: normal work — a edited forward, d added.
-        let candidate = build_on_disk(
-            dir.path().to_path_buf(),
+        let candidate = build_on_store(
+            store.clone(),
             vec![
                 entry("n/a.md", "a-v2", T0 + HOUR),
                 entry("n/b.md", "b", T0),
@@ -341,9 +348,7 @@ mod tests {
         )
         .await;
 
-        let scan = scan(dir.path().to_path_buf(), current, candidate)
-            .await
-            .unwrap();
+        let scan = scan(store, current, candidate).await.unwrap();
         assert_eq!(scan.mtime_regressions, 0);
         assert_eq!(scan.deletions, 0);
         assert_eq!(scan.content_changes, 1);
@@ -365,8 +370,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn clock_skew_within_allowance_is_not_regression() {
         let dir = tempdir().unwrap();
-        let current = build_on_disk(
-            dir.path().to_path_buf(),
+        let store = test_writer(dir.path());
+        let current = build_on_store(
+            store.clone(),
             vec![
                 entry("n/a.md", "a-desktop", T0),
                 entry("n/b.md", "b-desktop", T0),
@@ -374,8 +380,8 @@ mod tests {
         )
         .await;
         // Laptop clock runs 2h behind but genuinely edits both files.
-        let candidate = build_on_disk(
-            dir.path().to_path_buf(),
+        let candidate = build_on_store(
+            store.clone(),
             vec![
                 entry("n/a.md", "a-laptop", T0 - 2 * HOUR),
                 entry("n/b.md", "b-laptop", T0 - 2 * HOUR),
@@ -383,9 +389,7 @@ mod tests {
         )
         .await;
 
-        let scan = scan(dir.path().to_path_buf(), current, candidate)
-            .await
-            .unwrap();
+        let scan = scan(store, current, candidate).await.unwrap();
         assert_eq!(scan.content_changes, 2);
         assert_eq!(
             scan.mtime_regressions, 0,
@@ -396,18 +400,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn identical_subtrees_are_skipped() {
         let dir = tempdir().unwrap();
+        let store = test_writer(dir.path());
         let shared = vec![entry("keep/x.md", "x", T0)];
         let mut cur = shared.clone();
         cur.push(entry("work/y.md", "y-v2", T0));
         let mut cand = shared;
         cand.push(entry("work/y.md", "y-v1", T0 - 2 * DAY));
 
-        let current = build_on_disk(dir.path().to_path_buf(), cur).await;
-        let candidate = build_on_disk(dir.path().to_path_buf(), cand).await;
+        let current = build_on_store(store.clone(), cur).await;
+        let candidate = build_on_store(store.clone(), cand).await;
 
-        let scan = scan(dir.path().to_path_buf(), current, candidate)
-            .await
-            .unwrap();
+        let scan = scan(store, current, candidate).await.unwrap();
         assert_eq!(scan.content_changes, 1);
         assert_eq!(scan.mtime_regressions, 1);
     }

@@ -402,6 +402,7 @@ fn write_blob_with_optional_perf(
 /// observing partial data, but an additional per-file fsync would defeat
 /// group commit and is unnecessary: startup recovery can recreate this mirror
 /// from the fdatasync'ed journal after any crash or power loss.
+#[cfg(test)]
 pub(crate) fn materialize_journaled_blob(path: &Path, data: &[u8]) -> Result<(), std::io::Error> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "blob path has no parent")
@@ -465,12 +466,6 @@ pub fn blob_exists(path: &Path) -> bool {
     path.exists()
 }
 
-pub fn blob_exists_measured(path: &Path, perf: &ServerPerfCounters) -> bool {
-    let exists = path.exists();
-    perf.record_index_lookup(exists);
-    exists
-}
-
 /// Verify that an object still matches the content address encoded by its
 /// path. Check endpoints use this for the small set of objects a changed
 /// batch wants to reuse, allowing pre-atomic-write partials or disk damage to
@@ -480,6 +475,7 @@ pub fn blob_matches_hash(path: &Path, expected: &FileHash) -> bool {
     std::fs::read(path).is_ok_and(|bytes| sync_core::hash::hash_bytes(&bytes) == *expected)
 }
 
+#[cfg(test)]
 pub fn blob_matches_hash_measured(
     path: &Path,
     expected: &FileHash,

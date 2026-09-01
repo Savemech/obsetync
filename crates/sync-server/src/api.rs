@@ -8,9 +8,6 @@ use crate::error::ServerError;
 use crate::perf::{DiffSample, RequestPhase, ServerPerfCounters};
 use crate::secure;
 use crate::state::SharedState;
-use crate::storage::{
-    blob_exists_measured, blob_matches_hash_measured, read_blob_measured, StorageLayout,
-};
 use crate::storage_writer::{
     DurableObject, StorageObjectKind, StoreError, StoreOutcome, StoreResult,
 };
@@ -64,6 +61,17 @@ async fn store_one_object(
         .pop()
         .ok_or_else(|| ServerError::Internal("storage writer returned no object result".into()))?
         .map_err(storage_writer_error)
+}
+
+fn read_stored_object(
+    state: &SharedState,
+    kind: StorageObjectKind,
+    hash: &FileHash,
+) -> Result<Option<Vec<u8>>, ServerError> {
+    state
+        .storage_writer
+        .read(kind, hash)
+        .map_err(|error| ServerError::Internal(error.to_string()))
 }
 
 /// Authenticated device id, inserted into request extensions by
@@ -1050,8 +1058,7 @@ async fn enforce_guard(
     if cfg.mode == crate::guard::GuardMode::Off {
         return Ok(());
     }
-    let index_base = state.layout.base.join("index");
-    let scan = crate::guard::scan(index_base, current, candidate)
+    let scan = crate::guard::scan(state.storage_writer.clone(), current, candidate)
         .await
         .map_err(|e| ServerError::Internal(format!("guard scan failed: {}", e)))?;
     if let Some(reason) = scan.triggered(cfg) {
@@ -1121,20 +1128,16 @@ async fn put_root(
     // until this walk succeeds. Besides blocking traversal-shaped paths, the
     // count check prevents a false total_files field from weakening the
     // blast-radius guard. The walk reads compact index nodes, not file data.
-    let entries = bridge::run_validate_root(state.layout.base.join("index"), incoming_root.clone())
+    let entries = bridge::run_validate_root(state.storage_writer.clone(), incoming_root.clone())
         .await
         .map_err(|e| ServerError::BadRequest(format!("invalid root structure: {}", e)))?;
     for entry in &entries {
         let present = if sync_core::fastcdc_chunker::should_chunk(entry.size_bytes) {
-            blob_exists_measured(
-                &state.layout.content_manifest_path(&entry.hash),
-                state.perf.as_ref(),
-            )
+            stored_manifest_is_usable(&state, &entry.hash)
         } else {
-            blob_exists_measured(
-                &state.layout.content_blob_path(&entry.hash),
-                state.perf.as_ref(),
-            )
+            state
+                .storage_writer
+                .contains(StorageObjectKind::Content, &entry.hash)
         };
         if !present {
             return Err(ServerError::BadRequest(format!(
@@ -1262,15 +1265,11 @@ async fn put_root(
                 let base_root = sync_core::chunk::RootNode::deserialize(&base_data)
                     .map_err(|e| ServerError::Internal(format!("corrupt base root: {}", e)))?;
 
-                // Run merge via the bridge (handles !Send). The content root
-                // lets the merge line-merge same-file text edits and store
-                // the merged blob where pullers fetch content by hash.
-                let index_base = state.layout.base.join("index");
-                let content_base = state.layout.base.join("content");
+                // Run merge via the bridge (handles !Send). The packed store
+                // supplies both tree nodes and small-file merge content.
                 let incoming_for_merge = incoming_root;
                 let merge_result = bridge::run_merge(
-                    index_base,
-                    content_base,
+                    state.storage_writer.clone(),
                     base_root,
                     current_root,
                     incoming_for_merge,
@@ -1440,8 +1439,7 @@ async fn post_diff(
     };
 
     // Compute deltas via bridge.
-    let index_base = state.layout.base.join("index");
-    let diff_result = bridge::run_diff_with_stats(index_base, from_root, to_root)
+    let diff_result = bridge::run_diff_with_stats(state.storage_writer.clone(), from_root, to_root)
         .await
         .map_err(|e| ServerError::Internal(format!("diff failed: {}", e)))?;
     let compute_elapsed = diff_started.elapsed();
@@ -1555,21 +1553,9 @@ async fn get_chunk(
 ) -> Result<impl IntoResponse, ServerError> {
     let hash =
         hex_to_hash(&hash_hex).map_err(|_| ServerError::BadRequest("invalid hash".into()))?;
-    let path = state.layout.index_path(&hash);
-    let data = read_blob_measured(&path, state.perf.as_ref())
+    let data = read_stored_object(&state, StorageObjectKind::IndexChunk, &hash)?
         .ok_or_else(|| ServerError::NotFound(format!("chunk {} not found", hash_hex)))?;
-    let hash_started = std::time::Instant::now();
-    let matches = hash_bytes(&data) == hash;
-    state
-        .perf
-        .record_hash_check(data.len() as u64, hash_started.elapsed(), matches);
     state.perf.record_request_objects(1);
-    if !matches {
-        return Err(ServerError::Internal(format!(
-            "index chunk {} failed content-address validation",
-            hash_hex
-        )));
-    }
     Ok((StatusCode::OK, data))
 }
 
@@ -1620,11 +1606,9 @@ async fn post_chunks_check(
         .filter(|h| {
             hex_to_hash(h)
                 .map(|hash| {
-                    !blob_matches_hash_measured(
-                        &state.layout.index_path(&hash),
-                        &hash,
-                        state.perf.as_ref(),
-                    )
+                    !state
+                        .storage_writer
+                        .contains(StorageObjectKind::IndexChunk, &hash)
                 })
                 .unwrap_or(false)
         })
@@ -1640,21 +1624,9 @@ async fn get_content(
 ) -> Result<impl IntoResponse, ServerError> {
     let hash =
         hex_to_hash(&hash_hex).map_err(|_| ServerError::BadRequest("invalid hash".into()))?;
-    let path = state.layout.content_blob_path(&hash);
-    let data = read_blob_measured(&path, state.perf.as_ref())
+    let data = read_stored_object(&state, StorageObjectKind::Content, &hash)?
         .ok_or_else(|| ServerError::NotFound(format!("content {} not found", hash_hex)))?;
-    let hash_started = std::time::Instant::now();
-    let matches = hash_bytes(&data) == hash;
-    state
-        .perf
-        .record_hash_check(data.len() as u64, hash_started.elapsed(), matches);
     state.perf.record_request_objects(1);
-    if !matches {
-        return Err(ServerError::Internal(format!(
-            "content {} failed content-address validation",
-            hash_hex
-        )));
-    }
     Ok((StatusCode::OK, data))
 }
 
@@ -1695,11 +1667,9 @@ async fn post_content_check(
         .filter(|h| {
             hex_to_hash(h)
                 .map(|hash| {
-                    !blob_matches_hash_measured(
-                        &state.layout.content_blob_path(&hash),
-                        &hash,
-                        state.perf.as_ref(),
-                    )
+                    !state
+                        .storage_writer
+                        .contains(StorageObjectKind::Content, &hash)
                 })
                 .unwrap_or(false)
         })
@@ -1778,15 +1748,23 @@ fn validate_content_manifest_structure(
 /// disk corruption and proves the ordered concatenation hashes to the
 /// manifest/file-tree hash without ever holding the whole file in memory.
 fn validate_content_manifest(
-    layout: &StorageLayout,
+    state: &SharedState,
     expected_file_hash: &FileHash,
     manifest: &WireContentManifest,
-    perf: &crate::perf::ServerPerfCounters,
 ) -> Result<(), ServerError> {
-    validate_content_manifest_with_loader(expected_file_hash, manifest, perf, |chunk_hash| {
-        read_blob_measured(&layout.content_chunk_path(chunk_hash), perf)
-            .map(std::borrow::Cow::Owned)
-    })
+    validate_content_manifest_with_loader(
+        expected_file_hash,
+        manifest,
+        state.perf.as_ref(),
+        |chunk_hash| {
+            state
+                .storage_writer
+                .read(StorageObjectKind::ContentChunk, chunk_hash)
+                .ok()
+                .flatten()
+                .map(std::borrow::Cow::Owned)
+        },
+    )
 }
 
 /// Full manifest validation with a caller-supplied chunk source. Bulk upload
@@ -1834,15 +1812,16 @@ async fn get_manifest(
 ) -> Result<impl IntoResponse, ServerError> {
     let hash =
         hex_to_hash(&hash_hex).map_err(|_| ServerError::BadRequest("invalid hash".into()))?;
-    let path = state.layout.content_manifest_path(&hash);
-    let data = read_blob_measured(&path, state.perf.as_ref())
+    let data = read_stored_object(&state, StorageObjectKind::Manifest, &hash)?
         .ok_or_else(|| ServerError::NotFound(format!("manifest {} not found", hash_hex)))?;
     let manifest: WireContentManifest = serde_json::from_slice(&data)
         .map_err(|e| ServerError::Internal(format!("corrupt manifest {}: {}", hash_hex, e)))?;
     let chunk_hashes = validate_content_manifest_structure(&hash, &manifest)
         .map_err(|e| ServerError::Internal(format!("corrupt manifest {}: {}", hash_hex, e)))?;
     if chunk_hashes.iter().any(|chunk| {
-        !blob_exists_measured(&state.layout.content_chunk_path(chunk), state.perf.as_ref())
+        !state
+            .storage_writer
+            .contains(StorageObjectKind::ContentChunk, chunk)
     }) {
         return Err(ServerError::Internal(format!(
             "manifest {} references a missing chunk",
@@ -1865,7 +1844,7 @@ async fn put_manifest(
     let hash =
         hex_to_hash(&hash_hex).map_err(|_| ServerError::BadRequest("invalid hash".into()))?;
     let manifest: WireContentManifest = serde_json::from_slice(&body)?;
-    validate_content_manifest(&state.layout, &hash, &manifest, state.perf.as_ref())?;
+    validate_content_manifest(&state, &hash, &manifest)?;
     // Store a canonical representation only after all referenced bytes and
     // the full-file content address have been verified.
     let encoded = serde_json::to_vec(&manifest)?;
@@ -1888,21 +1867,9 @@ async fn get_content_chunk(
 ) -> Result<impl IntoResponse, ServerError> {
     let hash =
         hex_to_hash(&hash_hex).map_err(|_| ServerError::BadRequest("invalid hash".into()))?;
-    let path = state.layout.content_chunk_path(&hash);
-    let data = read_blob_measured(&path, state.perf.as_ref())
+    let data = read_stored_object(&state, StorageObjectKind::ContentChunk, &hash)?
         .ok_or_else(|| ServerError::NotFound(format!("content chunk {} not found", hash_hex)))?;
-    let hash_started = std::time::Instant::now();
-    let matches = hash_bytes(&data) == hash;
-    state
-        .perf
-        .record_hash_check(data.len() as u64, hash_started.elapsed(), matches);
     state.perf.record_request_objects(1);
-    if !matches {
-        return Err(ServerError::Internal(format!(
-            "content chunk {} failed content-address validation",
-            hash_hex
-        )));
-    }
     Ok((StatusCode::OK, data))
 }
 
@@ -1948,28 +1915,29 @@ async fn post_manifests_check(
         .into_iter()
         .filter(|h| {
             hex_to_hash(h)
-                .map(|hash| !stored_manifest_is_usable(&state.layout, &hash, state.perf.as_ref()))
+                .map(|hash| !stored_manifest_is_usable(&state, &hash))
                 .unwrap_or(false)
         })
         .collect();
     Ok(axum::Json(serde_json::json!({ "needed": needed })))
 }
 
-fn stored_manifest_is_usable(
-    layout: &StorageLayout,
-    file_hash: &FileHash,
-    perf: &crate::perf::ServerPerfCounters,
-) -> bool {
-    let Some(data) = read_blob_measured(&layout.content_manifest_path(file_hash), perf) else {
+fn stored_manifest_is_usable(state: &SharedState, file_hash: &FileHash) -> bool {
+    let Ok(Some(data)) = state
+        .storage_writer
+        .read(StorageObjectKind::Manifest, file_hash)
+    else {
         return false;
     };
     let Ok(manifest) = serde_json::from_slice::<WireContentManifest>(&data) else {
         return false;
     };
     validate_content_manifest_structure(file_hash, &manifest).is_ok_and(|chunk_hashes| {
-        chunk_hashes
-            .iter()
-            .all(|chunk| blob_exists_measured(&layout.content_chunk_path(chunk), perf))
+        chunk_hashes.iter().all(|chunk| {
+            state
+                .storage_writer
+                .contains(StorageObjectKind::ContentChunk, chunk)
+        })
     })
 }
 
@@ -1985,11 +1953,9 @@ async fn post_content_chunks_check(
         .filter(|h| {
             hex_to_hash(h)
                 .map(|hash| {
-                    !blob_matches_hash_measured(
-                        &state.layout.content_chunk_path(&hash),
-                        &hash,
-                        state.perf.as_ref(),
-                    )
+                    !state
+                        .storage_writer
+                        .contains(StorageObjectKind::ContentChunk, &hash)
                 })
                 .unwrap_or(false)
         })
@@ -1998,19 +1964,6 @@ async fn post_content_chunks_check(
 }
 
 // --- Bounded binary bulk HTTP v1 -----------------------------------------
-
-fn bulk_object_path(
-    layout: &StorageLayout,
-    kind: ObjectKind,
-    hash: &FileHash,
-) -> std::path::PathBuf {
-    match kind {
-        ObjectKind::Content => layout.content_blob_path(hash),
-        ObjectKind::ContentChunk => layout.content_chunk_path(hash),
-        ObjectKind::IndexChunk => layout.index_path(hash),
-        ObjectKind::Manifest => layout.content_manifest_path(hash),
-    }
-}
 
 fn storage_object_kind(kind: ObjectKind) -> StorageObjectKind {
     match kind {
@@ -2034,12 +1987,10 @@ fn upload_status(result: &StoreResult) -> UploadStatus {
 
 fn bulk_object_is_usable(state: &SharedState, kind: ObjectKind, hash: &FileHash) -> bool {
     match kind {
-        ObjectKind::Manifest => stored_manifest_is_usable(&state.layout, hash, state.perf.as_ref()),
-        _ => blob_matches_hash_measured(
-            &bulk_object_path(&state.layout, kind, hash),
-            hash,
-            state.perf.as_ref(),
-        ),
+        ObjectKind::Manifest => stored_manifest_is_usable(state, hash),
+        _ => state
+            .storage_writer
+            .contains(storage_object_kind(kind), hash),
     }
 }
 
@@ -2126,11 +2077,12 @@ async fn post_bulk_put(
                     if let Some((bytes, _)) = pending_chunks.get(chunk_hash) {
                         Some(std::borrow::Cow::Borrowed(*bytes))
                     } else {
-                        read_blob_measured(
-                            &state.layout.content_chunk_path(chunk_hash),
-                            state.perf.as_ref(),
-                        )
-                        .map(std::borrow::Cow::Owned)
+                        state
+                            .storage_writer
+                            .read(StorageObjectKind::ContentChunk, chunk_hash)
+                            .ok()
+                            .flatten()
+                            .map(std::borrow::Cow::Owned)
                     }
                 },
             )
@@ -2231,8 +2183,7 @@ fn read_bulk_object(
     kind: ObjectKind,
     hash: &FileHash,
 ) -> Result<Option<Vec<u8>>, ServerError> {
-    let path = bulk_object_path(&state.layout, kind, hash);
-    let Some(bytes) = read_blob_measured(&path, state.perf.as_ref()) else {
+    let Some(bytes) = read_stored_object(state, storage_object_kind(kind), hash)? else {
         return Ok(None);
     };
     if kind == ObjectKind::Manifest {
@@ -2241,7 +2192,9 @@ fn read_bulk_object(
         let chunks = validate_content_manifest_structure(hash, &manifest)
             .map_err(|error| ServerError::Internal(format!("corrupt manifest: {error}")))?;
         if chunks.iter().any(|chunk| {
-            !blob_exists_measured(&state.layout.content_chunk_path(chunk), state.perf.as_ref())
+            !state
+                .storage_writer
+                .contains(StorageObjectKind::ContentChunk, chunk)
         }) {
             return Err(ServerError::Internal(
                 "manifest references a missing content chunk".into(),
@@ -2250,16 +2203,6 @@ fn read_bulk_object(
         return Ok(Some(bytes));
     }
 
-    let hash_started = std::time::Instant::now();
-    let matches = hash_bytes(&bytes) == *hash;
-    state
-        .perf
-        .record_hash_check(bytes.len() as u64, hash_started.elapsed(), matches);
-    if !matches {
-        return Err(ServerError::Internal(
-            "bulk object failed content-address validation".into(),
-        ));
-    }
     Ok(Some(bytes))
 }
 
@@ -2596,7 +2539,11 @@ mod integration_tests {
 
         assert_eq!(wire_status, StatusCode::OK);
         assert_eq!(semantic_status, StatusCode::NO_CONTENT.as_u16());
-        assert!(env.state.layout.content_chunk_path(&hash).exists());
+        assert!(env
+            .state
+            .storage_writer
+            .contains(StorageObjectKind::ContentChunk, &hash));
+        assert!(!env.state.layout.content_chunk_path(&hash).exists());
     }
 
     #[tokio::test]
@@ -2641,6 +2588,45 @@ mod integration_tests {
             !env.state.layout.index_path(&root_hash).exists(),
             "semantic root bytes must not pollute the global byte-addressed index",
         );
+    }
+
+    #[tokio::test]
+    async fn nonempty_root_validation_reads_index_and_content_from_pack_segments() {
+        let env = setup();
+        let vault = "packed-root";
+        let content = b"packed root content".to_vec();
+        let content_hash = hash_bytes(&content);
+        let content_path = format!("/api/v1/content/{}", hash_to_hex(&content_hash));
+        assert_eq!(
+            send(&env, "PUT", &content_path, &content).await.0,
+            StatusCode::OK
+        );
+        let entry = sync_core::chunk::FileEntry::new(
+            "note.md".into(),
+            content_hash,
+            1_800_000_000_000,
+            content.len() as u64,
+        );
+        let root = sync_core::tree::build_tree(
+            &env.state.storage_writer,
+            vec![entry],
+            vault,
+            "packed-test",
+        )
+        .await
+        .unwrap();
+        let mut payload = "0".repeat(64).into_bytes();
+        payload.extend_from_slice(&root.serialize());
+        let path = format!("/api/v1/root/{vault}");
+        let (status, _) = send_semantic(&env, "PUT", &path, &payload).await;
+
+        assert_eq!(status, StatusCode::OK.as_u16());
+        assert_eq!(env.state.vaults.get_current_root(vault), Some(root.hash()));
+        assert!(!env.state.layout.content_blob_path(&content_hash).exists());
+        assert!(env
+            .state
+            .storage_writer
+            .contains(StorageObjectKind::Content, &content_hash));
     }
 
     #[tokio::test]
@@ -2691,7 +2677,11 @@ mod integration_tests {
         let path = format!("/api/v1/content/manifest/{}", hash_to_hex(&file_hash));
         let (status, _) = send(&env, "PUT", &path, &body).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(env.state.layout.content_manifest_path(&file_hash).exists());
+        assert!(env
+            .state
+            .storage_writer
+            .contains(StorageObjectKind::Manifest, &file_hash));
+        assert!(!env.state.layout.content_manifest_path(&file_hash).exists());
     }
 
     #[tokio::test]
@@ -2819,13 +2809,20 @@ mod integration_tests {
         assert_eq!(put_status, StatusCode::OK.as_u16());
         assert_eq!(&ack[..4], bulk::PACK_ACK_MAGIC);
         assert_eq!(&ack[8..], &[0, 1, 2, 0, 3]);
-        assert!(env.state.layout.content_blob_path(&first_hash).exists());
-        assert!(env.state.layout.content_blob_path(&second_hash).exists());
+        assert!(env
+            .state
+            .storage_writer
+            .contains(StorageObjectKind::Content, &first_hash));
+        assert!(env
+            .state
+            .storage_writer
+            .contains(StorageObjectKind::Content, &second_hash));
         assert!(!env
             .state
-            .layout
-            .content_blob_path(&declared_bad_hash)
-            .exists());
+            .storage_writer
+            .contains(StorageObjectKind::Content, &declared_bad_hash));
+        assert!(!env.state.layout.content_blob_path(&first_hash).exists());
+        assert!(!env.state.layout.content_blob_path(&second_hash).exists());
         let storage = env.state.perf.snapshot().storage;
         assert_eq!(storage.pack_appends, 2);
         assert_eq!(storage.fdatasyncs, 1);
@@ -2976,8 +2973,16 @@ mod integration_tests {
         let (status, ack) = send_semantic(&env, "POST", "/api/v1/bulk/put", &pack).await;
         assert_eq!(status, StatusCode::OK.as_u16());
         assert_eq!(&ack[8..], &[0, 0]);
-        assert!(env.state.layout.content_chunk_path(&chunk_hash).exists());
-        assert!(env.state.layout.content_manifest_path(&file_hash).exists());
+        assert!(env
+            .state
+            .storage_writer
+            .contains(StorageObjectKind::ContentChunk, &chunk_hash));
+        assert!(env
+            .state
+            .storage_writer
+            .contains(StorageObjectKind::Manifest, &file_hash));
+        assert!(!env.state.layout.content_chunk_path(&chunk_hash).exists());
+        assert!(!env.state.layout.content_manifest_path(&file_hash).exists());
         let storage = env.state.perf.snapshot().storage;
         assert_eq!(storage.pack_appends, 2);
         assert_eq!(storage.fdatasyncs, 1);
@@ -2985,26 +2990,12 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn bulk_storage_error_is_per_record_retryable_and_whole_pack_is_idempotent() {
+    async fn bulk_pack_retry_is_idempotent_without_another_segment_append() {
         let env = setup();
-        let first = b"retry after blocked prefix".to_vec();
+        let first = b"first idempotent packed object".to_vec();
         let first_hash = hash_bytes(&first);
-        let (second, second_hash) = (0u32..)
-            .map(|salt| format!("independent record {salt}").into_bytes())
-            .map(|bytes| {
-                let hash = hash_bytes(&bytes);
-                (bytes, hash)
-            })
-            .find(|(_, hash)| hash[0] != first_hash[0])
-            .unwrap();
-        let blocked_parent = env
-            .state
-            .layout
-            .content_blob_path(&first_hash)
-            .parent()
-            .unwrap()
-            .to_path_buf();
-        std::fs::write(&blocked_parent, b"not a directory").unwrap();
+        let second = b"second idempotent packed object".to_vec();
+        let second_hash = hash_bytes(&second);
 
         let records = [
             UploadRecord {
@@ -3025,25 +3016,34 @@ mod integration_tests {
         let pack = bulk::encode_upload_pack(&records).unwrap();
         let (status, first_ack) = send_semantic(&env, "POST", "/api/v1/bulk/put", &pack).await;
         assert_eq!(status, StatusCode::OK.as_u16());
-        assert_eq!(&first_ack[8..], &[4, 0]);
-        assert!(!env.state.layout.content_blob_path(&first_hash).exists());
-        assert!(env.state.layout.content_blob_path(&second_hash).exists());
+        assert_eq!(&first_ack[8..], &[0, 0]);
+        let after_first = env.state.perf.snapshot().storage;
+        assert_eq!(after_first.pack_appends, 2);
+        assert_eq!(after_first.fdatasyncs, 1);
 
-        std::fs::remove_file(&blocked_parent).unwrap();
         let (_, retry_ack) = send_semantic(&env, "POST", "/api/v1/bulk/put", &pack).await;
-        assert_eq!(&retry_ack[8..], &[0, 1]);
+        assert_eq!(&retry_ack[8..], &[1, 1]);
+        let after_retry = env.state.perf.snapshot().storage;
+        assert_eq!(after_retry.pack_appends, 2);
+        assert_eq!(after_retry.fdatasyncs, 1);
         assert_eq!(
-            std::fs::read(env.state.layout.content_blob_path(&first_hash)).unwrap(),
-            first
+            env.state
+                .storage_writer
+                .read(StorageObjectKind::Content, &first_hash)
+                .unwrap(),
+            Some(first)
         );
         assert_eq!(
-            std::fs::read(env.state.layout.content_blob_path(&second_hash)).unwrap(),
-            second
+            env.state
+                .storage_writer
+                .read(StorageObjectKind::Content, &second_hash)
+                .unwrap(),
+            Some(second)
         );
     }
 
     #[tokio::test]
-    async fn bulk_manifest_dependency_is_retryable_when_its_chunk_write_fails() {
+    async fn bulk_manifest_and_chunk_retry_are_group_idempotent() {
         let env = setup();
         let chunk = b"manifest waits for durable chunk";
         let chunk_hash = hash_bytes(chunk);
@@ -3058,15 +3058,6 @@ mod integration_tests {
             }],
         }))
         .unwrap();
-        let blocked_parent = env
-            .state
-            .layout
-            .content_chunk_path(&chunk_hash)
-            .parent()
-            .unwrap()
-            .to_path_buf();
-        std::fs::write(&blocked_parent, b"not a directory").unwrap();
-
         let records = [
             UploadRecord {
                 kind: ObjectKind::ContentChunk,
@@ -3085,24 +3076,17 @@ mod integration_tests {
         ];
         let pack = bulk::encode_upload_pack(&records).unwrap();
         let (_, first_ack) = send_semantic(&env, "POST", "/api/v1/bulk/put", &pack).await;
-        assert_eq!(&first_ack[8..], &[4, 4]);
-        // The journaled manifest mirror may already be visible, but it is not
-        // usable/ACKable while its preceding chunk failed publication.
-        assert!(!stored_manifest_is_usable(
-            &env.state.layout,
-            &file_hash,
-            env.state.perf.as_ref(),
-        ));
+        assert_eq!(&first_ack[8..], &[0, 0]);
+        assert!(stored_manifest_is_usable(&env.state, &file_hash));
 
-        std::fs::remove_file(&blocked_parent).unwrap();
         let (_, retry_ack) = send_semantic(&env, "POST", "/api/v1/bulk/put", &pack).await;
-        assert_eq!(&retry_ack[8..], &[0, 1]);
-        assert!(env.state.layout.content_chunk_path(&chunk_hash).exists());
-        assert!(stored_manifest_is_usable(
-            &env.state.layout,
-            &file_hash,
-            env.state.perf.as_ref(),
-        ));
+        assert_eq!(&retry_ack[8..], &[1, 1]);
+        assert_eq!(env.state.perf.snapshot().storage.fdatasyncs, 1);
+        assert!(env
+            .state
+            .storage_writer
+            .contains(StorageObjectKind::ContentChunk, &chunk_hash));
+        assert!(stored_manifest_is_usable(&env.state, &file_hash));
     }
 
     /// An envelope encrypted against the wrong server pubkey must 401 (AEAD

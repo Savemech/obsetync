@@ -656,7 +656,7 @@ async fn purge_vault(
         .map_err(|e| ServerErrorHtml(format!("corrupt current root: {}", e)))?;
 
     let (mut new_root, removed, kept) =
-        crate::bridge::run_purge(state.layout.base.join("index"), current_root, patterns)
+        crate::bridge::run_purge(state.storage_writer.clone(), current_root, patterns)
             .await
             .map_err(|e| ServerErrorHtml(format!("purge failed: {}", e)))?;
 
@@ -709,37 +709,54 @@ struct WireManifest {
 #[derive(serde::Deserialize)]
 struct WireChunk {
     hash: String,
+    offset: u64,
+    size: u32,
 }
 
 /// Read a file's full content from the content store by hash — a single blob,
 /// or reassembled from its chunk manifest for large files. Blocking I/O; call
 /// inside spawn_blocking. Shared by the export and the file-diff viewer.
 fn read_file_content(
-    layout: &crate::storage::StorageLayout,
+    store: &crate::storage_writer::StorageWriter,
     hash: &sync_core::hash::FileHash,
 ) -> Result<Vec<u8>, String> {
-    use std::io::Read;
-    let blob_path = layout.content_blob_path(hash);
-    if blob_path.exists() {
-        let mut data = Vec::new();
-        std::fs::File::open(&blob_path)
-            .and_then(|mut f| f.read_to_end(&mut data))
-            .map_err(|e| e.to_string())?;
+    use crate::storage_writer::StorageObjectKind;
+    if let Some(data) = store
+        .read(StorageObjectKind::Content, hash)
+        .map_err(|error| error.to_string())?
+    {
         return Ok(data);
     }
-    let manifest_path = layout.content_manifest_path(hash);
-    let manifest_json =
-        std::fs::read(&manifest_path).map_err(|e| format!("manifest missing: {}", e))?;
+    let manifest_json = store
+        .read(StorageObjectKind::Manifest, hash)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "manifest missing".to_string())?;
     let manifest: WireManifest =
         serde_json::from_slice(&manifest_json).map_err(|e| format!("corrupt manifest: {}", e))?;
-    let mut data = Vec::with_capacity(manifest.total_size as usize);
+    let capacity = usize::try_from(manifest.total_size)
+        .map_err(|_| "manifest size exceeds platform range".to_string())?;
+    let mut data = Vec::with_capacity(capacity);
+    let mut expected_offset = 0u64;
     for chunk in &manifest.chunks {
+        if chunk.offset != expected_offset {
+            return Err("manifest chunk offsets are not contiguous".into());
+        }
         let chunk_hash = sync_core::hash::hex_to_hash(&chunk.hash)
             .map_err(|_| format!("bad chunk hash '{}'", chunk.hash))?;
-        let chunk_path = layout.content_chunk_path(&chunk_hash);
-        std::fs::File::open(&chunk_path)
-            .and_then(|mut f| f.read_to_end(&mut data))
-            .map_err(|e| format!("chunk missing: {}", e))?;
+        let bytes = store
+            .read(StorageObjectKind::ContentChunk, &chunk_hash)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "chunk missing".to_string())?;
+        if bytes.len() != chunk.size as usize {
+            return Err("manifest chunk size mismatch".into());
+        }
+        data.extend_from_slice(&bytes);
+        expected_offset = expected_offset
+            .checked_add(u64::from(chunk.size))
+            .ok_or_else(|| "manifest size overflow".to_string())?;
+    }
+    if expected_offset != manifest.total_size || sync_core::hash::hash_bytes(&data) != *hash {
+        return Err("manifest content does not match its file hash".into());
     }
     Ok(data)
 }
@@ -763,11 +780,12 @@ async fn export_vault(
     let root = sync_core::chunk::RootNode::deserialize(&root_bytes)
         .map_err(|e| ServerErrorHtml(format!("corrupt root: {}", e)))?;
 
-    let entries = crate::bridge::run_list_entries(state.layout.base.join("index"), root)
+    let entries = crate::bridge::run_list_entries(state.storage_writer.clone(), root)
         .await
         .map_err(|e| ServerErrorHtml(format!("failed to list entries: {}", e)))?;
 
     let layout = state.layout.clone();
+    let object_store = state.storage_writer.clone();
     let file_count = entries.len();
     let tar_file = tokio::task::spawn_blocking(move || -> Result<std::fs::File, String> {
         use std::io::{Seek, Write};
@@ -782,7 +800,7 @@ async fn export_vault(
         let mut builder = tar::Builder::new(&tmp);
 
         for entry in &entries {
-            let data = read_file_content(&layout, &entry.hash)
+            let data = read_file_content(&object_store, &entry.hash)
                 .map_err(|e| format!("{}: {}", entry.path, e))?;
 
             let mut header = tar::Header::new_gnu();
@@ -1198,11 +1216,10 @@ async fn api_diff(
     let from_root = load(&from_hex)?;
     let to_root = load(&to_hex)?;
 
-    let index = state.layout.base.join("index");
-    let from_entries = crate::bridge::run_list_entries(index.clone(), from_root)
+    let from_entries = crate::bridge::run_list_entries(state.storage_writer.clone(), from_root)
         .await
         .map_err(|e| ServerErrorHtml(format!("list from-root: {}", e)))?;
-    let to_entries = crate::bridge::run_list_entries(index, to_root)
+    let to_entries = crate::bridge::run_list_entries(state.storage_writer.clone(), to_root)
         .await
         .map_err(|e| ServerErrorHtml(format!("list to-root: {}", e)))?;
 
@@ -1282,14 +1299,14 @@ async fn api_filediff(
     State(state): State<SharedState>,
     Path((_vault_id, old_hex, new_hex)): Path<(String, String, String)>,
 ) -> Result<axum::Json<serde_json::Value>, ServerErrorHtml> {
-    let layout = state.layout.clone();
+    let object_store = state.storage_writer.clone();
     let (old, new) = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Vec<u8>), String> {
         let read = |hex: &str| -> Result<Vec<u8>, String> {
             if hex == ZERO_HASH_HEX {
                 return Ok(Vec::new());
             }
             let h = sync_core::hash::hex_to_hash(hex).map_err(|_| "invalid hash".to_string())?;
-            read_file_content(&layout, &h)
+            read_file_content(&object_store, &h)
         };
         Ok((read(&old_hex)?, read(&new_hex)?))
     })
@@ -1374,7 +1391,6 @@ async fn api_stats(
     const MAX: usize = 300;
     items.truncate(MAX);
 
-    let index = state.layout.base.join("index");
     let mut out = serde_json::Map::new();
     for (hash_hex, parent_hex, _) in items {
         let (Ok(h), Ok(p)) = (
@@ -1395,7 +1411,9 @@ async fn api_stats(
         ) else {
             continue;
         };
-        if let Ok(deltas) = crate::bridge::run_diff(index.clone(), parent, root).await {
+        if let Ok(deltas) =
+            crate::bridge::run_diff(state.storage_writer.clone(), parent, root).await
+        {
             let files = deltas.len();
             let bytes: u64 = deltas
                 .iter()

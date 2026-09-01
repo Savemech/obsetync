@@ -1498,6 +1498,7 @@ name = "sync-server"
 version = "1.10.2"
 dependencies = [
  "aes-gcm",
+ "async-trait",
  "axum",
  "base64",
  "blake3",

@@ -34,6 +34,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 sha2 = "0.10"
 rand = "0.9"
 thiserror = { workspace = true }
+async-trait = "0.1"
 
 # Secure transport primitives: X25519 ECDH + HKDF-SHA256 + AES-256-GCM.
 # Replaces all cert/CA infrastructure.
