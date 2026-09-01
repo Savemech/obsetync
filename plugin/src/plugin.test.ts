@@ -20,3 +20,5 @@ import "./wasm-runtime.test";
 import "./desktop-hash-workers.test";
 import "./hash-runtime.test";
 import "./bulk-codec.test";
+import "./ws-data-codec.test";
+import "./ws-data.test";

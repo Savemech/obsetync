@@ -54,6 +54,7 @@ const INFO_C2S_BOOT = "obsetync/v2/c2s-boot";
 const INFO_S2C_BOOT = "obsetync/v2/s2c-boot";
 
 const WS_AAD_PREFIX = "obsetync/ws/v2";
+const WS_DATA_AAD_PREFIX = "obsetync/ws-data/v1";
 const WS_INFO_C2S = "obsetync/ws/v2/c2s";
 const WS_INFO_S2C = "obsetync/ws/v2/s2c";
 
@@ -490,8 +491,15 @@ export function generateWsEphKeypair(): { priv: Uint8Array; pubB64: string } {
     return { priv, pubB64: btoa(bin) };
 }
 
-function wsAad(dir: "c2s" | "s2c", seq: number): Uint8Array {
-    const prefix = new TextEncoder().encode(`${WS_AAD_PREFIX} ${dir} `);
+export type ObsetyncWsProtocol = "realtime-v2" | "data-v1";
+
+function wsAad(
+    protocol: ObsetyncWsProtocol,
+    dir: "c2s" | "s2c",
+    seq: number,
+): Uint8Array {
+    const generation = protocol === "data-v1" ? WS_DATA_AAD_PREFIX : WS_AAD_PREFIX;
+    const prefix = new TextEncoder().encode(`${generation} ${dir} `);
     const seqBytes = new Uint8Array(8);
     new DataView(seqBytes.buffer).setBigUint64(0, BigInt(seq), false); // big-endian
     return concat(prefix, seqBytes);
@@ -505,6 +513,7 @@ export class ObsetyncWsSession {
     private constructor(
         private readonly c2sKey: CryptoKey,
         private readonly s2cKey: CryptoKey,
+        private readonly protocol: ObsetyncWsProtocol,
     ) {}
 
     /** Derive both directional keys from the mint exchange. Zeroes the
@@ -513,6 +522,7 @@ export class ObsetyncWsSession {
         clientEphPriv: Uint8Array,
         serverEphPubB64: string,
         ticketHex: string,
+        protocol: ObsetyncWsProtocol = "realtime-v2",
     ): Promise<ObsetyncWsSession> {
         if (clientEphPriv.length !== PUBKEY_LEN || !/^[0-9a-f]{64}$/i.test(ticketHex)) {
             clientEphPriv.fill(0);
@@ -571,19 +581,29 @@ export class ObsetyncWsSession {
         return new ObsetyncWsSession(
             await derive(WS_INFO_C2S, "encrypt"),
             await derive(WS_INFO_S2C, "decrypt"),
+            protocol,
         );
     }
 
     /** Seal an inner JSON frame for sending (c2s). */
     async seal(innerJson: string): Promise<Uint8Array> {
+        return this.sealBytes(new TextEncoder().encode(innerJson));
+    }
+
+    /** Seal arbitrary binary plaintext for the data lane. The cipher, key
+     *  schedule, and directional sequence rule match realtime, while a
+     *  generation-specific AAD domain prevents cross-protocol replay. A data
+     *  lane always has its own ticket/session, so it cannot contend with
+     *  realtime. */
+    async sealBytes(plaintext: Uint8Array): Promise<Uint8Array> {
         const nonce = randomNonce();
-        const aad = wsAad("c2s", this.seqOut);
+        const aad = wsAad(this.protocol, "c2s", this.seqOut);
         this.seqOut++;
         const ct = new Uint8Array(
             await crypto.subtle.encrypt(
                 { name: "AES-GCM", iv: bs(nonce), additionalData: bs(aad) },
                 this.c2sKey,
-                bs(new TextEncoder().encode(innerJson)),
+                bs(plaintext),
             ),
         );
         return concat(nonce, ct);
@@ -591,22 +611,26 @@ export class ObsetyncWsSession {
 
     /** Open a received sealed frame (s2c). Throws on tamper/desync. */
     async open(frame: Uint8Array): Promise<string> {
+        return new TextDecoder().decode(await this.openBytes(frame));
+    }
+
+    /** Open arbitrary binary plaintext from the data lane. */
+    async openBytes(frame: Uint8Array): Promise<Uint8Array> {
         if (frame.length < NONCE_LEN + TAG_LEN) {
             throw new ObsetyncSecureTransportError("ws frame too short");
         }
         const nonce = frame.slice(0, NONCE_LEN);
         const ct = frame.slice(NONCE_LEN);
-        const aad = wsAad("s2c", this.seqIn);
+        const aad = wsAad(this.protocol, "s2c", this.seqIn);
         this.seqIn++;
         try {
-            const plain = new Uint8Array(
+            return new Uint8Array(
                 await crypto.subtle.decrypt(
                     { name: "AES-GCM", iv: bs(nonce), additionalData: bs(aad) },
                     this.s2cKey,
                     bs(ct),
                 ),
             );
-            return new TextDecoder().decode(plain);
         } catch {
             throw new ObsetyncSecureTransportError(
                 "ws frame failed to open (tampered or sequence desync)",

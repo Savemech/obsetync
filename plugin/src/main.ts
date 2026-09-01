@@ -328,8 +328,14 @@ export default class ObsetyncPlugin extends Plugin {
                         ? `v1 · ${bulk.objects} objects · ${formatDebugBytes(bulk.requestBytes ?? 0)} request cap`
                         : "server fallback"}`,
                 );
+                push(
+                    `  WS data:          ${bulk.wsDataEnabled
+                        ? `v1 · ${bulk.wsDataState ?? "off"} · ${formatDebugBytes(bulk.wsDataFrameBytes ?? 0)} payload cap`
+                        : "bulk HTTP fallback"}`,
+                );
             } catch (e: any) {
                 push(`  Bulk HTTP:        negotiation failed: ${e?.message ?? e}`);
+                push(`  WS data:          negotiation unavailable`);
             }
             if (this.settings.vaultId) {
                 try {

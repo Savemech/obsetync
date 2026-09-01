@@ -3,7 +3,9 @@ import {
     ObsetyncSecureChannel,
     ObsetyncSecureTransportError,
     ObsetyncSessionStaleError,
+    ObsetyncWsSession,
     extractRequestNonce,
+    generateWsEphKeypair,
 } from "./secure";
 import { DurableSequenceAllocator } from "./transport-sequence";
 import { validateFileDeltas } from "./delta-validation";
@@ -31,6 +33,11 @@ import {
     type BulkRuntime,
     type BulkUploadRecord,
 } from "./bulk-codec";
+import { ObsetyncWsDataLane } from "./ws-data";
+import {
+    WsDataFrameType,
+    negotiateWsDataPayloadBytes,
+} from "./ws-data-codec";
 
 export { BulkObjectKind, type BulkUploadRecord } from "./bulk-codec";
 
@@ -136,6 +143,11 @@ export class ObsetyncApi {
      *  does not offer a valid bulk-v1 path. */
     private bulkLimits: BulkCodecLimits | null | undefined;
     private capabilitiesPromise: Promise<BulkCodecLimits | null> | null = null;
+    /** undefined = capabilities not fetched; null = no authenticated
+     *  ws-data-v1 offer. */
+    private wsDataFrameBytes: number | null | undefined;
+    private wsDataLane: ObsetyncWsDataLane | null = null;
+    private wsDataFallbackLogAfter = 0;
     private readonly sequences: DurableSequenceAllocator;
 
     constructor(
@@ -327,6 +339,9 @@ export class ObsetyncApi {
         requestBytes?: number;
         objects?: number;
         objectBytes?: number;
+        wsDataEnabled?: boolean;
+        wsDataState?: string;
+        wsDataFrameBytes?: number;
     }> {
         const limits = await this.getBulkLimits();
         return limits ? {
@@ -334,7 +349,16 @@ export class ObsetyncApi {
             requestBytes: limits.maxBytes,
             objects: limits.maxObjects,
             objectBytes: limits.maxObjectBytes,
+            wsDataEnabled: this.wsDataFrameBytes !== null,
+            wsDataState: this.wsDataLane?.getState() ?? "off",
+            wsDataFrameBytes: this.wsDataFrameBytes ?? undefined,
         } : { enabled: false };
+    }
+
+    /** Stop the optional transfer socket when the sync engine unloads. */
+    closeDataLane(): void {
+        this.wsDataLane?.close();
+        this.wsDataLane = null;
     }
 
     /** Upload records in ordered, count/byte-bounded packs. Records above the
@@ -420,34 +444,56 @@ export class ObsetyncApi {
             }
             let cursor = 0;
             while (cursor < group.length) {
-                const request = encodeBulkGetRequest(
-                    kind,
-                    group,
-                    cursor,
-                    limits.maxBytes,
-                    limits.maxObjects,
-                );
-                const response = await this.sealed("POST", "/api/v1/bulk/get", request, perf);
-                if (response.status === 404 || response.status === 405) {
-                    this.bulkLimits = null;
-                    for (const hash of group.slice(cursor)) {
-                        retain(hash, await this.getObjectLegacy(kind, hash, perf));
+                let responseBytes: Uint8Array | null = null;
+                if (this.wsDataFrameBytes !== null && this.wsDataFrameBytes !== undefined) {
+                    const wsBudget = Math.min(limits.maxBytes, this.wsDataFrameBytes);
+                    const wsRequest = encodeBulkGetRequest(
+                        kind,
+                        group,
+                        cursor,
+                        wsBudget,
+                        limits.maxObjects,
+                    );
+                    responseBytes = await this.tryDataRpc(
+                        WsDataFrameType.GetPack,
+                        wsRequest,
+                        WsDataFrameType.GetResult,
+                        perf,
+                    );
+                }
+                if (!responseBytes) {
+                    const request = encodeBulkGetRequest(
+                        kind,
+                        group,
+                        cursor,
+                        limits.maxBytes,
+                        limits.maxObjects,
+                    );
+                    const response = await this.sealed("POST", "/api/v1/bulk/get", request, perf);
+                    if (response.status === 404 || response.status === 405) {
+                        this.bulkLimits = null;
+                        this.wsDataFrameBytes = null;
+                        this.closeDataLane();
+                        for (const hash of group.slice(cursor)) {
+                            retain(hash, await this.getObjectLegacy(kind, hash, perf));
+                        }
+                        cursor = group.length;
+                        continue;
                     }
-                    cursor = group.length;
-                    continue;
+                    if (response.status === 413) {
+                        // A stored object may predate bulk-v1 and exceed its
+                        // per-object cap (notably a 4 MiB FastCDC chunk). Preserve
+                        // correctness through the stable single-object GET.
+                        const hash = group[cursor];
+                        retain(hash, await this.getObjectLegacy(kind, hash, perf));
+                        cursor++;
+                        continue;
+                    }
+                    if (!response.ok) throw new Error(`bulk get failed: ${response.status}`);
+                    responseBytes = new Uint8Array(await response.arrayBuffer());
                 }
-                if (response.status === 413) {
-                    // A stored object may predate bulk-v1 and exceed its
-                    // per-object cap (notably a 4 MiB FastCDC chunk). Preserve
-                    // correctness through the stable single-object GET.
-                    const hash = group[cursor];
-                    retain(hash, await this.getObjectLegacy(kind, hash, perf));
-                    cursor++;
-                    continue;
-                }
-                if (!response.ok) throw new Error(`bulk get failed: ${response.status}`);
                 const page = decodeBulkDownloadResponse(
-                    new Uint8Array(await response.arrayBuffer()),
+                    responseBytes,
                     group.length,
                     cursor,
                     limits,
@@ -603,9 +649,21 @@ export class ObsetyncApi {
         for (let offset = 0; offset < hashes.length; offset += hashesPerRequest) {
             const batch = hashes.slice(offset, offset + hashesPerRequest);
             const body = encodeBulkCheckRequest(kind, batch, limits.maxObjects);
+            const dataResponse = await this.tryDataRpc(
+                WsDataFrameType.CheckObjects,
+                body,
+                WsDataFrameType.CheckResult,
+                perf,
+            );
+            if (dataResponse) {
+                needed.push(...decodeBulkCheckResponse(dataResponse, batch));
+                continue;
+            }
             const response = await this.sealed("POST", "/api/v1/bulk/check", body, perf);
             if (response.status === 404 || response.status === 405) {
                 this.bulkLimits = null;
+                this.wsDataFrameBytes = null;
+                this.closeDataLane();
                 return null;
             }
             if (!response.ok) throw new Error(`bulk check failed: ${response.status}`);
@@ -629,17 +687,25 @@ export class ObsetyncApi {
                 await new Promise<void>((resolve) =>
                     globalThis.setTimeout(resolve, retryDelays[attempt]));
             }
-            const response = await this.sealed("POST", "/api/v1/bulk/put", body, perf);
-            if (response.status === 404 || response.status === 405) {
-                this.bulkLimits = null;
-                for (const record of records) await this.putObjectLegacy(record, perf);
-                return;
-            }
-            if (!response.ok) throw new Error(`bulk put failed: ${response.status}`);
-            const statuses = decodeBulkUploadAck(
-                new Uint8Array(await response.arrayBuffer()),
-                records.length,
+            let responseBytes = await this.tryDataRpc(
+                WsDataFrameType.PutPack,
+                body,
+                WsDataFrameType.PutAck,
+                perf,
             );
+            if (!responseBytes) {
+                const response = await this.sealed("POST", "/api/v1/bulk/put", body, perf);
+                if (response.status === 404 || response.status === 405) {
+                    this.bulkLimits = null;
+                    this.wsDataFrameBytes = null;
+                    this.closeDataLane();
+                    for (const record of records) await this.putObjectLegacy(record, perf);
+                    return;
+                }
+                if (!response.ok) throw new Error(`bulk put failed: ${response.status}`);
+                responseBytes = new Uint8Array(await response.arrayBuffer());
+            }
+            const statuses = decodeBulkUploadAck(responseBytes, records.length);
             const permanent = statuses.findIndex((status) =>
                 status === BulkUploadStatus.BadHash ||
                 status === BulkUploadStatus.RejectedLimit);
@@ -663,7 +729,7 @@ export class ObsetyncApi {
     private async getBulkLimits(perf?: PerfOperation): Promise<BulkCodecLimits | null> {
         if (this.bulkLimits !== undefined) return this.bulkLimits;
         if (this.capabilitiesPromise) return this.capabilitiesPromise;
-        this.capabilitiesPromise = (async () => {
+        this.capabilitiesPromise = (async (): Promise<BulkCodecLimits | null> => {
             // A fresh/rotated server-eph bundle already carries capabilities.
             // Existing sessions upgraded in place discover them through this
             // one sealed endpoint without requiring re-enrollment.
@@ -677,17 +743,93 @@ export class ObsetyncApi {
             );
             if (response.status === 404 || response.status === 405) {
                 this.bulkLimits = null;
+                this.wsDataFrameBytes = null;
+                this.closeDataLane();
                 return null;
             }
             if (!response.ok) throw new Error(`capability negotiation failed: ${response.status}`);
             const bundle = await response.json();
-            this.bulkLimits = negotiateBulkLimits(bundle, this.runtime);
-            return this.bulkLimits;
+            this.applyCapabilityBundle(bundle);
+            return this.bulkLimits ?? null;
         })();
         try {
             return await this.capabilitiesPromise;
         } finally {
             this.capabilitiesPromise = null;
+        }
+    }
+
+    private applyCapabilityBundle(bundle: any): void {
+        this.bulkLimits = negotiateBulkLimits(bundle, this.runtime);
+        const frameBytes = negotiateWsDataPayloadBytes(bundle);
+        if (frameBytes === null && this.wsDataLane) this.closeDataLane();
+        this.wsDataFrameBytes = frameBytes;
+    }
+
+    private async getDataLane(perf?: PerfOperation): Promise<ObsetyncWsDataLane | null> {
+        await this.getBulkLimits(perf);
+        if (this.wsDataFrameBytes === null || this.wsDataFrameBytes === undefined ||
+            typeof WebSocket === "undefined") {
+            return null;
+        }
+        if (!this.wsDataLane) {
+            this.wsDataLane = new ObsetyncWsDataLane({
+                baseUrl: this.serverUrl,
+                runtime: this.runtime,
+                advertisedPayloadBytes: this.wsDataFrameBytes,
+                openSession: async () => {
+                    const keys = generateWsEphKeypair();
+                    const minted = await this.mintWsTicket(keys.pubB64);
+                    if (!minted.server_eph_pub) {
+                        keys.priv.fill(0);
+                        throw new Error("server omitted the WS data ephemeral key");
+                    }
+                    return {
+                        ticket: minted.ticket,
+                        session: await ObsetyncWsSession.create(
+                            keys.priv,
+                            minted.server_eph_pub,
+                            minted.ticket,
+                            "data-v1",
+                        ),
+                    };
+                },
+            });
+        }
+        return this.wsDataLane;
+    }
+
+    private async tryDataRpc(
+        type: WsDataFrameType.CheckObjects | WsDataFrameType.PutPack | WsDataFrameType.GetPack,
+        payload: Uint8Array,
+        expected:
+            | WsDataFrameType.CheckResult
+            | WsDataFrameType.PutAck
+            | WsDataFrameType.GetResult,
+        perf?: PerfOperation,
+    ): Promise<Uint8Array | null> {
+        if (this.wsDataFrameBytes !== undefined && this.wsDataFrameBytes !== null &&
+            payload.byteLength > this.wsDataFrameBytes) {
+            return null;
+        }
+        const lane = await this.getDataLane(perf);
+        if (!lane) return null;
+        try {
+            const response = await lane.request(type, payload, expected, perf);
+            this.wsDataFallbackLogAfter = 0;
+            return response;
+        } catch (error) {
+            perf?.increment({ retries: 1 });
+            const now = Date.now();
+            if (now >= this.wsDataFallbackLogAfter) {
+                const message = error instanceof Error ? error.message : String(error);
+                console.warn(
+                    "[obsetync] ws-data unavailable; using bulk HTTP (further messages suppressed for 30s):",
+                    message,
+                );
+                this.wsDataFallbackLogAfter = now + 30_000;
+            }
+            return null;
         }
     }
 
@@ -958,7 +1100,7 @@ export class ObsetyncApi {
         ) {
             throw new Error("server returned an invalid transport-v2 ephemeral bundle");
         }
-        this.bulkLimits = negotiateBulkLimits(bundle, this.runtime);
+        this.applyCapabilityBundle(bundle);
         await persistence.update({
             esPub: bundle.Es_pub,
             esPubValidUntil: bundle.valid_until,

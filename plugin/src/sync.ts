@@ -391,6 +391,7 @@ export class ObsetyncSyncEngine {
         }
         this.wsChannel?.stop();
         this.wsChannel = null;
+        this.api.closeDataLane();
         if (this.presenceHeartbeat !== null) {
             window.clearInterval(this.presenceHeartbeat);
             this.presenceHeartbeat = null;

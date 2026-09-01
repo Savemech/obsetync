@@ -4,6 +4,7 @@ import {
     HTTP_WIRE_VERSION,
     ObsetyncSecureChannel,
     ObsetyncSessionStaleError,
+    ObsetyncWsSession,
     extractRequestNonce,
 } from "./secure";
 
@@ -146,10 +147,76 @@ async function run(): Promise<void> {
     );
     assert.equal(bootstrapPlaintext.length, 0);
 
+    // ws-data-v1 reuses the ticket-derived directional keys, but its AAD
+    // domain is distinct from realtime-v2. Exercise the production client
+    // implementation against an independently constructed peer frame.
+    const wsClientPrivate = crypto.getRandomValues(new Uint8Array(32));
+    const wsClientPublic = x25519.getPublicKey(wsClientPrivate);
+    const wsServerPrivate = crypto.getRandomValues(new Uint8Array(32));
+    const wsServerPublic = x25519.getPublicKey(wsServerPrivate);
+    const wsTicket = "cd".repeat(32);
+    const wsShared = x25519.getSharedSecret(wsServerPrivate, wsClientPublic);
+    const wsSession = await ObsetyncWsSession.create(
+        wsClientPrivate,
+        b64(wsServerPublic),
+        wsTicket,
+        "data-v1",
+    );
+    assert.ok(wsClientPrivate.every((byte) => byte === 0));
+    const ticketSalt = new TextEncoder().encode(wsTicket);
+    const c2sKey = await aesKey(wsShared, ticketSalt, "obsetync/ws/v2/c2s");
+    const dataPrefix = new TextEncoder().encode("obsetync/ws-data/v1 c2s ");
+    const realtimePrefix = new TextEncoder().encode("obsetync/ws/v2 c2s ");
+    const sequenceZero = new Uint8Array(8);
+    const sealedData = await wsSession.sealBytes(new TextEncoder().encode("OBW1 data"));
+    const openedData = new Uint8Array(await crypto.subtle.decrypt(
+        {
+            name: "AES-GCM",
+            iv: bs(sealedData.slice(0, 12)),
+            additionalData: bs(concat(dataPrefix, sequenceZero)),
+        },
+        c2sKey,
+        bs(sealedData.slice(12)),
+    ));
+    assert.equal(new TextDecoder().decode(openedData), "OBW1 data");
+    await assert.rejects(crypto.subtle.decrypt(
+        {
+            name: "AES-GCM",
+            iv: bs(sealedData.slice(0, 12)),
+            additionalData: bs(concat(realtimePrefix, sequenceZero)),
+        },
+        c2sKey,
+        bs(sealedData.slice(12)),
+    ));
+
+    const s2cKey = await aesKey(wsShared, ticketSalt, "obsetync/ws/v2/s2c");
+    const wsResponseNonce = crypto.getRandomValues(new Uint8Array(12));
+    const responseBytes = new TextEncoder().encode("OBW1 response");
+    const wsResponseCiphertext = new Uint8Array(await crypto.subtle.encrypt(
+        {
+            name: "AES-GCM",
+            iv: bs(wsResponseNonce),
+            additionalData: bs(concat(
+                new TextEncoder().encode("obsetync/ws-data/v1 s2c "),
+                sequenceZero,
+            )),
+        },
+        s2cKey,
+        bs(responseBytes),
+    ));
+    assert.equal(
+        new TextDecoder().decode(await wsSession.openBytes(
+            concat(wsResponseNonce, wsResponseCiphertext),
+        )),
+        "OBW1 response",
+    );
+
     staticPrivate.fill(0);
     ephemeralPrivate.fill(0);
     keyMaterial.fill(0);
-    console.log("secure.test: 12 assertions passed");
+    wsServerPrivate.fill(0);
+    wsShared.fill(0);
+    console.log("secure.test: 16 assertions passed");
 }
 
 void run();
