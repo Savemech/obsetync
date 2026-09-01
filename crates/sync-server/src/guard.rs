@@ -41,6 +41,7 @@ use crate::storage_writer::StorageWriter;
 use sync_core::chunk::RootNode;
 use sync_core::store::ChunkStore;
 use sync_core::tree::load_all_entries;
+use sync_core::versioned_root::VersionedRoot;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuardMode {
@@ -162,6 +163,46 @@ pub async fn scan(
                 scan_inner(&store, &current, &candidate, skew_ms)
                     .await
                     .map_err(|e| e.to_string())
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+pub async fn scan_versioned(
+    store: StorageWriter,
+    current: VersionedRoot,
+    candidate: VersionedRoot,
+) -> Result<GuardScan, String> {
+    if let (VersionedRoot::V1(current), VersionedRoot::V1(candidate)) = (&current, &candidate) {
+        return scan(store, current.clone(), candidate.clone()).await;
+    }
+    store
+        .run_blocking(move |store| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, async {
+                let current_entries = sync_core::versioned_root::load_all_entries(&store, &current)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let candidate_entries =
+                    sync_core::versioned_root::load_all_entries(&store, &candidate)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                let mut out = GuardScan {
+                    current_total: current.total_files(),
+                    ..GuardScan::default()
+                };
+                compare_entries(
+                    &current_entries,
+                    &candidate_entries,
+                    config().mtime_skew_ms,
+                    &mut out,
+                );
+                Ok(out)
             })
         })
         .await

@@ -121,6 +121,13 @@ pub struct DecryptedRequest {
     pub bearer_token: String,
     pub sequence: u64,
     pub inner_body: Vec<u8>,
+    /// Public half of the client's per-process HTTP channel. It is not a
+    /// credential, but it is a stable, authenticated session identifier:
+    /// every request carrying it proved possession of the matching private
+    /// key by opening the AEAD envelope. Capability reports are bound to this
+    /// value so downgrading a plugin cannot inherit a newer process' feature
+    /// declaration merely by reusing the same enrolled device identity.
+    pub client_session: [u8; PUBKEY_LEN],
     /// Double-DH IKM is 64 bytes; bootstrap IKM is 32 bytes.
     pub key_material: Zeroizing<Vec<u8>>,
     pub mode: TransportMode,
@@ -283,6 +290,7 @@ pub fn decrypt_request(
         bearer_token,
         sequence,
         inner_body,
+        client_session: pubkey_bytes,
         key_material,
         mode,
         nonce_req: nonce_bytes,

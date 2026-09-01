@@ -12,6 +12,9 @@ pub enum ServerError {
     PayloadTooLarge(String),
     ServiceUnavailable(String),
     Conflict(String),
+    /// The enrolled identity is still valid, but this process does not speak
+    /// the active data format. Clients must update/reload, never re-enroll.
+    UpgradeRequired(String),
     Unauthorized,
     Internal(String),
 }
@@ -26,6 +29,7 @@ impl std::fmt::Display for ServerError {
             Self::PayloadTooLarge(msg) => write!(f, "payload too large: {}", msg),
             Self::ServiceUnavailable(msg) => write!(f, "service unavailable: {}", msg),
             Self::Conflict(msg) => write!(f, "conflict: {}", msg),
+            Self::UpgradeRequired(msg) => write!(f, "upgrade required: {}", msg),
             Self::Unauthorized => write!(f, "unauthorized"),
             Self::Internal(msg) => write!(f, "internal: {}", msg),
         }
@@ -43,6 +47,7 @@ impl IntoResponse for ServerError {
             Self::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg.clone()),
             Self::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
             Self::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
+            Self::UpgradeRequired(msg) => (StatusCode::UPGRADE_REQUIRED, msg.clone()),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".into()),
             Self::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
         };
@@ -106,6 +111,17 @@ mod tests {
             status_and_body(ServerError::Conflict("merge needed".into()).into_response()).await;
         assert_eq!(s, StatusCode::CONFLICT);
         assert!(b.contains("merge needed"));
+    }
+
+    #[tokio::test]
+    async fn upgrade_required_renders_426_without_revoking_identity() {
+        let (s, b) = status_and_body(
+            ServerError::UpgradeRequired("update plugin; enrollment remains valid".into())
+                .into_response(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::UPGRADE_REQUIRED);
+        assert!(b.contains("enrollment remains valid"));
     }
 
     #[tokio::test]

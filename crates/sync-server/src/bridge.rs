@@ -1,7 +1,10 @@
 use crate::storage_writer::StorageWriter;
 use sync_core::chunk::RootNode;
 use sync_core::diff::FileDelta;
+#[cfg(test)]
 use sync_core::merge::MergeResult;
+use sync_core::merge::VersionedMergeResult;
+use sync_core::versioned_root::VersionedRoot;
 
 const MAX_ROOT_FILES: u64 = 5_000_000;
 const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
@@ -11,6 +14,7 @@ const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 ///
 /// The same packed store supplies index nodes and small-file bytes. Merged
 /// index/content objects return through its single durable writer.
+#[cfg(test)]
 pub async fn run_merge(
     store: StorageWriter,
     base: RootNode,
@@ -34,9 +38,33 @@ pub async fn run_merge(
         .map_err(|e| e.to_string())?
 }
 
+pub async fn run_versioned_merge(
+    store: StorageWriter,
+    base: VersionedRoot,
+    side_a: VersionedRoot,
+    side_b: VersionedRoot,
+) -> Result<VersionedMergeResult, String> {
+    store
+        .run_blocking(move |store| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, async {
+                sync_core::merge::merge_versioned_trees(&store, &store, &base, &side_a, &side_b)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Load every file entry reachable from a root (all subtrees flattened),
 /// in a blocking task with a LocalSet — used by the admin export to
 /// materialize a snapshot without touching merge/diff logic.
+#[cfg(test)]
 pub async fn run_list_entries(
     store: StorageWriter,
     root: RootNode,
@@ -61,6 +89,63 @@ pub async fn run_list_entries(
                 }
                 entries.sort();
                 Ok(entries)
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+pub async fn run_versioned_list_entries(
+    store: StorageWriter,
+    root: VersionedRoot,
+) -> Result<Vec<sync_core::chunk::FileEntry>, String> {
+    store
+        .run_blocking(move |store| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, async {
+                sync_core::versioned_root::load_all_entries(&store, &root)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Rebuild one semantic snapshot in another tree format. The immutable file
+/// entries/content hashes are unchanged; only index nodes and the root
+/// envelope are regenerated. Used by explicit admin activation/rollback of
+/// Tree v2, never by an ordinary client push.
+pub async fn run_project_root_version(
+    store: StorageWriter,
+    root: VersionedRoot,
+    target_version: u32,
+    device_id: String,
+) -> Result<VersionedRoot, String> {
+    store
+        .run_blocking(move |store| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, async {
+                let entries = sync_core::versioned_root::load_all_entries(&store, &root)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                sync_core::versioned_root::build_root(
+                    &store,
+                    entries,
+                    target_version,
+                    root.vault_id(),
+                    &device_id,
+                )
+                .await
+                .map_err(|e| e.to_string())
             })
         })
         .await
@@ -164,6 +249,52 @@ pub async fn run_validate_root(
         .map_err(|e| e.to_string())?
 }
 
+pub async fn run_validate_versioned_root(
+    store: StorageWriter,
+    root: VersionedRoot,
+) -> Result<Vec<sync_core::chunk::FileEntry>, String> {
+    match root {
+        VersionedRoot::V1(root) => run_validate_root(store, root).await,
+        VersionedRoot::V2(root) => {
+            if root.total_files() > MAX_ROOT_FILES {
+                return Err(format!(
+                    "root declares too many files: {}",
+                    root.total_files()
+                ));
+            }
+            store
+                .run_blocking(move |store| {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| e.to_string())?;
+                    let local = tokio::task::LocalSet::new();
+                    local.block_on(&rt, async {
+                        let entries = sync_core::tree_v2::load_all_entries(&store, &root.tree)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        for entry in &entries {
+                            if !valid_vault_path(&entry.path) {
+                                return Err(format!("unsafe vault path {:?}", entry.path));
+                            }
+                            if entry.size_bytes > JS_MAX_SAFE_INTEGER
+                                || entry.mtime_ms > JS_MAX_SAFE_INTEGER
+                            {
+                                return Err(format!(
+                                    "entry {:?} exceeds client integer range",
+                                    entry.path
+                                ));
+                            }
+                        }
+                        Ok(entries)
+                    })
+                })
+                .await
+                .map_err(|e| e.to_string())?
+        }
+    }
+}
+
 fn valid_vault_path(path: &str) -> bool {
     if path.is_empty() || path.len() > 4096 || path.starts_with('/') || path.contains('\\') {
         return false;
@@ -195,6 +326,7 @@ fn valid_top_level_prefix(prefix: &str) -> bool {
 /// Merkle tree so that ignoring clients can reach parity again. Returns
 /// `(new_root, removed, kept)`. Reuses the same flatten-then-rebuild path as
 /// export + build_tree, so it can't desync from how roots are normally built.
+#[cfg(test)]
 pub async fn run_purge(
     store: StorageWriter,
     root: RootNode,
@@ -231,7 +363,48 @@ pub async fn run_purge(
         .map_err(|e| e.to_string())?
 }
 
+pub async fn run_versioned_purge(
+    store: StorageWriter,
+    root: VersionedRoot,
+    patterns: Vec<String>,
+) -> Result<(VersionedRoot, usize, usize), String> {
+    store
+        .run_blocking(move |store| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, async {
+                let version = root.version();
+                let vault_id = root.vault_id().to_owned();
+                let parent = root.hash();
+                let mut entries = sync_core::versioned_root::load_all_entries(&store, &root)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let before = entries.len();
+                entries.retain(|entry| !crate::ignore_match::matches_any(&entry.path, &patterns));
+                let kept = entries.len();
+                let removed = before - kept;
+                let mut new_root = sync_core::versioned_root::build_root(
+                    &store,
+                    entries,
+                    version,
+                    &vault_id,
+                    "admin-purge",
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                new_root.set_history_metadata(0, Some(parent), "admin-purge");
+                Ok((new_root, removed, kept))
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Run sync-core's `compute_deltas` in a blocking task with a LocalSet.
+#[cfg(test)]
 pub async fn run_diff(
     store: StorageWriter,
     from_root: RootNode,
@@ -240,6 +413,7 @@ pub async fn run_diff(
     Ok(run_diff_with_stats(store, from_root, to_root).await?.deltas)
 }
 
+#[cfg(test)]
 pub async fn run_diff_with_stats(
     store: StorageWriter,
     from_root: RootNode,
@@ -260,6 +434,38 @@ pub async fn run_diff_with_stats(
         })
         .await
         .map_err(|e| e.to_string())?
+}
+
+pub async fn run_versioned_diff_with_stats(
+    store: StorageWriter,
+    from_root: VersionedRoot,
+    to_root: VersionedRoot,
+) -> Result<sync_core::diff::DiffResult, String> {
+    store
+        .run_blocking(move |store| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, async {
+                sync_core::diff::compute_versioned_deltas_with_stats(&store, &from_root, &to_root)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+pub async fn run_versioned_diff(
+    store: StorageWriter,
+    from_root: VersionedRoot,
+    to_root: VersionedRoot,
+) -> Result<Vec<FileDelta>, String> {
+    Ok(run_versioned_diff_with_stats(store, from_root, to_root)
+        .await?
+        .deltas)
 }
 
 #[cfg(test)]

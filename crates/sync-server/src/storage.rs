@@ -3,8 +3,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-use sync_core::chunk::RootNode;
 use sync_core::hash::{hash_to_hex, hex_to_hash, FileHash};
+use sync_core::versioned_root::VersionedRoot;
+
+#[cfg(test)]
+use sync_core::chunk::RootNode;
 
 /// Manages the filesystem layout for the server's data directory.
 #[derive(Debug, Clone)]
@@ -249,8 +252,8 @@ impl VaultStore {
         // set of unique states: once valid metadata has been recorded for a
         // semantic root, a replay of the same state must not rewrite it.
         if read_blob_with_optional_perf(&path, self.perf.as_deref()).is_some_and(|existing| {
-            RootNode::deserialize(&existing)
-                .is_ok_and(|root| root.vault_id == vault_id && root.hash() == *hash)
+            VersionedRoot::deserialize(&existing)
+                .is_ok_and(|root| root.vault_id() == vault_id && root.hash() == *hash)
         }) {
             return Ok(());
         }
@@ -261,6 +264,14 @@ impl VaultStore {
     pub fn get_root(&self, vault_id: &str, hash: &FileHash) -> Option<Vec<u8>> {
         let path = self.layout.vault_root_path(vault_id, hash);
         read_blob_with_optional_perf(&path, self.perf.as_deref())
+    }
+
+    pub fn get_current_version(&self, vault_id: &str) -> Option<u32> {
+        let hash = self.get_current_root(vault_id)?;
+        let bytes = self.get_root(vault_id, &hash)?;
+        VersionedRoot::deserialize(&bytes)
+            .ok()
+            .map(|root| root.version())
     }
 
     /// Check if a vault exists (has at least one root).

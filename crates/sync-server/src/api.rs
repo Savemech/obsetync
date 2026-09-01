@@ -91,6 +91,13 @@ async fn read_stored_object(
 #[derive(Clone)]
 pub struct DeviceIdExt(pub String);
 
+/// Authenticated per-process HTTP channel id, inserted by `secure_envelope`.
+/// Unlike `DeviceIdExt`, this changes whenever the plugin establishes a new
+/// X25519 channel and therefore cannot carry stale runtime capabilities across
+/// a plugin downgrade/reload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientSessionExt(pub [u8; 32]);
+
 /// Historical wire-v1 implementation kept temporarily as migration context;
 /// cfg(false) guarantees wire v2 is the sole compiled middleware.
 #[cfg(any())]
@@ -454,6 +461,9 @@ async fn secure_envelope(
             }
         }
         parts.extensions.insert(DeviceIdExt(device_id));
+        parts
+            .extensions
+            .insert(ClientSessionExt(decrypted.client_session));
         device_short
     };
     let auth_elapsed = auth_started.elapsed();
@@ -694,7 +704,7 @@ async fn get_server_eph(State(state): State<SharedState>) -> impl IntoResponse {
 fn capability_bundle() -> serde_json::Value {
     serde_json::json!({
         // Never advertise a future fast path before this binary can serve it.
-        "capabilities": ["bulk-http-v1", "ws-data-v1", "paged-diff-v1"],
+        "capabilities": ["bulk-http-v1", "ws-data-v1", "paged-diff-v1", "tree-v2"],
         "limits": {
             "bulk_request_bytes": BULK_REQUEST_BYTES,
             "bulk_objects": BULK_OBJECTS,
@@ -708,8 +718,100 @@ fn capability_bundle() -> serde_json::Value {
     })
 }
 
-async fn post_capabilities() -> impl IntoResponse {
-    axum::Json(capability_bundle())
+const TREE_V2_CAPABILITY: &str = "tree-v2";
+const MAX_CAPABILITY_REPORT_BYTES: usize = 8 * 1024;
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapabilityReport {
+    protocol_version: u32,
+    vault_id: String,
+    capabilities: Vec<String>,
+}
+
+async fn post_capabilities(
+    State(state): State<SharedState>,
+    axum::Extension(device): axum::Extension<DeviceIdExt>,
+    axum::Extension(session): axum::Extension<ClientSessionExt>,
+    body: axum::body::Bytes,
+) -> Result<impl IntoResponse, ServerError> {
+    if body.len() > MAX_CAPABILITY_REPORT_BYTES {
+        return Err(ServerError::PayloadTooLarge(
+            "capability report exceeds 8 KiB".into(),
+        ));
+    }
+    let report = if body.is_empty() {
+        None
+    } else {
+        let report: CapabilityReport = serde_json::from_slice(&body).map_err(|error| {
+            ServerError::BadRequest(format!("invalid capability report: {error}"))
+        })?;
+        if report.protocol_version != 1 {
+            return Err(ServerError::BadRequest(
+                "unsupported capability-report protocol_version".into(),
+            ));
+        }
+        Some(report)
+    };
+
+    let devices = state.devices.clone();
+    let device_id = device.0;
+    let session_id = session.0;
+    let vault_id = report.as_ref().map(|report| report.vault_id.clone());
+    let capabilities = report
+        .as_ref()
+        .map(|report| report.capabilities.clone())
+        .unwrap_or_default();
+    let reported_vault = vault_id.clone();
+    state
+        .control_io
+        .run(move || {
+            devices.report_capabilities(
+                &device_id,
+                session_id,
+                reported_vault.as_deref(),
+                &capabilities,
+            )
+        })
+        .await
+        .map_err(|error| ServerError::ServiceUnavailable(error.to_string()))?
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::InvalidInput => ServerError::BadRequest(error.to_string()),
+            _ => ServerError::Internal(format!("persist capability report: {error}")),
+        })?;
+
+    let current_version = if let Some(vault_id) = vault_id {
+        let layout = state.layout.clone();
+        let perf = state.perf.clone();
+        state
+            .control_io
+            .run(move || {
+                crate::storage::VaultStore::with_perf(layout, perf)
+                    .get_current_version(&vault_id)
+                    .unwrap_or(1)
+            })
+            .await
+            .map_err(|error| ServerError::ServiceUnavailable(error.to_string()))?
+    } else {
+        1
+    };
+    let fleet = state.devices.fleet_capability(TREE_V2_CAPABILITY);
+    let mut bundle = capability_bundle();
+    bundle["tree"] = serde_json::json!({
+        "current_version": current_version,
+        "fleet_ready": fleet.ready(),
+        "ready_devices": fleet.ready_devices,
+        "enrolled_devices": fleet.enrolled_devices,
+        "activation": if current_version == 2 {
+            "active"
+        } else if fleet.ready() {
+            "eligible"
+        } else {
+            "blocked"
+        },
+        "required_client_capability": TREE_V2_CAPABILITY,
+    });
+    Ok(axum::Json(bundle))
 }
 
 // --- Semantic-method dispatchers ---
@@ -745,24 +847,44 @@ async fn root_dispatcher(
     Path(vault_id): Path<String>,
     request: Request,
 ) -> Response {
+    let device = request
+        .extensions()
+        .get::<DeviceIdExt>()
+        .cloned()
+        .unwrap_or_else(|| DeviceIdExt(String::new()));
+    let session = request
+        .extensions()
+        .get::<ClientSessionExt>()
+        .copied()
+        .unwrap_or(ClientSessionExt([0; 32]));
     match semantic_method(request.headers()) {
-        Some(ref m) if m == Method::GET => match get_root(State(state), Path(vault_id)).await {
-            Ok(r) => r.into_response(),
-            Err(e) => e.into_response(),
-        },
+        Some(ref m) if m == Method::GET => {
+            match get_root(
+                State(state),
+                Path(vault_id),
+                axum::Extension(device),
+                axum::Extension(session),
+            )
+            .await
+            {
+                Ok(r) => r.into_response(),
+                Err(e) => e.into_response(),
+            }
+        }
         Some(ref m) if m == Method::PUT => {
-            // The device id (injected by secure_envelope) lives in the request
-            // extensions — grab it before consuming the body.
-            let device = request
-                .extensions()
-                .get::<DeviceIdExt>()
-                .cloned()
-                .unwrap_or_else(|| DeviceIdExt(String::new()));
             let body = match consume_body(request).await {
                 Ok(b) => b,
                 Err(r) => return r,
             };
-            match put_root(State(state), Path(vault_id), axum::Extension(device), body).await {
+            match put_root(
+                State(state),
+                Path(vault_id),
+                axum::Extension(device),
+                axum::Extension(session),
+                body,
+            )
+            .await
+            {
                 Ok(r) => r.into_response(),
                 Err(e) => e.into_response(),
             }
@@ -776,9 +898,26 @@ async fn root_at_dispatcher(
     Path((vault_id, hash)): Path<(String, String)>,
     request: Request,
 ) -> Response {
+    let device = request
+        .extensions()
+        .get::<DeviceIdExt>()
+        .cloned()
+        .unwrap_or_else(|| DeviceIdExt(String::new()));
+    let session = request
+        .extensions()
+        .get::<ClientSessionExt>()
+        .copied()
+        .unwrap_or(ClientSessionExt([0; 32]));
     match semantic_method(request.headers()) {
         Some(ref method) if method == Method::GET => {
-            match get_root_at(State(state), Path((vault_id, hash))).await {
+            match get_root_at(
+                State(state),
+                Path((vault_id, hash)),
+                axum::Extension(device),
+                axum::Extension(session),
+            )
+            .await
+            {
                 Ok(response) => response.into_response(),
                 Err(error) => error.into_response(),
             }
@@ -893,9 +1032,55 @@ async fn health() -> &'static str {
 
 // --- Root Management ---
 
+fn decode_stored_root(
+    bytes: &[u8],
+    description: &str,
+) -> Result<sync_core::versioned_root::VersionedRoot, ServerError> {
+    sync_core::versioned_root::VersionedRoot::deserialize(bytes)
+        .map_err(|error| ServerError::Internal(format!("corrupt {description} root: {error}")))
+}
+
+fn validate_root_identity(
+    root: &sync_core::versioned_root::VersionedRoot,
+    vault_id: &str,
+    expected_hash: &FileHash,
+    description: &str,
+) -> Result<(), ServerError> {
+    if root.vault_id() != vault_id || root.hash() != *expected_hash {
+        return Err(ServerError::Internal(format!(
+            "{description} root identity mismatch"
+        )));
+    }
+    Ok(())
+}
+
+fn require_tree_access(
+    state: &SharedState,
+    device_id: &str,
+    session_id: &[u8; 32],
+    vault_id: &str,
+    tree_version: u32,
+) -> Result<(), ServerError> {
+    if tree_version != sync_core::versioned_root::TREE_V2 {
+        return Ok(());
+    }
+    if state
+        .devices
+        .session_supports(device_id, session_id, vault_id, TREE_V2_CAPABILITY)
+    {
+        return Ok(());
+    }
+    Err(ServerError::UpgradeRequired(
+        "this vault uses Tree v2; update/reload the Obsetync plugin and retry — enrollment remains valid"
+            .into(),
+    ))
+}
+
 async fn get_root(
     State(state): State<SharedState>,
     Path(vault_id): Path<String>,
+    axum::Extension(device): axum::Extension<DeviceIdExt>,
+    axum::Extension(session): axum::Extension<ClientSessionExt>,
 ) -> Result<impl IntoResponse, ServerError> {
     let hash = state
         .vaults
@@ -907,6 +1092,10 @@ async fn get_root(
         .get_root(&vault_id, &hash)
         .ok_or_else(|| ServerError::NotFound("root data missing".into()))?;
 
+    let root = decode_stored_root(&data, "current")?;
+    validate_root_identity(&root, &vault_id, &hash, "current")?;
+    require_tree_access(&state, &device.0, &session.0, &vault_id, root.version())?;
+
     Ok((StatusCode::OK, data))
 }
 
@@ -916,6 +1105,8 @@ async fn get_root(
 async fn get_root_at(
     State(state): State<SharedState>,
     Path((vault_id, hash_hex)): Path<(String, String)>,
+    axum::Extension(device): axum::Extension<DeviceIdExt>,
+    axum::Extension(session): axum::Extension<ClientSessionExt>,
 ) -> Result<impl IntoResponse, ServerError> {
     let hash = hex_to_hash(&hash_hex)
         .map_err(|_| ServerError::BadRequest("invalid historical root hash".into()))?;
@@ -923,13 +1114,9 @@ async fn get_root_at(
         .vaults
         .get_root(&vault_id, &hash)
         .ok_or_else(|| ServerError::NotFound("root not found in history".into()))?;
-    let root = sync_core::chunk::RootNode::deserialize(&data)
-        .map_err(|error| ServerError::Internal(format!("corrupt historical root: {error}")))?;
-    if root.vault_id != vault_id || root.hash() != hash {
-        return Err(ServerError::Internal(
-            "historical root identity mismatch".into(),
-        ));
-    }
+    let root = decode_stored_root(&data, "historical")?;
+    validate_root_identity(&root, &vault_id, &hash, "historical")?;
+    require_tree_access(&state, &device.0, &session.0, &vault_id, root.version())?;
     Ok((StatusCode::OK, data))
 }
 
@@ -944,6 +1131,8 @@ const HISTORY_LIMIT: usize = 50;
 async fn get_history(
     State(state): State<SharedState>,
     Path(vault_id): Path<String>,
+    axum::Extension(device): axum::Extension<DeviceIdExt>,
+    axum::Extension(session): axum::Extension<ClientSessionExt>,
 ) -> Result<impl IntoResponse, ServerError> {
     if !state.vaults.vault_exists(&vault_id) {
         return Err(ServerError::NotFound(format!(
@@ -952,6 +1141,21 @@ async fn get_history(
         )));
     }
     let current = state.vaults.get_current_root(&vault_id);
+    if let Some(current_hash) = current {
+        let current_data = state
+            .vaults
+            .get_root(&vault_id, &current_hash)
+            .ok_or_else(|| ServerError::Internal("current root data missing".into()))?;
+        let current_root = decode_stored_root(&current_data, "current")?;
+        validate_root_identity(&current_root, &vault_id, &current_hash, "current")?;
+        require_tree_access(
+            &state,
+            &device.0,
+            &session.0,
+            &vault_id,
+            current_root.version(),
+        )?;
+    }
     let current_hex = current.map(|h| hash_to_hex(&h));
 
     let roots_dir = state.layout.vault_roots_dir(&vault_id);
@@ -965,16 +1169,17 @@ async fn get_history(
             let Ok(bytes) = std::fs::read(e.path()) else {
                 continue;
             };
-            let Ok(root) = sync_core::chunk::RootNode::deserialize(&bytes) else {
+            let Ok(root) = sync_core::versioned_root::VersionedRoot::deserialize(&bytes) else {
                 continue; // skip corrupt entries rather than failing the listing
             };
             let hex = hash_to_hex(&root.hash());
             entries.push(serde_json::json!({
                 "root": hex,
-                "parent": root.parent_hash.map(|h| hash_to_hex(&h)),
-                "created_ms": root.created_ms,
-                "device_id": root.device_id,
-                "total_files": root.total_files,
+                "parent": root.parent_hash().map(|h| hash_to_hex(&h)),
+                "created_ms": root.created_ms(),
+                "device_id": root.device_id(),
+                "total_files": root.total_files(),
+                "tree_version": root.version(),
                 "current": Some(&hex) == current_hex.as_ref(),
             }));
         }
@@ -999,11 +1204,30 @@ async fn history_dispatcher(
     Path(vault_id): Path<String>,
     request: Request,
 ) -> Response {
+    let device = request
+        .extensions()
+        .get::<DeviceIdExt>()
+        .cloned()
+        .unwrap_or_else(|| DeviceIdExt(String::new()));
+    let session = request
+        .extensions()
+        .get::<ClientSessionExt>()
+        .copied()
+        .unwrap_or(ClientSessionExt([0; 32]));
     match semantic_method(request.headers()) {
-        Some(ref m) if m == Method::GET => match get_history(State(state), Path(vault_id)).await {
-            Ok(r) => r.into_response(),
-            Err(e) => e.into_response(),
-        },
+        Some(ref m) if m == Method::GET => {
+            match get_history(
+                State(state),
+                Path(vault_id),
+                axum::Extension(device),
+                axum::Extension(session),
+            )
+            .await
+            {
+                Ok(r) => r.into_response(),
+                Err(e) => e.into_response(),
+            }
+        }
         _ => (StatusCode::METHOD_NOT_ALLOWED, "unsupported method").into_response(),
     }
 }
@@ -1113,6 +1337,8 @@ async fn post_crdt_compact(
 async fn post_rollback(
     State(state): State<SharedState>,
     Path(vault_id): Path<String>,
+    axum::Extension(device): axum::Extension<DeviceIdExt>,
+    axum::Extension(session): axum::Extension<ClientSessionExt>,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
     let hex = std::str::from_utf8(&body)
@@ -1120,15 +1346,49 @@ async fn post_rollback(
         .trim();
     let hash = hex_to_hash(hex).map_err(|_| ServerError::BadRequest("invalid root hash".into()))?;
 
-    state
+    let target_data = state
         .vaults
         .get_root(&vault_id, &hash)
         .ok_or_else(|| ServerError::NotFound("root not found in history".into()))?;
-
+    let target_root = decode_stored_root(&target_data, "rollback target")?;
+    validate_root_identity(&target_root, &vault_id, &hash, "rollback target")?;
+    require_tree_access(
+        &state,
+        &device.0,
+        &session.0,
+        &vault_id,
+        target_root.version(),
+    )?;
     // Same per-vault write lock as put_root — a rollback racing an in-flight
     // push is a lost update.
     let vault_lock = state.vault_lock(&vault_id);
     let _vault_guard = vault_lock.lock().await;
+
+    if target_root.version() == sync_core::versioned_root::TREE_V2 {
+        let fleet = state.devices.fleet_capability(TREE_V2_CAPABILITY);
+        if !fleet.ready() {
+            return Err(ServerError::Conflict(format!(
+                "Tree v2 rollback blocked: {}/{} enrolled devices reported support",
+                fleet.ready_devices, fleet.enrolled_devices
+            )));
+        }
+    }
+
+    if let Some(current_hash) = state.vaults.get_current_root(&vault_id) {
+        let current_data = state
+            .vaults
+            .get_root(&vault_id, &current_hash)
+            .ok_or_else(|| ServerError::Internal("current root data missing".into()))?;
+        let current_root = decode_stored_root(&current_data, "current")?;
+        validate_root_identity(&current_root, &vault_id, &current_hash, "current")?;
+        require_tree_access(
+            &state,
+            &device.0,
+            &session.0,
+            &vault_id,
+            current_root.version(),
+        )?;
+    }
 
     state.vaults.set_current_root(&vault_id, &hash)?;
     state.notify_root_changed(&vault_id, &hash_to_hex(&hash));
@@ -1152,15 +1412,15 @@ async fn enforce_guard(
     state: &SharedState,
     vault_id: &str,
     device_id: &str,
-    current: sync_core::chunk::RootNode,
-    candidate: sync_core::chunk::RootNode,
+    current: sync_core::versioned_root::VersionedRoot,
+    candidate: sync_core::versioned_root::VersionedRoot,
     branch: &'static str,
 ) -> Result<(), ServerError> {
     let cfg = crate::guard::config();
     if cfg.mode == crate::guard::GuardMode::Off {
         return Ok(());
     }
-    let scan = crate::guard::scan(state.storage_writer.clone(), current, candidate)
+    let scan = crate::guard::scan_versioned(state.storage_writer.clone(), current, candidate)
         .await
         .map_err(|e| ServerError::Internal(format!("guard scan failed: {}", e)))?;
     if let Some(reason) = scan.triggered(cfg) {
@@ -1207,6 +1467,7 @@ async fn put_root(
     State(state): State<SharedState>,
     Path(vault_id): Path<String>,
     axum::Extension(device): axum::Extension<DeviceIdExt>,
+    axum::Extension(session): axum::Extension<ClientSessionExt>,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
     // Parent hash is prepended to the body as a 64-byte ASCII prefix (hex
@@ -1224,10 +1485,10 @@ async fn put_root(
         .to_owned();
     let root_bytes = &body[64..];
 
-    let mut incoming_root = sync_core::chunk::RootNode::deserialize(root_bytes)
+    let mut incoming_root = sync_core::versioned_root::VersionedRoot::deserialize(root_bytes)
         .map_err(|e| ServerError::BadRequest(format!("invalid root: {}", e)))?;
 
-    if incoming_root.vault_id != vault_id {
+    if incoming_root.vault_id() != vault_id {
         return Err(ServerError::BadRequest(
             "root vault_id does not match request path".into(),
         ));
@@ -1237,9 +1498,10 @@ async fn put_root(
     // until this walk succeeds. Besides blocking traversal-shaped paths, the
     // count check prevents a false total_files field from weakening the
     // blast-radius guard. The walk reads compact index nodes, not file data.
-    let entries = bridge::run_validate_root(state.storage_writer.clone(), incoming_root.clone())
-        .await
-        .map_err(|e| ServerError::BadRequest(format!("invalid root structure: {}", e)))?;
+    let entries =
+        bridge::run_validate_versioned_root(state.storage_writer.clone(), incoming_root.clone())
+            .await
+            .map_err(|e| ServerError::BadRequest(format!("invalid root structure: {}", e)))?;
     let writer = state.storage_writer.clone();
     writer
         .run_blocking(move |writer| {
@@ -1277,14 +1539,22 @@ async fn put_root(
     // History metadata is server-authored. It is not part of the semantic
     // root hash, so trusting client values would let a replay rewrite the
     // displayed author, timestamp, or parent of an existing state.
-    incoming_root.created_ms = unix_time_ms();
-    incoming_root.device_id = device.0.clone();
+    incoming_root.set_history_metadata(unix_time_ms(), None, device.0.clone());
 
     match current_root_hash {
         None => {
-            // First push — accept directly.
-            incoming_root.parent_hash = None;
-            let incoming_bytes = incoming_root.serialize();
+            // Staged migration: a new vault always starts on the universally
+            // supported v1 format. Tree v2 is activated explicitly only after
+            // every enrolled device has reported support.
+            if incoming_root.version() != sync_core::versioned_root::TREE_V1 {
+                return Err(ServerError::Conflict(
+                    "Tree v2 is not active for this vault; create it with Tree v1 first".into(),
+                ));
+            }
+            incoming_root.set_history_metadata(unix_time_ms(), None, device.0.clone());
+            let incoming_bytes = incoming_root
+                .serialize()
+                .map_err(|error| ServerError::Internal(format!("serialize root: {error}")))?;
             state
                 .vaults
                 .store_root(&vault_id, &incoming_hash, &incoming_bytes)?;
@@ -1308,20 +1578,48 @@ async fn put_root(
         Some(current_hash) => {
             let parent_hash = hex_to_hash(&parent_hex)
                 .map_err(|_| ServerError::BadRequest("invalid X-Parent-Root header".into()))?;
-            incoming_root.parent_hash = Some(parent_hash);
-            let incoming_bytes = incoming_root.serialize();
+            let current_data = state
+                .vaults
+                .get_root(&vault_id, &current_hash)
+                .ok_or_else(|| ServerError::Internal("current root data missing".into()))?;
+            let current_root = decode_stored_root(&current_data, "current")?;
+            validate_root_identity(&current_root, &vault_id, &current_hash, "current")?;
+            require_tree_access(
+                &state,
+                &device.0,
+                &session.0,
+                &vault_id,
+                current_root.version(),
+            )?;
+            if incoming_root.version() != current_root.version() {
+                return if current_root.version() == sync_core::versioned_root::TREE_V2 {
+                    Err(ServerError::UpgradeRequired(
+                        "this vault uses Tree v2; update/reload the Obsetync plugin and retry — enrollment remains valid"
+                            .into(),
+                    ))
+                } else {
+                    Err(ServerError::Conflict(
+                        "Tree v2 is not active for this vault".into(),
+                    ))
+                };
+            }
+            require_tree_access(
+                &state,
+                &device.0,
+                &session.0,
+                &vault_id,
+                incoming_root.version(),
+            )?;
+            incoming_root.set_history_metadata(unix_time_ms(), Some(parent_hash), device.0.clone());
+            let incoming_bytes = incoming_root
+                .serialize()
+                .map_err(|error| ServerError::Internal(format!("serialize root: {error}")))?;
 
             if current_hash == parent_hash {
                 // Fast-forward — parent matches current. The parent claim is
                 // self-asserted (a client with a stale tree but a fresh root
                 // poller satisfies this check while reverting the vault —
                 // incident 2026-07-13), so gate the commit on a content scan.
-                let current_data = state
-                    .vaults
-                    .get_root(&vault_id, &current_hash)
-                    .ok_or_else(|| ServerError::Internal("current root data missing".into()))?;
-                let current_root = sync_core::chunk::RootNode::deserialize(&current_data)
-                    .map_err(|e| ServerError::Internal(format!("corrupt current root: {}", e)))?;
                 enforce_guard(
                     &state,
                     &vault_id,
@@ -1354,14 +1652,6 @@ async fn put_root(
                 ))
             } else {
                 // Diverged — need to merge.
-                let current_data = state
-                    .vaults
-                    .get_root(&vault_id, &current_hash)
-                    .ok_or_else(|| ServerError::Internal("current root data missing".into()))?;
-
-                let current_root = sync_core::chunk::RootNode::deserialize(&current_data)
-                    .map_err(|e| ServerError::Internal(format!("corrupt current root: {}", e)))?;
-
                 // Find the base (common ancestor).
                 // For now, use the parent hash as the base.
                 // TODO: walk parent chain to find true common ancestor.
@@ -1375,13 +1665,14 @@ async fn put_root(
                             )
                         })?;
 
-                let base_root = sync_core::chunk::RootNode::deserialize(&base_data)
-                    .map_err(|e| ServerError::Internal(format!("corrupt base root: {}", e)))?;
+                let base_root = decode_stored_root(&base_data, "base")?;
+                validate_root_identity(&base_root, &vault_id, &parent_hash, "base")?;
 
                 // Run merge via the bridge (handles !Send). The packed store
                 // supplies both tree nodes and small-file merge content.
                 let incoming_for_merge = incoming_root;
-                let merge_result = bridge::run_merge(
+                let current_for_guard = current_root.clone();
+                let mut merge_result = bridge::run_versioned_merge(
                     state.storage_writer.clone(),
                     base_root,
                     current_root,
@@ -1391,19 +1682,25 @@ async fn put_root(
                 .map_err(|e| ServerError::Internal(format!("merge failed: {}", e)))?;
 
                 let merged_hash = merge_result.new_root.hash();
-                let merged_bytes = merge_result.new_root.serialize();
+                merge_result.new_root.set_history_metadata(
+                    unix_time_ms(),
+                    Some(current_hash),
+                    "server",
+                );
+                let merged_bytes = merge_result
+                    .new_root
+                    .serialize()
+                    .map_err(|error| ServerError::Internal(format!("serialize merge: {error}")))?;
 
                 // A merge with a poisoned base (claimed parent newer than the
                 // pusher's real tree epoch) silently reverts every file the
                 // stale side "didn't change since base" — scan the outcome
                 // against current before committing it.
-                let current_root_again = sync_core::chunk::RootNode::deserialize(&current_data)
-                    .map_err(|e| ServerError::Internal(format!("corrupt current root: {}", e)))?;
                 enforce_guard(
                     &state,
                     &vault_id,
                     &device.0,
-                    current_root_again,
+                    current_for_guard,
                     merge_result.new_root.clone(),
                     "merge",
                 )
@@ -1477,32 +1774,23 @@ fn load_snapshot_root(
     vault_id: &str,
     hash: &FileHash,
     description: &str,
-) -> Result<sync_core::chunk::RootNode, ServerError> {
+) -> Result<sync_core::versioned_root::VersionedRoot, ServerError> {
     let data = state.vaults.get_root(vault_id, hash).ok_or_else(|| {
         ServerError::BadRequest(format!(
             "{description} root not found in history — full rescan needed"
         ))
     })?;
-    let root = sync_core::chunk::RootNode::deserialize(&data)
-        .map_err(|error| ServerError::Internal(format!("corrupt {description} root: {error}")))?;
-    if root.vault_id != vault_id || root.hash() != *hash {
-        return Err(ServerError::Internal(format!(
-            "{description} root identity mismatch"
-        )));
-    }
+    let root = decode_stored_root(&data, description)?;
+    validate_root_identity(&root, vault_id, hash, description)?;
     Ok(root)
 }
 
-fn empty_diff_root(vault_id: &str) -> sync_core::chunk::RootNode {
-    sync_core::chunk::RootNode {
-        vault_id: vault_id.to_owned(),
-        created_ms: 0,
-        version: 1,
-        children: vec![],
-        total_files: 0,
-        parent_hash: None,
-        device_id: "fresh-client".to_owned(),
-    }
+fn empty_diff_root(
+    vault_id: &str,
+    version: u32,
+) -> Result<sync_core::versioned_root::VersionedRoot, ServerError> {
+    sync_core::versioned_root::empty_root(version, vault_id, "fresh-client")
+        .map_err(|error| ServerError::Internal(format!("build empty diff root: {error}")))
 }
 
 /// Bounded binary delta page. The first request omits `to_root`; this handler
@@ -1511,6 +1799,8 @@ fn empty_diff_root(vault_id: &str) -> sync_core::chunk::RootNode {
 async fn post_diff_page(
     State(state): State<SharedState>,
     Path(vault_id): Path<String>,
+    axum::Extension(device): axum::Extension<DeviceIdExt>,
+    axum::Extension(session): axum::Extension<ClientSessionExt>,
     body: axum::body::Bytes,
 ) -> Result<Response, ServerError> {
     let started = std::time::Instant::now();
@@ -1525,14 +1815,15 @@ async fn post_diff_page(
     };
 
     let to_root = load_snapshot_root(&state, &vault_id, &to_hash, "target")?;
+    require_tree_access(&state, &device.0, &session.0, &vault_id, to_root.version())?;
     let from_root = if request.from_root == [0; 32] {
-        empty_diff_root(&vault_id)
+        empty_diff_root(&vault_id, to_root.version())?
     } else {
         load_snapshot_root(&state, &vault_id, &request.from_root, "source")?
     };
 
     let mut diff_result =
-        bridge::run_diff_with_stats(state.storage_writer.clone(), from_root, to_root)
+        bridge::run_versioned_diff_with_stats(state.storage_writer.clone(), from_root, to_root)
             .await
             .map_err(|error| ServerError::Internal(format!("paged diff failed: {error}")))?;
     diff_page::sort_and_validate_deltas(&mut diff_result.deltas)
@@ -1575,6 +1866,8 @@ async fn post_diff_page(
 async fn post_diff(
     State(state): State<SharedState>,
     Path(vault_id): Path<String>,
+    axum::Extension(device): axum::Extension<DeviceIdExt>,
+    axum::Extension(session): axum::Extension<ClientSessionExt>,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
     let diff_started = std::time::Instant::now();
@@ -1597,6 +1890,8 @@ async fn post_diff(
         .vaults
         .get_current_root(&vault_id)
         .ok_or_else(|| ServerError::NotFound(format!("vault '{}' not found", vault_id)))?;
+    let to_root = load_snapshot_root(&state, &vault_id, &current_hash, "current")?;
+    require_tree_access(&state, &device.0, &session.0, &vault_id, to_root.version())?;
 
     // Same root — no changes.
     if device_root_hash == current_hash {
@@ -1616,45 +1911,21 @@ async fn post_diff(
         return Ok((StatusCode::NOT_MODIFIED, "[]".to_string()));
     }
 
-    let current_data = state
-        .vaults
-        .get_root(&vault_id, &current_hash)
-        .ok_or_else(|| ServerError::Internal("current root data missing".into()))?;
-
-    let to_root = sync_core::chunk::RootNode::deserialize(&current_data)
-        .map_err(|e| ServerError::Internal(format!("corrupt current root: {}", e)))?;
-
     // A device_root of all zeros is the client signalling "fresh sync — I
     // have nothing locally, give me every file as an addition". This is how
     // first-time enrolled clients (iPhone via BRAT, new desktop install)
     // bootstrap without needing to know an existing server root.
     let from_root = if device_root_hash == [0u8; 32] {
-        sync_core::chunk::RootNode {
-            vault_id: vault_id.clone(),
-            created_ms: 0,
-            version: 1,
-            children: vec![],
-            total_files: 0,
-            parent_hash: None,
-            device_id: "fresh-client".to_string(),
-        }
+        empty_diff_root(&vault_id, to_root.version())?
     } else {
-        let device_root_data = state
-            .vaults
-            .get_root(&vault_id, &device_root_hash)
-            .ok_or_else(|| {
-                ServerError::BadRequest(
-                    "device root not found in history — full rescan needed".into(),
-                )
-            })?;
-        sync_core::chunk::RootNode::deserialize(&device_root_data)
-            .map_err(|e| ServerError::Internal(format!("corrupt device root: {}", e)))?
+        load_snapshot_root(&state, &vault_id, &device_root_hash, "device")?
     };
 
     // Compute deltas via bridge.
-    let diff_result = bridge::run_diff_with_stats(state.storage_writer.clone(), from_root, to_root)
-        .await
-        .map_err(|e| ServerError::Internal(format!("diff failed: {}", e)))?;
+    let diff_result =
+        bridge::run_versioned_diff_with_stats(state.storage_writer.clone(), from_root, to_root)
+            .await
+            .map_err(|e| ServerError::Internal(format!("diff failed: {}", e)))?;
     let compute_elapsed = diff_started.elapsed();
     let deltas = diff_result.deltas;
 
@@ -2684,10 +2955,20 @@ mod integration_tests {
         path: &str,
         inner_body: &[u8],
     ) -> (Vec<u8>, DecryptedRequest) {
+        seal_as(env, &env.client_priv, semantic_method, path, inner_body)
+    }
+
+    fn seal_as(
+        env: &Env,
+        client_private: &StaticSecret,
+        semantic_method: &str,
+        path: &str,
+        inner_body: &[u8],
+    ) -> (Vec<u8>, DecryptedRequest) {
         let wire_body = {
             let eph = env.state.eph.read().unwrap();
             encrypt_request_for_tests(
-                &env.client_priv,
+                client_private,
                 &env.server_pub,
                 Some(&PublicKey::from(eph.current.public)),
                 &env.bearer,
@@ -2750,6 +3031,28 @@ mod integration_tests {
         inner_body: &[u8],
     ) -> (u16, Vec<u8>) {
         let (wire_body, opened_request) = seal(env, semantic_method, path, inner_body);
+        let (wire_status, wire_response) =
+            dispatch_wire(env, semantic_method, path, wire_body).await;
+        assert_eq!(wire_status, StatusCode::OK);
+        decrypt_response_for_tests(
+            &wire_response,
+            &opened_request.key_material,
+            opened_request.mode,
+            semantic_method,
+            path,
+            &opened_request.nonce_req,
+        )
+    }
+
+    async fn send_semantic_as(
+        env: &Env,
+        client_private: &StaticSecret,
+        semantic_method: &str,
+        path: &str,
+        inner_body: &[u8],
+    ) -> (u16, Vec<u8>) {
+        let (wire_body, opened_request) =
+            seal_as(env, client_private, semantic_method, path, inner_body);
         let (wire_status, wire_response) =
             dispatch_wire(env, semantic_method, path, wire_body).await;
         assert_eq!(wire_status, StatusCode::OK);
@@ -3060,7 +3363,7 @@ mod integration_tests {
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
             value["capabilities"],
-            serde_json::json!(["bulk-http-v1", "ws-data-v1", "paged-diff-v1"])
+            serde_json::json!(["bulk-http-v1", "ws-data-v1", "paged-diff-v1", "tree-v2"])
         );
         assert_eq!(value["limits"]["bulk_request_bytes"], BULK_REQUEST_BYTES);
         assert_eq!(value["limits"]["bulk_objects"], BULK_OBJECTS);
@@ -3070,6 +3373,197 @@ mod integration_tests {
         assert_eq!(value["limits"]["diff_page_bytes"], DIFF_PAGE_BYTES);
         assert_eq!(value["limits"]["diff_page_records"], MAX_PAGE_RECORDS);
         assert_eq!(value["limits"]["diff_path_bytes"], MAX_PATH_BYTES);
+    }
+
+    #[tokio::test]
+    async fn personalized_capability_report_binds_the_live_crypto_session() {
+        let env = setup();
+        let report = serde_json::to_vec(&serde_json::json!({
+            "protocol_version": 1,
+            "vault_id": "cap-vault",
+            "capabilities": ["tree-v2"],
+        }))
+        .unwrap();
+        let (status, body) = send_semantic(&env, "POST", "/api/v1/capabilities", &report).await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        let bundle: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(bundle["tree"]["current_version"], 1);
+        assert_eq!(bundle["tree"]["activation"], "eligible");
+        assert_eq!(bundle["tree"]["fleet_ready"], true);
+        assert_eq!(bundle["tree"]["ready_devices"], 1);
+        assert_eq!(bundle["tree"]["enrolled_devices"], 1);
+
+        let device = env.state.devices.list().pop().unwrap();
+        let session = PublicKey::from(&env.client_priv).to_bytes();
+        assert!(env.state.devices.session_supports(
+            &device.device_id,
+            &session,
+            "cap-vault",
+            "tree-v2",
+        ));
+        assert_eq!(device.capabilities, vec!["tree-v2"]);
+
+        let malformed = serde_json::to_vec(&serde_json::json!({
+            "protocol_version": 99,
+            "vault_id": "cap-vault",
+            "capabilities": ["tree-v2"],
+        }))
+        .unwrap();
+        assert_eq!(
+            send_semantic(&env, "POST", "/api/v1/capabilities", &malformed)
+                .await
+                .0,
+            StatusCode::BAD_REQUEST.as_u16(),
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_v2_mixed_fleet_upgrades_and_downgrades_without_reenrollment() {
+        let env = setup();
+        let vault = "mixed-tree";
+        let capability_path = "/api/v1/capabilities";
+        let report = serde_json::to_vec(&serde_json::json!({
+            "protocol_version": 1,
+            "vault_id": vault,
+            "capabilities": ["tree-v2"],
+        }))
+        .unwrap();
+        assert_eq!(
+            send_semantic(&env, "POST", capability_path, &report)
+                .await
+                .0,
+            StatusCode::OK.as_u16(),
+        );
+
+        let content = b"mixed-version content".to_vec();
+        let content_hash = hash_bytes(&content);
+        let content_path = format!("/api/v1/content/{}", hash_to_hex(&content_hash));
+        assert_eq!(
+            send_semantic(&env, "PUT", &content_path, &content).await.0,
+            StatusCode::NO_CONTENT.as_u16(),
+        );
+        let entry = sync_core::chunk::FileEntry::new(
+            "note.md".into(),
+            content_hash,
+            1_900_000_000_000,
+            content.len() as u64,
+        );
+        let v1 = sync_core::versioned_root::build_root(
+            &env.state.storage_writer,
+            vec![entry],
+            sync_core::versioned_root::TREE_V1,
+            vault,
+            "new-client",
+        )
+        .await
+        .unwrap();
+        let v1_hash = v1.hash();
+        let mut first_push = "0".repeat(64).into_bytes();
+        first_push.extend_from_slice(&v1.serialize().unwrap());
+        let root_path = format!("/api/v1/root/{vault}");
+        assert_eq!(
+            send_semantic(&env, "PUT", &root_path, &first_push).await.0,
+            StatusCode::OK.as_u16(),
+        );
+
+        // Simulate the admin activation transaction after the fleet gate.
+        let mut v2 = bridge::run_project_root_version(
+            env.state.storage_writer.clone(),
+            v1.clone(),
+            sync_core::versioned_root::TREE_V2,
+            "admin-tree-migration".into(),
+        )
+        .await
+        .unwrap();
+        v2.set_history_metadata(1_900_000_000_100, Some(v1_hash), "admin-tree-migration");
+        let v2_hash = v2.hash();
+        let v2_bytes = v2.serialize().unwrap();
+        env.state
+            .vaults
+            .store_root(vault, &v2_hash, &v2_bytes)
+            .unwrap();
+        env.state.vaults.set_current_root(vault, &v2_hash).unwrap();
+
+        let (new_status, new_root) = send_semantic(&env, "GET", &root_path, &[]).await;
+        assert_eq!(new_status, StatusCode::OK.as_u16());
+        assert!(new_root.starts_with(b"OVR2"));
+        let diff_path = format!("/api/v1/diff/{vault}");
+        let (diff_status, diff_body) =
+            send_semantic(&env, "POST", &diff_path, hash_to_hex(&v1_hash).as_bytes()).await;
+        assert_eq!(diff_status, StatusCode::OK.as_u16());
+        assert_eq!(diff_body, b"[]");
+
+        // Same enrolled bearer, different (downgraded/reloaded) client
+        // process: it cannot inherit the first process' v2 declaration.
+        let old_client = StaticSecret::from([19; 32]);
+        let (old_status, old_body) =
+            send_semantic_as(&env, &old_client, "GET", &root_path, &[]).await;
+        assert_eq!(old_status, StatusCode::UPGRADE_REQUIRED.as_u16());
+        let old_message = String::from_utf8(old_body).unwrap();
+        assert!(old_message.contains("enrollment remains valid"));
+        assert!(!old_message.to_ascii_lowercase().contains("re-enroll"));
+
+        // A legacy empty report is a durable downgrade signal and blocks any
+        // future v2 activation/rollback, yet leaves authentication untouched.
+        assert_eq!(
+            send_semantic_as(&env, &old_client, "POST", capability_path, &[])
+                .await
+                .0,
+            StatusCode::OK.as_u16(),
+        );
+        assert!(!env.state.devices.fleet_capability("tree-v2").ready());
+
+        // Explicit server-generated v1 projection restores compatibility;
+        // the exact same bearer and client channel succeeds — no reset or
+        // enrollment operation occurred anywhere in this test.
+        let mut downgraded = bridge::run_project_root_version(
+            env.state.storage_writer.clone(),
+            v2,
+            sync_core::versioned_root::TREE_V1,
+            "admin-tree-migration".into(),
+        )
+        .await
+        .unwrap();
+        downgraded.set_history_metadata(1_900_000_000_200, Some(v2_hash), "admin-tree-migration");
+        let downgraded_hash = downgraded.hash();
+        let downgraded_bytes = downgraded.serialize().unwrap();
+        env.state
+            .vaults
+            .store_root(vault, &downgraded_hash, &downgraded_bytes)
+            .unwrap();
+        env.state
+            .vaults
+            .set_current_root(vault, &downgraded_hash)
+            .unwrap();
+        let (restored_status, restored_root) =
+            send_semantic_as(&env, &old_client, "GET", &root_path, &[]).await;
+        assert_eq!(restored_status, StatusCode::OK.as_u16());
+        assert!(!restored_root.starts_with(b"OVR2"));
+
+        let history_path = format!("/api/v1/history/{vault}");
+        let (history_status, history_body) =
+            send_semantic_as(&env, &old_client, "GET", &history_path, &[]).await;
+        assert_eq!(history_status, StatusCode::OK.as_u16());
+        let history: serde_json::Value = serde_json::from_slice(&history_body).unwrap();
+        assert!(history["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|root| root["tree_version"] == 2));
+
+        let rollback_path = format!("/api/v1/rollback/{vault}");
+        let (rollback_status, rollback_body) = send_semantic_as(
+            &env,
+            &old_client,
+            "POST",
+            &rollback_path,
+            hash_to_hex(&v2_hash).as_bytes(),
+        )
+        .await;
+        assert_eq!(rollback_status, StatusCode::UPGRADE_REQUIRED.as_u16());
+        assert!(String::from_utf8(rollback_body)
+            .unwrap()
+            .contains("enrollment remains valid"));
     }
 
     fn paged_diff_request(
@@ -3691,7 +4185,7 @@ mod integration_tests {
         assert!(bundle["valid_until"].as_u64().is_some());
         assert_eq!(
             bundle["capabilities"],
-            serde_json::json!(["bulk-http-v1", "ws-data-v1", "paged-diff-v1"])
+            serde_json::json!(["bulk-http-v1", "ws-data-v1", "paged-diff-v1", "tree-v2"])
         );
         assert_eq!(bundle["limits"]["bulk_request_bytes"], BULK_REQUEST_BYTES);
     }

@@ -34,6 +34,14 @@ pub fn admin_router(state: SharedState) -> Router {
         .route("/admin/api/performance", get(api_performance))
         .route("/admin/vaults/{vault_id}", get(vault_detail))
         .route("/admin/vaults/{vault_id}/rollback", post(rollback_vault))
+        .route(
+            "/admin/vaults/{vault_id}/tree-v2/activate",
+            post(activate_tree_v2),
+        )
+        .route(
+            "/admin/vaults/{vault_id}/tree-v2/downgrade",
+            post(downgrade_tree_v2),
+        )
         .route("/admin/vaults/{vault_id}/purge", post(purge_vault))
         .route("/admin/vaults/{vault_id}/explorer", get(explorer))
         .route("/admin/vaults/{vault_id}/api/stats", get(api_stats))
@@ -522,6 +530,7 @@ async fn vault_detail(
         hash: String,
         created_ms: u64,
         total_files: u64,
+        tree_version: u32,
     }
     let roots_dir = state.layout.vault_roots_dir(&vault_id);
     let mut metas: Vec<RootMeta> = Vec::new();
@@ -537,13 +546,14 @@ async fn vault_detail(
             let Some(bytes) = state.vaults.get_root(&vault_id, &h) else {
                 continue;
             };
-            let Ok(r) = sync_core::chunk::RootNode::deserialize(&bytes) else {
+            let Ok(r) = sync_core::versioned_root::VersionedRoot::deserialize(&bytes) else {
                 continue;
             };
             metas.push(RootMeta {
                 hash: hash.to_string(),
-                created_ms: r.created_ms,
-                total_files: r.total_files,
+                created_ms: r.created_ms(),
+                total_files: r.total_files(),
+                tree_version: r.version(),
             });
         }
     }
@@ -569,10 +579,11 @@ async fn vault_detail(
                 String::new()
             };
             format!(
-                r#"<tr><td>{when}</td><td><code>{hash:.16}…</code>{marker}</td><td>{files}</td><td>{rollback}<a class="btn-small" href="/admin/vaults/{vault}/export/{hash}">export</a></td></tr>"#,
+                r#"<tr><td>{when}</td><td><code>{hash:.16}…</code>{marker}</td><td>v{version}</td><td>{files}</td><td>{rollback}<a class="btn-small" href="/admin/vaults/{vault}/export/{hash}">export</a></td></tr>"#,
                 when = format_time(m.created_ms),
                 hash = m.hash,
                 marker = marker,
+                version = m.tree_version,
                 files = m.total_files,
                 rollback = rollback,
                 vault = vault_id,
@@ -580,16 +591,43 @@ async fn vault_detail(
         })
         .collect();
 
+    let current_version = state.vaults.get_current_version(&vault_id);
+    let fleet = state.devices.fleet_capability("tree-v2");
+    let tree_controls = match current_version {
+        Some(1) if fleet.ready() => format!(
+            r#"<p>Tree v1 · fleet ready ({}/{} devices).</p>
+<form method="POST" action="/admin/vaults/{vault_id}/tree-v2/activate"
+      onsubmit="return confirm('Activate Tree v2 for this vault? Older plugin sessions will receive HTTP 426 until updated.')">
+<button type="submit" class="btn-small">activate Tree v2</button></form>"#,
+            fleet.ready_devices, fleet.enrolled_devices,
+        ),
+        Some(1) => format!(
+            "<p>Tree v1 · activation blocked: {}/{} enrolled devices reported tree-v2.</p>",
+            fleet.ready_devices, fleet.enrolled_devices,
+        ),
+        Some(2) => format!(
+            r#"<p><strong>Tree v2 active</strong> · fleet readiness {}/{}.</p>
+<form method="POST" action="/admin/vaults/{vault_id}/tree-v2/downgrade"
+      onsubmit="return confirm('Project the current snapshot back to Tree v1? File content and history are preserved.')">
+<button type="submit" class="btn-small">downgrade current snapshot to v1</button></form>"#,
+            fleet.ready_devices, fleet.enrolled_devices,
+        ),
+        Some(version) => format!("<p>Unsupported current tree version {version}.</p>"),
+        None => "<p>No current tree.</p>".to_owned(),
+    };
+
     Ok(Html(format!(
         r#"<!DOCTYPE html>
 <html><head><title>{vault_id} - ObsetyNC</title>{CSS}</head>
 <body>
 <h1><a href="/admin">ObsetyNC</a> / <a href="/admin/vaults">Vaults</a> / {vault_id}</h1>
 <p>Current root: <code>{:.16}...</code></p>
+<h2>Tree format</h2>
+{tree_controls}
 <h2>Root History</h2>
 <p><a class="btn" href="/admin/vaults/{vault_id}/explorer">🔍 Open version explorer</a> &nbsp; browse every version, see changed files (svn-style), and diff them inline — all on one page.</p>
 <table>
-<tr><th>When</th><th>Root</th><th>Files</th><th>Actions</th></tr>
+<tr><th>When</th><th>Root</th><th>Tree</th><th>Files</th><th>Actions</th></tr>
 {root_rows}
 </table>
 <h2>Purge ignored paths</h2>
@@ -625,15 +663,29 @@ async fn rollback_vault(
         .map_err(|_| ServerErrorHtml("invalid hash".into()))?;
 
     // Verify the root exists.
-    state
+    let root_bytes = state
         .vaults
         .get_root(&vault_id, &hash)
         .ok_or_else(|| ServerErrorHtml("root not found in history".into()))?;
-
+    let root = sync_core::versioned_root::VersionedRoot::deserialize(&root_bytes)
+        .map_err(|error| ServerErrorHtml(format!("corrupt rollback root: {error}")))?;
+    if root.vault_id() != vault_id || root.hash() != hash {
+        return Err(ServerErrorHtml("rollback root identity mismatch".into()));
+    }
     // Same per-vault write lock as put_root — a rollback racing an in-flight
     // push is the same lost-update bug in admin clothing.
     let vault_lock = state.vault_lock(&vault_id);
     let _vault_guard = vault_lock.lock().await;
+
+    if root.version() == sync_core::versioned_root::TREE_V2 {
+        let fleet = state.devices.fleet_capability("tree-v2");
+        if !fleet.ready() {
+            return Err(ServerErrorHtml(format!(
+                "cannot roll back to Tree v2: only {}/{} enrolled devices are ready",
+                fleet.ready_devices, fleet.enrolled_devices
+            )));
+        }
+    }
 
     state
         .vaults
@@ -642,6 +694,103 @@ async fn rollback_vault(
     state.notify_root_changed(&vault_id, &hash_to_hex(&hash));
 
     Ok(Redirect::to(&format!("/admin/vaults/{}", vault_id)))
+}
+
+async fn activate_tree_v2(
+    State(state): State<SharedState>,
+    Path(vault_id): Path<String>,
+) -> Result<Redirect, ServerErrorHtml> {
+    project_tree_version(state, vault_id, sync_core::versioned_root::TREE_V2).await
+}
+
+async fn downgrade_tree_v2(
+    State(state): State<SharedState>,
+    Path(vault_id): Path<String>,
+) -> Result<Redirect, ServerErrorHtml> {
+    project_tree_version(state, vault_id, sync_core::versioned_root::TREE_V1).await
+}
+
+/// Explicit, copy-on-write tree-format transition. File entries and content
+/// objects are preserved byte-for-byte; a new immutable index/root is linked
+/// to the previous current root, so both activation and downgrade remain
+/// visible and reversible in history.
+async fn project_tree_version(
+    state: SharedState,
+    vault_id: String,
+    target_version: u32,
+) -> Result<Redirect, ServerErrorHtml> {
+    let vault_lock = state.vault_lock(&vault_id);
+    let _vault_guard = vault_lock.lock().await;
+
+    if target_version == sync_core::versioned_root::TREE_V2 {
+        let fleet = state.devices.fleet_capability("tree-v2");
+        if !fleet.ready() {
+            return Err(ServerErrorHtml(format!(
+                "Tree v2 activation blocked: {}/{} enrolled devices reported support",
+                fleet.ready_devices, fleet.enrolled_devices
+            )));
+        }
+    }
+
+    let current_hash = state
+        .vaults
+        .get_current_root(&vault_id)
+        .ok_or_else(|| ServerErrorHtml("vault has no current root".into()))?;
+    let current_bytes = state
+        .vaults
+        .get_root(&vault_id, &current_hash)
+        .ok_or_else(|| ServerErrorHtml("current root data missing".into()))?;
+    let current_root = sync_core::versioned_root::VersionedRoot::deserialize(&current_bytes)
+        .map_err(|error| ServerErrorHtml(format!("corrupt current root: {error}")))?;
+    if current_root.vault_id() != vault_id || current_root.hash() != current_hash {
+        return Err(ServerErrorHtml("current root identity mismatch".into()));
+    }
+    if current_root.version() == target_version {
+        return Ok(Redirect::to(&format!("/admin/vaults/{vault_id}")));
+    }
+
+    let mut projected = crate::bridge::run_project_root_version(
+        state.storage_writer.clone(),
+        current_root,
+        target_version,
+        "admin-tree-migration".into(),
+    )
+    .await
+    .map_err(|error| ServerErrorHtml(format!("tree projection failed: {error}")))?;
+    projected.set_history_metadata(
+        admin_unix_time_ms(),
+        Some(current_hash),
+        "admin-tree-migration",
+    );
+    let projected_hash = projected.hash();
+    let projected_bytes = projected
+        .serialize()
+        .map_err(|error| ServerErrorHtml(format!("serialize projected root: {error}")))?;
+    state
+        .vaults
+        .store_root(&vault_id, &projected_hash, &projected_bytes)
+        .map_err(|error| ServerErrorHtml(format!("store projected root: {error}")))?;
+    state
+        .vaults
+        .set_current_root(&vault_id, &projected_hash)
+        .map_err(|error| ServerErrorHtml(format!("set projected root current: {error}")))?;
+    state.notify_root_changed(&vault_id, &hash_to_hex(&projected_hash));
+
+    tracing::warn!(
+        vault = %vault_id,
+        from = %&hash_to_hex(&current_hash)[..16],
+        to = %&hash_to_hex(&projected_hash)[..16],
+        tree_version = target_version,
+        "admin changed current tree format without changing file content"
+    );
+    Ok(Redirect::to(&format!("/admin/vaults/{vault_id}")))
+}
+
+fn admin_unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 // --- Purge ignored paths (Slice 2b) ---
@@ -686,11 +835,11 @@ async fn purge_vault(
         .vaults
         .get_root(&vault_id, &current_hash)
         .ok_or_else(|| ServerErrorHtml("current root data missing".into()))?;
-    let current_root = sync_core::chunk::RootNode::deserialize(&current_bytes)
+    let current_root = sync_core::versioned_root::VersionedRoot::deserialize(&current_bytes)
         .map_err(|e| ServerErrorHtml(format!("corrupt current root: {}", e)))?;
 
     let (mut new_root, removed, kept) =
-        crate::bridge::run_purge(state.storage_writer.clone(), current_root, patterns)
+        crate::bridge::run_versioned_purge(state.storage_writer.clone(), current_root, patterns)
             .await
             .map_err(|e| ServerErrorHtml(format!("purge failed: {}", e)))?;
 
@@ -701,8 +850,10 @@ async fn purge_vault(
 
     // Link the new root to the one it descends from so history stays a chain.
     // (parent_hash is metadata, not part of the content hash.)
-    new_root.parent_hash = Some(current_hash);
-    let new_bytes = new_root.serialize();
+    new_root.set_history_metadata(admin_unix_time_ms(), Some(current_hash), "admin-purge");
+    let new_bytes = new_root
+        .serialize()
+        .map_err(|error| ServerErrorHtml(format!("serialize purged root: {error}")))?;
     let new_hash = new_root.hash();
 
     state
@@ -811,10 +962,10 @@ async fn export_vault(
         .vaults
         .get_root(&vault_id, &hash)
         .ok_or_else(|| ServerErrorHtml("root not found in history".into()))?;
-    let root = sync_core::chunk::RootNode::deserialize(&root_bytes)
+    let root = sync_core::versioned_root::VersionedRoot::deserialize(&root_bytes)
         .map_err(|e| ServerErrorHtml(format!("corrupt root: {}", e)))?;
 
-    let entries = crate::bridge::run_list_entries(state.storage_writer.clone(), root)
+    let entries = crate::bridge::run_versioned_list_entries(state.storage_writer.clone(), root)
         .await
         .map_err(|e| ServerErrorHtml(format!("failed to list entries: {}", e)))?;
 
@@ -982,6 +1133,7 @@ async fn claim_enrollment(
 
 // --- Error type for HTML pages ---
 
+#[derive(Debug)]
 struct ServerErrorHtml(String);
 
 impl IntoResponse for ServerErrorHtml {
@@ -1125,6 +1277,10 @@ fn current_root_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ServerConfig;
+    use crate::state::AppState;
+    use crate::storage::StorageLayout;
+    use std::sync::Arc;
     use std::time::Duration;
     use tempfile::tempdir;
 
@@ -1252,6 +1408,71 @@ mod tests {
         let dir = tempdir().unwrap();
         assert_eq!(dir_stats(dir.path()), (0, 0));
     }
+
+    #[tokio::test]
+    async fn tree_projection_requires_fleet_then_roundtrips_without_identity_reset() {
+        let dir = tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        layout.init_directories().unwrap();
+        crate::box_key::init_box_keypair(&layout).unwrap();
+        let token = "a".repeat(64);
+        crate::devices::register_device(&layout, "device", "Desktop", &token).unwrap();
+        let state = Arc::new(AppState::new(ServerConfig::new(dir.path().to_path_buf())));
+        let vault = "tree-admin";
+        let v1 = sync_core::versioned_root::empty_root(
+            sync_core::versioned_root::TREE_V1,
+            vault,
+            "device",
+        )
+        .unwrap();
+        let v1_hash = v1.hash();
+        state
+            .vaults
+            .store_root(vault, &v1_hash, &v1.serialize().unwrap())
+            .unwrap();
+        state.vaults.set_current_root(vault, &v1_hash).unwrap();
+
+        let blocked = project_tree_version(
+            state.clone(),
+            vault.into(),
+            sync_core::versioned_root::TREE_V2,
+        )
+        .await;
+        assert!(blocked.is_err());
+        assert_eq!(state.vaults.get_current_root(vault), Some(v1_hash));
+
+        state
+            .devices
+            .report_capabilities("device", [4; 32], Some(vault), &["tree-v2".into()])
+            .unwrap();
+        let _ = project_tree_version(
+            state.clone(),
+            vault.into(),
+            sync_core::versioned_root::TREE_V2,
+        )
+        .await
+        .unwrap();
+        let v2_hash = state.vaults.get_current_root(vault).unwrap();
+        assert_ne!(v2_hash, v1_hash);
+        let v2 = sync_core::versioned_root::VersionedRoot::deserialize(
+            &state.vaults.get_root(vault, &v2_hash).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v2.version(), 2);
+        assert_eq!(v2.parent_hash(), Some(v1_hash));
+        assert_eq!(v2.total_files(), 0);
+
+        let _ = project_tree_version(
+            state.clone(),
+            vault.into(),
+            sync_core::versioned_root::TREE_V1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.vaults.get_current_root(vault), Some(v1_hash));
+        assert_eq!(state.vaults.get_current_version(vault), Some(1));
+        assert!(state.devices.authenticate(&token).is_ok());
+    }
 }
 
 // --- Version diff viewer (svn-like: file summary + per-file drill-down) ---
@@ -1273,25 +1494,27 @@ async fn api_diff(
     State(state): State<SharedState>,
     Path((vault_id, from_hex, to_hex)): Path<(String, String, String)>,
 ) -> Result<axum::Json<serde_json::Value>, ServerErrorHtml> {
-    let load = |hex: &str| -> Result<sync_core::chunk::RootNode, ServerErrorHtml> {
+    let load = |hex: &str| -> Result<sync_core::versioned_root::VersionedRoot, ServerErrorHtml> {
         let hash = sync_core::hash::hex_to_hash(hex)
             .map_err(|_| ServerErrorHtml("invalid root hash".into()))?;
         let bytes = state
             .vaults
             .get_root(&vault_id, &hash)
             .ok_or_else(|| ServerErrorHtml("root not found in history".into()))?;
-        sync_core::chunk::RootNode::deserialize(&bytes)
+        sync_core::versioned_root::VersionedRoot::deserialize(&bytes)
             .map_err(|e| ServerErrorHtml(format!("corrupt root: {}", e)))
     };
     let from_root = load(&from_hex)?;
     let to_root = load(&to_hex)?;
 
-    let from_entries = crate::bridge::run_list_entries(state.storage_writer.clone(), from_root)
-        .await
-        .map_err(|e| ServerErrorHtml(format!("list from-root: {}", e)))?;
-    let to_entries = crate::bridge::run_list_entries(state.storage_writer.clone(), to_root)
-        .await
-        .map_err(|e| ServerErrorHtml(format!("list to-root: {}", e)))?;
+    let from_entries =
+        crate::bridge::run_versioned_list_entries(state.storage_writer.clone(), from_root)
+            .await
+            .map_err(|e| ServerErrorHtml(format!("list from-root: {}", e)))?;
+    let to_entries =
+        crate::bridge::run_versioned_list_entries(state.storage_writer.clone(), to_root)
+            .await
+            .map_err(|e| ServerErrorHtml(format!("list to-root: {}", e)))?;
 
     use std::collections::BTreeMap;
     let from_map: BTreeMap<&str, &sync_core::chunk::FileEntry> =
@@ -1451,11 +1674,11 @@ async fn api_stats(
             let Some(bytes) = state.vaults.get_root(&vault_id, &h) else {
                 continue;
             };
-            let Ok(r) = sync_core::chunk::RootNode::deserialize(&bytes) else {
+            let Ok(r) = sync_core::versioned_root::VersionedRoot::deserialize(&bytes) else {
                 continue;
             };
-            if let Some(p) = r.parent_hash {
-                items.push((hash.to_string(), hash_to_hex(&p), r.created_ms));
+            if let Some(p) = r.parent_hash() {
+                items.push((hash.to_string(), hash_to_hex(&p), r.created_ms()));
             }
         }
     }
@@ -1478,13 +1701,13 @@ async fn api_stats(
             continue;
         };
         let (Ok(root), Ok(parent)) = (
-            sync_core::chunk::RootNode::deserialize(&rb),
-            sync_core::chunk::RootNode::deserialize(&pb),
+            sync_core::versioned_root::VersionedRoot::deserialize(&rb),
+            sync_core::versioned_root::VersionedRoot::deserialize(&pb),
         ) else {
             continue;
         };
         if let Ok(deltas) =
-            crate::bridge::run_diff(state.storage_writer.clone(), parent, root).await
+            crate::bridge::run_versioned_diff(state.storage_writer.clone(), parent, root).await
         {
             let files = deltas.len();
             let bytes: u64 = deltas
@@ -1522,6 +1745,7 @@ async fn explorer(
         created_ms: u64,
         total_files: u64,
         parent: Option<String>,
+        tree_version: u32,
     }
     let roots_dir = state.layout.vault_roots_dir(&vault_id);
     let mut metas: Vec<Meta> = Vec::new();
@@ -1537,14 +1761,15 @@ async fn explorer(
             let Some(bytes) = state.vaults.get_root(&vault_id, &h) else {
                 continue;
             };
-            let Ok(r) = sync_core::chunk::RootNode::deserialize(&bytes) else {
+            let Ok(r) = sync_core::versioned_root::VersionedRoot::deserialize(&bytes) else {
                 continue;
             };
             metas.push(Meta {
                 hash: hash.to_string(),
-                created_ms: r.created_ms,
-                total_files: r.total_files,
-                parent: r.parent_hash.map(|p| hash_to_hex(&p)),
+                created_ms: r.created_ms(),
+                total_files: r.total_files(),
+                parent: r.parent_hash().map(|p| hash_to_hex(&p)),
+                tree_version: r.version(),
             });
         }
     }
@@ -1558,6 +1783,7 @@ async fn explorer(
                 "short": &m.hash[..m.hash.len().min(12)],
                 "parent": m.parent,
                 "files": m.total_files,
+                "tree": m.tree_version,
                 "when": format_time(m.created_ms),
                 "current": m.hash == current_hex,
             })

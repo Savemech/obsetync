@@ -1,5 +1,5 @@
 use crate::storage::StorageLayout;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{Error, ErrorKind, Write};
 use std::path::Path;
@@ -20,6 +20,12 @@ pub struct DeviceInfo {
     pub last_seen: u64,
     #[serde(default)]
     pub vaults: Vec<String>,
+    /// Last durably reported client capabilities. This is a conservative
+    /// fleet-readiness hint, never authorization by itself; runtime use of a
+    /// versioned endpoint additionally requires a report from the exact
+    /// authenticated HTTP session.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     pub bearer_token: String,
 }
 
@@ -40,7 +46,9 @@ struct RegistryEntry {
     name: String,
     device_id: String,
     enrolled_at: u64,
-    vaults: Vec<String>,
+    vaults: RwLock<Vec<String>>,
+    capabilities: RwLock<Vec<String>>,
+    session_capabilities: Mutex<VecDeque<SessionCapabilityReport>>,
     bearer_token: String,
     last_seen: AtomicU64,
     persisted_last_seen: AtomicU64,
@@ -49,6 +57,32 @@ struct RegistryEntry {
     session_cancelled: CancellationToken,
 }
 
+#[derive(Debug, Clone)]
+struct SessionCapabilityReport {
+    session_id: [u8; 32],
+    vaults: Vec<String>,
+    capabilities: Vec<String>,
+}
+
+/// Conservative activation view. Revoked devices are excluded; every other
+/// enrolled device must have durably advertised the requested capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FleetCapabilityStatus {
+    pub enrolled_devices: usize,
+    pub ready_devices: usize,
+}
+
+impl FleetCapabilityStatus {
+    pub fn ready(self) -> bool {
+        self.enrolled_devices > 0 && self.ready_devices == self.enrolled_devices
+    }
+}
+
+const MAX_CAPABILITIES: usize = 32;
+const MAX_CAPABILITY_LEN: usize = 64;
+const MAX_VAULT_ID_LEN: usize = 1024;
+const MAX_CAPABILITY_SESSIONS: usize = 8;
+
 impl RegistryEntry {
     fn from_disk(info: DeviceInfo, revoked_at: Option<u64>) -> Self {
         let last_seen = info.last_seen;
@@ -56,7 +90,9 @@ impl RegistryEntry {
             name: info.name,
             device_id: info.device_id,
             enrolled_at: info.enrolled_at,
-            vaults: info.vaults,
+            vaults: RwLock::new(info.vaults),
+            capabilities: RwLock::new(info.capabilities),
+            session_capabilities: Mutex::new(VecDeque::new()),
             bearer_token: info.bearer_token,
             last_seen: AtomicU64::new(last_seen),
             persisted_last_seen: AtomicU64::new(last_seen),
@@ -72,7 +108,16 @@ impl RegistryEntry {
             device_id: self.device_id.clone(),
             enrolled_at: self.enrolled_at,
             last_seen: self.last_seen.load(Ordering::Acquire),
-            vaults: self.vaults.clone(),
+            vaults: self
+                .vaults
+                .read()
+                .expect("device vault list poisoned")
+                .clone(),
+            capabilities: self
+                .capabilities
+                .read()
+                .expect("device capability list poisoned")
+                .clone(),
             bearer_token: self.bearer_token.clone(),
         }
     }
@@ -201,6 +246,142 @@ impl DeviceRegistry {
         } else {
             Some(entry.session_cancelled.clone())
         }
+    }
+
+    /// Durably record the feature set claimed by an authenticated client
+    /// session. Disk is updated before either the fleet hint or the runtime
+    /// session proof becomes visible.
+    pub fn report_capabilities(
+        &self,
+        device_id: &str,
+        session_id: [u8; 32],
+        vault_id: Option<&str>,
+        capabilities: &[String],
+    ) -> Result<(), std::io::Error> {
+        let capabilities = normalize_capabilities(capabilities)?;
+        let vault_id = vault_id.map(validate_vault_id).transpose()?;
+        let _mutation = self
+            .mutations
+            .lock()
+            .expect("device mutation lock poisoned");
+        let entry = self
+            .entry(device_id)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "device not found"))?;
+        if entry.revoked.load(Ordering::Acquire) {
+            return Err(Error::new(ErrorKind::PermissionDenied, "device revoked"));
+        }
+
+        let mut persisted = entry.snapshot();
+        if let Some(vault_id) = vault_id {
+            if !persisted.vaults.iter().any(|known| known == vault_id) {
+                persisted.vaults.push(vault_id.to_owned());
+                persisted.vaults.sort();
+            }
+        }
+        persisted.capabilities = capabilities.clone();
+        persist_device_info(&self.layout, &persisted)?;
+
+        *entry.vaults.write().expect("device vault list poisoned") = persisted.vaults;
+        *entry
+            .capabilities
+            .write()
+            .expect("device capability list poisoned") = capabilities.clone();
+
+        let mut reports = entry
+            .session_capabilities
+            .lock()
+            .expect("device session capability list poisoned");
+        if let Some(position) = reports
+            .iter()
+            .position(|report| report.session_id == session_id)
+        {
+            let mut report = reports.remove(position).expect("position came from deque");
+            report.capabilities = capabilities;
+            if let Some(vault_id) = vault_id {
+                if !report.vaults.iter().any(|known| known == vault_id) {
+                    report.vaults.push(vault_id.to_owned());
+                    report.vaults.sort();
+                }
+            } else {
+                // An empty legacy report is a positive downgrade signal for
+                // this session, not an omission we should inherit around.
+                report.vaults.clear();
+            }
+            reports.push_back(report);
+        } else {
+            reports.push_back(SessionCapabilityReport {
+                session_id,
+                vaults: vault_id.into_iter().map(str::to_owned).collect(),
+                capabilities,
+            });
+        }
+        while reports.len() > MAX_CAPABILITY_SESSIONS {
+            reports.pop_front();
+        }
+        Ok(())
+    }
+
+    /// Runtime gate for a versioned endpoint. Persisted readiness alone is
+    /// deliberately insufficient: the exact authenticated process must have
+    /// declared the capability for this vault.
+    pub fn session_supports(
+        &self,
+        device_id: &str,
+        session_id: &[u8; 32],
+        vault_id: &str,
+        capability: &str,
+    ) -> bool {
+        let Some(entry) = self.entry(device_id) else {
+            return false;
+        };
+        if entry.revoked.load(Ordering::Acquire) {
+            return false;
+        }
+        let supported = entry
+            .session_capabilities
+            .lock()
+            .expect("device session capability list poisoned")
+            .iter()
+            .find(|report| &report.session_id == session_id)
+            .is_some_and(|report| {
+                report.vaults.iter().any(|vault| vault == vault_id)
+                    && report
+                        .capabilities
+                        .iter()
+                        .any(|supported| supported == capability)
+            });
+        supported
+    }
+
+    pub fn fleet_capability(&self, capability: &str) -> FleetCapabilityStatus {
+        let entries: Vec<_> = self
+            .maps
+            .read()
+            .expect("device registry poisoned")
+            .by_id
+            .values()
+            .cloned()
+            .collect();
+        let mut status = FleetCapabilityStatus {
+            enrolled_devices: 0,
+            ready_devices: 0,
+        };
+        for entry in entries {
+            if entry.revoked.load(Ordering::Acquire) {
+                continue;
+            }
+            status.enrolled_devices += 1;
+            if entry
+                .capabilities
+                .read()
+                .expect("device capability list poisoned")
+                .iter()
+                .any(|supported| supported == capability)
+            {
+                status.ready_devices += 1;
+            }
+        }
+        status
     }
 
     /// Durable registration first; only then does the token become visible
@@ -378,6 +559,7 @@ pub fn register_device(
         enrolled_at: now,
         last_seen: now,
         vaults: vec![],
+        capabilities: vec![],
         bearer_token: bearer_token.to_string(),
     };
 
@@ -674,6 +856,45 @@ fn valid_token(token: &str) -> bool {
     token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn normalize_capabilities(capabilities: &[String]) -> Result<Vec<String>, std::io::Error> {
+    if capabilities.len() > MAX_CAPABILITIES {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "too many device capabilities",
+        ));
+    }
+    let mut normalized = Vec::with_capacity(capabilities.len());
+    for capability in capabilities {
+        if capability.is_empty()
+            || capability.len() > MAX_CAPABILITY_LEN
+            || !capability
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "invalid device capability",
+            ));
+        }
+        normalized.push(capability.to_ascii_lowercase());
+    }
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
+}
+
+fn validate_vault_id(vault_id: &str) -> Result<&str, std::io::Error> {
+    if vault_id.is_empty()
+        || vault_id.len() > MAX_VAULT_ID_LEN
+        || vault_id
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+    {
+        return Err(Error::new(ErrorKind::InvalidInput, "invalid vault id"));
+    }
+    Ok(vault_id)
+}
+
 /// Replace one small metadata file durably. The temp file is synced before
 /// publication and the directory is synced after rename, so a successful
 /// admin mutation survives a power loss before memory state is changed.
@@ -954,18 +1175,20 @@ mod tests {
             enrolled_at: 1,
             last_seen: 2,
             vaults: vec!["v1".into(), "v2".into()],
+            capabilities: vec!["tree-v2".into()],
             bearer_token: token_64(),
         };
         let json = serde_json::to_string(&info).unwrap();
         let back: DeviceInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(back.vaults, info.vaults);
+        assert_eq!(back.capabilities, info.capabilities);
         assert_eq!(back.bearer_token, info.bearer_token);
     }
 
     #[test]
-    fn device_info_vaults_default_empty_when_missing() {
-        // `vaults` is `#[serde(default)]` — older device.json without that key
-        // must still parse.
+    fn device_info_migration_fields_default_empty_when_missing() {
+        // `vaults` and `capabilities` are `#[serde(default)]` — older
+        // device.json files without either key must still parse.
         let json = r#"{
             "name": "n",
             "device_id": "id",
@@ -975,6 +1198,7 @@ mod tests {
         }"#;
         let info: DeviceInfo = serde_json::from_str(json).unwrap();
         assert!(info.vaults.is_empty());
+        assert!(info.capabilities.is_empty());
     }
 
     #[test]
@@ -1136,6 +1360,151 @@ mod tests {
     }
 
     #[test]
+    fn capability_report_is_durable_but_runtime_proof_is_session_bound() {
+        let (_d, layout) = fresh_layout();
+        register_device(&layout, "desktop", "Desktop", &"a".repeat(64)).unwrap();
+        register_device(&layout, "phone", "Phone", &"b".repeat(64)).unwrap();
+        let registry = DeviceRegistry::load(layout.clone()).unwrap();
+        let desktop_session = [1; 32];
+        let tree_v2 = vec!["tree-v2".to_owned(), "tree-v2".to_owned()];
+
+        assert_eq!(
+            registry.fleet_capability("tree-v2"),
+            FleetCapabilityStatus {
+                enrolled_devices: 2,
+                ready_devices: 0,
+            }
+        );
+        registry
+            .report_capabilities("desktop", desktop_session, Some("vault"), &tree_v2)
+            .unwrap();
+        assert!(registry.session_supports("desktop", &desktop_session, "vault", "tree-v2"));
+        assert!(!registry.session_supports("desktop", &[2; 32], "vault", "tree-v2"));
+        assert_eq!(
+            registry.fleet_capability("tree-v2"),
+            FleetCapabilityStatus {
+                enrolled_devices: 2,
+                ready_devices: 1,
+            }
+        );
+        assert_eq!(
+            get_device(&layout, "desktop").unwrap().capabilities,
+            vec!["tree-v2"]
+        );
+
+        let restarted = DeviceRegistry::load(layout).unwrap();
+        assert_eq!(restarted.fleet_capability("tree-v2").ready_devices, 1);
+        assert!(
+            !restarted.session_supports("desktop", &desktop_session, "vault", "tree-v2"),
+            "a process restart must require the live client to report again"
+        );
+    }
+
+    #[test]
+    fn downgraded_session_cannot_inherit_tree_v2_support() {
+        let (_d, layout) = fresh_layout();
+        register_device(&layout, "dev", "Desktop", &token_64()).unwrap();
+        let registry = DeviceRegistry::load(layout).unwrap();
+        let new_session = [7; 32];
+        let downgraded_session = [8; 32];
+        registry
+            .report_capabilities("dev", new_session, Some("vault"), &["TREE-V2".to_owned()])
+            .unwrap();
+        assert!(registry.fleet_capability("tree-v2").ready());
+
+        registry
+            .report_capabilities("dev", downgraded_session, None, &[])
+            .unwrap();
+        assert!(!registry.fleet_capability("tree-v2").ready());
+        assert!(!registry.session_supports("dev", &downgraded_session, "vault", "tree-v2"));
+        assert!(registry.session_supports("dev", &new_session, "vault", "tree-v2"));
+
+        // An explicit legacy report from the same channel revokes its own
+        // runtime proof and vault association immediately after durability.
+        registry
+            .report_capabilities("dev", new_session, None, &[])
+            .unwrap();
+        assert!(!registry.session_supports("dev", &new_session, "vault", "tree-v2"));
+    }
+
+    #[test]
+    fn capability_publish_failure_leaves_memory_unmodified() {
+        let (_d, layout) = fresh_layout();
+        register_device(&layout, "dev", "Desktop", &token_64()).unwrap();
+        let registry = DeviceRegistry::load(layout.clone()).unwrap();
+        let device_json = layout.device_dir("dev").join("device.json");
+        fs::remove_file(&device_json).unwrap();
+        fs::create_dir(&device_json).unwrap();
+
+        assert!(registry
+            .report_capabilities("dev", [3; 32], Some("vault"), &["tree-v2".to_owned()],)
+            .is_err());
+        assert_eq!(registry.fleet_capability("tree-v2").ready_devices, 0);
+        assert!(!registry.session_supports("dev", &[3; 32], "vault", "tree-v2"));
+    }
+
+    #[test]
+    fn capability_runtime_cache_is_bounded_and_revoked_devices_leave_fleet() {
+        let (_d, layout) = fresh_layout();
+        register_device(&layout, "dev", "Desktop", &token_64()).unwrap();
+        let registry = DeviceRegistry::load(layout).unwrap();
+        for value in 0..=MAX_CAPABILITY_SESSIONS {
+            registry
+                .report_capabilities(
+                    "dev",
+                    [value as u8; 32],
+                    Some("vault"),
+                    &["tree-v2".to_owned()],
+                )
+                .unwrap();
+        }
+        assert!(!registry.session_supports("dev", &[0; 32], "vault", "tree-v2"));
+        assert!(registry.session_supports(
+            "dev",
+            &[MAX_CAPABILITY_SESSIONS as u8; 32],
+            "vault",
+            "tree-v2"
+        ));
+        assert!(registry.fleet_capability("tree-v2").ready());
+
+        registry.revoke("dev").unwrap();
+        assert_eq!(
+            registry.fleet_capability("tree-v2"),
+            FleetCapabilityStatus {
+                enrolled_devices: 0,
+                ready_devices: 0,
+            }
+        );
+        assert!(!registry.session_supports(
+            "dev",
+            &[MAX_CAPABILITY_SESSIONS as u8; 32],
+            "vault",
+            "tree-v2"
+        ));
+    }
+
+    #[test]
+    fn capability_report_rejects_unbounded_or_malformed_input() {
+        let (_d, layout) = fresh_layout();
+        register_device(&layout, "dev", "Desktop", &token_64()).unwrap();
+        let registry = DeviceRegistry::load(layout).unwrap();
+        assert!(registry
+            .report_capabilities("dev", [1; 32], Some("vault"), &["bad value".into()])
+            .is_err());
+        assert!(registry
+            .report_capabilities(
+                "dev",
+                [1; 32],
+                Some("vault"),
+                &vec!["x".into(); MAX_CAPABILITIES + 1],
+            )
+            .is_err());
+        assert!(registry
+            .report_capabilities("dev", [1; 32], Some(""), &[])
+            .is_err());
+    }
+
+    #[test]
     fn strict_startup_rejects_corrupt_or_misplaced_metadata() {
         let (_d, layout) = fresh_layout();
         let dir = layout.device_dir("directory-id");
@@ -1152,6 +1521,7 @@ mod tests {
             enrolled_at: 1,
             last_seen: 1,
             vaults: Vec::new(),
+            capabilities: Vec::new(),
             bearer_token: token_64(),
         };
         fs::write(dir.join("device.json"), serde_json::to_vec(&info).unwrap()).unwrap();
