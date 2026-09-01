@@ -65,16 +65,21 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/sync-core/Cargo.toml   crates/sync-core/Cargo.toml
 COPY crates/sync-schema/Cargo.toml crates/sync-schema/Cargo.toml
 COPY crates/sync-server/Cargo.toml crates/sync-server/Cargo.toml
+# perf-harness is another workspace member. It is not built into the runtime,
+# but Cargo still needs its manifest and a target during the dependency-only
+# resolver pass.
+COPY crates/perf-harness/Cargo.toml crates/perf-harness/Cargo.toml
 # e2e-tests is a workspace member but unused at runtime; cargo's manifest
 # resolver still demands the Cargo.toml exist during the pre-fetch pass.
 COPY crates/e2e-tests/Cargo.toml   crates/e2e-tests/Cargo.toml
 
 # Stub out the actual crate sources so `cargo fetch` can parse everything
 # without needing the real code. We throw these stubs away before the real build.
-RUN mkdir -p crates/sync-core/src crates/sync-schema/src crates/sync-server/src crates/e2e-tests/src && \
+RUN mkdir -p crates/sync-core/src crates/sync-schema/src crates/sync-server/src crates/perf-harness/src crates/e2e-tests/src && \
     echo "fn main() {}" > crates/sync-server/src/main.rs && \
     echo ""            > crates/sync-core/src/lib.rs && \
     echo ""            > crates/sync-schema/src/lib.rs && \
+    echo "fn main() {}" > crates/perf-harness/src/main.rs && \
     echo ""            > crates/e2e-tests/src/lib.rs
 
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
