@@ -6,6 +6,7 @@ use crate::hash::{hash_bytes, FileHash};
 use crate::store::ChunkStore;
 use crate::sync_rules::is_text_file;
 use crate::tree::load_all_entries;
+use crate::versioned_root::VersionedRoot;
 use std::collections::HashMap;
 
 /// Result of a three-way tree merge.
@@ -21,6 +22,14 @@ pub struct MergeResult {
     /// (three-way line merge of non-overlapping changes). Counted separately
     /// from `auto_resolved_count` so callers can tell tree-level picks from
     /// genuine text merges.
+    pub text_merged_count: usize,
+}
+
+#[derive(Debug)]
+pub struct VersionedMergeResult {
+    pub new_root: VersionedRoot,
+    pub file_conflicts: Vec<FileConflict>,
+    pub auto_resolved_count: usize,
     pub text_merged_count: usize,
 }
 
@@ -230,6 +239,81 @@ pub async fn merge_trees<S: ChunkStore, C: ContentStore>(
 
     Ok(MergeResult {
         new_root: merged_root,
+        file_conflicts,
+        auto_resolved_count: auto_resolved,
+        text_merged_count: text_merged,
+    })
+}
+
+/// Three-way merge across the Tree v1/v2 migration boundary. Pure v1 keeps
+/// the optimized prefix-aware implementation above. Any pair involving v2 is
+/// flattened through strict versioned loaders, merged by the same canonical
+/// file-state resolver and rebuilt in the current server root's version
+/// (`side_a`). This makes history/rollback coexistence correct before a later
+/// range-aware three-way merge optimizes the rare divergent path.
+pub async fn merge_versioned_trees<S: ChunkStore, C: ContentStore>(
+    store: &S,
+    content: &C,
+    base: &VersionedRoot,
+    side_a: &VersionedRoot,
+    side_b: &VersionedRoot,
+) -> Result<VersionedMergeResult, ChunkError> {
+    if let (VersionedRoot::V1(base), VersionedRoot::V1(side_a), VersionedRoot::V1(side_b)) =
+        (base, side_a, side_b)
+    {
+        let result = merge_trees(store, content, base, side_a, side_b).await?;
+        return Ok(VersionedMergeResult {
+            new_root: VersionedRoot::V1(result.new_root),
+            file_conflicts: result.file_conflicts,
+            auto_resolved_count: result.auto_resolved_count,
+            text_merged_count: result.text_merged_count,
+        });
+    }
+
+    let base_entries = crate::versioned_root::load_all_entries(store, base).await?;
+    let a_entries = crate::versioned_root::load_all_entries(store, side_a).await?;
+    let b_entries = crate::versioned_root::load_all_entries(store, side_b).await?;
+    let mut merged_entries = Vec::with_capacity(a_entries.len().max(b_entries.len()));
+    let mut file_conflicts = Vec::new();
+    let mut auto_resolved = 0usize;
+    let mut text_todo = Vec::new();
+    merge_entry_lists(
+        &base_entries,
+        &a_entries,
+        &b_entries,
+        &mut merged_entries,
+        &mut file_conflicts,
+        &mut auto_resolved,
+        &mut text_todo,
+    );
+
+    let mut text_merged = 0usize;
+    for todo in &text_todo {
+        if try_text_merge(content, todo, &mut merged_entries).await? {
+            text_merged += 1;
+        } else {
+            file_conflicts.push(FileConflict {
+                path: todo.path.clone(),
+                base_hash: todo.base_hash,
+                side_a_hash: todo.a.hash,
+                side_b_hash: todo.b.hash,
+            });
+        }
+    }
+
+    merged_entries.sort();
+    merged_entries.dedup_by(|left, right| left.path == right.path);
+    let mut new_root = crate::versioned_root::build_root(
+        store,
+        merged_entries,
+        side_a.version(),
+        side_a.vault_id(),
+        "server",
+    )
+    .await?;
+    new_root.set_history_metadata(0, Some(side_a.hash()), "server");
+    Ok(VersionedMergeResult {
+        new_root,
         file_conflicts,
         auto_resolved_count: auto_resolved,
         text_merged_count: text_merged,
@@ -917,5 +1001,75 @@ mod tests {
             .unwrap();
         assert_eq!(result.text_merged_count, 0);
         assert_eq!(result.file_conflicts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn every_mixed_version_merge_preserves_semantics_and_current_format() {
+        let store = MemoryChunkStore::new();
+        let content = MemoryContentStore::new();
+        let base_entries = vec![make_entry("a.md", "a0"), make_entry("b.md", "b0")];
+        let a_entries = vec![make_entry("a.md", "a1"), make_entry("b.md", "b0")];
+        let b_entries = vec![
+            make_entry("a.md", "a0"),
+            make_entry("b.md", "b0"),
+            make_entry("c.md", "c1"),
+        ];
+        let expected = vec![
+            make_entry("a.md", "a1"),
+            make_entry("b.md", "b0"),
+            make_entry("c.md", "c1"),
+        ];
+        let mut bases = Vec::new();
+        let mut sides_a = Vec::new();
+        let mut sides_b = Vec::new();
+        for version in [
+            crate::versioned_root::TREE_V1,
+            crate::versioned_root::TREE_V2,
+        ] {
+            bases.push(
+                crate::versioned_root::build_root(
+                    &store,
+                    base_entries.clone(),
+                    version,
+                    "vault",
+                    "base",
+                )
+                .await
+                .unwrap(),
+            );
+            sides_a.push(
+                crate::versioned_root::build_root(&store, a_entries.clone(), version, "vault", "a")
+                    .await
+                    .unwrap(),
+            );
+            sides_b.push(
+                crate::versioned_root::build_root(&store, b_entries.clone(), version, "vault", "b")
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        for base in &bases {
+            for side_a in &sides_a {
+                for side_b in &sides_b {
+                    let result = merge_versioned_trees(&store, &content, base, side_a, side_b)
+                        .await
+                        .unwrap();
+                    assert_eq!(result.new_root.version(), side_a.version());
+                    assert_eq!(result.new_root.parent_hash(), Some(side_a.hash()));
+                    assert_eq!(result.file_conflicts.len(), 0);
+                    assert_eq!(
+                        crate::versioned_root::load_all_entries(&store, &result.new_root)
+                            .await
+                            .unwrap(),
+                        expected,
+                        "base {} / current {} / incoming {}",
+                        base.version(),
+                        side_a.version(),
+                        side_b.version(),
+                    );
+                }
+            }
+        }
     }
 }

@@ -5,12 +5,12 @@ use std::collections::BTreeMap;
 
 /// Current time as Unix milliseconds.
 /// Uses js_sys::Date::now() in WASM (SystemTime panics on wasm32-unknown-unknown).
-#[cfg(feature = "wasm")]
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
 fn now_ms() -> u64 {
     js_sys::Date::now() as u64
 }
 
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

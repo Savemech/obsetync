@@ -16,6 +16,9 @@ const INTERNAL_MAGIC: &[u8; 4] = b"OVI2";
 const ROOT_MAGIC: &[u8; 4] = b"OVR2";
 const LEAF_HEADER_BYTES: usize = 8;
 const INTERNAL_HEADER_BYTES: usize = 12;
+const STORED_ROOT_HEADER_BYTES: usize = 64;
+const MAX_STORED_ROOT_BYTES: usize = 16 * 1024;
+const MAX_ROOT_ID_BYTES: usize = 1_024;
 
 pub const TREE_VERSION: u32 = 2;
 pub const MIN_LEAF_ENTRIES: usize = 128;
@@ -48,6 +51,178 @@ pub struct TreeV2Root {
     pub version: u32,
     pub total_files: u64,
     pub child: Option<RangeRef>,
+}
+
+/// Persisted/history wrapper for a Tree v2 semantic projection. History
+/// metadata intentionally remains outside [`TreeV2Root::hash`], matching the
+/// Tree v1 rule that a state has one identity regardless of author or time.
+///
+/// The canonical `OVR2` encoding is deliberately separate from the v1
+/// FlatBuffer envelope. An old decoder fails closed instead of interpreting a
+/// v2 root with v1 layout semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootNodeV2 {
+    pub vault_id: String,
+    pub created_ms: u64,
+    pub tree: TreeV2Root,
+    pub parent_hash: Option<FileHash>,
+    pub device_id: String,
+}
+
+impl RootNodeV2 {
+    pub fn new(
+        vault_id: impl Into<String>,
+        device_id: impl Into<String>,
+        tree: TreeV2Root,
+    ) -> Result<Self, ChunkError> {
+        let root = Self {
+            vault_id: vault_id.into(),
+            created_ms: 0,
+            tree,
+            parent_hash: None,
+            device_id: device_id.into(),
+        };
+        root.validate()?;
+        Ok(root)
+    }
+
+    pub fn hash(&self) -> FileHash {
+        self.tree.hash()
+    }
+
+    pub fn total_files(&self) -> u64 {
+        self.tree.total_files
+    }
+
+    pub fn serialize(&self) -> Result<Vec<u8>, ChunkError> {
+        self.validate()?;
+        let mut capacity = STORED_ROOT_HEADER_BYTES
+            .checked_add(self.vault_id.len())
+            .and_then(|value| value.checked_add(self.device_id.len()))
+            .ok_or_else(|| invalid("Tree v2 stored root length overflow"))?;
+        if self.parent_hash.is_some() {
+            capacity = capacity
+                .checked_add(32)
+                .ok_or_else(|| invalid("Tree v2 stored root length overflow"))?;
+        }
+        if let Some(child) = &self.tree.child {
+            capacity = capacity
+                .checked_add(2)
+                .and_then(|value| value.checked_add(range_record_len(child)))
+                .ok_or_else(|| invalid("Tree v2 stored root length overflow"))?;
+        }
+        if capacity > MAX_STORED_ROOT_BYTES {
+            return Err(invalid("Tree v2 stored root exceeds the byte cap"));
+        }
+
+        let vault_len = u16::try_from(self.vault_id.len())
+            .map_err(|_| invalid("Tree v2 vault id is too long"))?;
+        let device_len = u16::try_from(self.device_id.len())
+            .map_err(|_| invalid("Tree v2 device id is too long"))?;
+        let mut flags = 0u8;
+        if self.parent_hash.is_some() {
+            flags |= 1;
+        }
+        if self.tree.child.is_some() {
+            flags |= 2;
+        }
+
+        let mut output = Vec::with_capacity(capacity);
+        output.extend_from_slice(ROOT_MAGIC);
+        output.extend_from_slice(&TREE_VERSION.to_le_bytes());
+        output.extend_from_slice(&self.created_ms.to_le_bytes());
+        output.extend_from_slice(&self.tree.total_files.to_le_bytes());
+        output.extend_from_slice(&vault_len.to_le_bytes());
+        output.extend_from_slice(&device_len.to_le_bytes());
+        output.push(flags);
+        output.extend_from_slice(&[0; 3]);
+        output.extend_from_slice(&self.hash());
+        if let Some(parent) = self.parent_hash {
+            output.extend_from_slice(&parent);
+        }
+        if let Some(child) = &self.tree.child {
+            output.extend_from_slice(&child.height.to_le_bytes());
+            encode_range_ref(child, &mut output)?;
+        }
+        output.extend_from_slice(self.vault_id.as_bytes());
+        output.extend_from_slice(self.device_id.as_bytes());
+        debug_assert_eq!(output.len(), capacity);
+        Ok(output)
+    }
+
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, ChunkError> {
+        if bytes.len() < STORED_ROOT_HEADER_BYTES || bytes.len() > MAX_STORED_ROOT_BYTES {
+            return Err(invalid("Tree v2 stored root length is invalid"));
+        }
+        let mut reader = Reader::new(bytes);
+        if reader.take(4)? != ROOT_MAGIC {
+            return Err(invalid("unknown Tree v2 root magic"));
+        }
+        if reader.u32()? != TREE_VERSION {
+            return Err(invalid("unsupported Tree v2 root version"));
+        }
+        let created_ms = reader.u64()?;
+        let total_files = reader.u64()?;
+        let vault_len = reader.u16()? as usize;
+        let device_len = reader.u16()? as usize;
+        let flags = reader.u8()?;
+        if flags & !0b11 != 0 || reader.take(3)? != [0; 3] {
+            return Err(invalid("Tree v2 stored root flags are invalid"));
+        }
+        let declared_hash: FileHash = reader
+            .take(32)?
+            .try_into()
+            .map_err(|_| invalid("Tree v2 root hash is truncated"))?;
+        let parent_hash = if flags & 1 != 0 {
+            Some(
+                reader
+                    .take(32)?
+                    .try_into()
+                    .map_err(|_| invalid("Tree v2 parent hash is truncated"))?,
+            )
+        } else {
+            None
+        };
+        let child = if flags & 2 != 0 {
+            let height = reader.u16()?;
+            Some(decode_range_ref(&mut reader, height)?)
+        } else {
+            None
+        };
+        if vault_len == 0 || vault_len > MAX_ROOT_ID_BYTES || device_len > MAX_ROOT_ID_BYTES {
+            return Err(invalid("Tree v2 root identifier length is invalid"));
+        }
+        let vault_id = std::str::from_utf8(reader.take(vault_len)?)
+            .map_err(|_| invalid("Tree v2 vault id is not UTF-8"))?
+            .to_owned();
+        let device_id = std::str::from_utf8(reader.take(device_len)?)
+            .map_err(|_| invalid("Tree v2 device id is not UTF-8"))?
+            .to_owned();
+        reader.finish()?;
+
+        let root = Self {
+            vault_id,
+            created_ms,
+            tree: TreeV2Root {
+                version: TREE_VERSION,
+                total_files,
+                child,
+            },
+            parent_hash,
+            device_id,
+        };
+        root.validate()?;
+        if root.hash() != declared_hash {
+            return Err(invalid("Tree v2 declared root hash is invalid"));
+        }
+        Ok(root)
+    }
+
+    fn validate(&self) -> Result<(), ChunkError> {
+        validate_root_shape(&self.tree)?;
+        validate_root_id("vault", &self.vault_id, false)?;
+        validate_root_id("device", &self.device_id, true)
+    }
 }
 
 impl TreeV2Root {
@@ -971,6 +1146,18 @@ fn validate_path(path: &str) -> Result<(), ChunkError> {
     Ok(())
 }
 
+fn validate_root_id(kind: &str, value: &str, allow_empty: bool) -> Result<(), ChunkError> {
+    if (!allow_empty && value.is_empty())
+        || value.len() > MAX_ROOT_ID_BYTES
+        || value
+            .chars()
+            .any(|character| character.is_control() || character == '\u{7f}')
+    {
+        return Err(invalid(format!("Tree v2 {kind} id is invalid")));
+    }
+    Ok(())
+}
+
 fn leaf_record_len(entry: &FileEntry) -> usize {
     2 + entry.path.len() + 32 + 8 + 8
 }
@@ -1052,6 +1239,10 @@ impl<'a> Reader<'a> {
                 .try_into()
                 .map_err(|_| invalid("Tree v2 u16 is truncated"))?,
         ))
+    }
+
+    fn u8(&mut self) -> Result<u8, ChunkError> {
+        Ok(self.take(1)?[0])
     }
 
     fn u32(&mut self) -> Result<u32, ChunkError> {
@@ -1403,6 +1594,50 @@ mod tests {
             actual.extend(page);
         }
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn stored_root_roundtrips_and_rejects_every_truncation() {
+        let store = MemoryChunkStore::new();
+        let tree = build_tree(&store, entries(2_000)).await.unwrap();
+        let mut root = RootNodeV2::new("vault", "device", tree).unwrap();
+        root.created_ms = 1_900_000_000_123;
+        root.parent_hash = Some(hash_bytes(b"parent"));
+        let bytes = root.serialize().unwrap();
+        assert_eq!(&bytes[..4], ROOT_MAGIC);
+        assert_eq!(RootNodeV2::deserialize(&bytes).unwrap(), root);
+        for end in 0..bytes.len() {
+            assert!(
+                RootNodeV2::deserialize(&bytes[..end]).is_err(),
+                "accepted stored-root prefix {end}"
+            );
+        }
+
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(RootNodeV2::deserialize(&trailing).is_err());
+        let mut wrong_hash = bytes.clone();
+        wrong_hash[32] ^= 1;
+        assert!(RootNodeV2::deserialize(&wrong_hash).is_err());
+        let mut reserved = bytes.clone();
+        reserved[29] = 1;
+        assert!(RootNodeV2::deserialize(&reserved).is_err());
+        let mut unknown_flag = bytes.clone();
+        unknown_flag[28] |= 0x80;
+        assert!(RootNodeV2::deserialize(&unknown_flag).is_err());
+
+        let mut metadata_changed = root.clone();
+        metadata_changed.created_ms += 1;
+        metadata_changed.device_id = "other-device".into();
+        metadata_changed.parent_hash = None;
+        assert_eq!(metadata_changed.hash(), root.hash());
+        assert_ne!(metadata_changed.serialize().unwrap(), bytes);
+
+        let empty = RootNodeV2::new("vault", "", empty_root()).unwrap();
+        assert_eq!(
+            RootNodeV2::deserialize(&empty.serialize().unwrap()).unwrap(),
+            empty
+        );
     }
 
     #[tokio::test]

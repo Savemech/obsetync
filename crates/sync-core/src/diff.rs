@@ -2,6 +2,7 @@ use crate::chunk::{ChunkError, RootNode};
 use crate::hash::FileHash;
 use crate::store::ChunkStore;
 use crate::tree::load_all_entries;
+use crate::versioned_root::VersionedRoot;
 
 /// A single file-level change between two roots.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -170,6 +171,62 @@ pub async fn compute_deltas_with_stats<S: ChunkStore>(
 
     let deltas = detect_renames(raw_deltas);
     Ok(DiffResult { deltas, stats })
+}
+
+/// Diff any supported persisted tree pair. Same-version calls retain their
+/// native subtree skipping. A migration-boundary v1/v2 pair is flattened
+/// through strict loaders and compared semantically; this path is bounded by
+/// the versioned-root entry cap and exists only while history spans formats.
+pub async fn compute_versioned_deltas_with_stats<S: ChunkStore>(
+    store: &S,
+    from: &VersionedRoot,
+    to: &VersionedRoot,
+) -> Result<DiffResult, ChunkError> {
+    let mut result = match (from, to) {
+        (VersionedRoot::V1(from), VersionedRoot::V1(to)) => {
+            compute_deltas_with_stats(store, from, to).await?
+        }
+        (VersionedRoot::V2(from), VersionedRoot::V2(to)) => {
+            crate::tree_v2::compute_deltas_with_stats(store, &from.tree, &to.tree).await?
+        }
+        _ => {
+            let from_entries = crate::versioned_root::load_all_entries(store, from).await?;
+            let to_entries = crate::versioned_root::load_all_entries(store, to).await?;
+            let mut raw = Vec::new();
+            diff_entries(&from_entries, &to_entries, &mut raw);
+            DiffResult {
+                deltas: detect_renames(raw),
+                stats: DiffStats {
+                    nodes_visited: 2,
+                    nodes_skipped: 0,
+                    entries_materialized: (from_entries.len() + to_entries.len()) as u64,
+                },
+            }
+        }
+    };
+    result
+        .deltas
+        .sort_by(|left, right| delta_path(left).cmp(delta_path(right)));
+    Ok(result)
+}
+
+pub async fn compute_versioned_deltas<S: ChunkStore>(
+    store: &S,
+    from: &VersionedRoot,
+    to: &VersionedRoot,
+) -> Result<Vec<FileDelta>, ChunkError> {
+    Ok(compute_versioned_deltas_with_stats(store, from, to)
+        .await?
+        .deltas)
+}
+
+fn delta_path(delta: &FileDelta) -> &str {
+    match delta {
+        FileDelta::Added { path, .. }
+        | FileDelta::Modified { path, .. }
+        | FileDelta::Deleted { path, .. }
+        | FileDelta::Renamed { path, .. } => path,
+    }
 }
 
 /// Diff two sorted entry lists and produce raw deltas.
@@ -597,5 +654,86 @@ mod tests {
         let json = serde_json::to_string(&d).unwrap();
         assert!(json.contains("deleted"));
         let _back: FileDelta = serde_json::from_str(&json).unwrap();
+    }
+
+    #[tokio::test]
+    async fn every_v1_v2_pair_emits_the_same_canonical_deltas() {
+        let store = MemoryChunkStore::new();
+        let moved_hash = hash_bytes(b"moved");
+        let before_entries = vec![
+            make_entry("a/keep.md", "same"),
+            FileEntry::new("m/source.md".into(), moved_hash, 10, 5),
+            make_entry("z.md", "old"),
+        ];
+        let after_entries = vec![
+            make_entry("a/keep.md", "same"),
+            make_entry("b/new.md", "added"),
+            FileEntry::new("n/target.md".into(), moved_hash, 10, 5),
+            make_entry("z.md", "new"),
+        ];
+        let before = [
+            crate::versioned_root::build_root(
+                &store,
+                before_entries.clone(),
+                crate::versioned_root::TREE_V1,
+                "vault",
+                "device",
+            )
+            .await
+            .unwrap(),
+            crate::versioned_root::build_root(
+                &store,
+                before_entries.clone(),
+                crate::versioned_root::TREE_V2,
+                "vault",
+                "device",
+            )
+            .await
+            .unwrap(),
+        ];
+        let after = [
+            crate::versioned_root::build_root(
+                &store,
+                after_entries.clone(),
+                crate::versioned_root::TREE_V1,
+                "vault",
+                "device",
+            )
+            .await
+            .unwrap(),
+            crate::versioned_root::build_root(
+                &store,
+                after_entries,
+                crate::versioned_root::TREE_V2,
+                "vault",
+                "device",
+            )
+            .await
+            .unwrap(),
+        ];
+
+        let expected = compute_versioned_deltas(&store, &before[0], &after[0])
+            .await
+            .unwrap();
+        assert!(matches!(
+            expected.iter().find(|delta| matches!(delta, FileDelta::Renamed { .. })),
+            Some(FileDelta::Renamed { path, old_path, .. })
+                if path == "n/target.md" && old_path == "m/source.md"
+        ));
+        for from in &before {
+            for to in &after {
+                assert_eq!(
+                    compute_versioned_deltas(&store, from, to).await.unwrap(),
+                    expected,
+                    "{} -> {} mismatch",
+                    from.version(),
+                    to.version(),
+                );
+            }
+        }
+        assert!(compute_versioned_deltas(&store, &before[0], &before[1])
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

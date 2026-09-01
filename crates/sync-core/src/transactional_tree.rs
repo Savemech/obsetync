@@ -88,7 +88,10 @@ pub fn sweep_store<'a>(
     Ok(sweep_marked(store, &reachable))
 }
 
-fn sweep_marked(store: &MemoryChunkStore, reachable: &HashSet<FileHash>) -> ChunkGcStats {
+pub(crate) fn sweep_marked(
+    store: &MemoryChunkStore,
+    reachable: &HashSet<FileHash>,
+) -> ChunkGcStats {
     let (before, after, bytes_removed) = store.retain_chunks(reachable);
     ChunkGcStats {
         before: before as u64,
@@ -275,7 +278,7 @@ impl TransactionalTree {
     }
 }
 
-fn sorted_hashes(hashes: HashSet<FileHash>) -> Result<Vec<FileHash>, ChunkError> {
+pub(crate) fn sorted_hashes(hashes: HashSet<FileHash>) -> Result<Vec<FileHash>, ChunkError> {
     let mut hashes: Vec<_> = hashes.into_iter().collect();
     hashes.sort();
     Ok(hashes)

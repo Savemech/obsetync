@@ -3,6 +3,8 @@
 use crate::chunk::{FileEntry, RootNode};
 use crate::hash::{hash_bytes, hash_to_hex, hex_to_hash};
 use crate::transactional_tree::TransactionalTree;
+use crate::transactional_tree_v2::TransactionalTreeV2;
+use crate::versioned_root::{VersionedRoot, TREE_V1, TREE_V2};
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
@@ -30,7 +32,14 @@ pub fn wasm_hash(data: &[u8]) -> String {
 /// Used by the plugin's push path to incrementally update the tree.
 #[wasm_bindgen]
 pub struct WasmTree {
-    inner: TransactionalTree,
+    inner: WasmTreeInner,
+    vault_id: String,
+    device_id: String,
+}
+
+enum WasmTreeInner {
+    V1(TransactionalTree),
+    V2(TransactionalTreeV2),
 }
 
 #[wasm_bindgen]
@@ -38,84 +47,159 @@ impl WasmTree {
     #[wasm_bindgen(constructor)]
     pub fn new(vault_id: &str, device_id: &str) -> Self {
         Self {
-            inner: TransactionalTree::new(vault_id, device_id),
+            inner: WasmTreeInner::V1(TransactionalTree::new(vault_id, device_id)),
+            vault_id: vault_id.to_owned(),
+            device_id: device_id.to_owned(),
+        }
+    }
+
+    /// Select the empty tree's format after authenticated capability
+    /// negotiation. Switching a populated graph is forbidden; callers rebuild
+    /// it from sync-base so v1/v2 node bytes can never share one transaction.
+    pub fn set_tree_version(&mut self, version: u32) -> Result<(), JsValue> {
+        if self.root_hash_hex().is_some() || self.has_candidate() {
+            return Err(JsValue::from_str(
+                "cannot switch the format of a populated WASM tree",
+            ));
+        }
+        self.inner = match version {
+            TREE_V1 => WasmTreeInner::V1(TransactionalTree::new(&self.vault_id, &self.device_id)),
+            TREE_V2 => WasmTreeInner::V2(TransactionalTreeV2::new(&self.vault_id, &self.device_id)),
+            other => {
+                return Err(JsValue::from_str(&format!(
+                    "unsupported tree version {other}"
+                )))
+            }
+        };
+        Ok(())
+    }
+
+    pub fn tree_version(&self) -> u32 {
+        match &self.inner {
+            WasmTreeInner::V1(_) => TREE_V1,
+            WasmTreeInner::V2(_) => TREE_V2,
         }
     }
 
     /// Load a root from serialized bytes (received from server or local cache).
     pub fn load_root(&mut self, root_bytes: &[u8]) -> Result<(), JsValue> {
-        let root =
-            RootNode::deserialize(root_bytes).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let root = VersionedRoot::deserialize(root_bytes)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        if root.vault_id() != self.vault_id {
+            return Err(JsValue::from_str(
+                "root vault id does not match the WASM tree",
+            ));
+        }
 
         // Root bytes live separately from the byte-addressed leaf/internal
         // store: RootNode::hash() is semantic and intentionally excludes its
         // history metadata, so it is not a Blake3 address for root_bytes.
-        self.inner.load_root_without_chunks(root);
+        self.inner = match root {
+            VersionedRoot::V1(root) => {
+                let mut tree = TransactionalTree::new(&self.vault_id, &self.device_id);
+                tree.load_root_without_chunks(root);
+                WasmTreeInner::V1(tree)
+            }
+            VersionedRoot::V2(root) => {
+                let mut tree = TransactionalTreeV2::new(&self.vault_id, &self.device_id);
+                tree.load_root_without_chunks(root);
+                WasmTreeInner::V2(tree)
+            }
+        };
         Ok(())
     }
 
     /// Get the current root hash as hex string.
     pub fn root_hash_hex(&self) -> Option<String> {
-        self.inner
-            .committed_root_hash()
-            .map(|hash| hash_to_hex(&hash))
+        match &self.inner {
+            WasmTreeInner::V1(tree) => tree.committed_root_hash(),
+            WasmTreeInner::V2(tree) => tree.committed_root_hash(),
+        }
+        .map(|hash| hash_to_hex(&hash))
     }
 
     /// Get the serialized root bytes for upload to server.
-    pub fn root_bytes(&self) -> Option<Vec<u8>> {
-        self.inner.committed_root().map(RootNode::serialize)
+    pub fn root_bytes(&self) -> Result<Option<Vec<u8>>, JsValue> {
+        match &self.inner {
+            WasmTreeInner::V1(tree) => Ok(tree.committed_root().map(RootNode::serialize)),
+            WasmTreeInner::V2(tree) => tree
+                .committed_root()
+                .map(|root| root.serialize())
+                .transpose()
+                .map_err(|error| JsValue::from_str(&error.to_string())),
+        }
     }
 
     /// Get total file count in the tree.
     pub fn total_files(&self) -> f64 {
-        self.inner
-            .committed_root()
-            .map(|r| r.total_files as f64)
-            .unwrap_or(0.0)
+        match &self.inner {
+            WasmTreeInner::V1(tree) => tree.committed_root().map(|root| root.total_files as f64),
+            WasmTreeInner::V2(tree) => tree.committed_root().map(|root| root.total_files() as f64),
+        }
+        .unwrap_or(0.0)
     }
 
     /// Begin an isolated candidate rooted at the committed graph.
     pub fn begin_candidate(&mut self) -> Result<(), JsValue> {
-        self.inner
-            .begin_candidate()
-            .map_err(|error| JsValue::from_str(&error.to_string()))
+        match &mut self.inner {
+            WasmTreeInner::V1(tree) => tree.begin_candidate(),
+            WasmTreeInner::V2(tree) => run_local(tree.begin_candidate()),
+        }
+        .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
     pub fn has_candidate(&self) -> bool {
-        self.inner.has_candidate()
+        match &self.inner {
+            WasmTreeInner::V1(tree) => tree.has_candidate(),
+            WasmTreeInner::V2(tree) => tree.has_candidate(),
+        }
     }
 
     pub fn candidate_root_hash_hex(&self) -> Option<String> {
-        self.inner
-            .candidate_root_hash()
-            .map(|hash| hash_to_hex(&hash))
+        match &self.inner {
+            WasmTreeInner::V1(tree) => tree.candidate_root_hash(),
+            WasmTreeInner::V2(tree) => tree.candidate_root_hash(),
+        }
+        .map(|hash| hash_to_hex(&hash))
     }
 
-    pub fn candidate_root_bytes(&self) -> Option<Vec<u8>> {
-        self.inner.candidate_root().map(RootNode::serialize)
+    pub fn candidate_root_bytes(&self) -> Result<Option<Vec<u8>>, JsValue> {
+        match &self.inner {
+            WasmTreeInner::V1(tree) => Ok(tree.candidate_root().map(RootNode::serialize)),
+            WasmTreeInner::V2(tree) => tree
+                .candidate_root()
+                .map(|root| root.serialize())
+                .transpose()
+                .map_err(|error| JsValue::from_str(&error.to_string())),
+        }
     }
 
     pub fn candidate_total_files(&self) -> f64 {
-        self.inner
-            .candidate_root()
-            .map(|root| root.total_files as f64)
-            .unwrap_or(0.0)
+        match &self.inner {
+            WasmTreeInner::V1(tree) => tree.candidate_root().map(|root| root.total_files as f64),
+            WasmTreeInner::V2(tree) => tree.candidate_root().map(|root| root.total_files() as f64),
+        }
+        .unwrap_or(0.0)
     }
 
     /// Promote the candidate only after the server has accepted its root.
     pub fn commit_candidate(&mut self) -> Result<JsValue, JsValue> {
-        self.inner
-            .commit_candidate()
-            .map(|stats| to_js(&stats))
-            .map_err(|error| JsValue::from_str(&error.to_string()))
+        match &mut self.inner {
+            WasmTreeInner::V1(tree) => tree.commit_candidate(),
+            WasmTreeInner::V2(tree) => run_local(tree.commit_candidate()),
+        }
+        .map(|stats| to_js(&stats))
+        .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
     /// Discard a failed candidate and retain only the committed graph.
     pub fn abort_candidate(&mut self) -> Result<JsValue, JsValue> {
-        self.inner
-            .abort_candidate()
-            .map(|stats| to_js(&stats))
-            .map_err(|error| JsValue::from_str(&error.to_string()))
+        match &mut self.inner {
+            WasmTreeInner::V1(tree) => tree.abort_candidate(),
+            WasmTreeInner::V2(tree) => run_local(tree.abort_candidate()),
+        }
+        .map(|stats| to_js(&stats))
+        .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
     /// Update a single file entry in the tree.
@@ -129,16 +213,22 @@ impl WasmTree {
         let file_hash = hex_to_hash(hash_hex)
             .map_err(|error| JsValue::from_str(&format!("invalid hash: {error}")))?;
         let entry = FileEntry::new(path.to_owned(), file_hash, mtime_ms as u64, size as u64);
-        run_local(self.inner.apply_committed(&[entry], &[]))
-            .map(|_| ())
-            .map_err(|error| JsValue::from_str(&error.to_string()))
+        match &mut self.inner {
+            WasmTreeInner::V1(tree) => run_local(tree.apply_committed(&[entry], &[])),
+            WasmTreeInner::V2(tree) => run_local(tree.apply_committed(&[entry], &[])),
+        }
+        .map(|_| ())
+        .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
     /// Delete a file entry from the tree.
     pub fn delete_entry(&mut self, path: &str) -> Result<(), JsValue> {
-        run_local(self.inner.apply_committed(&[], &[path.to_owned()]))
-            .map(|_| ())
-            .map_err(|error| JsValue::from_str(&error.to_string()))
+        match &mut self.inner {
+            WasmTreeInner::V1(tree) => run_local(tree.apply_committed(&[], &[path.to_owned()])),
+            WasmTreeInner::V2(tree) => run_local(tree.apply_committed(&[], &[path.to_owned()])),
+        }
+        .map(|_| ())
+        .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
     /// Apply a batch of upserts in ONE update_tree call.
@@ -155,9 +245,12 @@ impl WasmTree {
         if entries.is_empty() {
             return Ok(());
         }
-        run_local(self.inner.apply_committed(&entries, &[]))
-            .map(|_| ())
-            .map_err(|error| JsValue::from_str(&error.to_string()))
+        match &mut self.inner {
+            WasmTreeInner::V1(tree) => run_local(tree.apply_committed(&entries, &[])),
+            WasmTreeInner::V2(tree) => run_local(tree.apply_committed(&entries, &[])),
+        }
+        .map(|_| ())
+        .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
     /// Delete a batch of paths in ONE update_tree call.
@@ -171,21 +264,30 @@ impl WasmTree {
             return Ok(());
         }
 
-        run_local(self.inner.apply_committed(&[], &paths))
-            .map(|_| ())
-            .map_err(|error| JsValue::from_str(&error.to_string()))
+        match &mut self.inner {
+            WasmTreeInner::V1(tree) => run_local(tree.apply_committed(&[], &paths)),
+            WasmTreeInner::V2(tree) => run_local(tree.apply_committed(&[], &paths)),
+        }
+        .map(|_| ())
+        .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
     pub fn candidate_update_batch(&mut self, entries_json: &str) -> Result<(), JsValue> {
         let entries = parse_entries(entries_json)?;
-        run_local(self.inner.apply_candidate(&entries, &[]))
-            .map_err(|error| JsValue::from_str(&error.to_string()))
+        match &mut self.inner {
+            WasmTreeInner::V1(tree) => run_local(tree.apply_candidate(&entries, &[])),
+            WasmTreeInner::V2(tree) => run_local(tree.apply_candidate(&entries, &[])),
+        }
+        .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
     pub fn candidate_delete_batch(&mut self, paths_json: &str) -> Result<(), JsValue> {
         let paths = parse_paths(paths_json)?;
-        run_local(self.inner.apply_candidate(&[], &paths))
-            .map_err(|error| JsValue::from_str(&error.to_string()))
+        match &mut self.inner {
+            WasmTreeInner::V1(tree) => run_local(tree.apply_candidate(&[], &paths)),
+            WasmTreeInner::V2(tree) => run_local(tree.apply_candidate(&[], &paths)),
+        }
+        .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
     /// Build a tree from scratch given a JSON array of file entries.
@@ -193,8 +295,39 @@ impl WasmTree {
     /// Input: [{ "path": "...", "hash": "hex", "mtime_ms": u64, "size": u64 }, ...]
     pub fn build_from_entries(&mut self, entries_json: &str) -> Result<(), JsValue> {
         let entries = parse_entries(entries_json)?;
-        run_local(self.inner.rebuild(entries))
-            .map_err(|error| JsValue::from_str(&error.to_string()))
+        match &mut self.inner {
+            WasmTreeInner::V1(tree) => run_local(tree.rebuild(entries)),
+            WasmTreeInner::V2(tree) => run_local(tree.rebuild(entries)),
+        }
+        .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Atomically rebuild the semantic sync-base snapshot in a negotiated
+    /// tree format. Unlike `set_tree_version`, this is deliberately valid for
+    /// a populated tree: a live server-side v1/v2 transition must replace the
+    /// whole immutable graph without exposing an empty or half-built state.
+    pub fn rebuild_from_entries_in_version(
+        &mut self,
+        version: u32,
+        entries_json: &str,
+    ) -> Result<(), JsValue> {
+        let entries = parse_entries(entries_json)?;
+        let mut replacement = match version {
+            TREE_V1 => WasmTreeInner::V1(TransactionalTree::new(&self.vault_id, &self.device_id)),
+            TREE_V2 => WasmTreeInner::V2(TransactionalTreeV2::new(&self.vault_id, &self.device_id)),
+            other => {
+                return Err(JsValue::from_str(&format!(
+                    "unsupported tree version {other}"
+                )))
+            }
+        };
+        match &mut replacement {
+            WasmTreeInner::V1(tree) => run_local(tree.rebuild(entries)),
+            WasmTreeInner::V2(tree) => run_local(tree.rebuild(entries)),
+        }
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        self.inner = replacement;
+        Ok(())
     }
 }
 
@@ -203,7 +336,10 @@ impl WasmTree {
 #[wasm_bindgen]
 pub fn wasm_tree_get_chunk(tree: &WasmTree, hash_hex: &str) -> Option<Vec<u8>> {
     let hash = hex_to_hash(hash_hex).ok()?;
-    tree.inner.chunk_bytes(&hash)
+    match &tree.inner {
+        WasmTreeInner::V1(inner) => inner.chunk_bytes(&hash),
+        WasmTreeInner::V2(inner) => inner.chunk_bytes(&hash),
+    }
 }
 
 /// Return hex hashes of all byte-addressed index chunks (LeafChunk/InternalNode)
@@ -211,7 +347,7 @@ pub fn wasm_tree_get_chunk(tree: &WasmTree, hash_hex: &str) -> Option<Vec<u8>> {
 /// The plugin calls this before putRoot to upload any chunks the server is missing.
 #[wasm_bindgen]
 pub fn wasm_tree_chunk_hashes(tree: &WasmTree) -> Result<Vec<String>, JsValue> {
-    if tree.inner.has_candidate() {
+    if tree.has_candidate() {
         wasm_tree_candidate_chunk_hashes(tree)
     } else {
         wasm_tree_committed_chunk_hashes(tree)
@@ -220,26 +356,32 @@ pub fn wasm_tree_chunk_hashes(tree: &WasmTree) -> Result<Vec<String>, JsValue> {
 
 #[wasm_bindgen]
 pub fn wasm_tree_committed_chunk_hashes(tree: &WasmTree) -> Result<Vec<String>, JsValue> {
-    tree.inner
-        .committed_chunk_hashes()
-        .map(hex_hashes)
-        .map_err(|error| JsValue::from_str(&error.to_string()))
+    match &tree.inner {
+        WasmTreeInner::V1(inner) => inner.committed_chunk_hashes(),
+        WasmTreeInner::V2(inner) => run_local(inner.committed_chunk_hashes()),
+    }
+    .map(hex_hashes)
+    .map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
 #[wasm_bindgen]
 pub fn wasm_tree_candidate_chunk_hashes(tree: &WasmTree) -> Result<Vec<String>, JsValue> {
-    tree.inner
-        .candidate_chunk_hashes()
-        .map(hex_hashes)
-        .map_err(|error| JsValue::from_str(&error.to_string()))
+    match &tree.inner {
+        WasmTreeInner::V1(inner) => inner.candidate_chunk_hashes(),
+        WasmTreeInner::V2(inner) => run_local(inner.candidate_chunk_hashes()),
+    }
+    .map(hex_hashes)
+    .map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
 #[wasm_bindgen]
 pub fn wasm_tree_new_candidate_chunk_hashes(tree: &WasmTree) -> Result<Vec<String>, JsValue> {
-    tree.inner
-        .new_candidate_chunk_hashes()
-        .map(hex_hashes)
-        .map_err(|error| JsValue::from_str(&error.to_string()))
+    match &tree.inner {
+        WasmTreeInner::V1(inner) => inner.new_candidate_chunk_hashes(),
+        WasmTreeInner::V2(inner) => run_local(inner.new_candidate_chunk_hashes()),
+    }
+    .map(hex_hashes)
+    .map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
 /// Parse the root hash from cached root bytes without loading the tree structure.
@@ -250,8 +392,13 @@ pub fn wasm_tree_new_candidate_chunk_hashes(tree: &WasmTree) -> Result<Vec<Strin
 /// from sync-base on first push, which correctly populates the full MemoryChunkStore.
 #[wasm_bindgen]
 pub fn wasm_root_hash_from_bytes(bytes: &[u8]) -> Option<String> {
-    let root = RootNode::deserialize(bytes).ok()?;
+    let root = VersionedRoot::deserialize(bytes).ok()?;
     Some(hash_to_hex(&root.hash()))
+}
+
+#[wasm_bindgen]
+pub fn wasm_root_version_from_bytes(bytes: &[u8]) -> Option<u32> {
+    Some(VersionedRoot::deserialize(bytes).ok()?.version())
 }
 
 /// Run FastCDC sub-file chunking on a large file.
