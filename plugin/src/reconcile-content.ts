@@ -18,6 +18,12 @@ export interface ReconcileContentIndex {
     bytesTotal: number;
 }
 
+export interface ReconcileManifestRange {
+    hash: string;
+    offset: number;
+    size: number;
+}
+
 /**
  * Build the content-addressed lookup used by reconcile while retaining the
  * physical workload totals used to calculate end-to-end deduplication.
@@ -56,4 +62,22 @@ export function sumIndexedContentBytes(
         bytes += index.get(hash)?.size ?? 0;
     }
     return bytes;
+}
+
+/** Convert a server missing bitmap into ordered, unique file ranges. A
+ * repeated content hash is uploaded from its first occurrence only. */
+export function selectReconcileMissingRanges(
+    chunks: readonly ReconcileManifestRange[],
+    missingHashes: Iterable<string>,
+): ReconcileManifestRange[] {
+    const missing = new Set(missingHashes);
+    const selected = new Set<string>();
+    const ranges: ReconcileManifestRange[] = [];
+    for (const chunk of chunks) {
+        if (missing.has(chunk.hash) && !selected.has(chunk.hash)) {
+            selected.add(chunk.hash);
+            ranges.push(chunk);
+        }
+    }
+    return ranges;
 }

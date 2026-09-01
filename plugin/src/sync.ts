@@ -38,8 +38,10 @@ import {
 } from "./bulk-codec";
 import {
     HashWorkerFileDriftError,
+    HashWorkerPoolError,
     type DesktopHashWorkerPool,
 } from "./desktop-hash-workers";
+import { reconcileDesktopLargeFile } from "./desktop-reconcile-upload";
 import {
     automaticChangeNeedsReview,
     metadataScanNeedsReview,
@@ -768,6 +770,90 @@ export class ObsetyncSyncEngine {
             progress(`reconcile: large file ${largeIdx}/${missingLargeManifests.length}`);
             notice?.setMessage(`Re-uploading large file ${largeIdx}/${missingLargeManifests.length}`);
             try {
+                const absolutePath = this.io.getAbsolutePath(path);
+                const currentStat = absolutePath ? await this.io.stat(path) : null;
+                if (
+                    this.hashWorkers && absolutePath &&
+                    (!currentStat || currentStat.size !== source.size)
+                ) {
+                    await yieldToUI();
+                    continue;
+                }
+                if (
+                    this.hashWorkers && absolutePath && currentStat &&
+                    currentStat.size === source.size
+                ) {
+                    try {
+                        const ranged = await reconcileDesktopLargeFile(
+                            this.hashWorkers,
+                            {
+                                absolutePath,
+                                expectedHash: hash,
+                                expectedSize: currentStat.size,
+                                expectedMtime: currentStat.mtime,
+                                feedBytes: getHashTuning().feedBytes,
+                            },
+                            async (hashes) => {
+                                const endChunkCheck = perf?.phase("check");
+                                try {
+                                    return await this.api.checkContentChunks([...hashes], perf);
+                                } finally {
+                                    endChunkCheck?.();
+                                }
+                            },
+                            async (records) => {
+                                const endUpload = perf?.phase("upload");
+                                try {
+                                    await this.api.putObjects(records, perf);
+                                } finally {
+                                    endUpload?.();
+                                }
+                            },
+                            this.hashWorkerAbort.signal,
+                        );
+                        perf?.addPhase("read", ranged.workerReadMs);
+                        perf?.addPhase("fastcdc", ranged.workerHashMs);
+                        if (ranged.status === "drifted") {
+                            await yieldToUI();
+                            continue;
+                        }
+                        perf?.addPhase("read", ranged.rangeReadMs);
+                        perf?.observePeakBatchBytes(ranged.peakBufferedBytes);
+                        contentBytesNeeded += ranged.neededBytes;
+                        bytes += ranged.uploadedBytes;
+                        largeUploaded++;
+                        perf?.increment({
+                            filesCompleted: 1,
+                            bytesTransferred: ranged.uploadedBytes,
+                        });
+                        await yieldToUI();
+                        continue;
+                    } catch (error) {
+                        if (
+                            error instanceof HashWorkerFileDriftError ||
+                            (error instanceof HashWorkerPoolError && error.code === "CLOSED") ||
+                            (error as Error)?.name === "AbortError"
+                        ) {
+                            throw error;
+                        }
+                        if (error instanceof HashWorkerPoolError) {
+                            if (!this.hashWorkerFallbackWarned) {
+                                this.hashWorkerFallbackWarned = true;
+                                console.warn(
+                                    "[obsetync] hash worker unavailable during reconcile; " +
+                                    "using renderer fallback:",
+                                    error,
+                                );
+                            }
+                        } else {
+                            throw error;
+                        }
+                    }
+                }
+
+                // Mobile or worker-unavailable fallback. DataAdapter has no
+                // ranged-read API, so this remains one explicitly bounded
+                // whole-file operation per large file.
                 const endRead = perf?.phase("read");
                 const data = await this.io.readFile(path);
                 endRead?.();

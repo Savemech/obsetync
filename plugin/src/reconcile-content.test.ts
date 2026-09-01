@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import {
     buildReconcileContentIndex,
+    selectReconcileMissingRanges,
     sumIndexedContentBytes,
 } from "./reconcile-content";
 
@@ -22,8 +23,21 @@ function run(): void {
         10,
         "planned content bytes counted a duplicate or unknown hash",
     );
+    assert.deepEqual(
+        selectReconcileMissingRanges([
+            { hash: "a", offset: 0, size: 4 },
+            { hash: "b", offset: 4, size: 4 },
+            { hash: "a", offset: 8, size: 4 },
+            { hash: "c", offset: 12, size: 4 },
+        ], ["c", "a", "unknown"]),
+        [
+            { hash: "a", offset: 0, size: 4 },
+            { hash: "c", offset: 12, size: 4 },
+        ],
+        "missing manifest ranges were reordered or duplicated",
+    );
 
-    console.log("reconcile-content.test: 6 assertions passed");
+    console.log("reconcile-content.test: 7 assertions passed");
 }
 
 run();
