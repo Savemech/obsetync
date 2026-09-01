@@ -10,6 +10,7 @@ pub enum ServerError {
     NotFound(String),
     BadRequest(String),
     PayloadTooLarge(String),
+    ServiceUnavailable(String),
     Conflict(String),
     Unauthorized,
     Internal(String),
@@ -23,6 +24,7 @@ impl std::fmt::Display for ServerError {
             Self::NotFound(msg) => write!(f, "not found: {}", msg),
             Self::BadRequest(msg) => write!(f, "bad request: {}", msg),
             Self::PayloadTooLarge(msg) => write!(f, "payload too large: {}", msg),
+            Self::ServiceUnavailable(msg) => write!(f, "service unavailable: {}", msg),
             Self::Conflict(msg) => write!(f, "conflict: {}", msg),
             Self::Unauthorized => write!(f, "unauthorized"),
             Self::Internal(msg) => write!(f, "internal: {}", msg),
@@ -39,6 +41,7 @@ impl IntoResponse for ServerError {
             Self::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             Self::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg.clone()),
+            Self::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
             Self::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".into()),
             Self::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
@@ -113,6 +116,15 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
         assert!(b.contains("bounded endpoint"));
+    }
+
+    #[tokio::test]
+    async fn service_unavailable_renders_503() {
+        let (s, b) =
+            status_and_body(ServerError::ServiceUnavailable("writer busy".into()).into_response())
+                .await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(b.contains("writer busy"));
     }
 
     #[tokio::test]

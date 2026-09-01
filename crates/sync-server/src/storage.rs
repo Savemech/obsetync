@@ -280,6 +280,7 @@ pub fn write_blob(path: &Path, data: &[u8]) -> Result<(), std::io::Error> {
     write_blob_with_optional_perf(path, data, None)
 }
 
+#[cfg(test)]
 pub fn write_blob_measured(
     path: &Path,
     data: &[u8],
