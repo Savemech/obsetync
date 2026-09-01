@@ -91,6 +91,15 @@ Both WASM builds expose: `WasmTree`, `Hasher`, `WasmChunker`, `wasm_hash`, `wasm
 
 Streaming calls use an adaptive bounded feed: 512 KiB initially on desktop (up to 1 MiB), 256 KiB on mobile, and back down toward 64 KiB when a synchronous WASM step blocks the event loop or Chromium reports heap pressure. Feed size changes never alter hashes or FastCDC boundaries.
 
+On desktop, `hash-worker-entry.ts` is bundled as minified CommonJS and embedded
+as text in `main.js`. A bounded `worker_threads` pool starts it with `eval: true`,
+so community-plugin installers still need only the standard plugin files. Each
+worker owns a separate SIMD WASM instance and opens the absolute file path from
+its job. The wire object contains path, expected size/mtime, feed, and
+`hash|manifest` mode; results contain only digest/manifest metadata and timings.
+The worker stats the open inode before processing and the pathname afterward,
+rejecting drift or atomic replacement before the candidate tree can commit.
+
 The native build exposes (to `bridge.rs`): `sync_core::diff::compute_deltas`, `sync_core::merge::merge_trees`, `sync_core::store::DiskChunkStore`.
 
 `diff.rs` and `merge.rs` are compiled into the WASM binary but all their code is unreachable from JavaScript and will be eliminated by `wasm-opt` dead-code elimination during the release build.

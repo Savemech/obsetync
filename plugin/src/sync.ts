@@ -19,7 +19,7 @@ const LARGE_FILE_THRESHOLD = 1_048_576; // 1 MB
 import { ObsetyncApi, PushConflict } from "./api";
 import { conflictCopyPath } from "./conflict-path";
 import { ObsetyncWsChannel, PresenceUpdate, WsState } from "./ws";
-import { PlatformIO } from "./platform";
+import { PlatformIO, type FileStat } from "./platform";
 import { ObsetyncSyncBase } from "./sync-base";
 import { ObsetyncJournal, type NewJournalEntry } from "./journal";
 import { perfSpan } from "./debug-log";
@@ -32,6 +32,10 @@ import { DirtyPathSet, type DirtyFileChange } from "./dirty-set";
 import { OperationCheckpoint } from "./operation-checkpoint";
 import { exactArrayBuffer } from "./binary";
 import { getHashTuning } from "./hash-runtime";
+import {
+    HashWorkerFileDriftError,
+    type DesktopHashWorkerPool,
+} from "./desktop-hash-workers";
 import {
     automaticChangeNeedsReview,
     metadataScanNeedsReview,
@@ -99,6 +103,8 @@ export class ObsetyncSyncEngine {
      *  append/hash classification has not finished yet. Pull consults this
      *  live set immediately before replacing remote content. */
     private localEventsInFlight = new Set<string>();
+    private readonly hashWorkerAbort = new AbortController();
+    private hashWorkerFallbackWarned = false;
 
     constructor(
         private app: App,
@@ -126,6 +132,7 @@ export class ObsetyncSyncEngine {
         ignorePatterns: string[] = [],
         private operationCheckpoint?: OperationCheckpoint,
         private autoSync: boolean = true,
+        private hashWorkers: DesktopHashWorkerPool | null = null,
     ) {
         this.localRootHash = initialRootHash;
         this.ignore = compileIgnore(ignorePatterns);
@@ -373,6 +380,7 @@ export class ObsetyncSyncEngine {
     /** Stop the sync engine. */
     stop(): void {
         this.stopped = true;
+        this.hashWorkerAbort.abort();
         if (this.syncTimer) {
             window.clearInterval(this.syncTimer);
             this.syncTimer = null;
@@ -903,15 +911,14 @@ export class ObsetyncSyncEngine {
                         }
                         const itemIndex = i + batchIndex;
                         const sampleWeight = hashSampleWeights[itemIndex];
-                        const hash = await hashFileStreaming(
+                        const stable = await this.hashStableFile(
                             path,
-                            this.io,
-                            this.wasm,
+                            stat,
                             sampleWeight > 0 ? perf : undefined,
                             sampleWeight,
                         );
-                        if (base && hash === base.hash) return null; // unchanged
-                        return { path, stat, hash, base };
+                        if (base && stable.hash === base.hash) return null; // unchanged
+                        return { path, stat: stable.stat, hash: stable.hash, base };
                     })
                 );
 
@@ -1448,6 +1455,7 @@ export class ObsetyncSyncEngine {
                     if (operationId) this.operationCheckpoint?.progress(operationId, text);
                 },
                 perf,
+                this.hashWorkers,
             );
             if (result.newRootHash) {
                 this.localRootHash = result.newRootHash;
@@ -1746,15 +1754,19 @@ export class ObsetyncSyncEngine {
                                 }
                                 const itemIndex = i + batchIndex;
                                 const sampleWeight = hashSampleWeights[itemIndex];
-                                const hash = await hashFileStreaming(
+                                const stable = await this.hashStableFile(
                                     path,
-                                    this.io,
-                                    this.wasm,
+                                    stat,
                                     sampleWeight > 0 ? perf : undefined,
                                     sampleWeight,
                                 );
-                                if (hash === knownHash) return null;
-                                return { path, stat, hash, knownHash };
+                                if (stable.hash === knownHash) return null;
+                                return {
+                                    path,
+                                    stat: stable.stat,
+                                    hash: stable.hash,
+                                    knownHash,
+                                };
                             }),
                         );
                         for (const result of results) {
@@ -1844,11 +1856,75 @@ export class ObsetyncSyncEngine {
                 : null;
         }
         try {
-            return await hashFileStreaming(file.path, this.io, this.wasm);
+            return (await this.hashStableFile(file.path, file.stat)).hash;
         } catch (error) {
             console.warn(`[obsetync] pull-echo verification failed for ${file.path}:`, error);
             return null;
         }
+    }
+
+    /** Hash a stable pathname. Desktop workers receive only path/stat metadata
+     * and return only digest/timings; a stat drift retries once with the fresh
+     * fingerprint. Mobile and unavailable-worker paths keep the bounded
+     * renderer implementation. */
+    private async hashStableFile(
+        path: string,
+        expected: FileStat,
+        perf?: PerfOperation,
+        perfWeight = 1,
+    ): Promise<{ hash: string; stat: FileStat }> {
+        let current = expected;
+        for (let attempt = 0; attempt < 2; attempt++) {
+            const absolutePath = this.io.getAbsolutePath(path);
+            if (this.hashWorkers && absolutePath) {
+                try {
+                    const result = await this.hashWorkers.run({
+                        absolutePath,
+                        expectedSize: current.size,
+                        expectedMtime: current.mtime,
+                        mode: "hash",
+                        feedBytes: getHashTuning().feedBytes,
+                    }, this.hashWorkerAbort.signal);
+                    if (result.mode !== "hash") throw new Error("hash worker mode mismatch");
+                    perf?.addPhase("read", result.read_ms * perfWeight);
+                    perf?.addPhase("hash", result.hash_ms * perfWeight);
+                    return { hash: result.hash, stat: current };
+                } catch (error) {
+                    if (error instanceof HashWorkerFileDriftError) {
+                        const refreshed = await this.io.stat(path);
+                        if (refreshed && attempt === 0) {
+                            current = refreshed;
+                            continue;
+                        }
+                        throw error;
+                    }
+                    if ((error as Error)?.name === "AbortError") throw error;
+                    if (!this.hashWorkerFallbackWarned) {
+                        this.hashWorkerFallbackWarned = true;
+                        console.warn(
+                            "[obsetync] desktop hash worker failed; using renderer fallback:",
+                            error,
+                        );
+                    }
+                }
+            }
+
+            const hash = await hashFileStreaming(path, this.io, this.wasm, perf, perfWeight);
+            const after = await this.io.stat(path);
+            if (
+                after &&
+                after.size === current.size &&
+                Math.abs(after.mtime - current.mtime) <= 1
+            ) {
+                return { hash, stat: after };
+            }
+            if (after && attempt === 0) {
+                current = after;
+                continue;
+            }
+            throw new HashWorkerFileDriftError();
+        }
+        throw new HashWorkerFileDriftError();
     }
 
     private attachVaultListeners(): void {

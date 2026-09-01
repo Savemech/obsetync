@@ -4,6 +4,7 @@ import {
     reenrollmentRequired,
 } from "./transport-errors";
 import { PerfTrace } from "./perf-trace";
+import { HashWorkerFileDriftError } from "./desktop-hash-workers";
 
 (globalThis as any).window ??= globalThis;
 
@@ -335,11 +336,90 @@ async function incrementalPushChecksOnlyNewCandidateChunks(): Promise<void> {
     check(f.abortCalls() === 0, "incremental push aborted after success");
 }
 
+async function workerManifestAvoidsRendererFileBytes(): Promise<void> {
+    const f = fixture();
+    const fileHash = "f".repeat(64);
+    const chunkHash = "1".repeat(64);
+    const size = 2 * 1024 * 1024;
+    f.wasm.wasm_should_chunk = (bytes: number) => bytes >= 1024 * 1024;
+    let readCalls = 0;
+    f.io.getAbsolutePath = (path: string) => `/vault/${path}`;
+    f.io.readFile = async () => {
+        readCalls++;
+        throw new Error("renderer read should not happen");
+    };
+    let workerInput: any;
+    const workers = {
+        run: async (input: any) => {
+            workerInput = input;
+            return {
+                type: "result",
+                job_id: "test",
+                mode: "manifest",
+                manifest: {
+                    file_hash: fileHash,
+                    total_size: size,
+                    chunks: [{ hash: chunkHash, offset: 0, size }],
+                },
+                size,
+                mtime: 10,
+                read_ms: 1,
+                hash_ms: 2,
+            };
+        },
+    } as any;
+    let manifestUploads = 0;
+    const api = {
+        ensureTransportReady: async () => {},
+        checkContentChunks: async () => [],
+        putManifest: async () => { manifestUploads++; },
+        putRoot: async () => ({ root_hash: "accepted", conflicts: [] }),
+    } as any;
+
+    await push(api, f.io, f.syncBase, f.wasm, f.tree, "vault", [{
+        action: "created",
+        path: "large.bin",
+        mtime: 10,
+        size,
+    }], "base", undefined, undefined, workers);
+
+    check(workerInput.absolutePath === "/vault/large.bin", "worker did not receive absolute path");
+    check(workerInput.mode === "manifest", "large file did not request a manifest job");
+    check(!("data" in workerInput), "file bytes crossed the worker boundary");
+    check(readCalls === 0, "deduplicated worker manifest re-read the file in renderer");
+    check(manifestUploads === 1, "worker manifest was not uploaded");
+    check(f.entries.get("large.bin")?.hash === fileHash, "worker hash was not committed");
+}
+
+async function workerDriftAbortsCandidate(): Promise<void> {
+    const f = fixture();
+    f.io.getAbsolutePath = () => "/vault/drift.md";
+    const workers = {
+        run: async () => { throw new HashWorkerFileDriftError(); },
+    } as any;
+    const api = { ensureTransportReady: async () => {} } as any;
+    let drifted = false;
+    try {
+        await push(api, f.io, f.syncBase, f.wasm, f.tree, "vault", [{
+            action: "modified",
+            path: "drift.md",
+            mtime: 12,
+            size: 12,
+        }], "base", undefined, undefined, workers);
+    } catch (error) {
+        drifted = error instanceof HashWorkerFileDriftError;
+    }
+    check(drifted, "worker stat drift was hidden");
+    check(f.abortCalls() === 1, "worker stat drift did not abort candidate");
+}
+
 void terminalPreflightDoesNotMutate()
     .then(failedRootRestoresCandidate)
     .then(failedRootDoesNotCommitUpsert)
     .then(everyPostCandidateFailureAbortsWithoutFullSnapshot)
     .then(incrementalPushChecksOnlyNewCandidateChunks)
+    .then(workerManifestAvoidsRendererFileBytes)
+    .then(workerDriftAbortsCandidate)
     .then(acceptedRootCommitsMetadata)
     .then(() => console.log(`push-transaction.test: ${assertions} assertions passed`))
     .catch((error) => {

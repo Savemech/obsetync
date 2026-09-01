@@ -17,4 +17,5 @@ import "./push-transaction.test";
 import "./perf-trace.test";
 import "./reconcile-content.test";
 import "./wasm-runtime.test";
+import "./desktop-hash-workers.test";
 import "./hash-runtime.test";

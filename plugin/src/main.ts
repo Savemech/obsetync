@@ -16,6 +16,11 @@ import {
 } from "./perf-trace";
 import { configureHashRuntime, type HashTuning } from "./hash-runtime";
 import { createWasmLoader, type WasmSelection } from "./wasm-runtime";
+import {
+    createDesktopHashWorkerPool,
+    type DesktopHashWorkerPool,
+} from "./desktop-hash-workers";
+import hashWorkerSource from "obsetync-hash-worker-source";
 
 // Static import of the wasm-bindgen --target web glue. esbuild inlines this
 // ES module into main.js at build time — no runtime `new Function(...)` or
@@ -52,6 +57,7 @@ export default class ObsetyncPlugin extends Plugin {
     private wasm!: WasmModule;
     private tree!: WasmTree;
     private wasmLoader: (() => Promise<WasmSelection<WasmModule>>) | null = null;
+    private hashWorkers: DesktopHashWorkerPool | null = null;
     private operationCheckpoint!: OperationCheckpoint;
     private statusBarEl: HTMLElement | null = null;
 
@@ -154,6 +160,8 @@ export default class ObsetyncPlugin extends Plugin {
         // never let it skip the listener teardown below.
         try {
             this.syncEngine?.stop();
+            void this.hashWorkers?.close();
+            this.hashWorkers = null;
         } catch (e) {
             console.warn("[obsetync] engine stop failed during unload:", e);
         }
@@ -204,6 +212,8 @@ export default class ObsetyncPlugin extends Plugin {
         push("--- Platform ---");
         push(`Transport:         AEAD envelope over HTTP (X25519 + HKDF-SHA256 + AES-256-GCM)`);
         push(`WASM:              ${this.wasm ? `loaded (${perfTrace.getProfile().wasmMode})` : "not loaded"}`);
+        const workerStats = this.hashWorkers?.stats();
+        push(`Hash workers:      ${workerStats ? `${workerStats.ready}/${workerStats.workers} ready · ${workerStats.active} active · ${workerStats.queued} queued` : "renderer fallback"}`);
         push(`Plugin id:         ${this.manifest.id}`);
         push(`Plugin version:    ${this.manifest.version}`);
         push("");
@@ -436,6 +446,10 @@ export default class ObsetyncPlugin extends Plugin {
         const endSpan = perfSpan("init");
         try {
             await this.initSyncInner();
+        } catch (error) {
+            await this.hashWorkers?.close();
+            this.hashWorkers = null;
+            throw error;
         } finally {
             endSpan();
         }
@@ -444,6 +458,8 @@ export default class ObsetyncPlugin extends Plugin {
     private async initSyncInner(): Promise<void> {
         // Stop existing engine if re-initializing.
         this.syncEngine?.stop();
+        await this.hashWorkers?.close();
+        this.hashWorkers = null;
 
         if (
             !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(this.settings.vaultId) ||
@@ -479,6 +495,21 @@ export default class ObsetyncPlugin extends Plugin {
         // initialize: development hash stubs are not content-address compatible
         // with the server and must never participate in a real vault.
         this.wasm = await this.loadWasm();
+        if (!Platform.isMobile) {
+            this.hashWorkers = createDesktopHashWorkerPool(hashWorkerSource);
+            if (this.hashWorkers) {
+                perfTrace.setProfile({
+                    ...perfTrace.getProfile(),
+                    hashConcurrency: this.hashWorkers.workerCount,
+                });
+                console.log(
+                    `[obsetync] desktop hash pool starting ` +
+                    `(${this.hashWorkers.workerCount} SIMD workers)`,
+                );
+            } else {
+                console.warn("[obsetync] desktop hash workers unavailable; using renderer hashing");
+            }
+        }
 
         // Create WASM tree.
         this.tree = new this.wasm.WasmTree(
@@ -524,6 +555,7 @@ export default class ObsetyncPlugin extends Plugin {
             this.settings.ignorePatterns,
             this.operationCheckpoint,
             this.settings.autoSync,
+            this.hashWorkers,
         );
 
         // Start.

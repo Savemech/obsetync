@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "runtime": {
+    "platform": "linux",
+    "architecture": "x64",
+    "node": "v22.23.2",
+    "cpu": "AMD Ryzen 9 5950X 16-Core Processor"
+  },
+  "workload": {
+    "files": 64,
+    "bytes": 1073741824,
+    "workers": 4,
+    "feed_bytes": 524288
+  },
+  "elapsed_ms": 516.318988,
+  "throughput_mib_per_second": 1983.2700787676629,
+  "event_loop_lag": {
+    "samples": 100,
+    "p50_ms": 0.20563500000002932,
+    "p95_ms": 0.6854060000000572,
+    "p99_ms": 0.8574309999999059,
+    "target_p95_ms": 16,
+    "target_met": true
+  },
+  "invariants": {
+    "scalar_simd_hash_parity_inherited_from_slice3": true,
+    "hash_manifest_parity": true,
+    "protocol_metadata_only": true,
+    "drift_detected": true,
+    "cancellation_observed": true
+  }
+}

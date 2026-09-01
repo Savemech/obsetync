@@ -29,6 +29,14 @@ the best SIMD median is 1,320 MiB/s versus 634 MiB/s scalar (2.08x). The parity
 gate separately checks one-shot/batched BLAKE3 plus streaming BLAKE3 and
 FastCDC manifests at five feed sizes over boundary-focused and 10 MiB inputs.
 
+`desktop-workers-slice4.json` runs the production worker bundle through four
+real Node `worker_threads` over 64 × 16 MiB deterministic files (1 GiB total).
+The minified production worker bundle sustains 1,983 MiB/s from warm filesystem
+cache while renderer-side event-loop lag remains 0.69 ms p95 / 0.86 ms p99
+across 100 samples, against the 16 ms p95 gate.
+The same run proves hash/manifest parity, cancellation, pre/post-stat drift
+detection, and that neither request nor response carries file bytes.
+
 This Linux/x86_64 run is implementation evidence, not the final cross-hardware
 release report. A17, M1, Snapdragon, cold/warm cache, power, and network fields
 are added by the final hardware gate.

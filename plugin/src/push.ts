@@ -8,6 +8,11 @@ import {
     planByteBoundedBatches,
     type HashTuning,
 } from "./hash-runtime";
+import {
+    HashWorkerFileDriftError,
+    HashWorkerPoolError,
+    type DesktopHashWorkerPool,
+} from "./desktop-hash-workers";
 
 /** Streaming Blake3 hasher — feed bounded slices, call finalize(), then free(). */
 export interface WasmHasher {
@@ -194,6 +199,7 @@ export async function push(
     baseRootHash: string | null,
     onProgress?: (msg: string) => void,
     perf?: PerfOperation,
+    hashWorkers?: DesktopHashWorkerPool | null,
 ): Promise<{ newRootHash: string | null; conflicts: any[] }> {
     perf?.setWorkload({ filesTotal: changes.length });
     if (changes.length === 0) {
@@ -286,6 +292,7 @@ export async function push(
     // files are singletons, while small files may share one WASM hash call
     // without allowing retained JS buffers to exceed the platform budget.
     const tuning = getHashTuning();
+    let workerFallbackWarned = false;
     const streamBatches = planByteBoundedBatches(nonDeleted, (change) => {
         if (change.size === undefined || wasm.wasm_should_chunk(change.size)) {
             return tuning.maxSingleBatchFileBytes + 1;
@@ -322,16 +329,82 @@ export async function push(
             // Partition: known-hash small files skip reading.
             const skipRead: FileChange[] = [];
             const needRead: FileChange[] = [];
+            const workerEligible: Array<{ change: FileChange; absolutePath: string }> = [];
             for (const c of group) {
                 if (c.hash && c.size !== undefined && !wasm.wasm_should_chunk(c.size)) {
                     skipRead.push(c);
                 } else {
-                    needRead.push(c);
+                    const absolutePath = c.data === undefined && c.size !== undefined &&
+                        c.mtime !== undefined ? io.getAbsolutePath(c.path) : null;
+                    if (hashWorkers && absolutePath) {
+                        workerEligible.push({ change: c, absolutePath });
+                    } else {
+                        needRead.push(c);
+                    }
                 }
             }
 
             for (const c of skipRead) {
                 batchFiles.push(new ObsetyncBatchFile(c, c.size!, c.mtime ?? Date.now()));
+            }
+
+            if (workerEligible.length > 0) {
+                const workerResults = await Promise.all(workerEligible.map(async (candidate) => {
+                    try {
+                        const result = await hashWorkers!.run({
+                            absolutePath: candidate.absolutePath,
+                            expectedSize: candidate.change.size!,
+                            expectedMtime: candidate.change.mtime!,
+                            mode: wasm.wasm_should_chunk(candidate.change.size!)
+                                ? "manifest"
+                                : "hash",
+                            feedBytes: tuning.feedBytes,
+                        });
+                        return { candidate, result };
+                    } catch (error) {
+                        if (
+                            error instanceof HashWorkerFileDriftError ||
+                            (error instanceof HashWorkerPoolError && error.code === "CLOSED") ||
+                            (error as Error)?.name === "AbortError"
+                        ) {
+                            throw error;
+                        }
+                        if (!workerFallbackWarned) {
+                            workerFallbackWarned = true;
+                            console.warn(
+                                "[obsetync] hash worker unavailable during push; " +
+                                "using renderer fallback:",
+                                error,
+                            );
+                        }
+                        needRead.push(candidate.change);
+                        return null;
+                    }
+                }));
+                perf?.observePeakBatchBytes(workerEligible.length * tuning.feedBytes);
+                for (const row of workerResults) {
+                    if (!row) continue;
+                    const { change } = row.candidate;
+                    perf?.addPhase("read", row.result.read_ms);
+                    if (row.result.mode === "hash") {
+                        perf?.addPhase("hash", row.result.hash_ms);
+                        change.hash = row.result.hash;
+                        batchFiles.push(new ObsetyncBatchFile(
+                            change,
+                            row.result.size,
+                            change.mtime!,
+                        ));
+                    } else {
+                        perf?.addPhase("fastcdc", row.result.hash_ms);
+                        change.hash = row.result.manifest.file_hash;
+                        batchFiles.push(new ObsetyncBatchFile(
+                            change,
+                            row.result.size,
+                            change.mtime!,
+                            row.result.manifest,
+                        ));
+                    }
+                }
             }
 
             if (needRead.length === 0) continue;
@@ -437,22 +510,51 @@ export async function push(
         // C. Upload missing content. Collect tree updates.
         // ------------------------------------------------------------------
         for (const { change, size, mtime, chunkInfo, largeData } of batchFiles) {
-            if (chunkInfo && largeData) {
-                let fileBytesUploaded = 0;
-                for (const chunk of chunkInfo.chunks as any[]) {
-                    if (neededChunksSet.has(chunk.hash)) {
-                        const chunkData = largeData.subarray(
-                            chunk.offset,
-                            chunk.offset + chunk.size,
+            if (chunkInfo) {
+                const missingChunks = (chunkInfo.chunks as any[])
+                    .filter((chunk: any) => neededChunksSet.has(chunk.hash));
+                let content = largeData;
+                if (missingChunks.length > 0 && !content) {
+                    const before = await io.stat(change.path);
+                    if (
+                        !before || before.size !== size ||
+                        Math.abs(before.mtime - mtime) > 1
+                    ) {
+                        throw new HashWorkerFileDriftError(
+                            "file changed between manifest planning and upload",
                         );
-                        const endUpload = perf?.phase("upload");
-                        try {
-                            await api.putContentChunk(chunk.hash, chunkData, perf);
-                        } finally {
-                            endUpload?.();
-                        }
-                        fileBytesUploaded += chunkData.length;
                     }
+                    const endRead = perf?.phase("read");
+                    try {
+                        content = await io.readFile(change.path);
+                    } finally {
+                        endRead?.();
+                    }
+                    const after = await io.stat(change.path);
+                    if (
+                        content.length !== size ||
+                        !after || after.size !== size ||
+                        Math.abs(after.mtime - mtime) > 1
+                    ) {
+                        throw new HashWorkerFileDriftError(
+                            "file changed while loading planned chunks",
+                        );
+                    }
+                    perf?.observePeakBatchBytes(content.length);
+                }
+                let fileBytesUploaded = 0;
+                for (const chunk of missingChunks) {
+                    const chunkData = content!.subarray(
+                        chunk.offset,
+                        chunk.offset + chunk.size,
+                    );
+                    const endUpload = perf?.phase("upload");
+                    try {
+                        await api.putContentChunk(chunk.hash, chunkData, perf);
+                    } finally {
+                        endUpload?.();
+                    }
+                    fileBytesUploaded += chunkData.length;
                 }
                 const endManifest = perf?.phase("upload");
                 try {
