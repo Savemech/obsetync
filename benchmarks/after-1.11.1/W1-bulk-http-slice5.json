@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "runtime": {
+    "platform": "linux",
+    "architecture": "x64",
+    "node": "v22.23.2",
+    "cpu": "AMD Ryzen 9 5950X 16-Core Processor"
+  },
+  "workload": {
+    "id": "W1",
+    "files": 100000,
+    "bytes": 870400000,
+    "size_distribution": "deterministic round-robin 1..16 KiB"
+  },
+  "profiles": [
+    {
+      "profile": "desktop",
+      "limits": {
+        "maxBytes": 8388608,
+        "maxObjects": 256,
+        "maxObjectBytes": 1048575
+      },
+      "planner_elapsed_ms": 122.15296899999998,
+      "check_requests": 391,
+      "upload_requests": 391,
+      "total_data_requests": 782,
+      "legacy_data_requests": 100391,
+      "request_reduction_ratio": 128.37723785166241,
+      "max_pack_bytes": 2238986,
+      "max_pack_objects": 256,
+      "single_object_fallbacks": 0,
+      "byte_limit_held": true,
+      "count_limit_held": true
+    },
+    {
+      "profile": "mobile",
+      "limits": {
+        "maxBytes": 2097152,
+        "maxObjects": 256,
+        "maxObjectBytes": 1048575
+      },
+      "planner_elapsed_ms": 84.036473,
+      "check_requests": 391,
+      "upload_requests": 419,
+      "total_data_requests": 810,
+      "legacy_data_requests": 100391,
+      "request_reduction_ratio": 123.9395061728395,
+      "max_pack_bytes": 2096960,
+      "max_pack_objects": 239,
+      "single_object_fallbacks": 0,
+      "byte_limit_held": true,
+      "count_limit_held": true
+    }
+  ],
+  "invariants": {
+    "production_planner_imported": true,
+    "order_preserved": true,
+    "aggregate_pack_bodies_not_materialized_by_planner": true
+  }
+}

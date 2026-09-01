@@ -37,6 +37,13 @@ across 100 samples, against the 16 ms p95 gate.
 The same run proves hash/manifest parity, cancellation, pre/post-stat drift
 detection, and that neither request nor response carries file bytes.
 
+`W1-bulk-http-slice5.json` runs the production bulk planner over all 100,000
+W1 files (870.4 MB, deterministic 1–16 KiB distribution). The legacy data
+path needs 100,391 check/upload requests. Bulk-v1 needs 782 on desktop and 810
+under the 2 MiB mobile budget: 128.4x and 123.9x fewer requests respectively.
+Every planned pack stays within the authenticated byte/count caps; the planner
+does not materialize aggregate bodies while calculating those boundaries.
+
 This Linux/x86_64 run is implementation evidence, not the final cross-hardware
 release report. A17, M1, Snapdragon, cold/warm cache, power, and network fields
 are added by the final hardware gate.
