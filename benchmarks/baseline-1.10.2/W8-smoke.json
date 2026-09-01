@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "harness_version": "1.10.2",
+  "workload": "W8",
+  "seed": 819217251961995265,
+  "scale": {
+    "millionths": 10000
+  },
+  "operating_system": "linux",
+  "architecture": "x86_64",
+  "file_count": 680,
+  "total_bytes": 22517093,
+  "iterations": [
+    {
+      "enumerate_and_hash_ns": 44194961,
+      "tree_build_ns": 950250,
+      "files_per_second": 15386.369500360008,
+      "mebibytes_per_second": 485.8918932914311,
+      "initial_tree_chunks": 1,
+      "final_tree_chunks": 1,
+      "initial_root": "5f63c12735192836871474ea8897232f8f3833c52d17ae7386dc2f7de80bfc60",
+      "final_root": "5f63c12735192836871474ea8897232f8f3833c52d17ae7386dc2f7de80bfc60",
+      "scenario_operations": 0,
+      "scenario_elapsed_ns": 1120,
+      "operation_latency_p50_ns": null,
+      "operation_latency_p95_ns": null,
+      "operation_latency_p99_ns": null
+    },
+    {
+      "enumerate_and_hash_ns": 28379938,
+      "tree_build_ns": 192590,
+      "files_per_second": 23960.587933631145,
+      "mebibytes_per_second": 756.6603307671411,
+      "initial_tree_chunks": 1,
+      "final_tree_chunks": 1,
+      "initial_root": "5f63c12735192836871474ea8897232f8f3833c52d17ae7386dc2f7de80bfc60",
+      "final_root": "5f63c12735192836871474ea8897232f8f3833c52d17ae7386dc2f7de80bfc60",
+      "scenario_operations": 0,
+      "scenario_elapsed_ns": 1040,
+      "operation_latency_p50_ns": null,
+      "operation_latency_p95_ns": null,
+      "operation_latency_p99_ns": null
+    },
+    {
+      "enumerate_and_hash_ns": 36173770,
+      "tree_build_ns": 212270,
+      "files_per_second": 18798.151257112542,
+      "mebibytes_per_second": 593.633820147332,
+      "initial_tree_chunks": 1,
+      "final_tree_chunks": 1,
+      "initial_root": "5f63c12735192836871474ea8897232f8f3833c52d17ae7386dc2f7de80bfc60",
+      "final_root": "5f63c12735192836871474ea8897232f8f3833c52d17ae7386dc2f7de80bfc60",
+      "scenario_operations": 0,
+      "scenario_elapsed_ns": 490,
+      "operation_latency_p50_ns": null,
+      "operation_latency_p95_ns": null,
+      "operation_latency_p99_ns": null
+    }
+  ]
+}

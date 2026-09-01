@@ -4,6 +4,7 @@ members = [
     "crates/sync-core",
     "crates/sync-schema",
     "crates/sync-server",
+    "crates/perf-harness",
     "crates/e2e-tests",
 ]
 # `cargo build --workspace` should not pull in reqwest + crypto deps from the

@@ -1,0 +1,17 @@
+[package]
+name = "perf-harness"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+sync-core = { path = "../sync-core" }
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"

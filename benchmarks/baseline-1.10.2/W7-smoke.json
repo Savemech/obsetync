@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "harness_version": "1.10.2",
+  "workload": "W7",
+  "seed": 819217251961995265,
+  "scale": {
+    "millionths": 10000
+  },
+  "operating_system": "linux",
+  "architecture": "x86_64",
+  "file_count": 500,
+  "total_bytes": 1135604,
+  "iterations": [
+    {
+      "enumerate_and_hash_ns": 10352994,
+      "tree_build_ns": 995151,
+      "files_per_second": 48295.20813013124,
+      "mebibytes_per_second": 104.60707003290092,
+      "initial_tree_chunks": 1,
+      "final_tree_chunks": 750,
+      "initial_root": "159b1075afb874e5fd432813370db2fb596bea03231e9fb487632afba9c6289d",
+      "final_root": "63a4bdb5aa9b810fd724681023d222a3d75a834b3d8bde0ec187672b52cce3a3",
+      "scenario_operations": 500,
+      "scenario_elapsed_ns": 103500371,
+      "operation_latency_p50_ns": 194930,
+      "operation_latency_p95_ns": 450711,
+      "operation_latency_p99_ns": 725681
+    },
+    {
+      "enumerate_and_hash_ns": 14053836,
+      "tree_build_ns": 204670,
+      "files_per_second": 35577.47507513251,
+      "mebibytes_per_second": 77.06055260700374,
+      "initial_tree_chunks": 1,
+      "final_tree_chunks": 750,
+      "initial_root": "159b1075afb874e5fd432813370db2fb596bea03231e9fb487632afba9c6289d",
+      "final_root": "63a4bdb5aa9b810fd724681023d222a3d75a834b3d8bde0ec187672b52cce3a3",
+      "scenario_operations": 500,
+      "scenario_elapsed_ns": 71309149,
+      "operation_latency_p50_ns": 146030,
+      "operation_latency_p95_ns": 297880,
+      "operation_latency_p99_ns": 575261
+    },
+    {
+      "enumerate_and_hash_ns": 9112124,
+      "tree_build_ns": 200240,
+      "files_per_second": 54871.94862580887,
+      "mebibytes_per_second": 118.852242178465,
+      "initial_tree_chunks": 1,
+      "final_tree_chunks": 750,
+      "initial_root": "159b1075afb874e5fd432813370db2fb596bea03231e9fb487632afba9c6289d",
+      "final_root": "63a4bdb5aa9b810fd724681023d222a3d75a834b3d8bde0ec187672b52cce3a3",
+      "scenario_operations": 500,
+      "scenario_elapsed_ns": 94733449,
+      "operation_latency_p50_ns": 180110,
+      "operation_latency_p95_ns": 432330,
+      "operation_latency_p99_ns": 1214030
+    }
+  ]
+}
