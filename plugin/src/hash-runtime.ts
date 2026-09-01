@@ -2,6 +2,11 @@ export type HashRuntime = "desktop" | "mobile" | "unknown";
 
 export interface HashTuning {
     runtime: HashRuntime;
+    profile: "recovery" | "conservative" | "balanced" | "throughput";
+    hashConcurrency: number;
+    maxHashConcurrency: number;
+    networkConcurrency: number;
+    applyConcurrency: number;
     feedBytes: number;
     minFeedBytes: number;
     maxFeedBytes: number;
@@ -10,6 +15,8 @@ export interface HashTuning {
     maxSingleBatchFileBytes: number;
     maxBatchHoldMs: number;
     readConcurrency: number;
+    transientBudgetBytes: number;
+    yieldBudgetMs: number;
 }
 
 export interface HashFeedback {
@@ -36,6 +43,11 @@ export function hashTuningForRuntime(runtime: HashRuntime): HashTuning {
     if (runtime === "desktop") {
         return {
             runtime,
+            profile: "balanced",
+            hashConcurrency: 4,
+            maxHashConcurrency: 4,
+            networkConcurrency: 8,
+            applyConcurrency: 16,
             feedBytes: 512 * KIB,
             minFeedBytes: MIN_FEED,
             maxFeedBytes: MIB,
@@ -44,11 +56,18 @@ export function hashTuningForRuntime(runtime: HashRuntime): HashTuning {
             maxSingleBatchFileBytes: MIB,
             maxBatchHoldMs: 8,
             readConcurrency: 4,
+            transientBudgetBytes: 128 * MIB,
+            yieldBudgetMs: 12,
         };
     }
     if (runtime === "mobile") {
         return {
             runtime,
+            profile: "conservative",
+            hashConcurrency: 1,
+            maxHashConcurrency: 1,
+            networkConcurrency: 4,
+            applyConcurrency: 8,
             feedBytes: 256 * KIB,
             minFeedBytes: MIN_FEED,
             maxFeedBytes: 256 * KIB,
@@ -57,10 +76,17 @@ export function hashTuningForRuntime(runtime: HashRuntime): HashTuning {
             maxSingleBatchFileBytes: MIB,
             maxBatchHoldMs: 4,
             readConcurrency: 2,
+            transientBudgetBytes: 64 * MIB,
+            yieldBudgetMs: 8,
         };
     }
     return {
         runtime,
+        profile: "conservative",
+        hashConcurrency: 1,
+        maxHashConcurrency: 2,
+        networkConcurrency: 2,
+        applyConcurrency: 4,
         feedBytes: 128 * KIB,
         minFeedBytes: MIN_FEED,
         maxFeedBytes: 512 * KIB,
@@ -69,6 +95,8 @@ export function hashTuningForRuntime(runtime: HashRuntime): HashTuning {
         maxSingleBatchFileBytes: MIB,
         maxBatchHoldMs: 4,
         readConcurrency: 2,
+        transientBudgetBytes: 64 * MIB,
+        yieldBudgetMs: 8,
     };
 }
 
@@ -77,10 +105,12 @@ export class AdaptiveHashTuner {
     private healthySamples = 0;
 
     constructor(
-        runtime: HashRuntime,
+        runtimeOrTuning: HashRuntime | HashTuning,
         private readonly onChange?: (tuning: HashTuning) => void,
     ) {
-        this.tuning = hashTuningForRuntime(runtime);
+        this.tuning = typeof runtimeOrTuning === "string"
+            ? hashTuningForRuntime(runtimeOrTuning)
+            : { ...runtimeOrTuning };
     }
 
     current(): HashTuning {
@@ -193,6 +223,15 @@ export function configureHashRuntime(
     onChange?: (tuning: HashTuning) => void,
 ): HashTuning {
     activeTuner = new AdaptiveHashTuner(runtime, onChange);
+    return activeTuner.current();
+}
+
+/** Reset the feed tuner around a governor-selected platform profile. */
+export function configureHashTuning(
+    tuning: HashTuning,
+    onChange?: (tuning: HashTuning) => void,
+): HashTuning {
+    activeTuner = new AdaptiveHashTuner(tuning, onChange);
     return activeTuner.current();
 }
 

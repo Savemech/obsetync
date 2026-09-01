@@ -93,6 +93,7 @@ export interface PerfIncrement {
     requestCount?: number;
     wsFrameCount?: number;
     retries?: number;
+    backpressureEvents?: number;
     resumedPages?: number;
 }
 
@@ -124,6 +125,7 @@ export interface PerfOperationRecord {
     requestCount: number;
     wsFrameCount: number;
     retries: number;
+    backpressureEvents: number;
     resumedPages: number;
     dedupRatio: number | null;
     phases: Partial<Record<PerfPhase, number>>;
@@ -263,6 +265,7 @@ class PerfOperationHandle implements PerfOperation {
         requestCount: 0,
         wsFrameCount: 0,
         retries: 0,
+        backpressureEvents: 0,
         resumedPages: 0,
     };
     private workload: Required<PerfWorkload> = {
@@ -281,6 +284,7 @@ class PerfOperationHandle implements PerfOperation {
     private wasmChunks: PerfWasmChunks | null = null;
     private finished = false;
     private lagTimer: ReturnType<typeof setTimeout> | null = null;
+    private nextLagProbeAt: number | null = null;
 
     constructor(
         id: string,
@@ -367,6 +371,12 @@ class PerfOperationHandle implements PerfOperation {
         if (delta.retries !== undefined) {
             this.values.retries += finiteNonNegative(delta.retries, "retries");
         }
+        if (delta.backpressureEvents !== undefined) {
+            this.values.backpressureEvents += finiteNonNegative(
+                delta.backpressureEvents,
+                "backpressureEvents",
+            );
+        }
         if (delta.resumedPages !== undefined) {
             this.values.resumedPages += finiteNonNegative(
                 delta.resumedPages,
@@ -422,14 +432,24 @@ class PerfOperationHandle implements PerfOperation {
 
     finish(outcome: PerfOutcome = "success"): void {
         if (this.finished) return;
+        const finishedMono = this.monotonicNow();
+        if (
+            this.lagTimer !== null && this.nextLagProbeAt !== null &&
+            finishedMono >= this.nextLagProbeAt
+        ) {
+            // A synchronous phase can block the scheduled callback and then
+            // finish before it runs. Preserve that terminal lag sample.
+            this.lag.observe(Math.max(0, finishedMono - this.nextLagProbeAt));
+        }
         this.finished = true;
         if (this.lagTimer !== null) {
             clearTimeout(this.lagTimer);
             this.lagTimer = null;
         }
+        this.nextLagProbeAt = null;
 
         const finishedAt = this.wallNow();
-        const durationMs = Math.max(0, this.monotonicNow() - this.startedMono);
+        const durationMs = Math.max(0, finishedMono - this.startedMono);
         const bytesTotal = this.workloadKnown.bytesTotal ? this.workload.bytesTotal : null;
         const bytesNeeded = this.workloadKnown.bytesNeeded ? this.workload.bytesNeeded : null;
         const dedupRatio =
@@ -463,12 +483,12 @@ class PerfOperationHandle implements PerfOperation {
     }
 
     private scheduleLagProbe(): void {
-        let expected = this.monotonicNow() + this.eventLoopIntervalMs;
+        this.nextLagProbeAt = this.monotonicNow() + this.eventLoopIntervalMs;
         const tick = () => {
             if (this.finished) return;
             const now = this.monotonicNow();
-            this.observeEventLoopLag(Math.max(0, now - expected));
-            expected = now + this.eventLoopIntervalMs;
+            this.observeEventLoopLag(Math.max(0, now - this.nextLagProbeAt!));
+            this.nextLagProbeAt = now + this.eventLoopIntervalMs;
             this.lagTimer = setTimeout(tick, this.eventLoopIntervalMs);
             (this.lagTimer as any)?.unref?.();
         };
@@ -486,6 +506,7 @@ export class PerfTrace {
     private readonly eventLoopIntervalMs: number;
     private readonly records: PerfOperationRecord[] = [];
     private readonly active = new Set<string>();
+    private readonly listeners = new Set<(record: PerfOperationRecord) => void>();
     private profile = cloneProfile(DEFAULT_PERF_PROFILE);
     private sequence = 0;
 
@@ -531,8 +552,21 @@ export class PerfTrace {
                 if (this.records.length > this.maxRecords) {
                     this.records.splice(0, this.records.length - this.maxRecords);
                 }
+                for (const listener of this.listeners) {
+                    try {
+                        listener(cloneRecord(record));
+                    } catch (error) {
+                        console.warn("[obsetync] performance listener failed:", error);
+                    }
+                }
             },
         );
+    }
+
+    /** Observe completed aggregate records. One faulty listener is isolated. */
+    subscribe(listener: (record: PerfOperationRecord) => void): () => void {
+        this.listeners.add(listener);
+        return () => this.listeners.delete(listener);
     }
 
     recent(): PerfOperationRecord[] {
@@ -574,7 +608,8 @@ export class PerfTrace {
                     : ` · lag p95<=${record.eventLoopLagP95Ms}ms`;
             lines.push(
                 `  ${record.kind} ${record.outcome} ${formatDuration(record.durationMs)}` +
-                    `${files}${bytes} · req ${record.requestCount} · retry ${record.retries}${lag}`,
+                    `${files}${bytes} · req ${record.requestCount} · retry ${record.retries}` +
+                    ` · pressure ${record.backpressureEvents}${lag}`,
             );
         }
         return lines;

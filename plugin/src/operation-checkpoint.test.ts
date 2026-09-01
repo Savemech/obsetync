@@ -26,7 +26,7 @@ async function run(): Promise<void> {
     let clock = 1000;
     const io = new MemoryIO();
     const first = new OperationCheckpoint(io, "1.10.1", () => clock);
-    await first.initialize();
+    assert.equal(await first.initialize(), null);
     const id = await first.begin("pull", "0/20 files");
     assert.ok(io.files.has(OPERATION_CHECKPOINT_PATHS.active));
 
@@ -40,7 +40,8 @@ async function run(): Promise<void> {
 
     // Simulate a renderer kill: no complete() call, then a fresh instance.
     const restarted = new OperationCheckpoint(io, "1.10.1", () => 9000);
-    await restarted.initialize();
+    const orphan = await restarted.initialize();
+    assert.equal(orphan?.phase, "pull");
     assert.equal(restarted.getLastInterruption()?.phase, "pull");
     assert.ok(io.files.has(OPERATION_CHECKPOINT_PATHS.lastInterruption));
     assert.ok(!io.files.has(OPERATION_CHECKPOINT_PATHS.active));
@@ -49,7 +50,11 @@ async function run(): Promise<void> {
     await restarted.complete(nextId);
     assert.ok(!io.files.has(OPERATION_CHECKPOINT_PATHS.active));
 
-    console.log("operation-checkpoint.test: 6 assertions passed");
+    const cleanRestart = new OperationCheckpoint(io, "1.10.1", () => 10_000);
+    assert.equal(await cleanRestart.initialize(), null);
+    assert.equal(cleanRestart.getLastInterruption()?.phase, "pull");
+
+    console.log("operation-checkpoint.test: 9 assertions passed");
 }
 
 void run();

@@ -23,6 +23,7 @@ import "./desktop-hash-workers.test";
 import "./desktop-ranged-upload.test";
 import "./desktop-reconcile-upload.test";
 import "./hash-runtime.test";
+import "./resource-governor.test";
 import "./bulk-codec.test";
 import "./ws-data-codec.test";
 import "./ws-data.test";

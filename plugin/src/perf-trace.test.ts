@@ -48,6 +48,7 @@ function run(): void {
         bytesTransferred: 250,
         requestCount: 5,
         retries: 1,
+        backpressureEvents: 2,
     });
     push.observePeakBatchBytes(128);
     push.observePeakBatchBytes(64);
@@ -72,6 +73,7 @@ function run(): void {
     assert.equal(first[0].bytesTransferred, 250);
     assert.equal(first[0].dedupRatio, 0.75);
     assert.equal(first[0].peakBatchBytes, 128);
+    assert.equal(first[0].backpressureEvents, 2);
     assert.equal(first[0].wasmChunksBefore, 20);
     assert.equal(first[0].wasmChunksReachable, 12);
     assert.equal(first[0].wasmChunksAfter, 12);
@@ -105,6 +107,37 @@ function run(): void {
     trace.clear();
     assert.equal(trace.recent().length, 0);
 
+    const delivered: string[] = [];
+    const unsubscribe = trace.subscribe((record) => delivered.push(record.operationId));
+    let isolatedWarnings = 0;
+    const originalWarn = console.warn;
+    console.warn = () => { isolatedWarnings++; };
+    const unsubscribeFault = trace.subscribe(() => { throw new Error("listener failure injection"); });
+    const subscribed = trace.begin("push");
+    try {
+        subscribed.finish();
+    } finally {
+        unsubscribeFault();
+        console.warn = originalWarn;
+    }
+    assert.deepEqual(delivered, [subscribed.operationId]);
+    assert.equal(isolatedWarnings, 1);
+    unsubscribe();
+    trace.begin("push").finish();
+    assert.equal(delivered.length, 1);
+
+    let blockedMono = 0;
+    const blockedTrace = new PerfTrace({
+        monotonicNow: () => blockedMono,
+        monitorEventLoop: true,
+        eventLoopIntervalMs: 25,
+    });
+    const blocked = blockedTrace.begin("scan");
+    blockedMono = 140;
+    blocked.finish();
+    assert.equal(blockedTrace.recent()[0].eventLoopLagSamples, 1);
+    assert.ok((blockedTrace.recent()[0].eventLoopLagP95Ms ?? 0) >= 100);
+
     assert.throws(
         () => new PerfTrace({ maxRecords: 0, monitorEventLoop: false }),
         /maxRecords/,
@@ -128,7 +161,7 @@ function run(): void {
         );
     }
 
-    console.log("perf-trace.test: 54 assertions passed");
+    console.log("perf-trace.test: 60 assertions passed");
 }
 
 run();

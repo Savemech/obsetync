@@ -19,6 +19,7 @@ function platformBudgetsAreBounded(): void {
     check(mobile.maxFeedBytes === 256 * 1024, "mobile feed cap is not bounded");
     check(mobile.maxBatchFiles === 64, "mobile file budget is wrong");
     check(mobile.maxBatchBytes === 2 * 1024 * 1024, "mobile byte budget is wrong");
+    check(mobile.applyConcurrency === 8, "mobile apply concurrency is not bounded");
 }
 
 function bytePlannerHonorsEveryLimit(): void {

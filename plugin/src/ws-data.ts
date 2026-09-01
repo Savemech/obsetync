@@ -55,6 +55,8 @@ export interface WsDataLaneOptions {
     openSession: () => Promise<OpenedSession>;
     socketFactory?: (url: string) => SocketLike;
     backoffStartMs?: number;
+    /** Dynamic local cap; authenticated server credits remain the ceiling. */
+    localRequestLimit?: () => number;
 }
 
 interface PendingRequest {
@@ -139,7 +141,7 @@ export class ObsetyncWsDataLane {
         if (payload.byteLength > limits.maxPayloadBytes) {
             throw new WsDataUnavailableError("RPC payload exceeds negotiated WS frame limit");
         }
-        await this.acquireCredit(payload.byteLength, limits);
+        await this.acquireCredit(payload.byteLength, limits, perf);
         const socket = this.socket;
         const session = this.session;
         if (!socket || !session || socket.readyState !== SOCKET_OPEN || this.state !== "ready") {
@@ -175,7 +177,7 @@ export class ObsetyncWsDataLane {
 
         this.txChain = this.txChain
             .then(async () => {
-                await this.waitForBufferedAmount(socket, limits);
+                await this.waitForBufferedAmount(socket, limits, perf);
                 const plaintext = encodeWsDataFrame(
                     type,
                     requestId,
@@ -366,9 +368,19 @@ export class ObsetyncWsDataLane {
         pending.resolve(frame.payload);
     }
 
-    private async acquireCredit(bytes: number, limits: WsDataLimits): Promise<void> {
+    private async acquireCredit(
+        bytes: number,
+        limits: WsDataLimits,
+        perf?: PerfOperation,
+    ): Promise<void> {
+        let pressureReported = false;
         for (;;) {
-            if (this.activeRequests < limits.maxInflightRequests &&
+            const configuredLimit = this.options.localRequestLimit?.() ??
+                limits.maxInflightRequests;
+            const requestLimit = Number.isFinite(configuredLimit)
+                ? Math.max(1, Math.min(limits.maxInflightRequests, Math.trunc(configuredLimit)))
+                : 1;
+            if (this.activeRequests < requestLimit &&
                 this.activeBytes + bytes <= limits.maxInflightBytes) {
                 // Reserve synchronously before returning the Promise. Several
                 // callers may wake in the same microtask turn; counting only
@@ -379,6 +391,13 @@ export class ObsetyncWsDataLane {
             }
             if (this.creditWaiters.length >= MAX_CREDIT_WAITERS) {
                 throw new WsDataUnavailableError("WS data credit wait queue is full");
+            }
+            const serverCreditBound =
+                this.activeRequests >= limits.maxInflightRequests ||
+                this.activeBytes + bytes > limits.maxInflightBytes;
+            if (serverCreditBound && !pressureReported) {
+                pressureReported = true;
+                perf?.increment({ backpressureEvents: 1 });
             }
             await new Promise<void>((resolve, reject) => {
                 this.creditWaiters.push({ resolve, reject });
@@ -400,10 +419,15 @@ export class ObsetyncWsDataLane {
         for (const waiter of waiters) waiter.resolve();
     }
 
-    private async waitForBufferedAmount(socket: SocketLike, limits: WsDataLimits): Promise<void> {
+    private async waitForBufferedAmount(
+        socket: SocketLike,
+        limits: WsDataLimits,
+        perf?: PerfOperation,
+    ): Promise<void> {
         const high = limits.maxInflightBytes;
         const low = Math.floor(high / 2);
         if (socket.bufferedAmount <= high) return;
+        perf?.increment({ backpressureEvents: 1 });
         while (socket.bufferedAmount > low) {
             if (this.socket !== socket || socket.readyState !== SOCKET_OPEN) {
                 throw new WsDataUnavailableError("WS data socket closed under backpressure");

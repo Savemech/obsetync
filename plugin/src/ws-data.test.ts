@@ -209,8 +209,64 @@ async function remoteRpcErrorDoesNotPoisonTheSession(): Promise<void> {
     lane.close();
 }
 
+async function localGovernorCapStaysBelowServerCredits(): Promise<void> {
+    let localLimit = 1;
+    let backpressureEvents = 0;
+    const perf = {
+        increment(delta: { backpressureEvents?: number }) {
+            backpressureEvents += delta.backpressureEvents ?? 0;
+        },
+    } as any;
+    let socket: FakeSocket | null = null;
+    const lane = new ObsetyncWsDataLane({
+        baseUrl: "http://server:27182",
+        runtime: "desktop",
+        advertisedPayloadBytes: 4096,
+        openSession,
+        localRequestLimit: () => localLimit,
+        socketFactory: () => {
+            socket = new FakeSocket("hold", {
+                maxInflightRequests: 4,
+                maxPayloadBytes: 1024,
+                maxInflightBytes: 4096,
+            });
+            return socket;
+        },
+    });
+    const first = lane.request(
+        WsDataFrameType.CheckObjects,
+        new Uint8Array([1]),
+        WsDataFrameType.CheckResult,
+        perf,
+    );
+    const second = lane.request(
+        WsDataFrameType.CheckObjects,
+        new Uint8Array([2]),
+        WsDataFrameType.CheckResult,
+        perf,
+    );
+    await eventually(() => socket?.rpcFrames.length === 1, "local request cap did not engage");
+    ok(
+        (socket as FakeSocket | null)?.rpcFrames.length === 1,
+        "server credits bypassed the local governor cap",
+    );
+    localLimit = 2;
+    socket!.releaseHeldInReverse();
+    await eventually(() => socket?.rpcFrames.length === 2, "raised local cap did not resume work");
+    socket!.releaseHeldInReverse();
+    await Promise.all([first, second]);
+    ok(backpressureEvents === 0, "local governor saturation was misreported as server pressure");
+    lane.close();
+}
+
 async function byteCreditsAndSocketWatermarksApplyBackpressure(): Promise<void> {
     let socket: FakeSocket | null = null;
+    let backpressureEvents = 0;
+    const perf = {
+        increment(delta: { backpressureEvents?: number }) {
+            backpressureEvents += delta.backpressureEvents ?? 0;
+        },
+    } as any;
     const lane = new ObsetyncWsDataLane({
         baseUrl: "http://server:27182",
         runtime: "desktop",
@@ -230,11 +286,13 @@ async function byteCreditsAndSocketWatermarksApplyBackpressure(): Promise<void> 
         WsDataFrameType.PutPack,
         new Uint8Array(800),
         WsDataFrameType.PutAck,
+        perf,
     );
     const second = lane.request(
         WsDataFrameType.PutPack,
         new Uint8Array(800),
         WsDataFrameType.PutAck,
+        perf,
     );
     await eventually(() => socket !== null, "backpressure socket was not constructed");
     await new Promise<void>((resolve) => setTimeout(resolve, 10));
@@ -246,6 +304,7 @@ async function byteCreditsAndSocketWatermarksApplyBackpressure(): Promise<void> 
     await eventually(() => socket!.rpcFrames.length === 2, "byte credit release did not resume waiter");
     socket!.releaseHeldInReverse();
     await Promise.all([first, second]);
+    ok(backpressureEvents === 2, "credit and socket pressure were not both measured once");
     lane.close();
 }
 
@@ -311,6 +370,7 @@ async function socketLossRejectsUnknownResultAndReconnectsFresh(): Promise<void>
 void (async () => {
     await multiplexesByRequestIdAndHonorsCredits();
     await remoteRpcErrorDoesNotPoisonTheSession();
+    await localGovernorCapStaysBelowServerCredits();
     await byteCreditsAndSocketWatermarksApplyBackpressure();
     await malformedErrorRejectsPendingWithoutHanging();
     await socketLossRejectsUnknownResultAndReconnectsFresh();

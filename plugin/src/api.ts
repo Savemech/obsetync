@@ -17,6 +17,7 @@ import {
     upgradeRequired,
 } from "./transport-errors";
 import type { PerfOperation } from "./perf-trace";
+import { getHashTuning } from "./hash-runtime";
 import {
     BulkObjectKind,
     BulkUploadStatus,
@@ -901,7 +902,7 @@ export class ObsetyncApi {
             }
             if (!statuses.includes(BulkUploadStatus.RetryableStorageError)) return;
             if (attempt + 1 < retryDelays.length) {
-                perf?.increment({ retries: 1 });
+                perf?.increment({ retries: 1, backpressureEvents: 1 });
                 continue;
             }
             throw new Error("bulk put exhausted retries after a storage error");
@@ -960,6 +961,7 @@ export class ObsetyncApi {
                 baseUrl: this.serverUrl,
                 runtime: this.runtime,
                 advertisedPayloadBytes: this.wsDataFrameBytes,
+                localRequestLimit: () => getHashTuning().networkConcurrency,
                 openSession: async () => {
                     const keys = generateWsEphKeypair();
                     const minted = await this.mintWsTicket(keys.pubB64);

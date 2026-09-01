@@ -2,6 +2,7 @@ import { App, PluginSettingTab, Setting, Notice } from "obsidian";
 import type ObsetyncPlugin from "./main";
 import { ObsetyncDebugModal } from "./debug-modal";
 import { DEFAULT_IGNORE_PATTERNS } from "./ignore";
+import type { ResourceRecoveryHint } from "./resource-governor";
 
 export type SyncPriority =
     | "sequential"   // as found (default)
@@ -42,6 +43,8 @@ export interface SyncSettings {
     esPubValidUntil: number;
     /** Durable high-water mark of pre-reserved outgoing sequence blocks. */
     lastOutgoingSeq: number;
+    /** Local-only conservative startup penalty after a renderer interruption. */
+    resourceRecoveryHint: ResourceRecoveryHint | null;
 }
 
 export const DEFAULT_SETTINGS: SyncSettings = {
@@ -63,6 +66,7 @@ export const DEFAULT_SETTINGS: SyncSettings = {
     esPub: "",
     esPubValidUntil: 0,
     lastOutgoingSeq: 0,
+    resourceRecoveryHint: null,
 };
 
 export class ObsetyncSettingTab extends PluginSettingTab {

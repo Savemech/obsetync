@@ -39,7 +39,7 @@ export class OperationCheckpoint {
     ) {}
 
     /** Promote an orphaned active marker to durable postmortem evidence. */
-    async initialize(): Promise<void> {
+    async initialize(): Promise<OperationRecord | null> {
         const active = await this.readRecord(ACTIVE_PATH);
         if (active) {
             this.lastInterruption = active;
@@ -48,9 +48,10 @@ export class OperationCheckpoint {
             console.warn(
                 `[obsetync] previous renderer stopped during ${active.phase}: ${active.detail}`,
             );
-            return;
+            return { ...active };
         }
         this.lastInterruption = await this.readRecord(LAST_INTERRUPTION_PATH);
+        return null;
     }
 
     async begin(phase: string, detail = "started"): Promise<string> {
