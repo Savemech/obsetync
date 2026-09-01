@@ -137,7 +137,9 @@ function profile(
 export function resourceProfilesFor(environment: ResourceEnvironment): ResourceProfileSet {
     const logicalCores = cores(environment.hardwareConcurrency);
     if (environment.runtime === "mobile" || environment.os === "ios") {
-        const family = "a17-ios" as const;
+        const family: ResourceProfile["family"] = environment.os === "ios"
+            ? "a17-ios"
+            : "generic";
         return {
             initialIndex: environment.simdAvailable ? 1 : 0,
             profiles: [
@@ -605,9 +607,16 @@ export class AdaptiveResourceGovernor {
             this.lastDecision = `minimum/maximum profile held: ${reason}`;
             return;
         }
+        const previous = this.index;
         this.index = clamped;
-        this.lastDecision = reason;
-        this.onProfileChange?.(this.current(), reason);
+        try {
+            this.onProfileChange?.(this.current(), reason);
+            this.lastDecision = reason;
+        } catch (error) {
+            this.index = previous;
+            this.lastDecision = `profile transition failed: ${reason}`;
+            throw error;
+        }
     }
 
     private clearRecoveryHintAfterHealthyWindow(): void {

@@ -14,13 +14,20 @@ import {
     normalizePerfArchitecture,
     perfTrace,
 } from "./perf-trace";
-import { configureHashRuntime, type HashTuning } from "./hash-runtime";
+import { configureHashTuning, getHashTuning, type HashTuning } from "./hash-runtime";
 import { createWasmLoader, type WasmSelection } from "./wasm-runtime";
 import {
     createDesktopHashWorkerPool,
     type DesktopHashWorkerPool,
 } from "./desktop-hash-workers";
 import hashWorkerSource from "obsetync-hash-worker-source";
+import {
+    AdaptiveResourceGovernor,
+    ResourceVisibilityGate,
+    measurementFromPerf,
+    type ResourceEnvironment,
+    type ResourceProfile,
+} from "./resource-governor";
 
 // Static import of the wasm-bindgen --target web glue. esbuild inlines this
 // ES module into main.js at build time — no runtime `new Function(...)` or
@@ -53,6 +60,42 @@ function formatDebugBytes(bytes: number): string {
     return `${bytes} B`;
 }
 
+function formatDebugRate(value: number | null, unit: "bytes/s" | "files/s" | null): string {
+    if (value === null || unit === null) return "unmeasured";
+    if (unit === "bytes/s") return `${formatDebugBytes(value)}/s`;
+    return `${value.toFixed(1)} files/s`;
+}
+
+function rendererMemoryPressure(): boolean {
+    const memory = (globalThis.performance as any)?.memory;
+    return Number.isFinite(memory?.usedJSHeapSize) &&
+        Number.isFinite(memory?.jsHeapSizeLimit) && memory.jsHeapSizeLimit > 0 &&
+        memory.usedJSHeapSize / memory.jsHeapSizeLimit >= 0.85;
+}
+
+function detectResourceEnvironment(
+    runtime: "desktop" | "mobile",
+    architecture: ResourceEnvironment["architecture"],
+): ResourceEnvironment {
+    const rawPlatform = String((globalThis as any).process?.platform ?? "");
+    const os: ResourceEnvironment["os"] = Platform.isIosApp
+        ? "ios"
+        : rawPlatform === "darwin" || rawPlatform === "win32" || rawPlatform === "linux"
+            ? rawPlatform
+            : "unknown";
+    const reportedCores = globalThis.navigator?.hardwareConcurrency;
+    const hardwareConcurrency = Number.isFinite(reportedCores)
+        ? Math.max(1, Math.trunc(reportedCores))
+        : 1;
+    let simdAvailable = false;
+    try {
+        simdAvailable = WebAssembly.validate(embeddedSimdWasmBytes as BufferSource);
+    } catch {
+        // The profile ladder stays conservative until scalar WASM is loaded.
+    }
+    return { runtime, architecture, os, hardwareConcurrency, simdAvailable };
+}
+
 export default class ObsetyncPlugin extends Plugin {
     settings: SyncSettings = DEFAULT_SETTINGS;
     private io!: PlatformIO;
@@ -65,6 +108,9 @@ export default class ObsetyncPlugin extends Plugin {
     private wasmLoader: (() => Promise<WasmSelection<WasmModule>>) | null = null;
     private hashWorkers: DesktopHashWorkerPool | null = null;
     private operationCheckpoint!: OperationCheckpoint;
+    private resourceGovernor!: AdaptiveResourceGovernor;
+    private visibilityGate!: ResourceVisibilityGate;
+    private unsubscribePerf: (() => void) | null = null;
     private statusBarEl: HTMLElement | null = null;
 
     async onload(): Promise<void> {
@@ -75,27 +121,6 @@ export default class ObsetyncPlugin extends Plugin {
                 : (globalThis as any).process?.arch ??
                     (globalThis.navigator as any)?.userAgentData?.architecture,
         );
-        const applyHashTuning = (tuning: HashTuning) => {
-            const current = perfTrace.getProfile();
-            perfTrace.setProfile({
-                ...current,
-                readConcurrency: tuning.readConcurrency,
-                feedBytes: tuning.feedBytes,
-                batchBytes: tuning.maxBatchBytes,
-            });
-        };
-        const hashTuning = configureHashRuntime(runtime, applyHashTuning);
-        perfTrace.setProfile({
-            runtime,
-            architecture: detectedArchitecture,
-            wasmMode: "unknown",
-            hashConcurrency: 1,
-            readConcurrency: hashTuning.readConcurrency,
-            networkConcurrency: 8,
-            feedBytes: hashTuning.feedBytes,
-            batchBytes: hashTuning.maxBatchBytes,
-            diffPageBytes: 0,
-        });
 
         // Capture every subsequent `[obsetync] …` console line into a ring
         // buffer so the "Show debug info" panel can surface them later,
@@ -115,7 +140,42 @@ export default class ObsetyncPlugin extends Plugin {
             this.io,
             this.manifest.version,
         );
-        await this.operationCheckpoint.initialize();
+        const newInterruption = await this.operationCheckpoint.initialize();
+
+        const environment = detectResourceEnvironment(runtime, detectedArchitecture);
+        const initiallyVisible = typeof document === "undefined" || !document.hidden;
+        this.visibilityGate = new ResourceVisibilityGate(runtime, initiallyVisible);
+        this.resourceGovernor = new AdaptiveResourceGovernor(environment, {
+            recoveryHint: this.settings.resourceRecoveryHint,
+            visible: initiallyVisible,
+            onProfileChange: (profile, reason) => this.applyResourceProfile(profile, reason),
+            onRecoveryHintChange: (hint) => {
+                this.settings.resourceRecoveryHint = hint;
+                void this.saveSettings().catch((error) => {
+                    console.warn("[obsetync] failed to persist resource recovery hint:", error);
+                });
+            },
+        });
+        this.applyResourceProfile(this.resourceGovernor.current(), "startup selection");
+        if (newInterruption) this.resourceGovernor.recordInterruption(newInterruption.phase);
+        this.unsubscribePerf = perfTrace.subscribe((record) => {
+            const stats = this.hashWorkers?.stats();
+            const files = record.filesTotal ?? record.filesCompleted;
+            const bytes = record.bytesTotal ?? record.bytesTransferred;
+            this.resourceGovernor.observe(measurementFromPerf(record, {
+                visible: typeof document === "undefined" || !document.hidden,
+                queueDepth: stats?.queued ?? 0,
+                averageFileBytes: files > 0 ? bytes / files : undefined,
+                memoryPressure: rendererMemoryPressure(),
+            }));
+        });
+        if (typeof document !== "undefined") {
+            this.registerDomEvent(document, "visibilitychange", () => {
+                const visible = !document.hidden;
+                this.resourceGovernor.setVisible(visible);
+                this.visibilityGate.setVisible(visible);
+            });
+        }
 
         // Persistence layers.
         this.syncBase = new ObsetyncSyncBase(this.app);
@@ -162,15 +222,22 @@ export default class ObsetyncPlugin extends Plugin {
     }
 
     onunload(): void {
-        // Engine stop first (crash logger still armed while it runs), but
-        // never let it skip the listener teardown below.
+        // Engine stop first while the crash logger is still armed. Every
+        // independent resource is then torn down even if an earlier one fails.
         try {
             this.syncEngine?.stop();
-            void this.hashWorkers?.close();
-            this.hashWorkers = null;
         } catch (e) {
             console.warn("[obsetync] engine stop failed during unload:", e);
         }
+        try {
+            void this.hashWorkers?.close();
+        } catch (e) {
+            console.warn("[obsetync] hash worker close failed during unload:", e);
+        }
+        this.hashWorkers = null;
+        this.unsubscribePerf?.();
+        this.unsubscribePerf = null;
+        this.visibilityGate?.dispose();
         crashLog.uninstall();
         debugLog.uninstall();
     }
@@ -219,13 +286,37 @@ export default class ObsetyncPlugin extends Plugin {
         push(`Transport:         AEAD envelope over HTTP (X25519 + HKDF-SHA256 + AES-256-GCM)`);
         push(`WASM:              ${this.wasm ? `loaded (${perfTrace.getProfile().wasmMode})` : "not loaded"}`);
         const workerStats = this.hashWorkers?.stats();
-        push(`Hash workers:      ${workerStats ? `${workerStats.ready}/${workerStats.workers} ready · ${workerStats.active} active · ${workerStats.queued} queued` : "renderer fallback"}`);
+        push(`Hash workers:      ${workerStats ? `${workerStats.ready}/${workerStats.limit} ready · ${workerStats.workers}/${workerStats.capacity} resident · ${workerStats.active} active · ${workerStats.queued} queued` : "renderer fallback"}`);
         push(`Plugin id:         ${this.manifest.id}`);
         push(`Plugin version:    ${this.manifest.version}`);
         push("");
 
         push("--- Performance (aggregate, path-free) ---");
         for (const line of perfTrace.formatDebug()) push(line);
+        push("");
+
+        push("--- Adaptive resource governor ---");
+        if (this.resourceGovernor) {
+            const governor = this.resourceGovernor.snapshot();
+            const tuning = getHashTuning();
+            push(`Platform family:    ${governor.family}`);
+            push(`Selected profile:   ${governor.profile} (${governor.profileIndex + 1}/${governor.profileCount})`);
+            push(`Actual limits:      hash ${workerStats?.limit ?? 1} · read ${tuning.readConcurrency} · network ${tuning.networkConcurrency} · apply ${tuning.applyConcurrency}`);
+            push(`Memory/yield:       ${formatDebugBytes(tuning.transientBudgetBytes)} transient · ${tuning.yieldBudgetMs}ms CPU slice`);
+            push(`Latest throughput:  ${formatDebugRate(governor.throughput, governor.throughputUnit)}`);
+            push(
+                `Phase throughput:   read ${formatDebugRate(governor.phaseThroughput.read, "bytes/s")} · ` +
+                `hash ${formatDebugRate(governor.phaseThroughput.hash, "bytes/s")} · ` +
+                `upload ${formatDebugRate(governor.phaseThroughput.upload, "bytes/s")}`,
+            );
+            push(`Latest UI lag:      ${governor.eventLoopLagP95Ms === null ? "unmeasured" : `p95<=${governor.eventLoopLagP95Ms}ms`}`);
+            push(`Last bottleneck:    ${governor.bottleneck}`);
+            push(`Last decision:      ${governor.decision}`);
+            push(`Recovery penalty:   ${governor.recoveryPenalty}`);
+            push(`Visibility gate:    ${this.visibilityGate?.isPaused() ? "paused before next mobile batch" : governor.visible ? "visible" : "hidden (desktop continues)"}`);
+        } else {
+            push("Governor not initialized yet.");
+        }
         push("");
 
         push("--- Previous interruption ---");
@@ -536,20 +627,26 @@ export default class ObsetyncPlugin extends Plugin {
         // initialize: development hash stubs are not content-address compatible
         // with the server and must never participate in a real vault.
         this.wasm = await this.loadWasm();
-        if (!Platform.isMobile) {
-            this.hashWorkers = createDesktopHashWorkerPool(hashWorkerSource);
+        if (!Platform.isMobile && perfTrace.getProfile().wasmMode === "simd") {
+            const tuning = getHashTuning();
+            this.hashWorkers = createDesktopHashWorkerPool(hashWorkerSource, {
+                initialWorkers: tuning.hashConcurrency,
+                maxWorkers: tuning.maxHashConcurrency,
+            });
             if (this.hashWorkers) {
                 perfTrace.setProfile({
                     ...perfTrace.getProfile(),
-                    hashConcurrency: this.hashWorkers.workerCount,
+                    hashConcurrency: this.hashWorkers.stats().limit,
                 });
                 console.log(
                     `[obsetync] desktop hash pool starting ` +
-                    `(${this.hashWorkers.workerCount} SIMD workers)`,
+                    `(${this.hashWorkers.stats().limit}/${this.hashWorkers.workerCount} SIMD workers)`,
                 );
             } else {
                 console.warn("[obsetync] desktop hash workers unavailable; using renderer hashing");
             }
+        } else if (!Platform.isMobile) {
+            console.log("[obsetync] scalar WASM selected; using renderer hashing");
         }
 
         // Create WASM tree.
@@ -619,6 +716,7 @@ export default class ObsetyncPlugin extends Plugin {
             this.operationCheckpoint,
             this.settings.autoSync,
             this.hashWorkers,
+            this.visibilityGate,
         );
 
         // Start.
@@ -664,6 +762,7 @@ export default class ObsetyncPlugin extends Plugin {
                 },
             });
             const selected = await this.wasmLoader();
+            this.resourceGovernor?.recordSimdAvailability(selected.mode === "simd");
             perfTrace.setProfile({
                 ...perfTrace.getProfile(),
                 wasmMode: selected.mode,
@@ -700,5 +799,43 @@ export default class ObsetyncPlugin extends Plugin {
         // Presence suffix: how many OTHER devices are active right now (Ph3).
         const peers = this.syncEngine?.getActivePeerCount() ?? 0;
         this.statusBarEl?.setText(peers > 0 ? `${text} · 👥${peers}` : text);
+    }
+
+    private applyResourceProfile(profile: ResourceProfile, reason: string): void {
+        const applyHashTuning = (tuning: HashTuning) => {
+            const current = perfTrace.getProfile();
+            const actualHashConcurrency = this.hashWorkers?.stats().limit ??
+                (profile.tuning.runtime === "mobile" ? 1 : current.hashConcurrency || 1);
+            perfTrace.setProfile({
+                ...current,
+                hashConcurrency: actualHashConcurrency,
+                readConcurrency: tuning.readConcurrency,
+                networkConcurrency: tuning.networkConcurrency,
+                feedBytes: tuning.feedBytes,
+                batchBytes: tuning.maxBatchBytes,
+            });
+        };
+        if (this.hashWorkers) {
+            this.hashWorkers.setActiveWorkerLimit(
+                Math.min(profile.tuning.hashConcurrency, this.hashWorkers.workerCount),
+            );
+        }
+        const selected = configureHashTuning(profile.tuning, applyHashTuning);
+        perfTrace.setProfile({
+            ...perfTrace.getProfile(),
+            runtime: selected.runtime,
+            architecture: this.resourceGovernor?.environment.architecture ?? "unknown",
+            hashConcurrency: this.hashWorkers?.stats().limit ?? 1,
+            readConcurrency: selected.readConcurrency,
+            networkConcurrency: selected.networkConcurrency,
+            feedBytes: selected.feedBytes,
+            batchBytes: selected.maxBatchBytes,
+        });
+        console.log(
+            `[obsetync] resource profile ${profile.family}/${profile.name}: ` +
+            `hash=${selected.hashConcurrency} read=${selected.readConcurrency} ` +
+            `network=${selected.networkConcurrency} batch=${formatDebugBytes(selected.maxBatchBytes)} ` +
+            `(${reason})`,
+        );
     }
 }

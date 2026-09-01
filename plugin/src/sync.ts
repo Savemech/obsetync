@@ -60,6 +60,7 @@ import {
     buildReconcileContentIndex,
     sumIndexedContentBytes,
 } from "./reconcile-content";
+import type { ResourceVisibilityGate } from "./resource-governor";
 
 export type SyncState = "idle" | "pulling" | "pushing" | "scanning" | "error";
 
@@ -140,6 +141,7 @@ export class ObsetyncSyncEngine {
         private operationCheckpoint?: OperationCheckpoint,
         private autoSync: boolean = true,
         private hashWorkers: DesktopHashWorkerPool | null = null,
+        private visibilityGate?: ResourceVisibilityGate,
     ) {
         this.localRootHash = initialRootHash;
         this.ignore = compileIgnore(ignorePatterns);
@@ -666,6 +668,7 @@ export class ObsetyncSyncEngine {
                 bytes += chunkBytes.length;
             }
         }
+        await this.waitForHeavyWork("reconcile index upload");
         await this.api.putObjects(treeRecords, perf);
         treeChunksUploaded += treeRecords.length;
         perf?.increment({
@@ -688,6 +691,7 @@ export class ObsetyncSyncEngine {
         );
         let smallChecked = 0;
         for (const batch of smallBatches) {
+            await this.waitForHeavyWork("reconcile content");
             const records: BulkUploadRecord[] = [];
             for (let i = 0; i < batch.length; i += reconcileTuning.readConcurrency) {
                 const group = batch.slice(i, i + reconcileTuning.readConcurrency);
@@ -763,6 +767,7 @@ export class ObsetyncSyncEngine {
         // re-chunk + upload only the missing ones.
         let largeIdx = 0;
         for (const hash of missingLargeManifests) {
+            await this.waitForHeavyWork("large-file reconcile");
             const source = largeByHash.get(hash);
             if (!source) continue;
             const { path } = source;
@@ -1053,6 +1058,7 @@ export class ObsetyncSyncEngine {
             };
 
             for (let i = 0; i < toHash.length; i += READ_CONCURRENCY) {
+                await this.waitForHeavyWork("full scan", operationId);
                 const batch = toHash.slice(i, i + READ_CONCURRENCY);
                 perf.observePeakBatchBytes(batch.reduce((sum, item) => {
                     const residentBytes = this.io.getAbsolutePath(item.path)
@@ -1170,6 +1176,20 @@ export class ObsetyncSyncEngine {
 
     // --- Private ---
 
+    /**
+     * iOS may suspend the renderer at any time once hidden. Stop only at a
+     * bounded batch boundary: an already-issued durability request is allowed
+     * to ACK, while the next read/hash/network allocation waits for visibility.
+     */
+    private async waitForHeavyWork(phase: string, operationId?: string): Promise<void> {
+        if (!this.visibilityGate?.isPaused()) return;
+        const detail = `paused while hidden before next ${phase} batch`;
+        if (operationId) this.operationCheckpoint?.progress(operationId, detail);
+        this.onStatusUpdate("sync ⏸");
+        await this.visibilityGate.waitForHeavyWork();
+        if (this.stopped) throw new Error("sync engine stopped");
+    }
+
     private async pullRemote(): Promise<void> {
         if (this.syncing || this.reenrollmentRequired || this.stopped) return;
         this.syncing = true;
@@ -1228,6 +1248,7 @@ export class ObsetyncSyncEngine {
                 // Slice 2: never fetch ignored paths; untrack them if purged.
                 (p) => this.isExcluded(p),
                 perf,
+                () => this.waitForHeavyWork("pull", operationId),
             );
             if (result.newRootBytes && this.wasm && this.tree) {
                 const alignment = alignTreeFormatFromRoot(
@@ -1653,6 +1674,7 @@ export class ObsetyncSyncEngine {
                 },
                 perf,
                 this.hashWorkers,
+                () => this.waitForHeavyWork("push", operationId),
             );
             if (result.newRootHash) {
                 this.localRootHash = result.newRootHash;
@@ -1931,6 +1953,7 @@ export class ObsetyncSyncEngine {
                     : null;
                 try {
                     for (let i = 0; i < plan.toHash.length; i += readConcurrency) {
+                        await this.waitForHeavyWork("metadata scan");
                         const batch = plan.toHash.slice(i, i + readConcurrency);
                         perf.observePeakBatchBytes(batch.reduce((sum, item) => {
                             const residentBytes = this.io.getAbsolutePath(item.path)

@@ -1,4 +1,4 @@
-import { pull } from "./pull";
+import { allSettledBounded, pull } from "./pull";
 import type { FileDelta } from "./api";
 import { PerfTrace } from "./perf-trace";
 
@@ -32,6 +32,23 @@ function transactionalTree(tree: any): any {
             active = false;
         },
     };
+}
+
+async function boundedApplyNeverExceedsTheSelectedLaneCount(): Promise<void> {
+    let active = 0;
+    let peak = 0;
+    const results = await allSettledBounded([0, 1, 2, 3, 4, 5], 2, async (value) => {
+        active++;
+        peak = Math.max(peak, active);
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        active--;
+        if (value === 3) throw new Error("injected apply failure");
+        return value * 2;
+    });
+    check(peak === 2, `bounded apply used ${peak} lanes instead of 2`);
+    check(results.length === 6, "bounded apply lost result slots");
+    check(results[3].status === "rejected", "bounded apply lost an individual failure");
+    check(results[4].status === "fulfilled" && results[4].value === 8, "result order drifted");
 }
 
 async function locallyEditedDeltaKeepsHonestBase(): Promise<void> {
@@ -622,14 +639,31 @@ async function smallMissesUseOneVerifiedBulkDownload(): Promise<void> {
         wasm_root_hash_from_bytes: () => "server-root",
     } as any;
 
-    const result = await pull(api, io, syncBase, "vault", "base-root", wasm, tree);
+    let heavyBatchPermits = 0;
+    const result = await pull(
+        api,
+        io,
+        syncBase,
+        "vault",
+        "base-root",
+        wasm,
+        tree,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        async () => { heavyBatchPermits++; },
+    );
     check(bulkCalls === 1, "three small misses were not coalesced into one bulk GET");
     check(singleCalls === 0, "bulk pull fell through to a single GET");
     check(files.size === 3, "bulk pull did not apply every verified record");
     check(result.downloaded === 3, "bulk pull lost physical-file progress");
+    check(heavyBatchPermits === 1, "pull bypassed its bounded download permit");
 }
 
-void locallyEditedDeltaKeepsHonestBase()
+void boundedApplyNeverExceedsTheSelectedLaneCount()
+    .then(locallyEditedDeltaKeepsHonestBase)
     .then(renameAfterCrashIsIdempotent)
     .then(sameSizeUnverifiedRenameTargetIsDeferred)
     .then(firstSyncAdoptsAnExistingEmptyServerRoot)
@@ -640,7 +674,7 @@ void locallyEditedDeltaKeepsHonestBase()
     .then(unchangedBaseAllowsRemoteDelete)
     .then(failedTreeRebaseAbortsCandidate)
     .then(smallMissesUseOneVerifiedBulkDownload)
-    .then(() => console.log("pull.test: 51 assertions passed"))
+    .then(() => console.log("pull.test: 56 assertions passed"))
     .catch((error) => {
         console.error(error);
         process.exitCode = 1;

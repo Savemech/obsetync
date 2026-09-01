@@ -62,6 +62,8 @@ function platformLaddersAreBounded(): void {
     assert.equal(ios.profiles[ios.initialIndex].tuning.transientBudgetBytes, 48 * MIB);
     assert.ok(ios.profiles.every((item) => item.tuning.hashConcurrency === 1));
     assert.ok(ios.profiles.every((item) => item.tuning.maxBatchBytes <= 2 * MIB));
+    const android = resourceProfilesFor({ ...IOS, os: "unknown" });
+    assert.equal(android.profiles[android.initialIndex].family, "generic");
 
     const m1 = resourceProfilesFor(M1);
     assert.equal(m1.profiles[m1.initialIndex].family, "m1-macos");
@@ -167,6 +169,22 @@ function additiveProbeRollsBackRegression(): void {
     assert.match(governor.snapshot().decision, /probe rollback/);
 }
 
+function failedProfileApplicationRollsBackSelection(): void {
+    const governor = new AdaptiveResourceGovernor(SNAPDRAGON, {
+        onProfileChange: (selected) => {
+            if (selected.name === "balanced") throw new Error("injected apply failure");
+        },
+    });
+    governor.observe(measurement({ bytesTransferred: 100 * MIB }));
+    governor.observe(measurement({ bytesTransferred: 112 * MIB }));
+    assert.throws(
+        () => governor.observe(measurement({ bytesTransferred: 126 * MIB })),
+        /injected apply failure/,
+    );
+    assert.equal(governor.current().name, "conservative");
+    assert.match(governor.snapshot().decision, /transition failed/);
+}
+
 function unrelatedOperationKindsDoNotTrainOneAnother(): void {
     const governor = new AdaptiveResourceGovernor(SNAPDRAGON);
     governor.observe(measurement({ operationKind: "push", bytesTransferred: 100 * MIB }));
@@ -238,6 +256,7 @@ async function run(): Promise<void> {
     recoveryHintsLowerStartExpireAndClear();
     interruptionAndAimdAreHysteretic();
     additiveProbeRollsBackRegression();
+    failedProfileApplicationRollsBackSelection();
     unrelatedOperationKindsDoNotTrainOneAnother();
     unmeasuredUiLatencyCannotIncreaseConcurrency();
     perfWindowsExposePhaseRatesWithoutPrivateData();

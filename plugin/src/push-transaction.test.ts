@@ -723,6 +723,7 @@ async function smallFilesReachTransportAsPacksNotPerFilePuts(): Promise<void> {
     let packedCalls = 0;
     let packedRecords = 0;
     let legacyPuts = 0;
+    let heavyBatchPermits = 0;
     const api = {
         ensureTransportReady: async () => {},
         checkContent: async (hashes: string[]) => {
@@ -737,11 +738,25 @@ async function smallFilesReachTransportAsPacksNotPerFilePuts(): Promise<void> {
         putRoot: async () => ({ root_hash: "accepted", conflicts: [] }),
     } as any;
 
-    await push(api, f.io, f.syncBase, f.wasm, f.tree, "vault", changes, "base");
+    await push(
+        api,
+        f.io,
+        f.syncBase,
+        f.wasm,
+        f.tree,
+        "vault",
+        changes,
+        "base",
+        undefined,
+        undefined,
+        undefined,
+        async () => { heavyBatchPermits++; },
+    );
     check(checkCalls <= 10, `600 files expanded to ${checkCalls} check batches`);
     check(packedCalls === checkCalls, "each stream batch did not become one packed upload call");
     check(packedRecords === 600, "packed push lost content records");
     check(legacyPuts === 0, "packed push issued a per-file content PUT");
+    check(heavyBatchPermits >= packedCalls, "push bypassed a heavy-batch permit");
     check(f.commitCalls() === 1, "packed push did not commit its candidate");
 }
 

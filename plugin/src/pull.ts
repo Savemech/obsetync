@@ -6,7 +6,7 @@ import type { PullWriteExpectation } from "./pull-echo";
 import { conflictCopyPath } from "./conflict-path";
 import type { PerfOperation } from "./perf-trace";
 import { BulkObjectKind } from "./bulk-codec";
-import { planByteBoundedBatches } from "./hash-runtime";
+import { getHashTuning, planByteBoundedBatches } from "./hash-runtime";
 import { diffCursorFromHex, diffCursorToHex } from "./diff-page-codec";
 
 const CHUNK_THRESHOLD = 1_048_576; // 1MB
@@ -15,6 +15,33 @@ const DESKTOP_BULK_DOWNLOAD_BYTES = 8 * 1_048_576;
 const MOBILE_BULK_DOWNLOAD_BYTES = 2 * 1_048_576;
 const BULK_DOWNLOAD_FILES = 256;
 const TRANSFER_DIR = ".obsidian/plugins/obsetync/transfers";
+
+export async function allSettledBounded<T, R>(
+    items: readonly T[],
+    concurrency: number,
+    mapper: (item: T, index: number) => Promise<R>,
+): Promise<Array<PromiseSettledResult<R>>> {
+    if (!Number.isInteger(concurrency) || concurrency <= 0) {
+        throw new RangeError("bounded apply concurrency must be positive");
+    }
+    const results = new Array<PromiseSettledResult<R>>(items.length);
+    let next = 0;
+    const worker = async () => {
+        for (;;) {
+            const index = next++;
+            if (index >= items.length) return;
+            try {
+                results[index] = { status: "fulfilled", value: await mapper(items[index], index) };
+            } catch (reason) {
+                results[index] = { status: "rejected", reason };
+            }
+        }
+    };
+    await Promise.all(
+        Array.from({ length: Math.min(concurrency, items.length) }, () => worker()),
+    );
+    return results;
+}
 
 /** Sentinel device-root that tells the server "I'm fresh, give me every
  *  file as an addition." Matches the all-zero branch in `post_diff`. */
@@ -90,6 +117,7 @@ export async function pull(
      *  converges the fleet while every device keeps its local copy. */
     isIgnored?: (path: string) => boolean,
     perf?: PerfOperation,
+    beforeHeavyBatch?: () => Promise<void>,
 ): Promise<PullResult> {
     // New servers stream a fixed snapshot through bounded binary pages. Keep
     // the legacy JSON path below intact for compatibility with 1.10.x and for
@@ -107,6 +135,7 @@ export async function pull(
         skipPaths,
         isIgnored,
         perf,
+        beforeHeavyBatch,
     );
     if (paged !== undefined) return paged;
 
@@ -185,6 +214,7 @@ export async function pull(
                 skipPaths,
                 onWritesKnown,
                 perf,
+                beforeHeavyBatch,
             );
         } finally {
             endApply?.();
@@ -322,6 +352,7 @@ export async function pull(
             skipPaths,
             onWritesKnown,
             perf,
+            beforeHeavyBatch,
         );
     } finally {
         endApply?.();
@@ -411,6 +442,7 @@ async function pullPagedIfSupported(
     skipPaths?: PullPathGuard,
     isIgnored?: (path: string) => boolean,
     perf?: PerfOperation,
+    beforeHeavyBatch?: () => Promise<void>,
 ): Promise<PullResult | undefined> {
     const candidate = api as unknown as Partial<PagedDiffApi>;
     if (
@@ -461,6 +493,7 @@ async function pullPagedIfSupported(
     }
 
     while (!complete) {
+        await beforeHeavyBatch?.();
         const endCheck = perf?.phase("check");
         let page: DiffPage | null | undefined;
         try {
@@ -515,6 +548,7 @@ async function pullPagedIfSupported(
                 skipPaths,
                 onWritesKnown,
                 perf,
+                beforeHeavyBatch,
             );
         } finally {
             endApply?.();
@@ -852,6 +886,7 @@ async function applyDeltas(
     skipPaths?: PullPathGuard,
     onWritesKnown?: (writes: PullWriteExpectation[]) => void,
     perf?: PerfOperation,
+    beforeHeavyBatch?: () => Promise<void>,
 ): Promise<{
     deferred: FileDelta[];
     downloaded: number;
@@ -1129,6 +1164,7 @@ async function applyDeltas(
                 stats,
                 () => shouldSkip(delta),
                 perf,
+                beforeHeavyBatch,
             ))
         );
         results.forEach((r, j) => {
@@ -1139,8 +1175,11 @@ async function applyDeltas(
     };
 
     const applySmallBatch = async (batch: FileDelta[]): Promise<void> => {
-        const preparations = await Promise.allSettled(batch.map((delta) =>
-            prepareContentDelta(
+        const activeTuning = getHashTuning();
+        const preparations = await allSettledBounded(
+            batch,
+            activeTuning.readConcurrency,
+            (delta) => prepareContentDelta(
                 io,
                 syncBase,
                 wasm,
@@ -1148,7 +1187,8 @@ async function applyDeltas(
                 stats,
                 () => shouldSkip(delta),
                 perf,
-            )));
+            ),
+        );
         const pending: Array<{ delta: FileDelta; preparation: PendingContentDownload }> = [];
         preparations.forEach((result, index) => {
             const delta = batch[index];
@@ -1182,7 +1222,10 @@ async function applyDeltas(
                 return;
             }
             const countedHashes = new Set<string>();
-            const applied = await Promise.allSettled(pending.map(({ delta, preparation }) => {
+            const applied = await allSettledBounded(
+                pending,
+                activeTuning.applyConcurrency,
+                ({ delta, preparation }) => {
                 const canonicalHash = delta.hash!.toLowerCase();
                 const countTransferredBytes = !countedHashes.has(canonicalHash);
                 countedHashes.add(canonicalHash);
@@ -1198,8 +1241,10 @@ async function applyDeltas(
                     perf,
                     downloaded.get(canonicalHash),
                     countTransferredBytes,
+                    beforeHeavyBatch,
                 );
-            }));
+                },
+            );
             applied.forEach((result, index) => {
                 if (result.status === "rejected") failed.push(pending[index].delta);
                 else if (!result.value) deferLocal(pending[index].delta);
@@ -1215,19 +1260,25 @@ async function applyDeltas(
     const largeDownloads = toDownload.filter((delta) => (delta.size ?? 0) >= CHUNK_THRESHOLD);
     const desktop = smallDownloads.length > 0 &&
         io.getAbsolutePath(smallDownloads[0].path) !== null;
+    const downloadTuning = getHashTuning();
     const smallBatches = planByteBoundedBatches(
         smallDownloads,
         (delta) => delta.size ?? 0,
         {
-            maxFiles: BULK_DOWNLOAD_FILES,
-            maxBytes: desktop ? DESKTOP_BULK_DOWNLOAD_BYTES : MOBILE_BULK_DOWNLOAD_BYTES,
+            maxFiles: Math.min(BULK_DOWNLOAD_FILES, downloadTuning.maxBatchFiles),
+            maxBytes: Math.min(
+                desktop ? DESKTOP_BULK_DOWNLOAD_BYTES : MOBILE_BULK_DOWNLOAD_BYTES,
+                downloadTuning.maxBatchBytes,
+            ),
             maxSingleBytes: CHUNK_THRESHOLD - 1,
         },
     );
     for (const batch of smallBatches) {
+        await beforeHeavyBatch?.();
         await applySmallBatch(batch);
     }
     for (const delta of largeDownloads) {
+        await beforeHeavyBatch?.();
         await applyLargeBatch([delta]);
     }
 
@@ -1240,6 +1291,7 @@ async function applyDeltas(
         console.warn(`[obsetync] pull: ${failed.length} file(s) failed first pass — retrying once`);
         for (const delta of failed) {
             try {
+                await beforeHeavyBatch?.();
                 const applied = await applyContentDelta(
                     api,
                     io,
@@ -1249,6 +1301,7 @@ async function applyDeltas(
                     stats,
                     () => shouldSkip(delta),
                     perf,
+                    beforeHeavyBatch,
                 );
                 if (!applied) {
                     deferLocal(delta);
@@ -1451,6 +1504,7 @@ async function finishContentDownload(
     perf?: PerfOperation,
     prefetchedSmallData?: Uint8Array,
     countTransferredBytes = true,
+    beforeHeavyBatch?: () => Promise<void>,
 ): Promise<boolean> {
     if (!delta.hash) return true;
     const { size, preserveExisting } = preparation;
@@ -1469,6 +1523,7 @@ async function finishContentDownload(
                 shouldDefer,
                 preserveExisting,
                 perf,
+                beforeHeavyBatch,
             );
         } catch (error) {
             if (error instanceof LocalEditDuringPull) return false;
@@ -1529,6 +1584,7 @@ async function applyContentDelta(
     stats: ApplyStats,
     shouldDefer?: () => boolean,
     perf?: PerfOperation,
+    beforeHeavyBatch?: () => Promise<void>,
 ): Promise<boolean> {
     const preparation = await prepareContentDelta(
         io,
@@ -1551,6 +1607,9 @@ async function applyContentDelta(
         preparation,
         shouldDefer,
         perf,
+        undefined,
+        true,
+        beforeHeavyBatch,
     );
 }
 
@@ -1746,6 +1805,7 @@ export async function applyLargeFile(
     shouldAbort?: () => boolean,
     preserveExisting = false,
     perf?: PerfOperation,
+    beforeHeavyBatch?: () => Promise<void>,
 ): Promise<void> {
     if (shouldAbort?.()) throw new LocalEditDuringPull();
     if (!wasm) throw new Error("WASM hash verifier unavailable for large file");
@@ -1827,12 +1887,18 @@ export async function applyLargeFile(
                 // Legacy GET keeps its original one-chunk transaction and
                 // checkpoint semantics. Only an authenticated bulk page may
                 // group several chunks before the first one is applied.
-                maxFiles: bulkEnabled ? BULK_DOWNLOAD_FILES : 1,
-                maxBytes: desktop ? DESKTOP_BULK_DOWNLOAD_BYTES : MOBILE_BULK_DOWNLOAD_BYTES,
+                maxFiles: bulkEnabled
+                    ? Math.min(BULK_DOWNLOAD_FILES, getHashTuning().maxBatchFiles)
+                    : 1,
+                maxBytes: Math.min(
+                    desktop ? DESKTOP_BULK_DOWNLOAD_BYTES : MOBILE_BULK_DOWNLOAD_BYTES,
+                    getHashTuning().maxBatchBytes,
+                ),
                 maxSingleBytes: CHUNK_THRESHOLD - 1,
             },
         );
         for (const batch of chunkBatches) {
+            await beforeHeavyBatch?.();
             if (shouldAbort?.()) throw new LocalEditDuringPull();
             const endDownload = perf?.phase("download");
             let downloaded: Map<string, Uint8Array>;

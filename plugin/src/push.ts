@@ -214,6 +214,7 @@ export async function push(
     onProgress?: (msg: string) => void,
     perf?: PerfOperation,
     hashWorkers?: DesktopHashWorkerPool | null,
+    beforeHeavyBatch?: () => Promise<void>,
 ): Promise<{ newRootHash: string | null; conflicts: any[] }> {
     perf?.setWorkload({ filesTotal: changes.length });
     if (changes.length === 0) {
@@ -319,6 +320,7 @@ export async function push(
         maxHoldMs: tuning.maxBatchHoldMs,
     });
     for (const batchChanges of streamBatches) {
+        await beforeHeavyBatch?.();
         // Yield before each batch so Electron's audio/render callbacks can run.
         await yieldToUI();
 
@@ -572,6 +574,7 @@ export async function push(
                     const putRangedRecords = async (
                         records: readonly BulkUploadRecord[],
                     ): Promise<void> => {
+                        await beforeHeavyBatch?.();
                         const endUpload = perf?.phase("upload");
                         try {
                             await api.putObjects(records, perf);
@@ -591,6 +594,7 @@ export async function push(
                         putRangedRecords,
                         async () => {
                             if (!uploadManifest) return;
+                            await beforeHeavyBatch?.();
                             const manifestRecord = makeManifestRecord();
                             perf?.observePeakBatchBytes(manifestRecord.data.byteLength);
                             const endUpload = perf?.phase("upload");
@@ -678,6 +682,7 @@ export async function push(
         }
 
         if (uploadRecords.length > 0) {
+            await beforeHeavyBatch?.();
             const endUpload = perf?.phase("upload");
             try {
                 await api.putObjects(uploadRecords, perf);
@@ -764,6 +769,7 @@ export async function push(
             }
             const endIndexUpload = perf?.phase("tree_index_upload");
             try {
+                await beforeHeavyBatch?.();
                 await api.putObjects(records, perf);
             } finally {
                 endIndexUpload?.();
@@ -892,11 +898,10 @@ export function streamingHash(wasm: WasmModule, data: Uint8Array): string {
  *  necessarily whole-file on Obsidian mobile, but WASM never receives a
  *  second whole-file copy and retains a bounded ~4 MiB window. */
 export async function chunkFileStreaming(wasm: WasmModule, data: Uint8Array): Promise<any> {
-    const YIELD_EVERY = 4 * 1024 * 1024;
     const chunker = new wasm.WasmChunker();
     try {
         let offset = 0;
-        let nextYield = YIELD_EVERY;
+        let lastYieldAt = monotonicNow();
         while (offset < data.length) {
             const feedBytes = getHashTuning().feedBytes;
             const end = Math.min(data.length, offset + feedBytes);
@@ -904,9 +909,10 @@ export async function chunkFileStreaming(wasm: WasmModule, data: Uint8Array): Pr
             chunker.update(data.subarray(offset, end));
             observeHashStep(end - offset, started);
             offset = end;
-            if (offset >= nextYield) {
+            const afterStep = monotonicNow();
+            if (afterStep - lastYieldAt >= getHashTuning().yieldBudgetMs) {
                 await yieldToUI();
-                nextYield = offset + YIELD_EVERY;
+                lastYieldAt = monotonicNow();
             }
         }
         return chunker.finish();
