@@ -35,6 +35,7 @@ use axum::{
 };
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
+use tokio_util::sync::CancellationToken;
 
 /// Cap on vaults per subscription frame — a self-hosted fleet syncs a
 /// handful of vaults; anything bigger is a client bug.
@@ -57,16 +58,32 @@ pub async fn ws_route(
         // v1 legacy: burn the ticket BEFORE upgrading — a rejected handshake
         // must not leave a spendable ticket behind.
         Some(ticket) => {
-            let Some(t) = ws_ticket::claim(&state.layout, &ticket) else {
+            let layout = state.layout.clone();
+            let claimed = match state
+                .control_io
+                .run(move || ws_ticket::claim(&layout, &ticket))
+                .await
+            {
+                Ok(claimed) => claimed,
+                Err(error) => {
+                    tracing::warn!(%error, "ws: ticket claim unavailable");
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "ticket service unavailable",
+                    )
+                        .into_response();
+                }
+            };
+            let Some(t) = claimed else {
                 tracing::warn!("ws: rejected v1 connection (unknown/expired/reused ticket)");
                 return (StatusCode::UNAUTHORIZED, "invalid ticket").into_response();
             };
-            if crate::devices::is_revoked(&state.layout, &t.device_id) {
+            let Some(session_cancelled) = state.devices.session_token(&t.device_id) else {
                 return (StatusCode::FORBIDDEN, "device revoked").into_response();
-            }
+            };
             let device_short = t.device_id[..t.device_id.len().min(12)].to_string();
             tracing::info!(device = %device_short, "ws: v1 session opening (plaintext, deprecated)");
-            upgrade.on_upgrade(move |socket| session(state, socket, t, false))
+            upgrade.on_upgrade(move |socket| session(state, socket, t, session_cancelled))
         }
         // v2: auth happens as the first frame after upgrade.
         None => upgrade.on_upgrade(move |socket| v2_entry(state, socket)),
@@ -106,7 +123,22 @@ async fn v2_entry(state: SharedState, socket: WebSocket) {
         }
     };
 
-    let Some(ticket) = ws_ticket::claim(&state.layout, &ticket_hex) else {
+    let layout = state.layout.clone();
+    let claimed = match state
+        .control_io
+        .run(move || ws_ticket::claim(&layout, &ticket_hex))
+        .await
+    {
+        Ok(claimed) => claimed,
+        Err(error) => {
+            tracing::warn!(%error, "ws: v2 ticket claim unavailable");
+            let _ = sink
+                .send(Message::Text(bye("ticket unavailable").into()))
+                .await;
+            return;
+        }
+    };
+    let Some(ticket) = claimed else {
         tracing::warn!("ws: rejected v2 auth (unknown/expired/reused ticket)");
         let _ = sink.send(Message::Text(bye("invalid ticket").into())).await;
         return;
@@ -119,14 +151,14 @@ async fn v2_entry(state: SharedState, socket: WebSocket) {
             .await;
         return;
     }
-    if crate::devices::is_revoked(&state.layout, &ticket.device_id) {
+    let Some(session_cancelled) = state.devices.session_token(&ticket.device_id) else {
         let _ = sink.send(Message::Text(bye("device revoked").into())).await;
         return;
-    }
+    };
 
     let device_short = ticket.device_id[..ticket.device_id.len().min(12)].to_string();
     tracing::info!(device = %device_short, "ws: v2 session opening (sealed)");
-    session_v2(state, sink, stream, ticket).await;
+    session_v2(state, sink, stream, ticket, session_cancelled).await;
 }
 
 /// Decoded session keys + directional counters for a v2 session.
@@ -170,6 +202,7 @@ async fn session_v2(
     mut sink: SplitSink<WebSocket, Message>,
     mut stream: SplitStream<WebSocket>,
     mut ticket: ws_ticket::WsTicket,
+    session_cancelled: CancellationToken,
 ) {
     let device_short = ticket.device_id[..ticket.device_id.len().min(12)].to_string();
     let Some(mut seal) = SealCtx::from_ticket(&ticket) else {
@@ -194,12 +227,14 @@ async fn session_v2(
     }
 
     // Wait for the (sealed) sub frame.
-    let vaults = match tokio::time::timeout(
-        std::time::Duration::from_secs(HANDSHAKE_DEADLINE_SECS),
-        read_sub_sealed(&mut stream, &mut seal),
-    )
-    .await
-    {
+    let subscription = tokio::select! {
+        _ = session_cancelled.cancelled() => return,
+        result = tokio::time::timeout(
+            std::time::Duration::from_secs(HANDSHAKE_DEADLINE_SECS),
+            read_sub_sealed(&mut stream, &mut seal),
+        ) => result,
+    };
+    let vaults = match subscription {
         Ok(Some(v)) if !v.is_empty() => v,
         _ => {
             if let Some(f) = seal.seal(&bye("expected sub frame")) {
@@ -211,7 +246,9 @@ async fn session_v2(
     tracing::info!(device = %device_short, vaults = ?vaults, "ws: v2 subscribed");
 
     // Device name for presence frames — fetched once.
-    let device_name = crate::devices::get_device(&state.layout, &ticket.device_id)
+    let device_name = state
+        .devices
+        .get(&ticket.device_id)
         .map(|d| d.name)
         .unwrap_or_else(|| device_short.clone());
 
@@ -262,6 +299,12 @@ async fn session_v2(
 
     loop {
         tokio::select! {
+            _ = session_cancelled.cancelled() => {
+                if let Some(frame) = seal.seal(&bye("device revoked")) {
+                    let _ = sink.send(Message::Binary(frame.into())).await;
+                }
+                break;
+            }
             frame = out_rx.recv() => {
                 match frame {
                     Some(inner) => {
@@ -379,16 +422,23 @@ async fn read_sub_sealed(
 }
 
 /// v1 legacy session: plaintext frames, ROOT NOTIFICATIONS ONLY.
-async fn session(state: SharedState, socket: WebSocket, ticket: ws_ticket::WsTicket, _v2: bool) {
+async fn session(
+    state: SharedState,
+    socket: WebSocket,
+    ticket: ws_ticket::WsTicket,
+    session_cancelled: CancellationToken,
+) {
     let device_short = ticket.device_id[..ticket.device_id.len().min(12)].to_string();
     let (mut sink, mut stream) = socket.split();
 
-    let vaults = match tokio::time::timeout(
-        std::time::Duration::from_secs(HANDSHAKE_DEADLINE_SECS),
-        read_sub_plain(&mut stream),
-    )
-    .await
-    {
+    let subscription = tokio::select! {
+        _ = session_cancelled.cancelled() => return,
+        result = tokio::time::timeout(
+            std::time::Duration::from_secs(HANDSHAKE_DEADLINE_SECS),
+            read_sub_plain(&mut stream),
+        ) => result,
+    };
+    let vaults = match subscription {
         Ok(Some(v)) if !v.is_empty() => v,
         _ => {
             let _ = sink
@@ -428,6 +478,10 @@ async fn session(state: SharedState, socket: WebSocket, ticket: ws_ticket::WsTic
 
     loop {
         tokio::select! {
+            _ = session_cancelled.cancelled() => {
+                let _ = sink.send(Message::Text(bye("device revoked").into())).await;
+                break;
+            }
             frame = out_rx.recv() => {
                 match frame {
                     Some(f) => {

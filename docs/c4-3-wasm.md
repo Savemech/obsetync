@@ -148,12 +148,11 @@ plugin: wasm_tree_get_chunk(tree, hash)      # get individual node bytes for upl
 
 ### Server diff (native build)
 ```
-SyncCoreBridge.run_diff(index_base, from_root, to_root)
-  → spawn_blocking + LocalSet
-      → DiskChunkStore::new(index_base)
-      → diff::compute_deltas(disk_store, from_root, to_root)
+SyncCoreBridge.run_diff(storage_writer, from_root, to_root)
+  → bounded StorageWriter read pool + LocalSet
+      → diff::compute_deltas(pack-backed store, from_root, to_root)
           → two-pointer over sorted prefix children
-          → for changed prefix: DiskChunkStore.get(hash) → FlatBuffersCodec.deserialize → diff entries
+          → for changed prefix: indexed pack read → FlatBuffersCodec.deserialize → diff entries
           → detect_renames: pair only unique one-delete/one-add matches per hash
   ← Vec<FileDelta>
 ```

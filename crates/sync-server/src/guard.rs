@@ -150,21 +150,22 @@ pub async fn scan(
     current: RootNode,
     candidate: RootNode,
 ) -> Result<GuardScan, String> {
-    tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?;
-        let skew_ms = config().mtime_skew_ms;
-        let local = tokio::task::LocalSet::new();
-        local.block_on(&rt, async {
-            scan_inner(&store, &current, &candidate, skew_ms)
-                .await
-                .map_err(|e| e.to_string())
+    store
+        .run_blocking(move |store| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            let skew_ms = config().mtime_skew_ms;
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, async {
+                scan_inner(&store, &current, &candidate, skew_ms)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
         })
-    })
-    .await
-    .map_err(|e| format!("join error: {}", e))?
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 async fn scan_inner<S: ChunkStore>(

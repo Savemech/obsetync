@@ -17,20 +17,21 @@ pub async fn run_merge(
     side_a: RootNode,
     side_b: RootNode,
 ) -> Result<MergeResult, String> {
-    tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?;
-        let local = tokio::task::LocalSet::new();
-        local.block_on(&rt, async {
-            sync_core::merge::merge_trees(&store, &store, &base, &side_a, &side_b)
-                .await
-                .map_err(|e| e.to_string())
+    store
+        .run_blocking(move |store| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, async {
+                sync_core::merge::merge_trees(&store, &store, &base, &side_a, &side_b)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
         })
-    })
-    .await
-    .map_err(|e| format!("join error: {}", e))?
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Load every file entry reachable from a root (all subtrees flattened),
@@ -40,29 +41,30 @@ pub async fn run_list_entries(
     store: StorageWriter,
     root: RootNode,
 ) -> Result<Vec<sync_core::chunk::FileEntry>, String> {
-    tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?;
-        let local = tokio::task::LocalSet::new();
-        local.block_on(&rt, async {
-            // Stored roots are normally trusted, but never turn a corrupt
-            // total_files field into a giant eager allocation.
-            let mut entries =
-                Vec::with_capacity(usize::try_from(root.total_files).unwrap_or(0).min(100_000));
-            for (_prefix, child_hash) in &root.children {
-                let mut child = sync_core::tree::load_all_entries(&store, child_hash)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                entries.append(&mut child);
-            }
-            entries.sort();
-            Ok(entries)
+    store
+        .run_blocking(move |store| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, async {
+                // Stored roots are normally trusted, but never turn a corrupt
+                // total_files field into a giant eager allocation.
+                let mut entries =
+                    Vec::with_capacity(usize::try_from(root.total_files).unwrap_or(0).min(100_000));
+                for (_prefix, child_hash) in &root.children {
+                    let mut child = sync_core::tree::load_all_entries(&store, child_hash)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    entries.append(&mut child);
+                }
+                entries.sort();
+                Ok(entries)
+            })
         })
-    })
-    .await
-    .map_err(|e| format!("join error: {}", e))?
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Validate and flatten an untrusted uploaded root before it can become the
@@ -73,92 +75,93 @@ pub async fn run_validate_root(
     store: StorageWriter,
     root: RootNode,
 ) -> Result<Vec<sync_core::chunk::FileEntry>, String> {
-    tokio::task::spawn_blocking(move || {
-        if root.version != 1 {
-            return Err(format!("unsupported root version {}", root.version));
-        }
-        if root.total_files > MAX_ROOT_FILES {
-            return Err(format!(
-                "root declares too many files: {}",
-                root.total_files
-            ));
-        }
-        if root.children.len() as u64 > root.total_files && root.total_files != 0 {
-            return Err("root has more top-level children than files".to_string());
-        }
-        if root.total_files == 0 && !root.children.is_empty() {
-            return Err("empty root has child nodes".to_string());
-        }
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?;
-        let local = tokio::task::LocalSet::new();
-        local.block_on(&rt, async {
-            let mut entries =
-                Vec::with_capacity(usize::try_from(root.total_files).unwrap_or(0).min(100_000));
-            let mut previous_prefix: Option<&str> = None;
-            for (prefix, child_hash) in &root.children {
-                if previous_prefix.is_some_and(|previous| previous >= prefix.as_str()) {
-                    return Err("root child prefixes are not strictly sorted".to_string());
-                }
-                if !valid_top_level_prefix(prefix) {
-                    return Err(format!("invalid root child prefix {prefix:?}"));
-                }
-                previous_prefix = Some(prefix);
-
-                let child = sync_core::tree::load_all_entries(&store, child_hash)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                // Each prefix is its own sorted namespace. The canonical root
-                // order puts the root-level prefix (`""`) first, but a root
-                // file such as `seed.md` can lexically follow `notes/x.md` in
-                // the next prefix, so ordering must not leak across children.
-                let mut previous_path: Option<String> = None;
-                for entry in child {
-                    if !valid_vault_path(&entry.path) {
-                        return Err(format!("unsafe vault path {:?}", entry.path));
-                    }
-                    if top_level_prefix(&entry.path) != prefix {
-                        return Err(format!(
-                            "entry {:?} is stored under wrong root prefix {:?}",
-                            entry.path, prefix
-                        ));
-                    }
-                    if previous_path
-                        .as_ref()
-                        .is_some_and(|previous| previous >= &entry.path)
-                    {
-                        return Err("root entries are not strictly path-sorted".to_string());
-                    }
-                    if entry.size_bytes > JS_MAX_SAFE_INTEGER
-                        || entry.mtime_ms > JS_MAX_SAFE_INTEGER
-                    {
-                        return Err(format!(
-                            "entry {:?} exceeds client integer range",
-                            entry.path
-                        ));
-                    }
-                    previous_path = Some(entry.path.clone());
-                    entries.push(entry);
-                    if entries.len() as u64 > root.total_files {
-                        return Err("root contains more entries than declared".to_string());
-                    }
-                }
+    store
+        .run_blocking(move |store| {
+            if root.version != 1 {
+                return Err(format!("unsupported root version {}", root.version));
             }
-            if entries.len() as u64 != root.total_files {
+            if root.total_files > MAX_ROOT_FILES {
                 return Err(format!(
-                    "root declares {} files but contains {}",
-                    root.total_files,
-                    entries.len()
+                    "root declares too many files: {}",
+                    root.total_files
                 ));
             }
-            Ok(entries)
+            if root.children.len() as u64 > root.total_files && root.total_files != 0 {
+                return Err("root has more top-level children than files".to_string());
+            }
+            if root.total_files == 0 && !root.children.is_empty() {
+                return Err("empty root has child nodes".to_string());
+            }
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, async {
+                let mut entries =
+                    Vec::with_capacity(usize::try_from(root.total_files).unwrap_or(0).min(100_000));
+                let mut previous_prefix: Option<&str> = None;
+                for (prefix, child_hash) in &root.children {
+                    if previous_prefix.is_some_and(|previous| previous >= prefix.as_str()) {
+                        return Err("root child prefixes are not strictly sorted".to_string());
+                    }
+                    if !valid_top_level_prefix(prefix) {
+                        return Err(format!("invalid root child prefix {prefix:?}"));
+                    }
+                    previous_prefix = Some(prefix);
+
+                    let child = sync_core::tree::load_all_entries(&store, child_hash)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    // Each prefix is its own sorted namespace. The canonical root
+                    // order puts the root-level prefix (`""`) first, but a root
+                    // file such as `seed.md` can lexically follow `notes/x.md` in
+                    // the next prefix, so ordering must not leak across children.
+                    let mut previous_path: Option<String> = None;
+                    for entry in child {
+                        if !valid_vault_path(&entry.path) {
+                            return Err(format!("unsafe vault path {:?}", entry.path));
+                        }
+                        if top_level_prefix(&entry.path) != prefix {
+                            return Err(format!(
+                                "entry {:?} is stored under wrong root prefix {:?}",
+                                entry.path, prefix
+                            ));
+                        }
+                        if previous_path
+                            .as_ref()
+                            .is_some_and(|previous| previous >= &entry.path)
+                        {
+                            return Err("root entries are not strictly path-sorted".to_string());
+                        }
+                        if entry.size_bytes > JS_MAX_SAFE_INTEGER
+                            || entry.mtime_ms > JS_MAX_SAFE_INTEGER
+                        {
+                            return Err(format!(
+                                "entry {:?} exceeds client integer range",
+                                entry.path
+                            ));
+                        }
+                        previous_path = Some(entry.path.clone());
+                        entries.push(entry);
+                        if entries.len() as u64 > root.total_files {
+                            return Err("root contains more entries than declared".to_string());
+                        }
+                    }
+                }
+                if entries.len() as u64 != root.total_files {
+                    return Err(format!(
+                        "root declares {} files but contains {}",
+                        root.total_files,
+                        entries.len()
+                    ));
+                }
+                Ok(entries)
+            })
         })
-    })
-    .await
-    .map_err(|e| format!("join error: {}", e))?
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 fn valid_vault_path(path: &str) -> bool {
@@ -197,33 +200,35 @@ pub async fn run_purge(
     root: RootNode,
     patterns: Vec<String>,
 ) -> Result<(RootNode, usize, usize), String> {
-    tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?;
-        let local = tokio::task::LocalSet::new();
-        local.block_on(&rt, async {
-            let vault_id = root.vault_id.clone();
-            let mut entries = Vec::with_capacity(root.total_files as usize);
-            for (_prefix, child_hash) in &root.children {
-                let mut child = sync_core::tree::load_all_entries(&store, child_hash)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                entries.append(&mut child);
-            }
-            let before = entries.len();
-            entries.retain(|e| !crate::ignore_match::matches_any(&e.path, &patterns));
-            let kept = entries.len();
-            let removed = before - kept;
-            let new_root = sync_core::tree::build_tree(&store, entries, &vault_id, "admin-purge")
-                .await
+    store
+        .run_blocking(move |store| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
                 .map_err(|e| e.to_string())?;
-            Ok((new_root, removed, kept))
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, async {
+                let vault_id = root.vault_id.clone();
+                let mut entries = Vec::with_capacity(root.total_files as usize);
+                for (_prefix, child_hash) in &root.children {
+                    let mut child = sync_core::tree::load_all_entries(&store, child_hash)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    entries.append(&mut child);
+                }
+                let before = entries.len();
+                entries.retain(|e| !crate::ignore_match::matches_any(&e.path, &patterns));
+                let kept = entries.len();
+                let removed = before - kept;
+                let new_root =
+                    sync_core::tree::build_tree(&store, entries, &vault_id, "admin-purge")
+                        .await
+                        .map_err(|e| e.to_string())?;
+                Ok((new_root, removed, kept))
+            })
         })
-    })
-    .await
-    .map_err(|e| format!("join error: {}", e))?
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Run sync-core's `compute_deltas` in a blocking task with a LocalSet.
@@ -240,20 +245,21 @@ pub async fn run_diff_with_stats(
     from_root: RootNode,
     to_root: RootNode,
 ) -> Result<sync_core::diff::DiffResult, String> {
-    tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?;
-        let local = tokio::task::LocalSet::new();
-        local.block_on(&rt, async {
-            sync_core::diff::compute_deltas_with_stats(&store, &from_root, &to_root)
-                .await
-                .map_err(|e| e.to_string())
+    store
+        .run_blocking(move |store| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, async {
+                sync_core::diff::compute_deltas_with_stats(&store, &from_root, &to_root)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
         })
-    })
-    .await
-    .map_err(|e| format!("join error: {}", e))?
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[cfg(test)]

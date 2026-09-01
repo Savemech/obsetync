@@ -76,6 +76,19 @@ prove request multiplexing, negotiated request/byte credits, buffered-amount
 hysteresis, protocol-specific AAD, strict decoding, bulk-HTTP fallback, and
 recovery after loss at auth, HELLO, CHECK, GET, and unknown PUT boundaries.
 
+Slice 9 changes execution topology rather than the W1 byte/request oracle, so
+its gate is covered by deterministic concurrency and recovery tests instead of
+a synthetic throughput claim. Bearer auth continues successfully after the
+test removes both on-disk lookup files, proving the served hot path is memory
+only. Restart tests reconstruct live/revoked/name/last-seen parity from
+canonical files; injected revocation publication failure leaves auth and every
+session token live, while a successful durable revoke immediately rejects HTTP
+and cancels 128 concurrent session handles. Blocking-pool tests hold the
+storage pool fully saturated and prove independent ticket/control work still
+completes. Admission is fixed at four coarse storage operations and two
+control-I/O operations, with permits acquired before `spawn_blocking`; bulk
+CHECK/PUT/GET submits one operation per pack, never one task per object.
+
 This Linux/x86_64 run is implementation evidence, not the final cross-hardware
 release report. A17, M1, Snapdragon, cold/warm cache, power, and network fields
 are added by the final hardware gate.

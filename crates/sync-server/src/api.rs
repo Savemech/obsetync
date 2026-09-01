@@ -9,7 +9,7 @@ use crate::perf::{DiffSample, RequestPhase, ServerPerfCounters};
 use crate::secure;
 use crate::state::SharedState;
 use crate::storage_writer::{
-    DurableObject, StorageObjectKind, StoreError, StoreOutcome, StoreResult,
+    DurableObject, StorageObjectKind, StorageWriter, StoreError, StoreOutcome, StoreResult,
 };
 use axum::{
     body::Body,
@@ -63,15 +63,26 @@ async fn store_one_object(
         .map_err(storage_writer_error)
 }
 
-fn read_stored_object(
-    state: &SharedState,
+fn read_stored_object_blocking(
+    writer: &StorageWriter,
     kind: StorageObjectKind,
     hash: &FileHash,
 ) -> Result<Option<Vec<u8>>, ServerError> {
-    state
-        .storage_writer
+    writer
         .read(kind, hash)
         .map_err(|error| ServerError::Internal(error.to_string()))
+}
+
+async fn read_stored_object(
+    state: &SharedState,
+    kind: StorageObjectKind,
+    hash: FileHash,
+) -> Result<Option<Vec<u8>>, ServerError> {
+    let writer = state.storage_writer.clone();
+    writer
+        .run_blocking(move |writer| read_stored_object_blocking(&writer, kind, &hash))
+        .await
+        .map_err(|error| ServerError::ServiceUnavailable(error.to_string()))?
 }
 
 /// Authenticated device id, inserted into request extensions by
@@ -329,9 +340,9 @@ async fn secure_envelope(
         // to a future compromise of the long-term server key.
         "bootstrap".to_owned()
     } else {
-        let device_id = match devices::lookup_token(&state.layout, &decrypted.bearer_token) {
-            Some(device_id) => device_id,
-            None => {
+        let authenticated = match state.devices.authenticate(&decrypted.bearer_token) {
+            Ok(device) => device,
+            Err(devices::AuthenticationError::Unknown) => {
                 state
                     .perf
                     .record_request_phase(RequestPhase::TokenReplay, auth_started.elapsed());
@@ -346,28 +357,64 @@ async fn secure_envelope(
                     state.perf.as_ref(),
                 );
             }
+            Err(devices::AuthenticationError::Revoked) => {
+                state
+                    .perf
+                    .record_request_phase(RequestPhase::TokenReplay, auth_started.elapsed());
+                state.perf.record_request_error();
+                tracing::warn!(method = %method, path = %path, "revoked device attempted request");
+                return encrypted_semantic_response(
+                    &decrypted,
+                    StatusCode::FORBIDDEN,
+                    br#"{"error":"revoked"}"#,
+                    &method,
+                    &path,
+                    state.perf.as_ref(),
+                );
+            }
         };
+        let device_id = authenticated.device_id;
         let device_short = device_id[..device_id.len().min(12)].to_owned();
-        if devices::is_revoked(&state.layout, &device_id) {
-            state
-                .perf
-                .record_request_phase(RequestPhase::TokenReplay, auth_started.elapsed());
-            state.perf.record_request_error();
-            tracing::warn!(device = %device_short, method = %method, path = %path, "revoked device attempted request");
-            return encrypted_semantic_response(
-                &decrypted,
-                StatusCode::FORBIDDEN,
-                br#"{"error":"revoked"}"#,
-                &method,
-                &path,
-                state.perf.as_ref(),
-            );
-        }
 
-        match state
+        let request_sequence = decrypted.sequence;
+        let replay_result = match state
             .sequences
-            .check_and_record(&device_id, decrypted.sequence)
+            .check_in_memory(&device_id, request_sequence)
         {
+            Some(decision) => Ok(decision),
+            None => {
+                let sequence_state = state.clone();
+                let sequence_device = device_id.clone();
+                match state
+                    .control_io
+                    .run(move || {
+                        sequence_state
+                            .sequences
+                            .check_and_record(&sequence_device, request_sequence)
+                    })
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(error) => {
+                        state.perf.record_request_phase(
+                            RequestPhase::TokenReplay,
+                            auth_started.elapsed(),
+                        );
+                        state.perf.record_request_error();
+                        tracing::error!(device = %device_short, reason = %error, "anti-replay reservation task failed");
+                        return encrypted_semantic_response(
+                            &decrypted,
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            br#"{"error":"anti_replay_unavailable"}"#,
+                            &method,
+                            &path,
+                            state.perf.as_ref(),
+                        );
+                    }
+                }
+            }
+        };
+        match replay_result {
             Ok(crate::seq_tracker::ReplayDecision::Accepted) => {}
             Ok(crate::seq_tracker::ReplayDecision::Replay { greatest_seen }) => {
                 let body = serde_json::json!({
@@ -405,7 +452,6 @@ async fn secure_envelope(
                 );
             }
         }
-        let _ = devices::touch_last_seen(&state.layout, &device_id);
         parts.extensions.insert(DeviceIdExt(device_id));
         device_short
     };
@@ -948,8 +994,14 @@ async fn post_ws_ticket(
         }
     };
 
-    let mut outcome = crate::ws_ticket::mint(&state.layout, &device.0, client_eph_pub)
-        .map_err(|e| ServerError::Internal(format!("ticket mint failed: {}", e)))?;
+    let layout = state.layout.clone();
+    let device_id = device.0;
+    let mut outcome = state
+        .control_io
+        .run(move || crate::ws_ticket::mint(&layout, &device_id, client_eph_pub))
+        .await
+        .map_err(|e| ServerError::Internal(format!("ticket mint unavailable: {e}")))?
+        .map_err(|e| ServerError::Internal(format!("ticket mint failed: {e}")))?;
     let response = serde_json::json!({
         "ticket": outcome.ticket.ticket,
         "expires_at": outcome.ticket.expires_at,
@@ -1080,7 +1132,14 @@ async fn enforce_guard(
             // One-time, admin-approved bypass for an INTENTIONAL bulk change the
             // guard can't distinguish from a runaway (e.g. deleting a build
             // tree). Consumed here so it applies to exactly this one push.
-            if crate::devices::consume_deletion_bypass(&state.layout, device_id) {
+            let layout = state.layout.clone();
+            let bypass_device = device_id.to_owned();
+            let bypass_granted = state
+                .control_io
+                .run(move || crate::devices::consume_deletion_bypass(&layout, &bypass_device))
+                .await
+                .unwrap_or(false);
+            if bypass_granted {
                 tracing::warn!(
                     vault = %vault_id,
                     branch,
@@ -1134,22 +1193,26 @@ async fn put_root(
     let entries = bridge::run_validate_root(state.storage_writer.clone(), incoming_root.clone())
         .await
         .map_err(|e| ServerError::BadRequest(format!("invalid root structure: {}", e)))?;
-    for entry in &entries {
-        let present = if sync_core::fastcdc_chunker::should_chunk(entry.size_bytes) {
-            stored_manifest_is_usable(&state, &entry.hash)
-        } else {
-            state
-                .storage_writer
-                .contains(StorageObjectKind::Content, &entry.hash)
-        };
-        if !present {
-            return Err(ServerError::BadRequest(format!(
-                "root references missing content for {:?}",
-                entry.path
-            )));
-        }
-    }
-    drop(entries);
+    let writer = state.storage_writer.clone();
+    writer
+        .run_blocking(move |writer| {
+            for entry in entries {
+                let present = if sync_core::fastcdc_chunker::should_chunk(entry.size_bytes) {
+                    stored_manifest_is_usable(&writer, &entry.hash)
+                } else {
+                    writer.contains(StorageObjectKind::Content, &entry.hash)
+                };
+                if !present {
+                    return Err(ServerError::BadRequest(format!(
+                        "root references missing content for {:?}",
+                        entry.path
+                    )));
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| ServerError::ServiceUnavailable(error.to_string()))??;
 
     let incoming_hash = incoming_root.hash();
 
@@ -1556,7 +1619,8 @@ async fn get_chunk(
 ) -> Result<impl IntoResponse, ServerError> {
     let hash =
         hex_to_hash(&hash_hex).map_err(|_| ServerError::BadRequest("invalid hash".into()))?;
-    let data = read_stored_object(&state, StorageObjectKind::IndexChunk, &hash)?
+    let data = read_stored_object(&state, StorageObjectKind::IndexChunk, hash)
+        .await?
         .ok_or_else(|| ServerError::NotFound(format!("chunk {} not found", hash_hex)))?;
     state.perf.record_request_objects(1);
     Ok((StatusCode::OK, data))
@@ -1604,18 +1668,20 @@ async fn post_chunks_check(
     let hashes: Vec<String> = serde_json::from_slice(&body)
         .map_err(|e| ServerError::BadRequest(format!("expected JSON array of hashes: {}", e)))?;
     state.perf.record_request_objects(hashes.len() as u64);
-    let needed: Vec<String> = hashes
-        .into_iter()
-        .filter(|h| {
-            hex_to_hash(h)
-                .map(|hash| {
-                    !state
-                        .storage_writer
-                        .contains(StorageObjectKind::IndexChunk, &hash)
+    let writer = state.storage_writer.clone();
+    let needed = writer
+        .run_blocking(move |writer| {
+            hashes
+                .into_iter()
+                .filter(|hash_hex| {
+                    hex_to_hash(hash_hex)
+                        .map(|hash| !writer.contains(StorageObjectKind::IndexChunk, &hash))
+                        .unwrap_or(false)
                 })
-                .unwrap_or(false)
+                .collect::<Vec<_>>()
         })
-        .collect();
+        .await
+        .map_err(|error| ServerError::ServiceUnavailable(error.to_string()))?;
     Ok(axum::Json(serde_json::json!({ "needed": needed })))
 }
 
@@ -1627,7 +1693,8 @@ async fn get_content(
 ) -> Result<impl IntoResponse, ServerError> {
     let hash =
         hex_to_hash(&hash_hex).map_err(|_| ServerError::BadRequest("invalid hash".into()))?;
-    let data = read_stored_object(&state, StorageObjectKind::Content, &hash)?
+    let data = read_stored_object(&state, StorageObjectKind::Content, hash)
+        .await?
         .ok_or_else(|| ServerError::NotFound(format!("content {} not found", hash_hex)))?;
     state.perf.record_request_objects(1);
     Ok((StatusCode::OK, data))
@@ -1665,18 +1732,20 @@ async fn post_content_check(
     let hashes: Vec<String> = serde_json::from_slice(&body)
         .map_err(|e| ServerError::BadRequest(format!("expected JSON array of hashes: {}", e)))?;
     state.perf.record_request_objects(hashes.len() as u64);
-    let needed: Vec<String> = hashes
-        .into_iter()
-        .filter(|h| {
-            hex_to_hash(h)
-                .map(|hash| {
-                    !state
-                        .storage_writer
-                        .contains(StorageObjectKind::Content, &hash)
+    let writer = state.storage_writer.clone();
+    let needed = writer
+        .run_blocking(move |writer| {
+            hashes
+                .into_iter()
+                .filter(|hash_hex| {
+                    hex_to_hash(hash_hex)
+                        .map(|hash| !writer.contains(StorageObjectKind::Content, &hash))
+                        .unwrap_or(false)
                 })
-                .unwrap_or(false)
+                .collect::<Vec<_>>()
         })
-        .collect();
+        .await
+        .map_err(|error| ServerError::ServiceUnavailable(error.to_string()))?;
     Ok(axum::Json(serde_json::json!({ "needed": needed })))
 }
 
@@ -1751,23 +1820,18 @@ fn validate_content_manifest_structure(
 /// disk corruption and proves the ordered concatenation hashes to the
 /// manifest/file-tree hash without ever holding the whole file in memory.
 fn validate_content_manifest(
-    state: &SharedState,
+    writer: &StorageWriter,
+    perf: &crate::perf::ServerPerfCounters,
     expected_file_hash: &FileHash,
     manifest: &WireContentManifest,
 ) -> Result<(), ServerError> {
-    validate_content_manifest_with_loader(
-        expected_file_hash,
-        manifest,
-        state.perf.as_ref(),
-        |chunk_hash| {
-            state
-                .storage_writer
-                .read(StorageObjectKind::ContentChunk, chunk_hash)
-                .ok()
-                .flatten()
-                .map(std::borrow::Cow::Owned)
-        },
-    )
+    validate_content_manifest_with_loader(expected_file_hash, manifest, perf, |chunk_hash| {
+        writer
+            .read(StorageObjectKind::ContentChunk, chunk_hash)
+            .ok()
+            .flatten()
+            .map(std::borrow::Cow::Owned)
+    })
 }
 
 /// Full manifest validation with a caller-supplied chunk source. Bulk upload
@@ -1815,22 +1879,33 @@ async fn get_manifest(
 ) -> Result<impl IntoResponse, ServerError> {
     let hash =
         hex_to_hash(&hash_hex).map_err(|_| ServerError::BadRequest("invalid hash".into()))?;
-    let data = read_stored_object(&state, StorageObjectKind::Manifest, &hash)?
-        .ok_or_else(|| ServerError::NotFound(format!("manifest {} not found", hash_hex)))?;
-    let manifest: WireContentManifest = serde_json::from_slice(&data)
-        .map_err(|e| ServerError::Internal(format!("corrupt manifest {}: {}", hash_hex, e)))?;
-    let chunk_hashes = validate_content_manifest_structure(&hash, &manifest)
-        .map_err(|e| ServerError::Internal(format!("corrupt manifest {}: {}", hash_hex, e)))?;
-    if chunk_hashes.iter().any(|chunk| {
-        !state
-            .storage_writer
-            .contains(StorageObjectKind::ContentChunk, chunk)
-    }) {
-        return Err(ServerError::Internal(format!(
-            "manifest {} references a missing chunk",
-            hash_hex,
-        )));
-    }
+    let writer = state.storage_writer.clone();
+    let manifest_label = hash_hex.clone();
+    let data = writer
+        .run_blocking(move |writer| {
+            let data = read_stored_object_blocking(&writer, StorageObjectKind::Manifest, &hash)?
+                .ok_or_else(|| {
+                    ServerError::NotFound(format!("manifest {manifest_label} not found"))
+                })?;
+            let manifest: WireContentManifest = serde_json::from_slice(&data).map_err(|error| {
+                ServerError::Internal(format!("corrupt manifest {manifest_label}: {error}"))
+            })?;
+            let chunk_hashes =
+                validate_content_manifest_structure(&hash, &manifest).map_err(|error| {
+                    ServerError::Internal(format!("corrupt manifest {manifest_label}: {error}"))
+                })?;
+            if chunk_hashes
+                .iter()
+                .any(|chunk| !writer.contains(StorageObjectKind::ContentChunk, chunk))
+            {
+                return Err(ServerError::Internal(format!(
+                    "manifest {manifest_label} references a missing chunk"
+                )));
+            }
+            Ok(data)
+        })
+        .await
+        .map_err(|error| ServerError::ServiceUnavailable(error.to_string()))??;
     state.perf.record_request_objects(1);
     Ok((
         StatusCode::OK,
@@ -1846,11 +1921,18 @@ async fn put_manifest(
 ) -> Result<impl IntoResponse, ServerError> {
     let hash =
         hex_to_hash(&hash_hex).map_err(|_| ServerError::BadRequest("invalid hash".into()))?;
-    let manifest: WireContentManifest = serde_json::from_slice(&body)?;
-    validate_content_manifest(&state, &hash, &manifest)?;
-    // Store a canonical representation only after all referenced bytes and
-    // the full-file content address have been verified.
-    let encoded = serde_json::to_vec(&manifest)?;
+    let writer = state.storage_writer.clone();
+    let perf = state.perf.clone();
+    let encoded = writer
+        .run_blocking(move |writer| {
+            let manifest: WireContentManifest = serde_json::from_slice(&body)?;
+            validate_content_manifest(&writer, perf.as_ref(), &hash, &manifest)?;
+            // Store a canonical representation only after every referenced
+            // chunk is read and the complete content address is verified.
+            serde_json::to_vec(&manifest).map_err(ServerError::from)
+        })
+        .await
+        .map_err(|error| ServerError::ServiceUnavailable(error.to_string()))??;
     let encoded_len = encoded.len();
     store_one_object(&state, StorageObjectKind::Manifest, hash, encoded).await?;
     state.perf.record_request_objects(1);
@@ -1870,7 +1952,8 @@ async fn get_content_chunk(
 ) -> Result<impl IntoResponse, ServerError> {
     let hash =
         hex_to_hash(&hash_hex).map_err(|_| ServerError::BadRequest("invalid hash".into()))?;
-    let data = read_stored_object(&state, StorageObjectKind::ContentChunk, &hash)?
+    let data = read_stored_object(&state, StorageObjectKind::ContentChunk, hash)
+        .await?
         .ok_or_else(|| ServerError::NotFound(format!("content chunk {} not found", hash_hex)))?;
     state.perf.record_request_objects(1);
     Ok((StatusCode::OK, data))
@@ -1914,33 +1997,34 @@ async fn post_manifests_check(
     let hashes: Vec<String> = serde_json::from_slice(&body)
         .map_err(|e| ServerError::BadRequest(format!("expected JSON array of hashes: {}", e)))?;
     state.perf.record_request_objects(hashes.len() as u64);
-    let needed: Vec<String> = hashes
-        .into_iter()
-        .filter(|h| {
-            hex_to_hash(h)
-                .map(|hash| !stored_manifest_is_usable(&state, &hash))
-                .unwrap_or(false)
+    let writer = state.storage_writer.clone();
+    let needed = writer
+        .run_blocking(move |writer| {
+            hashes
+                .into_iter()
+                .filter(|hash_hex| {
+                    hex_to_hash(hash_hex)
+                        .map(|hash| !stored_manifest_is_usable(&writer, &hash))
+                        .unwrap_or(false)
+                })
+                .collect::<Vec<_>>()
         })
-        .collect();
+        .await
+        .map_err(|error| ServerError::ServiceUnavailable(error.to_string()))?;
     Ok(axum::Json(serde_json::json!({ "needed": needed })))
 }
 
-fn stored_manifest_is_usable(state: &SharedState, file_hash: &FileHash) -> bool {
-    let Ok(Some(data)) = state
-        .storage_writer
-        .read(StorageObjectKind::Manifest, file_hash)
-    else {
+fn stored_manifest_is_usable(writer: &StorageWriter, file_hash: &FileHash) -> bool {
+    let Ok(Some(data)) = writer.read(StorageObjectKind::Manifest, file_hash) else {
         return false;
     };
     let Ok(manifest) = serde_json::from_slice::<WireContentManifest>(&data) else {
         return false;
     };
     validate_content_manifest_structure(file_hash, &manifest).is_ok_and(|chunk_hashes| {
-        chunk_hashes.iter().all(|chunk| {
-            state
-                .storage_writer
-                .contains(StorageObjectKind::ContentChunk, chunk)
-        })
+        chunk_hashes
+            .iter()
+            .all(|chunk| writer.contains(StorageObjectKind::ContentChunk, chunk))
     })
 }
 
@@ -1951,18 +2035,20 @@ async fn post_content_chunks_check(
     let hashes: Vec<String> = serde_json::from_slice(&body)
         .map_err(|e| ServerError::BadRequest(format!("expected JSON array of hashes: {}", e)))?;
     state.perf.record_request_objects(hashes.len() as u64);
-    let needed: Vec<String> = hashes
-        .into_iter()
-        .filter(|h| {
-            hex_to_hash(h)
-                .map(|hash| {
-                    !state
-                        .storage_writer
-                        .contains(StorageObjectKind::ContentChunk, &hash)
+    let writer = state.storage_writer.clone();
+    let needed = writer
+        .run_blocking(move |writer| {
+            hashes
+                .into_iter()
+                .filter(|hash_hex| {
+                    hex_to_hash(hash_hex)
+                        .map(|hash| !writer.contains(StorageObjectKind::ContentChunk, &hash))
+                        .unwrap_or(false)
                 })
-                .unwrap_or(false)
+                .collect::<Vec<_>>()
         })
-        .collect();
+        .await
+        .map_err(|error| ServerError::ServiceUnavailable(error.to_string()))?;
     Ok(axum::Json(serde_json::json!({ "needed": needed })))
 }
 
@@ -1988,18 +2074,16 @@ fn upload_status(result: &StoreResult) -> UploadStatus {
     }
 }
 
-fn bulk_object_is_usable(state: &SharedState, kind: ObjectKind, hash: &FileHash) -> bool {
+fn bulk_object_is_usable(writer: &StorageWriter, kind: ObjectKind, hash: &FileHash) -> bool {
     match kind {
-        ObjectKind::Manifest => stored_manifest_is_usable(state, hash),
-        _ => state
-            .storage_writer
-            .contains(storage_object_kind(kind), hash),
+        ObjectKind::Manifest => stored_manifest_is_usable(writer, hash),
+        _ => writer.contains(storage_object_kind(kind), hash),
     }
 }
 
-pub(crate) fn process_bulk_check(
+pub(crate) async fn process_bulk_check(
     state: &SharedState,
-    body: &[u8],
+    body: axum::body::Bytes,
     max_request_bytes: usize,
 ) -> Result<Vec<u8>, ServerError> {
     if body.len() > max_request_bytes {
@@ -2007,24 +2091,31 @@ pub(crate) fn process_bulk_check(
             "bulk check exceeds advertised byte limit".into(),
         ));
     }
-    let request = bulk::decode_check_request(body, BULK_OBJECTS)
-        .map_err(|error| ServerError::BadRequest(error.to_string()))?;
-    state
-        .perf
-        .record_request_objects(request.hashes.len() as u64);
-    let needed: Vec<bool> = request
-        .hashes
-        .iter()
-        .map(|hash| !bulk_object_is_usable(state, request.kind, hash))
-        .collect();
-    bulk::encode_check_response(&needed).map_err(|error| ServerError::Internal(error.to_string()))
+    let writer = state.storage_writer.clone();
+    let (response, object_count) = writer
+        .run_blocking(move |writer| {
+            let request = bulk::decode_check_request(&body, BULK_OBJECTS)
+                .map_err(|error| ServerError::BadRequest(error.to_string()))?;
+            let needed: Vec<bool> = request
+                .hashes
+                .iter()
+                .map(|hash| !bulk_object_is_usable(&writer, request.kind, hash))
+                .collect();
+            let response = bulk::encode_check_response(&needed)
+                .map_err(|error| ServerError::Internal(error.to_string()))?;
+            Ok::<_, ServerError>((response, request.hashes.len()))
+        })
+        .await
+        .map_err(|error| ServerError::ServiceUnavailable(error.to_string()))??;
+    state.perf.record_request_objects(object_count as u64);
+    Ok(response)
 }
 
 async fn post_bulk_check(
     State(state): State<SharedState>,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
-    let response = process_bulk_check(&state, &body, BULK_REQUEST_BYTES)?;
+    let response = process_bulk_check(&state, body, BULK_REQUEST_BYTES).await?;
     Ok((
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
@@ -2032,11 +2123,20 @@ async fn post_bulk_check(
     ))
 }
 
-pub(crate) async fn process_bulk_put(
-    state: &SharedState,
+struct PreparedBulkPut {
+    object_count: usize,
+    statuses: Vec<Option<UploadStatus>>,
+    writer_objects: Vec<DurableObject>,
+    record_for_writer_object: Vec<usize>,
+    manifest_dependencies: Vec<(usize, usize, Vec<usize>)>,
+}
+
+fn prepare_bulk_put(
+    writer: &StorageWriter,
+    perf: &ServerPerfCounters,
     body: &[u8],
     max_request_bytes: usize,
-) -> Result<Vec<u8>, ServerError> {
+) -> Result<PreparedBulkPut, ServerError> {
     let pack =
         bulk::decode_upload_pack(body, BULK_OBJECTS, max_request_bytes).map_err(|error| {
             if body.len() > max_request_bytes {
@@ -2045,11 +2145,11 @@ pub(crate) async fn process_bulk_put(
                 ServerError::BadRequest(error.to_string())
             }
         })?;
-    state.perf.record_request_objects(pack.records.len() as u64);
+    let object_count = pack.records.len();
 
-    let mut statuses = vec![None; pack.records.len()];
-    let mut writer_objects = Vec::with_capacity(pack.records.len());
-    let mut record_for_writer_object = Vec::with_capacity(pack.records.len());
+    let mut statuses = vec![None; object_count];
+    let mut writer_objects = Vec::with_capacity(object_count);
+    let mut record_for_writer_object = Vec::with_capacity(object_count);
     // Earlier valid chunk records can satisfy a later manifest before the
     // group is materialized. Values also carry the writer-result position so
     // a publication error propagates a retryable ACK to the dependent
@@ -2080,23 +2180,17 @@ pub(crate) async fn process_bulk_put(
                     continue;
                 }
             };
-            if validate_content_manifest_with_loader(
-                &record.hash,
-                &manifest,
-                state.perf.as_ref(),
-                |chunk_hash| {
-                    if let Some((bytes, _)) = pending_chunks.get(chunk_hash) {
-                        Some(std::borrow::Cow::Borrowed(*bytes))
-                    } else {
-                        state
-                            .storage_writer
-                            .read(StorageObjectKind::ContentChunk, chunk_hash)
-                            .ok()
-                            .flatten()
-                            .map(std::borrow::Cow::Owned)
-                    }
-                },
-            )
+            if validate_content_manifest_with_loader(&record.hash, &manifest, perf, |chunk_hash| {
+                if let Some((bytes, _)) = pending_chunks.get(chunk_hash) {
+                    Some(std::borrow::Cow::Borrowed(*bytes))
+                } else {
+                    writer
+                        .read(StorageObjectKind::ContentChunk, chunk_hash)
+                        .ok()
+                        .flatten()
+                        .map(std::borrow::Cow::Owned)
+                }
+            })
             .is_err()
             {
                 statuses[record_index] = Some(UploadStatus::BadHash);
@@ -2113,9 +2207,7 @@ pub(crate) async fn process_bulk_put(
         } else {
             let hash_started = std::time::Instant::now();
             let actual = hash_bytes(record.bytes);
-            state
-                .perf
-                .record_hash_verify(record.bytes.len() as u64, hash_started.elapsed());
+            perf.record_hash_verify(record.bytes.len() as u64, hash_started.elapsed());
             if actual != record.hash {
                 statuses[record_index] = Some(UploadStatus::BadHash);
                 continue;
@@ -2123,7 +2215,7 @@ pub(crate) async fn process_bulk_put(
             (record.bytes.to_vec(), Vec::new())
         };
 
-        if bulk_object_is_usable(state, record.kind, &record.hash) {
+        if bulk_object_is_usable(writer, record.kind, &record.hash) {
             statuses[record_index] = Some(UploadStatus::AlreadyPresent);
             continue;
         }
@@ -2146,6 +2238,39 @@ pub(crate) async fn process_bulk_put(
             bytes: stored_bytes,
         });
     }
+
+    Ok(PreparedBulkPut {
+        object_count,
+        statuses,
+        writer_objects,
+        record_for_writer_object,
+        manifest_dependencies,
+    })
+}
+
+pub(crate) async fn process_bulk_put(
+    state: &SharedState,
+    body: axum::body::Bytes,
+    max_request_bytes: usize,
+) -> Result<Vec<u8>, ServerError> {
+    let writer = state.storage_writer.clone();
+    let perf = state.perf.clone();
+    let prepared = writer
+        .run_blocking(move |writer| {
+            prepare_bulk_put(&writer, perf.as_ref(), &body, max_request_bytes)
+        })
+        .await
+        .map_err(|error| ServerError::ServiceUnavailable(error.to_string()))??;
+    state
+        .perf
+        .record_request_objects(prepared.object_count as u64);
+    let PreparedBulkPut {
+        mut statuses,
+        writer_objects,
+        record_for_writer_object,
+        manifest_dependencies,
+        ..
+    } = prepared;
 
     let writer_results: Vec<StoreResult> = if writer_objects.is_empty() {
         Vec::new()
@@ -2184,7 +2309,7 @@ async fn post_bulk_put(
     State(state): State<SharedState>,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
-    let response = process_bulk_put(&state, &body, BULK_REQUEST_BYTES).await?;
+    let response = process_bulk_put(&state, body, BULK_REQUEST_BYTES).await?;
     Ok((
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
@@ -2196,11 +2321,11 @@ async fn post_bulk_put(
 /// are represented by `Ok(None)`; corrupt objects fail closed exactly like
 /// their legacy single-object GET endpoint.
 fn read_bulk_object(
-    state: &SharedState,
+    writer: &StorageWriter,
     kind: ObjectKind,
     hash: &FileHash,
 ) -> Result<Option<Vec<u8>>, ServerError> {
-    let Some(bytes) = read_stored_object(state, storage_object_kind(kind), hash)? else {
+    let Some(bytes) = read_stored_object_blocking(writer, storage_object_kind(kind), hash)? else {
         return Ok(None);
     };
     if kind == ObjectKind::Manifest {
@@ -2208,11 +2333,10 @@ fn read_bulk_object(
             .map_err(|error| ServerError::Internal(format!("corrupt manifest: {error}")))?;
         let chunks = validate_content_manifest_structure(hash, &manifest)
             .map_err(|error| ServerError::Internal(format!("corrupt manifest: {error}")))?;
-        if chunks.iter().any(|chunk| {
-            !state
-                .storage_writer
-                .contains(StorageObjectKind::ContentChunk, chunk)
-        }) {
+        if chunks
+            .iter()
+            .any(|chunk| !writer.contains(StorageObjectKind::ContentChunk, chunk))
+        {
             return Err(ServerError::Internal(
                 "manifest references a missing content chunk".into(),
             ));
@@ -2223,9 +2347,9 @@ fn read_bulk_object(
     Ok(Some(bytes))
 }
 
-pub(crate) fn process_bulk_get(
+pub(crate) async fn process_bulk_get(
     state: &SharedState,
-    body: &[u8],
+    body: axum::body::Bytes,
     max_request_bytes: usize,
     max_response_bytes: usize,
 ) -> Result<Vec<u8>, ServerError> {
@@ -2234,83 +2358,94 @@ pub(crate) fn process_bulk_get(
             "bulk get request exceeds advertised byte limit".into(),
         ));
     }
-    let request = bulk::decode_get_request(body, BULK_OBJECTS)
-        .map_err(|error| ServerError::BadRequest(error.to_string()))?;
-    let response_budget = request.max_response_bytes as usize;
-    if response_budget == 0 || response_budget > max_response_bytes {
-        return Err(ServerError::PayloadTooLarge(
-            "bulk get response budget exceeds advertised limit".into(),
-        ));
-    }
-    let bitmap_len = bulk::bitmap_bytes(request.hashes.len())
-        .map_err(|error| ServerError::BadRequest(error.to_string()))?;
-    let fixed_bytes = DOWNLOAD_HEADER_BYTES
-        .checked_add(bitmap_len)
-        .and_then(|value| value.checked_add(PACK_HEADER_BYTES))
-        .ok_or_else(|| ServerError::BadRequest("bulk get response length overflow".into()))?;
-    if fixed_bytes > response_budget {
-        return Err(ServerError::PayloadTooLarge(
-            "bulk get response budget is below protocol overhead".into(),
-        ));
-    }
-
-    let start = request.cursor as usize;
-    let mut next_cursor = start;
-    let mut encoded_bytes = fixed_bytes;
-    let mut owned_records: Vec<(FileHash, Vec<u8>)> = Vec::new();
-    for hash in request.hashes.iter().skip(start) {
-        let Some(bytes) = read_bulk_object(state, request.kind, hash)? else {
-            // Missing is deliberately distinct from "not inspected yet": at
-            // completion the client detects any requested hash absent from
-            // the returned record set and raises the same failure as GET 404.
-            next_cursor += 1;
-            continue;
-        };
-        if bytes.len() > BULK_OBJECT_BYTES {
-            return Err(ServerError::PayloadTooLarge(
-                "object exceeds bulk-v1 per-object limit; use single GET".into(),
-            ));
-        }
-        let record_bytes = RECORD_HEADER_BYTES
-            .checked_add(bytes.len())
-            .ok_or_else(|| ServerError::BadRequest("bulk record length overflow".into()))?;
-        if encoded_bytes
-            .checked_add(record_bytes)
-            .is_none_or(|total| total > response_budget)
-        {
-            if next_cursor == start {
+    let writer = state.storage_writer.clone();
+    let (response, inspected) = writer
+        .run_blocking(move |writer| {
+            let request = bulk::decode_get_request(&body, BULK_OBJECTS)
+                .map_err(|error| ServerError::BadRequest(error.to_string()))?;
+            let response_budget = request.max_response_bytes as usize;
+            if response_budget == 0 || response_budget > max_response_bytes {
                 return Err(ServerError::PayloadTooLarge(
-                    "bulk get response budget cannot fit the next object".into(),
+                    "bulk get response budget exceeds advertised limit".into(),
                 ));
             }
-            break;
-        }
-        encoded_bytes += record_bytes;
-        owned_records.push((*hash, bytes));
-        next_cursor += 1;
-    }
+            let bitmap_len = bulk::bitmap_bytes(request.hashes.len())
+                .map_err(|error| ServerError::BadRequest(error.to_string()))?;
+            let fixed_bytes = DOWNLOAD_HEADER_BYTES
+                .checked_add(bitmap_len)
+                .and_then(|value| value.checked_add(PACK_HEADER_BYTES))
+                .ok_or_else(|| {
+                    ServerError::BadRequest("bulk get response length overflow".into())
+                })?;
+            if fixed_bytes > response_budget {
+                return Err(ServerError::PayloadTooLarge(
+                    "bulk get response budget is below protocol overhead".into(),
+                ));
+            }
 
-    let mut remaining = vec![0u8; bitmap_len];
-    for index in next_cursor..request.hashes.len() {
-        bulk::bitmap_set(&mut remaining, index);
-    }
-    let records: Vec<UploadRecord<'_>> = owned_records
-        .iter()
-        .map(|(hash, bytes)| UploadRecord {
-            kind: request.kind,
-            flags: 0,
-            hash: *hash,
-            plain_len: bytes.len() as u32,
-            bytes,
-        })
-        .collect();
-    let response =
-        bulk::encode_download_response(request.hashes.len(), next_cursor, &remaining, &records)
+            let start = request.cursor as usize;
+            let mut next_cursor = start;
+            let mut encoded_bytes = fixed_bytes;
+            let mut owned_records: Vec<(FileHash, Vec<u8>)> = Vec::new();
+            for hash in request.hashes.iter().skip(start) {
+                let Some(bytes) = read_bulk_object(&writer, request.kind, hash)? else {
+                    // Missing is deliberately distinct from "not inspected yet": at
+                    // completion the client detects any requested hash absent from
+                    // the returned record set and raises the same failure as GET 404.
+                    next_cursor += 1;
+                    continue;
+                };
+                if bytes.len() > BULK_OBJECT_BYTES {
+                    return Err(ServerError::PayloadTooLarge(
+                        "object exceeds bulk-v1 per-object limit; use single GET".into(),
+                    ));
+                }
+                let record_bytes = RECORD_HEADER_BYTES
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| ServerError::BadRequest("bulk record length overflow".into()))?;
+                if encoded_bytes
+                    .checked_add(record_bytes)
+                    .is_none_or(|total| total > response_budget)
+                {
+                    if next_cursor == start {
+                        return Err(ServerError::PayloadTooLarge(
+                            "bulk get response budget cannot fit the next object".into(),
+                        ));
+                    }
+                    break;
+                }
+                encoded_bytes += record_bytes;
+                owned_records.push((*hash, bytes));
+                next_cursor += 1;
+            }
+
+            let mut remaining = vec![0u8; bitmap_len];
+            for index in next_cursor..request.hashes.len() {
+                bulk::bitmap_set(&mut remaining, index);
+            }
+            let records: Vec<UploadRecord<'_>> = owned_records
+                .iter()
+                .map(|(hash, bytes)| UploadRecord {
+                    kind: request.kind,
+                    flags: 0,
+                    hash: *hash,
+                    plain_len: bytes.len() as u32,
+                    bytes,
+                })
+                .collect();
+            let response = bulk::encode_download_response(
+                request.hashes.len(),
+                next_cursor,
+                &remaining,
+                &records,
+            )
             .map_err(|error| ServerError::Internal(error.to_string()))?;
-    debug_assert!(response.len() <= response_budget);
-    state
-        .perf
-        .record_request_objects((next_cursor - start) as u64);
+            debug_assert!(response.len() <= response_budget);
+            Ok::<_, ServerError>((response, next_cursor - start))
+        })
+        .await
+        .map_err(|error| ServerError::ServiceUnavailable(error.to_string()))??;
+    state.perf.record_request_objects(inspected as u64);
     Ok(response)
 }
 
@@ -2318,7 +2453,7 @@ async fn post_bulk_get(
     State(state): State<SharedState>,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
-    let response = process_bulk_get(&state, &body, BULK_REQUEST_BYTES, BULK_REQUEST_BYTES)?;
+    let response = process_bulk_get(&state, body, BULK_REQUEST_BYTES, BULK_REQUEST_BYTES).await?;
     Ok((
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
@@ -3105,7 +3240,10 @@ mod integration_tests {
         let pack = bulk::encode_upload_pack(&records).unwrap();
         let (_, first_ack) = send_semantic(&env, "POST", "/api/v1/bulk/put", &pack).await;
         assert_eq!(&first_ack[8..], &[0, 0]);
-        assert!(stored_manifest_is_usable(&env.state, &file_hash));
+        assert!(stored_manifest_is_usable(
+            &env.state.storage_writer,
+            &file_hash
+        ));
 
         let (_, retry_ack) = send_semantic(&env, "POST", "/api/v1/bulk/put", &pack).await;
         assert_eq!(&retry_ack[8..], &[1, 1]);
@@ -3114,7 +3252,39 @@ mod integration_tests {
             .state
             .storage_writer
             .contains(StorageObjectKind::ContentChunk, &chunk_hash));
-        assert!(stored_manifest_is_usable(&env.state, &file_hash));
+        assert!(stored_manifest_is_usable(
+            &env.state.storage_writer,
+            &file_hash
+        ));
+    }
+
+    #[tokio::test]
+    async fn durable_revoke_immediately_closes_http_authorization() {
+        let env = setup();
+        let path = "/api/v1/root/revoked-vault";
+        let (wire_body, opened_request) = seal(&env, "GET", path, &[]);
+        let device_id = env.state.devices.list().pop().unwrap().device_id;
+
+        env.state.devices.revoke(&device_id).unwrap();
+        assert!(env
+            .state
+            .layout
+            .device_dir(&device_id)
+            .join("revoked")
+            .exists());
+
+        let (wire_status, wire_response) = dispatch_wire(&env, "GET", path, wire_body).await;
+        assert_eq!(wire_status, StatusCode::OK);
+        let (semantic_status, body) = decrypt_response_for_tests(
+            &wire_response,
+            &opened_request.key_material,
+            opened_request.mode,
+            "GET",
+            path,
+            &opened_request.nonce_req,
+        );
+        assert_eq!(semantic_status, StatusCode::FORBIDDEN.as_u16());
+        assert_eq!(body, br#"{"error":"revoked"}"#);
     }
 
     /// An envelope encrypted against the wrong server pubkey must 401 (AEAD

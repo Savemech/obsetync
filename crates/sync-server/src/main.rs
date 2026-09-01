@@ -1,5 +1,6 @@
 mod admin;
 mod api;
+mod blocking_io;
 mod box_key;
 mod bridge;
 mod bulk;
@@ -211,6 +212,34 @@ async fn cmd_run(
         "server listening (AEAD envelope over HTTP: X25519 + HKDF-SHA256 + AES-256-GCM)"
     );
 
+    // Coalesce request-hot last_seen atomics into durable metadata at a fixed
+    // cadence. This uses reserved control capacity, never the bulk read pool.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let registry = state.devices.clone();
+                match state
+                    .control_io
+                    .run(move || registry.flush_last_seen(false))
+                    .await
+                {
+                    Ok(Ok(flushed)) if flushed > 0 => {
+                        tracing::debug!(flushed, "devices: persisted last_seen batch");
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "devices: last_seen flush failed");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "devices: last_seen flush unavailable");
+                    }
+                }
+            }
+        });
+    }
+
     // Background: rotate revoked devices out completely after the TTL (default
     // 30 days; OBSETYNC_REVOKED_TTL_DAYS to tune). Runs on startup, then hourly.
     {
@@ -222,9 +251,22 @@ async fn cmd_run(
             .saturating_mul(86_400);
         tokio::spawn(async move {
             loop {
-                let removed = devices::purge_expired_revoked(&state.layout, ttl_secs);
-                if removed > 0 {
-                    tracing::info!(removed, "devices: rotated out expired revoked devices");
+                let registry = state.devices.clone();
+                match state
+                    .control_io
+                    .run(move || registry.purge_expired_revoked(ttl_secs))
+                    .await
+                {
+                    Ok(Ok(removed)) if removed > 0 => {
+                        tracing::info!(removed, "devices: rotated out expired revoked devices");
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "devices: revoked-device purge failed");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "devices: revoked-device purge unavailable");
+                    }
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
             }

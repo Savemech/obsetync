@@ -283,7 +283,9 @@ constructing a pending RPC. It also pauses transmission above the negotiated
 callers may wait for credit. The server applies the same request/byte ceilings,
 returns bounded `busy/retry_after` errors instead of queueing without limit,
 and cancels outstanding tasks when the socket disappears. Root commits never
-move onto this lane.
+move onto this lane. Every realtime and data session also holds the enrolled
+device's registry cancellation token: after the admin revocation marker is
+durable, one in-memory cancel closes all of that device's active sockets.
 
 An ACK can be lost after a durable content-addressed PUT. The client therefore
 never treats an unconsumed response as progress: it opens a new ticket/session,

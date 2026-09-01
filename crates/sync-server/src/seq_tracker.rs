@@ -51,11 +51,30 @@ pub struct SequenceTracker {
 }
 
 impl SequenceTracker {
-    pub fn new(layout: StorageLayout) -> Self {
-        Self {
+    pub fn new(layout: StorageLayout) -> Result<Self, std::io::Error> {
+        let tracker = Self {
             layout,
             states: Mutex::new(HashMap::new()),
+        };
+        tracker.load_existing_devices()?;
+        Ok(tracker)
+    }
+
+    /// Fast path used by HTTP auth. `None` means a new durable reservation is
+    /// required; callers then execute `check_and_record` on control I/O.
+    pub fn check_in_memory(&self, device_id: &str, sequence: u64) -> Option<ReplayDecision> {
+        let mut states = self.states.lock().expect("sequence tracker poisoned");
+        let state = states.entry(device_id.to_owned()).or_default();
+        if sequence == 0 || is_seen_or_stale(state, sequence) {
+            return Some(ReplayDecision::Replay {
+                greatest_seen: state.reserved_through.max(state.greatest_seen),
+            });
         }
+        if sequence > state.reserved_through {
+            return None;
+        }
+        record(state, sequence);
+        Some(ReplayDecision::Accepted)
     }
 
     /// Atomically reject duplicates/stale values and reserve durability before
@@ -111,6 +130,25 @@ impl SequenceTracker {
             reserved_through,
             seen,
         })
+    }
+
+    fn load_existing_devices(&self) -> Result<(), std::io::Error> {
+        let devices_dir = self.layout.base.join("devices");
+        let entries = match fs::read_dir(devices_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let mut states = self.states.lock().expect("sequence tracker poisoned");
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() || entry.file_name() == "tokens" {
+                continue;
+            }
+            let device_id = entry.file_name().to_string_lossy().into_owned();
+            states.insert(device_id.clone(), self.load(&device_id)?);
+        }
+        Ok(())
     }
 
     fn persist(&self, device_id: &str, reserved_through: u64) -> Result<(), std::io::Error> {
@@ -182,7 +220,7 @@ mod tests {
     #[test]
     fn accepts_reordered_parallel_requests_once() {
         let dir = tempdir().unwrap();
-        let tracker = SequenceTracker::new(StorageLayout::new(dir.path()));
+        let tracker = SequenceTracker::new(StorageLayout::new(dir.path())).unwrap();
         assert_eq!(
             tracker.check_and_record("device", 5).unwrap(),
             ReplayDecision::Accepted
@@ -207,11 +245,11 @@ mod tests {
     fn window_survives_restart_and_rejects_stale_values() {
         let dir = tempdir().unwrap();
         let layout = StorageLayout::new(dir.path());
-        let tracker = SequenceTracker::new(layout.clone());
+        let tracker = SequenceTracker::new(layout.clone()).unwrap();
         tracker.check_and_record("device", 10_000).unwrap();
         tracker.check_and_record("device", 9_500).unwrap();
 
-        let restarted = SequenceTracker::new(layout);
+        let restarted = SequenceTracker::new(layout).unwrap();
         assert!(matches!(
             restarted.check_and_record("device", 9_500).unwrap(),
             ReplayDecision::Replay {
@@ -239,7 +277,7 @@ mod tests {
     #[test]
     fn a_large_reserved_block_gap_is_valid() {
         let dir = tempdir().unwrap();
-        let tracker = SequenceTracker::new(StorageLayout::new(dir.path()));
+        let tracker = SequenceTracker::new(StorageLayout::new(dir.path())).unwrap();
         assert_eq!(
             tracker.check_and_record("device", 1).unwrap(),
             ReplayDecision::Accepted
@@ -254,7 +292,7 @@ mod tests {
     fn durable_file_reserves_a_whole_block_before_acceptance() {
         let dir = tempdir().unwrap();
         let layout = StorageLayout::new(dir.path());
-        let tracker = SequenceTracker::new(layout.clone());
+        let tracker = SequenceTracker::new(layout.clone()).unwrap();
         assert_eq!(
             tracker.check_and_record("device", 7).unwrap(),
             ReplayDecision::Accepted
@@ -264,12 +302,56 @@ mod tests {
         assert_eq!(durable.len(), FILE_BYTES);
         assert_eq!(u64::from_be_bytes(durable.try_into().unwrap()), 4096);
 
-        let restarted = SequenceTracker::new(layout);
+        let restarted = SequenceTracker::new(layout).unwrap();
         assert_eq!(
             restarted.check_and_record("device", 4096).unwrap(),
             ReplayDecision::Replay {
                 greatest_seen: 4096
             }
+        );
+    }
+
+    #[test]
+    fn reserved_sequences_complete_on_the_memory_only_fast_path() {
+        let dir = tempdir().unwrap();
+        let tracker = SequenceTracker::new(StorageLayout::new(dir.path())).unwrap();
+        assert!(tracker.check_in_memory("device", 1).is_none());
+        assert_eq!(
+            tracker.check_and_record("device", 1).unwrap(),
+            ReplayDecision::Accepted
+        );
+        assert_eq!(
+            tracker.check_in_memory("device", 2),
+            Some(ReplayDecision::Accepted)
+        );
+        assert_eq!(
+            tracker.check_in_memory("device", 2),
+            Some(ReplayDecision::Replay {
+                greatest_seen: 4096
+            })
+        );
+        assert!(tracker.check_in_memory("device", 4097).is_none());
+    }
+
+    #[test]
+    fn startup_preloads_reservations_and_fails_closed_on_corruption() {
+        let dir = tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        let tracker = SequenceTracker::new(layout.clone()).unwrap();
+        tracker.check_and_record("device", 7).unwrap();
+
+        let restarted = SequenceTracker::new(layout.clone()).unwrap();
+        assert_eq!(
+            restarted.check_in_memory("device", 7),
+            Some(ReplayDecision::Replay {
+                greatest_seen: 4096
+            })
+        );
+
+        fs::write(layout.device_sequence_path("device"), b"short").unwrap();
+        assert_eq!(
+            SequenceTracker::new(layout).err().unwrap().kind(),
+            std::io::ErrorKind::InvalidData
         );
     }
 }

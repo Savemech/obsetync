@@ -203,21 +203,36 @@ async fn data_entry(state: SharedState, socket: WebSocket) {
             .await;
         return;
     };
-    let Some(mut ticket) = ws_ticket::claim(&state.layout, &ticket_hex) else {
+    let layout = state.layout.clone();
+    let claimed = match state
+        .control_io
+        .run(move || ws_ticket::claim(&layout, &ticket_hex))
+        .await
+    {
+        Ok(claimed) => claimed,
+        Err(error) => {
+            tracing::warn!(%error, "ws-data: ticket claim unavailable");
+            let _ = sink
+                .send(Message::Text("data-lane ticket unavailable".into()))
+                .await;
+            return;
+        }
+    };
+    let Some(mut ticket) = claimed else {
         let _ = sink
             .send(Message::Text("invalid data-lane ticket".into()))
             .await;
         return;
     };
-    if ticket.c2s_key_hex.is_empty()
-        || ticket.s2c_key_hex.is_empty()
-        || crate::devices::is_revoked(&state.layout, &ticket.device_id)
+    let session_cancelled = state.devices.session_token(&ticket.device_id);
+    if ticket.c2s_key_hex.is_empty() || ticket.s2c_key_hex.is_empty() || session_cancelled.is_none()
     {
         let _ = sink
             .send(Message::Text("data lane unavailable".into()))
             .await;
         return;
     }
+    let session_cancelled = session_cancelled.expect("checked above");
     let device_short = ticket.device_id[..ticket.device_id.len().min(12)].to_owned();
     let Some(mut seal) = SealCtx::from_ticket(&ticket) else {
         return;
@@ -225,11 +240,13 @@ async fn data_entry(state: SharedState, socket: WebSocket) {
     zeroize::Zeroize::zeroize(&mut ticket.c2s_key_hex);
     zeroize::Zeroize::zeroize(&mut ticket.s2c_key_hex);
 
-    let hello = tokio::time::timeout(
-        std::time::Duration::from_secs(HANDSHAKE_DEADLINE_SECS),
-        read_hello(&mut stream, &mut seal),
-    )
-    .await;
+    let hello = tokio::select! {
+        _ = session_cancelled.cancelled() => return,
+        result = tokio::time::timeout(
+            std::time::Duration::from_secs(HANDSHAKE_DEADLINE_SECS),
+            read_hello(&mut stream, &mut seal),
+        ) => result,
+    };
     let Ok(Some(requested)) = hello else {
         return;
     };
@@ -261,7 +278,16 @@ async fn data_entry(state: SharedState, socket: WebSocket) {
         max_inflight_bytes = limits.max_inflight_bytes,
         "ws-data: sealed session ready"
     );
-    run_session(state, sink, stream, seal, limits, &device_short).await;
+    run_session(
+        state,
+        sink,
+        stream,
+        seal,
+        limits,
+        &device_short,
+        session_cancelled,
+    )
+    .await;
 }
 
 async fn read_hello(stream: &mut SplitStream<WebSocket>, seal: &mut SealCtx) -> Option<LaneLimits> {
@@ -290,6 +316,7 @@ async fn run_session(
     mut seal: SealCtx,
     limits: LaneLimits,
     device_short: &str,
+    session_cancelled: CancellationToken,
 ) {
     let (response_tx, mut response_rx) =
         tokio::sync::mpsc::channel::<RpcResponse>(limits.max_inflight_requests);
@@ -299,6 +326,9 @@ async fn run_session(
 
     loop {
         tokio::select! {
+            _ = session_cancelled.cancelled() => {
+                break;
+            }
             response = response_rx.recv() => {
                 let Some(response) = response else { break };
                 if let Some(active_rpc) = active.remove(&response.request_id) {
@@ -386,7 +416,7 @@ async fn run_session(
                                     &task_state,
                                     request_id,
                                     request_kind,
-                                    &payload,
+                                    payload,
                                     max_payload_bytes,
                                 ) => response,
                             };
@@ -426,21 +456,28 @@ async fn execute_rpc(
     state: &SharedState,
     request_id: u64,
     request_kind: FrameType,
-    payload: &[u8],
+    payload: Vec<u8>,
     max_payload_bytes: usize,
 ) -> RpcResponse {
     let result = match request_kind {
         FrameType::CheckObjects => {
-            crate::api::process_bulk_check(state, payload, max_payload_bytes)
+            crate::api::process_bulk_check(state, payload.into(), max_payload_bytes)
+                .await
                 .map(|payload| (FrameType::CheckResult, payload))
         }
-        FrameType::PutPack => crate::api::process_bulk_put(state, payload, max_payload_bytes)
-            .await
-            .map(|payload| (FrameType::PutAck, payload)),
-        FrameType::GetPack => {
-            crate::api::process_bulk_get(state, payload, max_payload_bytes, max_payload_bytes)
-                .map(|payload| (FrameType::GetResult, payload))
+        FrameType::PutPack => {
+            crate::api::process_bulk_put(state, payload.into(), max_payload_bytes)
+                .await
+                .map(|payload| (FrameType::PutAck, payload))
         }
+        FrameType::GetPack => crate::api::process_bulk_get(
+            state,
+            payload.into(),
+            max_payload_bytes,
+            max_payload_bytes,
+        )
+        .await
+        .map(|payload| (FrameType::GetResult, payload)),
         _ => Err(ServerError::BadRequest("unsupported data RPC".into())),
     };
     match result {

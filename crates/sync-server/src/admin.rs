@@ -66,14 +66,14 @@ async fn api_performance(
 // --- Dashboard ---
 
 async fn dashboard(State(state): State<SharedState>) -> Html<String> {
-    let device_list = devices::list_devices(&state.layout).unwrap_or_default();
+    let device_list = state.devices.list();
     let online = device_list
         .iter()
         .filter(|d| is_recent(d.last_seen))
         .count();
     let revoked = device_list
         .iter()
-        .filter(|d| devices::is_revoked(&state.layout, &d.device_id))
+        .filter(|d| state.devices.is_revoked(&d.device_id))
         .count();
 
     // Vault inventory: list each vault + size of its current root (if any).
@@ -107,14 +107,14 @@ async fn dashboard(State(state): State<SharedState>) -> Html<String> {
     let device_rows: String = device_list
         .iter()
         .map(|d| {
-            let dot = if devices::is_revoked(&state.layout, &d.device_id) {
+            let dot = if state.devices.is_revoked(&d.device_id) {
                 "⛔"
             } else if is_recent(d.last_seen) {
                 "🟢"
             } else {
                 "⚪"
             };
-            let status = if devices::is_revoked(&state.layout, &d.device_id) {
+            let status = if state.devices.is_revoked(&d.device_id) {
                 "Revoked"
             } else if is_recent(d.last_seen) {
                 "Online"
@@ -206,11 +206,11 @@ async fn dashboard(State(state): State<SharedState>) -> Html<String> {
 // --- Device List ---
 
 async fn device_list(State(state): State<SharedState>) -> Html<String> {
-    let devices = devices::list_devices(&state.layout).unwrap_or_default();
+    let devices = state.devices.list();
     let rows: String = devices
         .iter()
         .map(|d| {
-            let revoked = devices::is_revoked(&state.layout, &d.device_id);
+            let revoked = state.devices.is_revoked(&d.device_id);
             let status = if revoked {
                 "Revoked"
             } else if is_recent(d.last_seen) {
@@ -275,8 +275,16 @@ async fn create_device(
     State(state): State<SharedState>,
     Form(form): Form<NewDeviceForm>,
 ) -> Result<Html<String>, ServerErrorHtml> {
-    let info = enrollment::create_enrollment(&state.layout, &form.device_name)
-        .map_err(|e| ServerErrorHtml(format!("enrollment failed: {}", e)))?;
+    let layout = state.layout.clone();
+    let device_name = form.device_name;
+    let info = state
+        .control_io
+        .run(move || {
+            enrollment::create_enrollment(&layout, &device_name).map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|e| ServerErrorHtml(format!("enrollment unavailable: {e}")))?
+        .map_err(|e| ServerErrorHtml(format!("enrollment failed: {e}")))?;
 
     tracing::info!(
         device_name = %info.device_name,
@@ -314,10 +322,12 @@ async fn device_detail(
     State(state): State<SharedState>,
     Path(device_id): Path<String>,
 ) -> Result<Html<String>, ServerErrorHtml> {
-    let device = devices::get_device(&state.layout, &device_id)
+    let device = state
+        .devices
+        .get(&device_id)
         .ok_or_else(|| ServerErrorHtml("device not found".into()))?;
 
-    let revoked = devices::is_revoked(&state.layout, &device_id);
+    let revoked = state.devices.is_revoked(&device_id);
     let status = if revoked {
         "Revoked"
     } else if is_recent(device.last_seen) {
@@ -331,7 +341,7 @@ async fn device_detail(
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(30);
-        let note = match devices::revoked_at(&state.layout, &device_id) {
+        let note = match state.devices.revoked_at(&device_id) {
             Some(ts) if ts > 0 => {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -360,9 +370,21 @@ async fn device_detail(
         )
     };
 
+    let bypass_remaining = if revoked {
+        None
+    } else {
+        let layout = state.layout.clone();
+        let lookup_id = device_id.clone();
+        state
+            .control_io
+            .run(move || devices::deletion_bypass_remaining_ms(&layout, &lookup_id))
+            .await
+            .ok()
+            .flatten()
+    };
     let approve_section = if revoked {
         String::new()
-    } else if let Some(ms) = devices::deletion_bypass_remaining_ms(&state.layout, &device_id) {
+    } else if let Some(ms) = bypass_remaining {
         format!(
             r#"<p class="success">✅ One-time bulk-deletion approval is <strong>active</strong> — expires in ~{} min. This device's next push bypasses the blast-radius guard once, then it's consumed.</p>"#,
             (ms / 60_000).max(1)
@@ -403,8 +425,14 @@ async fn revoke_device(
     State(state): State<SharedState>,
     Path(device_id): Path<String>,
 ) -> Result<Redirect, ServerErrorHtml> {
-    devices::revoke_device(&state.layout, &device_id)
-        .map_err(|e| ServerErrorHtml(format!("revoke failed: {}", e)))?;
+    let registry = state.devices.clone();
+    let revoke_id = device_id.clone();
+    state
+        .control_io
+        .run(move || registry.revoke(&revoke_id))
+        .await
+        .map_err(|e| ServerErrorHtml(format!("revoke unavailable: {e}")))?
+        .map_err(|e| ServerErrorHtml(format!("revoke failed: {e}")))?;
     tracing::info!(
         device = %&device_id[..device_id.len().min(12)],
         "devices: revoked"
@@ -422,8 +450,14 @@ async fn approve_deletion(
     State(state): State<SharedState>,
     Path(device_id): Path<String>,
 ) -> Result<Redirect, ServerErrorHtml> {
-    devices::grant_deletion_bypass(&state.layout, &device_id, 15 * 60)
-        .map_err(|e| ServerErrorHtml(format!("approve failed: {}", e)))?;
+    let layout = state.layout.clone();
+    let approve_id = device_id.clone();
+    state
+        .control_io
+        .run(move || devices::grant_deletion_bypass(&layout, &approve_id, 15 * 60))
+        .await
+        .map_err(|e| ServerErrorHtml(format!("approval unavailable: {e}")))?
+        .map_err(|e| ServerErrorHtml(format!("approve failed: {e}")))?;
     tracing::warn!(
         device = %&device_id[..device_id.len().min(12)],
         "devices: granted a one-time guard bypass (bulk-deletion approval)"
@@ -715,7 +749,7 @@ struct WireChunk {
 
 /// Read a file's full content from the content store by hash — a single blob,
 /// or reassembled from its chunk manifest for large files. Blocking I/O; call
-/// inside spawn_blocking. Shared by the export and the file-diff viewer.
+/// inside StorageWriter's bounded read pool. Shared by export and file diff.
 fn read_file_content(
     store: &crate::storage_writer::StorageWriter,
     hash: &sync_core::hash::FileHash,
@@ -787,42 +821,43 @@ async fn export_vault(
     let layout = state.layout.clone();
     let object_store = state.storage_writer.clone();
     let file_count = entries.len();
-    let tar_file = tokio::task::spawn_blocking(move || -> Result<std::fs::File, String> {
-        use std::io::{Seek, Write};
+    let tar_file = object_store
+        .run_blocking(move |object_store| -> Result<std::fs::File, String> {
+            use std::io::{Seek, Write};
 
-        // Build the tar on the DATA filesystem, which has room for a full-vault
-        // tar — NOT the process temp dir, which on the hardened container is a
-        // small tmpfs where a large vault dies with ENOSPC. Still auto-removed
-        // when the handle drops (even if the download is abandoned mid-stream).
-        let tmp_dir = layout.base.join(".export-tmp");
-        std::fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
-        let tmp = tempfile::tempfile_in(&tmp_dir).map_err(|e| e.to_string())?;
-        let mut builder = tar::Builder::new(&tmp);
+            // Build the tar on the DATA filesystem, which has room for a full-vault
+            // tar — NOT the process temp dir, which on the hardened container is a
+            // small tmpfs where a large vault dies with ENOSPC. Still auto-removed
+            // when the handle drops (even if the download is abandoned mid-stream).
+            let tmp_dir = layout.base.join(".export-tmp");
+            std::fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
+            let tmp = tempfile::tempfile_in(&tmp_dir).map_err(|e| e.to_string())?;
+            let mut builder = tar::Builder::new(&tmp);
 
-        for entry in &entries {
-            let data = read_file_content(&object_store, &entry.hash)
-                .map_err(|e| format!("{}: {}", entry.path, e))?;
+            for entry in &entries {
+                let data = read_file_content(&object_store, &entry.hash)
+                    .map_err(|e| format!("{}: {}", entry.path, e))?;
 
-            let mut header = tar::Header::new_gnu();
-            header.set_size(data.len() as u64);
-            header.set_mode(0o644);
-            header.set_mtime(entry.mtime_ms / 1000);
-            header.set_cksum();
-            builder
-                .append_data(&mut header, &entry.path, data.as_slice())
-                .map_err(|e| format!("{}: tar append: {}", entry.path, e))?;
-        }
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_mtime(entry.mtime_ms / 1000);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, &entry.path, data.as_slice())
+                    .map_err(|e| format!("{}: tar append: {}", entry.path, e))?;
+            }
 
-        let mut inner = builder.into_inner().map_err(|e| e.to_string())?;
-        inner.flush().map_err(|e| e.to_string())?;
-        let mut file = tmp;
-        file.seek(std::io::SeekFrom::Start(0))
-            .map_err(|e| e.to_string())?;
-        Ok(file)
-    })
-    .await
-    .map_err(|e| ServerErrorHtml(format!("export task failed: {}", e)))?
-    .map_err(ServerErrorHtml)?;
+            let mut inner = builder.into_inner().map_err(|e| e.to_string())?;
+            inner.flush().map_err(|e| e.to_string())?;
+            let mut file = tmp;
+            file.seek(std::io::SeekFrom::Start(0))
+                .map_err(|e| e.to_string())?;
+            Ok(file)
+        })
+        .await
+        .map_err(|e| ServerErrorHtml(format!("export task failed: {e}")))?
+        .map_err(ServerErrorHtml)?;
 
     tracing::info!(
         vault = %vault_id,
@@ -859,9 +894,25 @@ async fn claim_enrollment(
     // Include the server's X25519 public key so the client can pin it for
     // all subsequent encrypted requests. Fetched fresh on every claim so
     // a key rotation propagates to newly enrolled devices.
-    let box_pub = match crate::box_key::load_box_pub_base64(&state.layout) {
-        Ok(s) => s,
+    let key_layout = state.layout.clone();
+    let box_pub = match state
+        .control_io
+        .run(move || {
+            crate::box_key::load_box_pub_base64(&key_layout).map_err(|error| error.to_string())
+        })
+        .await
+    {
         Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({ "error": format!("server box key lookup unavailable: {e}") })
+                    .to_string(),
+            )
+                .into_response();
+        }
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -872,7 +923,26 @@ async fn claim_enrollment(
         }
     };
 
-    match enrollment::claim_enrollment(&state.layout, &code) {
+    let claim_layout = state.layout.clone();
+    let registry = state.devices.clone();
+    let claim_code = code.clone();
+    let claim = match state
+        .control_io
+        .run(move || enrollment::claim_enrollment_registered(&claim_layout, &registry, &claim_code))
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({ "error": format!("enrollment unavailable: {e}") }).to_string(),
+            )
+                .into_response();
+        }
+    };
+
+    match claim {
         Ok(info) => {
             let (eph_public, eph_valid_until) = crate::eph_rotation::current_bundle(&state.eph);
             tracing::info!(
@@ -1300,19 +1370,21 @@ async fn api_filediff(
     Path((_vault_id, old_hex, new_hex)): Path<(String, String, String)>,
 ) -> Result<axum::Json<serde_json::Value>, ServerErrorHtml> {
     let object_store = state.storage_writer.clone();
-    let (old, new) = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Vec<u8>), String> {
-        let read = |hex: &str| -> Result<Vec<u8>, String> {
-            if hex == ZERO_HASH_HEX {
-                return Ok(Vec::new());
-            }
-            let h = sync_core::hash::hex_to_hash(hex).map_err(|_| "invalid hash".to_string())?;
-            read_file_content(&object_store, &h)
-        };
-        Ok((read(&old_hex)?, read(&new_hex)?))
-    })
-    .await
-    .map_err(|e| ServerErrorHtml(format!("diff task failed: {}", e)))?
-    .map_err(ServerErrorHtml)?;
+    let (old, new) = object_store
+        .run_blocking(move |object_store| -> Result<(Vec<u8>, Vec<u8>), String> {
+            let read = |hex: &str| -> Result<Vec<u8>, String> {
+                if hex == ZERO_HASH_HEX {
+                    return Ok(Vec::new());
+                }
+                let h =
+                    sync_core::hash::hex_to_hash(hex).map_err(|_| "invalid hash".to_string())?;
+                read_file_content(&object_store, &h)
+            };
+            Ok((read(&old_hex)?, read(&new_hex)?))
+        })
+        .await
+        .map_err(|e| ServerErrorHtml(format!("diff task failed: {e}")))?
+        .map_err(ServerErrorHtml)?;
 
     const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024; // 2 MiB per side
     let val = if old.len() > MAX_DIFF_BYTES || new.len() > MAX_DIFF_BYTES {

@@ -5,6 +5,7 @@
 //! and deduplicated, and a whole group becomes visible only after the segment
 //! crosses one `fdatasync` barrier.
 
+use crate::blocking_io::{BlockingError, BlockingPool};
 use crate::pack_store::{
     validate_object, ActiveSegment, CommitFault, OpenedPackStore, PackReadError, PackStore,
 };
@@ -29,6 +30,7 @@ const GROUP_TARGET_BYTES: u64 = 16 * 1024 * 1024;
 const GROUP_LATENCY: Duration = Duration::from_millis(5);
 const GROUP_OBJECT_TARGET: usize = 4096;
 const MAX_BATCH_OBJECTS: usize = 4096;
+const READ_TASK_PARALLELISM: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreOutcome {
@@ -69,6 +71,7 @@ struct WriterHandle {
     queued_bytes: AtomicU64,
     perf: Arc<ServerPerfCounters>,
     store: PackStore,
+    read_pool: BlockingPool,
 }
 
 struct QueueReservation {
@@ -133,6 +136,7 @@ impl StorageWriter {
             queued_bytes: AtomicU64::new(0),
             perf,
             store: store.clone(),
+            read_pool: BlockingPool::new("storage reads", READ_TASK_PARALLELISM),
         });
         std::thread::Builder::new()
             .name("obsetync-storage-writer".into())
@@ -194,6 +198,17 @@ impl StorageWriter {
         hash: &FileHash,
     ) -> Result<Option<Vec<u8>>, PackReadError> {
         self.inner.store.read(kind, hash)
+    }
+
+    /// Run one coarse storage read/scan operation on the bounded blocking
+    /// pool. The permit is acquired before Tokio creates a blocking task.
+    pub async fn run_blocking<F, T>(&self, operation: F) -> Result<T, BlockingError>
+    where
+        F: FnOnce(StorageWriter) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let writer = self.clone();
+        self.inner.read_pool.run(move || operation(writer)).await
     }
 
     #[cfg(test)]

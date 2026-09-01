@@ -43,7 +43,35 @@ pub fn create_enrollment(
 
 /// Claim an enrollment: verify code, register device, return the bundle.
 /// The enrollment record is deleted whether or not registration succeeds.
+#[cfg(test)]
 pub fn claim_enrollment(layout: &StorageLayout, code: &str) -> Result<EnrollmentInfo, String> {
+    claim_enrollment_with(layout, code, |info| {
+        devices::register_device(
+            layout,
+            &info.device_id,
+            &info.device_name,
+            &info.bearer_token,
+        )
+    })
+}
+
+/// Runtime claim path: registration is durably persisted and then published
+/// into the process registry before the enrollment bundle is returned.
+pub fn claim_enrollment_registered(
+    layout: &StorageLayout,
+    registry: &devices::DeviceRegistry,
+    code: &str,
+) -> Result<EnrollmentInfo, String> {
+    claim_enrollment_with(layout, code, |info| {
+        registry.register(&info.device_id, &info.device_name, &info.bearer_token)
+    })
+}
+
+fn claim_enrollment_with(
+    layout: &StorageLayout,
+    code: &str,
+    register: impl FnOnce(&EnrollmentInfo) -> Result<(), std::io::Error>,
+) -> Result<EnrollmentInfo, String> {
     let path = layout.enrollment_path(code);
     let data = fs::read_to_string(&path).map_err(|_| "enrollment code not found".to_string())?;
     let info: EnrollmentInfo =
@@ -55,13 +83,7 @@ pub fn claim_enrollment(layout: &StorageLayout, code: &str) -> Result<Enrollment
         return Err("enrollment code expired".into());
     }
 
-    devices::register_device(
-        layout,
-        &info.device_id,
-        &info.device_name,
-        &info.bearer_token,
-    )
-    .map_err(|e| format!("device registration failed: {}", e))?;
+    register(&info).map_err(|e| format!("device registration failed: {}", e))?;
 
     let _ = fs::remove_file(&path);
 

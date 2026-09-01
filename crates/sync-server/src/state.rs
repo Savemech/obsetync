@@ -1,5 +1,7 @@
+use crate::blocking_io::{self, BlockingPool};
 use crate::box_key;
 use crate::config::ServerConfig;
+use crate::devices::DeviceRegistry;
 use crate::eph_rotation::{self, EphState};
 use crate::perf::ServerPerfCounters;
 use crate::secure::KEY_LEN;
@@ -29,6 +31,12 @@ pub struct AppState {
     /// Aggregate-only process metrics exposed by the local admin endpoint.
     /// Inputs intentionally cannot carry vault paths, hashes, or identities.
     pub perf: Arc<ServerPerfCounters>,
+    /// Memory-resident auth/device state loaded from the filesystem before
+    /// listeners open. The filesystem remains authoritative across restart.
+    pub devices: DeviceRegistry,
+    /// Reserved blocking capacity for tickets, enrollment, and durable admin
+    /// mutations. Kept separate from bulk storage reads to prevent starvation.
+    pub control_io: BlockingPool,
     /// Dedicated bounded immutable-object writer. One checksummed journal
     /// fdatasync commits a whole group before loose mirrors become visible.
     pub storage_writer: StorageWriter,
@@ -68,7 +76,11 @@ impl AppState {
         let mut priv_bytes = [0u8; KEY_LEN];
         priv_bytes.copy_from_slice(priv_key.as_bytes());
         let eph = eph_rotation::init_eph_keys().expect("transport-v2 ephemeral key unavailable");
-        let sequences = SequenceTracker::new(layout.clone());
+        let sequences = SequenceTracker::new(layout.clone())
+            .expect("anti-replay reservations could not be loaded from disk");
+        let devices = DeviceRegistry::load(layout.clone())
+            .expect("device registry could not be loaded from disk");
+        let control_io = blocking_io::control_pool();
         let storage_writer = StorageWriter::start(layout.clone(), Arc::clone(&perf))
             .expect("storage writer journal recovery failed");
 
@@ -80,6 +92,8 @@ impl AppState {
             eph: Arc::new(RwLock::new(eph)),
             sequences,
             perf,
+            devices,
+            control_io,
             storage_writer,
             started_at: Instant::now(),
             vault_locks: StdMutex::new(HashMap::new()),
