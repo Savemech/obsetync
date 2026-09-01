@@ -10,7 +10,8 @@
     "bench:perf": "esbuild src/perf-overhead.bench.ts --bundle --platform=node --format=cjs | node",
     "bench:bulk": "esbuild src/bulk-planner.bench.ts --bundle --platform=node --format=cjs | node",
     "bench:ws-data": "esbuild src/ws-data.bench.ts --bundle --platform=node --format=cjs | node",
-    "bench:ranged": "esbuild src/desktop-ranged-upload.bench.ts --bundle --platform=node --format=cjs | node"
+    "bench:ranged": "esbuild src/desktop-ranged-upload.bench.ts --bundle --platform=node --format=cjs | node",
+    "bench:governor": "node scripts/run-resource-governor-bench.mjs"
   },
   "dependencies": {
     "@noble/curves": "^1.6.0"

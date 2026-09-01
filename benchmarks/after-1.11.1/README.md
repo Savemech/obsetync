@@ -128,6 +128,21 @@ size/mtime/ctime/device/inode fingerprint consumed by ranged pass 2. Hash and
 manifest fingerprints agree with the live pathname, no binary payload crosses
 the worker boundary, and renderer event-loop lag remains below 1 ms p95.
 
+`x86-resource-governor-slice14.json` compares the production adaptive-selected
+balanced profile with the conservative profile on an AMD Ryzen 9 5950X. It
+hashes 256 MiB per run through the production minified SIMD workers, with three
+counterbalanced warm-cache runs per profile. Balanced reaches a 3,341.74 MiB/s
+median versus 1,652.08 MiB/s conservative (2.02x), while the worst observed
+event-loop lag is 1.08 ms p95 against the 16 ms gate. Per-run RSS start, peak,
+and peak delta are retained in the artifact. The cross-platform runner can emit
+the equivalent real-hardware artifact on Apple M1 and Windows ARM64; it refuses
+unsupported architectures and refuses to record a failed gate.
+
+`hardware-matrix-slice14.md` is the qualification ledger and reproduction
+protocol. Only the x86 desktop controller row is measured so far. A17-class
+Obsidian/WebKit, M1, Snapdragon, and slow-storage contention rows remain
+explicitly pending and must not be inferred from unit-tested profile ladders.
+
 This Linux/x86_64 run is implementation evidence, not the final cross-hardware
 release report. A17, M1, Snapdragon, cold/warm cache, power, and network fields
 are added by the final hardware gate.

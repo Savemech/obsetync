@@ -1,0 +1,143 @@
+{
+  "schema_version": 1,
+  "evidence": "actual production SIMD worker/controller run",
+  "profile_family": "x86-desktop",
+  "runtime": {
+    "platform": "linux",
+    "architecture": "x64",
+    "node": "v22.23.2",
+    "cpu": "AMD Ryzen 9 5950X 16-Core Processor",
+    "logical_cores": 32
+  },
+  "workload": {
+    "files": 32,
+    "bytes_per_file": 8388608,
+    "total_bytes": 268435456,
+    "warm_cache": true,
+    "runs_per_profile": 3,
+    "alternating_order": true
+  },
+  "profiles": {
+    "conservative": {
+      "runtime": "desktop",
+      "profile": "conservative",
+      "hashConcurrency": 2,
+      "maxHashConcurrency": 4,
+      "networkConcurrency": 2,
+      "applyConcurrency": 8,
+      "feedBytes": 262144,
+      "minFeedBytes": 65536,
+      "maxFeedBytes": 524288,
+      "maxBatchFiles": 128,
+      "maxBatchBytes": 4194304,
+      "maxSingleBatchFileBytes": 1048576,
+      "maxBatchHoldMs": 8,
+      "readConcurrency": 2,
+      "transientBudgetBytes": 100663296,
+      "yieldBudgetMs": 10
+    },
+    "adaptive_selected": {
+      "runtime": "desktop",
+      "profile": "balanced",
+      "hashConcurrency": 4,
+      "maxHashConcurrency": 4,
+      "networkConcurrency": 4,
+      "applyConcurrency": 16,
+      "feedBytes": 524288,
+      "minFeedBytes": 65536,
+      "maxFeedBytes": 1048576,
+      "maxBatchFiles": 256,
+      "maxBatchBytes": 8388608,
+      "maxSingleBatchFileBytes": 1048576,
+      "maxBatchHoldMs": 8,
+      "readConcurrency": 4,
+      "transientBudgetBytes": 134217728,
+      "yieldBudgetMs": 12
+    }
+  },
+  "runs": [
+    {
+      "profile": "conservative",
+      "workers": 2,
+      "feed_bytes": 262144,
+      "elapsed_ms": 158.413406,
+      "throughput_mib_per_second": 1616.0248457759944,
+      "event_loop_lag_p95_ms": 0.7081430000000069,
+      "event_loop_lag_samples": 30,
+      "rss_start_bytes": 146255872,
+      "peak_rss_bytes": 146255872,
+      "peak_rss_delta_bytes": 0
+    },
+    {
+      "profile": "balanced",
+      "workers": 4,
+      "feed_bytes": 524288,
+      "elapsed_ms": 76.60672800000003,
+      "throughput_mib_per_second": 3341.74303854878,
+      "event_loop_lag_p95_ms": 1.078000999999972,
+      "event_loop_lag_samples": 14,
+      "rss_start_bytes": 142721024,
+      "peak_rss_bytes": 162119680,
+      "peak_rss_delta_bytes": 19398656
+    },
+    {
+      "profile": "balanced",
+      "workers": 4,
+      "feed_bytes": 524288,
+      "elapsed_ms": 75.55532399999993,
+      "throughput_mib_per_second": 3388.245678094111,
+      "event_loop_lag_p95_ms": 0.7611379999999599,
+      "event_loop_lag_samples": 14,
+      "rss_start_bytes": 162381824,
+      "peak_rss_bytes": 176537600,
+      "peak_rss_delta_bytes": 14155776
+    },
+    {
+      "profile": "conservative",
+      "workers": 2,
+      "feed_bytes": 262144,
+      "elapsed_ms": 152.15540599999997,
+      "throughput_mib_per_second": 1682.4903349145548,
+      "event_loop_lag_p95_ms": 0.7771950000000061,
+      "event_loop_lag_samples": 29,
+      "rss_start_bytes": 177061888,
+      "peak_rss_bytes": 177061888,
+      "peak_rss_delta_bytes": 0
+    },
+    {
+      "profile": "conservative",
+      "workers": 2,
+      "feed_bytes": 262144,
+      "elapsed_ms": 154.956182,
+      "throughput_mib_per_second": 1652.0799408958073,
+      "event_loop_lag_p95_ms": 0.5208619999999655,
+      "event_loop_lag_samples": 30,
+      "rss_start_bytes": 135618560,
+      "peak_rss_bytes": 138240000,
+      "peak_rss_delta_bytes": 2621440
+    },
+    {
+      "profile": "balanced",
+      "workers": 4,
+      "feed_bytes": 524288,
+      "elapsed_ms": 82.805879,
+      "throughput_mib_per_second": 3091.5679308228828,
+      "event_loop_lag_p95_ms": 0.8445950000000266,
+      "event_loop_lag_samples": 16,
+      "rss_start_bytes": 167337984,
+      "peak_rss_bytes": 171532288,
+      "peak_rss_delta_bytes": 4194304
+    }
+  ],
+  "medians": {
+    "conservative_mib_per_second": 1652.0799408958073,
+    "adaptive_mib_per_second": 3341.74303854878,
+    "adaptive_ratio": 2.022748994057023,
+    "worst_event_loop_lag_p95_ms": 1.078000999999972
+  },
+  "gates": {
+    "adaptive_not_worse_than_conservative_by_more_than_5_percent": true,
+    "event_loop_lag_p95_at_most_16_ms": true,
+    "passed": true
+  }
+}
