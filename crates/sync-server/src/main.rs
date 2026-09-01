@@ -16,6 +16,7 @@ mod secure;
 mod seq_tracker;
 mod state;
 mod storage;
+mod storage_writer;
 mod ws;
 mod ws_ticket;
 

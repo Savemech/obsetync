@@ -30,6 +30,7 @@ impl StorageLayout {
             "content",
             "content/manifests",
             "content/chunks",
+            "storage-writer",
         ];
         for dir in &dirs {
             std::fs::create_dir_all(self.base.join(dir))?;
@@ -65,6 +66,13 @@ impl StorageLayout {
             .join("content/chunks")
             .join(&hex[..2])
             .join(&hex[2..])
+    }
+
+    /// Transitional group-commit journal used by the loose-object writer.
+    /// The journal is the durability source of truth; loose files remain the
+    /// current read/index backend until pack storage replaces them.
+    pub fn storage_writer_journal_path(&self) -> PathBuf {
+        self.base.join("storage-writer/loose-groups-v1.log")
     }
 
     /// Durable HTTP-v2 anti-replay window for one enrolled device.
@@ -371,6 +379,68 @@ fn write_blob_with_optional_perf(
     Ok(())
 }
 
+/// Materialize a loose-object mirror after its bytes are already durable in
+/// the storage-writer journal. Atomic promotion still prevents readers from
+/// observing partial data, but an additional per-file fsync would defeat
+/// group commit and is unnecessary: startup recovery can recreate this mirror
+/// from the fdatasync'ed journal after any crash or power loss.
+pub(crate) fn materialize_journaled_blob(path: &Path, data: &[u8]) -> Result<(), std::io::Error> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "blob path has no parent")
+    })?;
+    std::fs::create_dir_all(parent)?;
+    if std::fs::read(path).is_ok_and(|existing| existing == data) {
+        return Ok(());
+    }
+
+    let tmp = path.with_extension(format!(
+        "journal-tmp-{}-{:016x}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp)?;
+    if let Err(error) = file.write_all(data) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    drop(file);
+
+    if let Err(rename_error) = std::fs::rename(&tmp, path) {
+        if std::fs::read(path).is_ok_and(|existing| existing == data) {
+            let _ = std::fs::remove_file(&tmp);
+            return Ok(());
+        }
+        let backup = path.with_extension(format!(
+            "journal-backup-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let had_existing = path.exists();
+        if had_existing {
+            std::fs::rename(path, &backup)?;
+        }
+        if let Err(error) = std::fs::rename(&tmp, path) {
+            if had_existing {
+                let _ = std::fs::rename(&backup, path);
+            }
+            let _ = std::fs::remove_file(&tmp);
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "journaled blob promotion failed after rename error {rename_error}: {error}"
+                ),
+            ));
+        }
+        if had_existing {
+            let _ = std::fs::remove_file(&backup);
+        }
+    }
+    Ok(())
+}
+
 /// Helper: check if a content-addressed blob exists.
 #[cfg(test)]
 pub fn blob_exists(path: &Path) -> bool {
@@ -452,6 +522,7 @@ mod tests {
             "content",
             "content/manifests",
             "content/chunks",
+            "storage-writer",
         ] {
             assert!(
                 dir.path().join(sub).is_dir(),
@@ -495,6 +566,25 @@ mod tests {
         assert_eq!(
             layout.content_chunk_path(&h),
             PathBuf::from(format!("/base/content/chunks/{}/{}", &hex[..2], &hex[2..]))
+        );
+        assert_eq!(
+            layout.storage_writer_journal_path(),
+            PathBuf::from("/base/storage-writer/loose-groups-v1.log")
+        );
+    }
+
+    #[test]
+    fn journaled_materialization_is_atomic_and_replaceable() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("objects/blob");
+        materialize_journaled_blob(&path, b"first").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        materialize_journaled_blob(&path, b"first").unwrap();
+        materialize_journaled_blob(&path, b"replacement").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
         );
     }
 

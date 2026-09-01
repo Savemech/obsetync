@@ -5,6 +5,7 @@ use crate::perf::ServerPerfCounters;
 use crate::secure::KEY_LEN;
 use crate::seq_tracker::SequenceTracker;
 use crate::storage::{StorageLayout, VaultStore};
+use crate::storage_writer::StorageWriter;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Instant;
@@ -28,6 +29,9 @@ pub struct AppState {
     /// Aggregate-only process metrics exposed by the local admin endpoint.
     /// Inputs intentionally cannot carry vault paths, hashes, or identities.
     pub perf: Arc<ServerPerfCounters>,
+    /// Dedicated bounded immutable-object writer. One checksummed journal
+    /// fdatasync commits a whole group before loose mirrors become visible.
+    pub storage_writer: StorageWriter,
     /// Wall-clock monotonic start time — used by the admin dashboard to show
     /// uptime. Instant is Copy, so reading from Arc<AppState> needs no lock.
     pub started_at: Instant,
@@ -65,6 +69,8 @@ impl AppState {
         priv_bytes.copy_from_slice(priv_key.as_bytes());
         let eph = eph_rotation::init_eph_keys().expect("transport-v2 ephemeral key unavailable");
         let sequences = SequenceTracker::new(layout.clone());
+        let storage_writer = StorageWriter::start(layout.clone(), Arc::clone(&perf))
+            .expect("storage writer journal recovery failed");
 
         Self {
             config,
@@ -74,6 +80,7 @@ impl AppState {
             eph: Arc::new(RwLock::new(eph)),
             sequences,
             perf,
+            storage_writer,
             started_at: Instant::now(),
             vault_locks: StdMutex::new(HashMap::new()),
             notifiers: StdMutex::new(HashMap::new()),

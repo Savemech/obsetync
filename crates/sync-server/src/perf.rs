@@ -216,6 +216,47 @@ impl ServerPerfCounters {
         self.rename_count.fetch_add(1, RELAXED);
     }
 
+    /// Record one durable journal group. `objects` counts immutable records,
+    /// while `fdatasyncs` deliberately advances once per group rather than
+    /// once per loose mirror file.
+    pub fn record_pack_commit(
+        &self,
+        objects: u64,
+        payload_bytes: u64,
+        write_elapsed: Duration,
+        durability_elapsed: Duration,
+    ) {
+        self.pack_appends.fetch_add(objects, RELAXED);
+        self.bytes_written.fetch_add(payload_bytes, RELAXED);
+        self.storage_write_ns
+            .fetch_add(duration_ns(write_elapsed), RELAXED);
+        self.durability_wait_ns
+            .fetch_add(duration_ns(durability_elapsed), RELAXED);
+        self.fdatasyncs.fetch_add(1, RELAXED);
+    }
+
+    pub fn record_writer_queue_add(&self, objects: u64) {
+        let depth = self.writer_queue_depth.fetch_add(objects, RELAXED) + objects;
+        let mut peak = self.writer_queue_peak.load(RELAXED);
+        while depth > peak {
+            match self
+                .writer_queue_peak
+                .compare_exchange_weak(peak, depth, RELAXED, RELAXED)
+            {
+                Ok(_) => break,
+                Err(actual) => peak = actual,
+            }
+        }
+    }
+
+    pub fn record_writer_queue_remove(&self, objects: u64) {
+        let _ = self
+            .writer_queue_depth
+            .fetch_update(RELAXED, RELAXED, |depth| {
+                Some(depth.saturating_sub(objects))
+            });
+    }
+
     pub fn record_hash_check(&self, bytes: u64, elapsed: Duration, matched: bool) {
         self.record_hash_verify(bytes, elapsed);
         if !matched {
@@ -332,6 +373,10 @@ mod tests {
         counters.record_request_error();
         counters.record_loose_read(40, Duration::from_micros(3));
         counters.record_loose_write(50, Duration::from_micros(4), Duration::from_micros(6), 2);
+        counters.record_pack_commit(8, 400, Duration::from_micros(9), Duration::from_micros(10));
+        counters.record_writer_queue_add(5);
+        counters.record_writer_queue_add(3);
+        counters.record_writer_queue_remove(6);
         counters.record_hash_check(50, Duration::from_micros(2), false);
         counters.record_diff(DiffSample {
             nodes_visited: 9,
@@ -350,7 +395,10 @@ mod tests {
         assert_eq!(snapshot.requests.envelope_open_ns, 11_000);
         assert_eq!(snapshot.storage.loose_reads, 1);
         assert_eq!(snapshot.storage.loose_writes, 1);
-        assert_eq!(snapshot.storage.fdatasyncs, 2);
+        assert_eq!(snapshot.storage.pack_appends, 8);
+        assert_eq!(snapshot.storage.fdatasyncs, 3);
+        assert_eq!(snapshot.storage.writer_queue_depth, 2);
+        assert_eq!(snapshot.storage.writer_queue_peak, 8);
         assert_eq!(snapshot.storage.bytes_rehashed, 50);
         assert_eq!(snapshot.storage.corrupted_records, 1);
         assert_eq!(snapshot.diff.nodes_visited, 9);
