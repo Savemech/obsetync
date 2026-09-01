@@ -15,6 +15,7 @@ import {
     hashToHex,
     negotiateBulkLimits,
     planBulkUploadSteps,
+    splitBulkUploadRecords,
     type BulkCodecLimits,
     type BulkUploadRecord,
 } from "./bulk-codec";
@@ -174,9 +175,35 @@ function w1RequestCountCollapsesToBoundedPacks(): void {
         "manifest did not remain after its chunk fallback");
 }
 
+function payloadTooLargeRetrySplitIsBalancedAndOrdered(): void {
+    const records = [
+        { kind: BulkObjectKind.Content, hash: hash(60), data: new Uint8Array(700_000) },
+        { kind: BulkObjectKind.Content, hash: hash(61), data: new Uint8Array(600_000) },
+        { kind: BulkObjectKind.Content, hash: hash(62), data: new Uint8Array(500_000) },
+        { kind: BulkObjectKind.Manifest, hash: hash(63), data: new Uint8Array(400_000) },
+    ];
+    const [first, second] = splitBulkUploadRecords(records);
+    check(first.length > 0 && second.length > 0, "413 split produced an empty pack");
+    check(
+        [...first, ...second].map((record) => record.hash).join(",") ===
+            records.map((record) => record.hash).join(","),
+        "413 split reordered records",
+    );
+    check(
+        bulkPackEncodedLength(first) < bulkPackEncodedLength(records) &&
+            bulkPackEncodedLength(second) < bulkPackEncodedLength(records),
+        "413 split did not reduce both retry packs",
+    );
+
+    let rejected = false;
+    try { splitBulkUploadRecords(records.slice(0, 1)); } catch { rejected = true; }
+    check(rejected, "413 split accepted a pack that cannot be divided");
+}
+
 checkCodecPreservesOrderingAndBitmap();
 uploadPackAndAckAreStrict();
 downloadPagesCarryCursorBitmapAndPack();
 malformedAndLimitCasesFailClosed();
 w1RequestCountCollapsesToBoundedPacks();
-console.log("bulk-codec.test: 41 assertions passed");
+payloadTooLargeRetrySplitIsBalancedAndOrdered();
+console.log("bulk-codec.test: 45 assertions passed");

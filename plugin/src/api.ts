@@ -24,6 +24,7 @@ import {
     BULK_MAX_OBJECTS,
     BULK_MOBILE_MAX_BYTES,
     BULK_SERVER_MAX_BYTES,
+    bulkPackEncodedLength,
     decodeBulkCheckResponse,
     decodeBulkDownloadResponse,
     decodeBulkUploadAck,
@@ -32,6 +33,7 @@ import {
     encodeBulkUploadPack,
     negotiateBulkLimits,
     planBulkUploadSteps,
+    splitBulkUploadRecords,
     type BulkCodecLimits,
     type BulkRuntime,
     type BulkUploadRecord,
@@ -883,6 +885,37 @@ export class ObsetyncApi {
                     this.wsDataFrameBytes = null;
                     this.closeDataLane();
                     for (const record of records) await this.putObjectLegacy(record, perf);
+                    return;
+                }
+                if (response.status === 413) {
+                    perf?.increment({ retries: 1, backpressureEvents: 1 });
+                    if (records.length === 1) {
+                        // A proxy or stale server limit can be lower than the
+                        // authenticated capability bundle. Leave the durable,
+                        // single-object path as the final compatibility lane.
+                        this.bulkLimits = null;
+                        this.wsDataFrameBytes = null;
+                        this.closeDataLane();
+                        await this.putObjectLegacy(records[0], perf);
+                        return;
+                    }
+                    const [first, second] = splitBulkUploadRecords(records);
+                    const retryMaxBytes = Math.max(
+                        bulkPackEncodedLength(first),
+                        bulkPackEncodedLength(second),
+                    );
+                    if (this.bulkLimits) {
+                        this.bulkLimits = {
+                            ...this.bulkLimits,
+                            maxBytes: Math.min(this.bulkLimits.maxBytes, retryMaxBytes),
+                        };
+                    }
+                    console.warn(
+                        `[obsetync] bulk upload ${body.byteLength} B exceeded the effective ` +
+                        `HTTP limit; retrying ordered packs of at most ${retryMaxBytes} B`,
+                    );
+                    await this.putBulkPack(first, limits, perf);
+                    await this.putBulkPack(second, limits, perf);
                     return;
                 }
                 if (!response.ok) throw new Error(`bulk put failed: ${response.status}`);

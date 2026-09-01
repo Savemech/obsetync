@@ -161,6 +161,43 @@ export function planBulkUploadSteps(
     return steps;
 }
 
+/** Split a rejected upload pack into two byte-balanced, ordered retries.
+ *  This is deliberately independent of the advertised limit: a reverse
+ *  proxy or stale server configuration can impose a smaller effective
+ *  ceiling than capability negotiation reported. */
+export function splitBulkUploadRecords(
+    records: readonly BulkUploadRecord[],
+): [BulkUploadRecord[], BulkUploadRecord[]] {
+    if (records.length < 2) {
+        throw new RangeError("bulk upload pack cannot be split");
+    }
+    const payloadBytes = records.reduce(
+        (total, record) => checkedAdd(
+            total,
+            checkedAdd(BULK_RECORD_HEADER_BYTES, record.data.byteLength, "bulk split record"),
+            "bulk split length",
+        ),
+        0,
+    );
+    const target = Math.ceil(payloadBytes / 2);
+    let consumed = 0;
+    let splitAt = 1;
+    for (let index = 0; index < records.length - 1; index++) {
+        consumed = checkedAdd(
+            consumed,
+            checkedAdd(
+                BULK_RECORD_HEADER_BYTES,
+                records[index].data.byteLength,
+                "bulk split record",
+            ),
+            "bulk split length",
+        );
+        splitAt = index + 1;
+        if (consumed >= target) break;
+    }
+    return [records.slice(0, splitAt), records.slice(splitAt)];
+}
+
 export function encodeBulkCheckRequest(
     kind: BulkObjectKind,
     hashes: readonly string[],

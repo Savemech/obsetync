@@ -13,7 +13,7 @@ use crate::storage_writer::{
 };
 use axum::{
     body::Body,
-    extract::{Path, Request, State},
+    extract::{DefaultBodyLimit, Path, Request, State},
     http::{HeaderMap, Method, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -658,6 +658,10 @@ pub fn sync_router(state: SharedState) -> Router {
         // `ops` frame; these two ride the sealed HTTP channel.
         .route("/api/v1/crdt/{vault_id}", post(post_crdt_get))
         .route("/api/v1/crdt/{vault_id}/compact", post(post_crdt_compact))
+        // `Bytes` extractors otherwise retain Axum's implicit 2 MiB ceiling.
+        // The envelope already bounds every wire body at MAX_BODY_BYTES, while
+        // individual handlers enforce their smaller advertised protocol caps.
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             secure_envelope,
@@ -3811,6 +3815,37 @@ mod integration_tests {
         assert_eq!(returned.records[0].bytes, second);
         assert_eq!(returned.records[1].hash, first_hash);
         assert_eq!(returned.records[1].bytes, first);
+    }
+
+    #[tokio::test]
+    async fn bulk_put_accepts_an_advertised_pack_above_axums_default_body_limit() {
+        let env = setup();
+        let payloads = [
+            vec![0x11; 768 * 1024],
+            vec![0x22; 768 * 1024],
+            vec![0x33; 768 * 1024],
+        ];
+        let hashes = payloads.each_ref().map(|payload| hash_bytes(payload));
+        let records = payloads
+            .iter()
+            .zip(hashes)
+            .map(|(payload, hash)| UploadRecord {
+                kind: ObjectKind::Content,
+                flags: 0,
+                hash,
+                plain_len: payload.len() as u32,
+                bytes: payload,
+            })
+            .collect::<Vec<_>>();
+        let pack = bulk::encode_upload_pack(&records).unwrap();
+        assert!(pack.len() > 2 * 1024 * 1024);
+        assert!(pack.len() < BULK_REQUEST_BYTES);
+
+        let (status, ack) = send_semantic(&env, "POST", "/api/v1/bulk/put", &pack).await;
+
+        assert_eq!(status, StatusCode::OK.as_u16());
+        assert_eq!(&ack[..4], bulk::PACK_ACK_MAGIC);
+        assert_eq!(&ack[8..], &[0, 0, 0]);
     }
 
     #[tokio::test]
