@@ -329,8 +329,13 @@ pub struct BenchmarkIteration {
     pub mebibytes_per_second: f64,
     pub initial_tree_chunks: u64,
     pub final_tree_chunks: u64,
+    pub final_reachable_tree_chunks: u64,
+    pub unreachable_tree_chunks: u64,
+    pub gc_removed_chunks: u64,
+    pub gc_removed_bytes: u64,
     pub initial_root: String,
     pub final_root: String,
+    pub root_matches_flat_oracle: bool,
     pub scenario_operations: u64,
     pub scenario_elapsed_ns: u64,
     pub operation_latency_p50_ns: Option<u64>,
@@ -575,15 +580,21 @@ pub async fn benchmark(
         }
         let enumerate_and_hash_ns = elapsed_ns(hash_started.elapsed());
 
-        let store = sync_core::store::MemoryChunkStore::new();
         let tree_started = Instant::now();
-        let mut root =
-            sync_core::tree::build_tree(&store, entries.clone(), "benchmark-vault", "perf-harness")
-                .await
-                .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+        let mut tree = sync_core::transactional_tree::TransactionalTree::new(
+            "benchmark-vault",
+            "perf-harness",
+        );
+        tree.rebuild(entries.clone())
+            .await
+            .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
         let tree_build_ns = elapsed_ns(tree_started.elapsed());
-        let initial_tree_chunks = store.len() as u64;
-        let initial_root = sync_core::hash::hash_to_hex(&root.hash());
+        let initial_tree_chunks = tree.store_len() as u64;
+        let initial_root = sync_core::hash::hash_to_hex(
+            &tree
+                .committed_root_hash()
+                .ok_or_else(|| HarnessError::ManifestMismatch("tree has no root".into()))?,
+        );
 
         let mut entry_map: BTreeMap<String, sync_core::chunk::FileEntry> = entries
             .into_iter()
@@ -595,8 +606,12 @@ pub async fn benchmark(
         let scenario_started = Instant::now();
         let mut operation_latencies = Vec::with_capacity(operation_limit);
         let mut applied_operations = 0u64;
+        let mut gc_removed_chunks = 0u64;
+        let mut gc_removed_bytes = 0u64;
         for (index, operation) in plan.operations.iter().take(operation_limit).enumerate() {
             let operation_started = Instant::now();
+            let mut changed = Vec::new();
+            let mut deleted = Vec::new();
             match operation {
                 ScenarioOperation::Modify {
                     path,
@@ -615,16 +630,8 @@ pub async fn benchmark(
                         plan.files.len() as u64 + index as u64 + 1,
                         *size,
                     );
-                    root = sync_core::tree::update_tree(
-                        &store,
-                        &root,
-                        std::slice::from_ref(&entry),
-                        &[],
-                    )
-                    .await
-                    .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
                     entry_map.insert(path.clone(), entry);
-                    applied_operations += 1;
+                    changed.push(entry_map[path].clone());
                 }
                 ScenarioOperation::Rename { from, to } => {
                     let mut entry = entry_map.remove(from).ok_or_else(|| {
@@ -633,16 +640,9 @@ pub async fn benchmark(
                         ))
                     })?;
                     entry.path = to.clone();
-                    root = sync_core::tree::update_tree(
-                        &store,
-                        &root,
-                        &[entry.clone()],
-                        std::slice::from_ref(from),
-                    )
-                    .await
-                    .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
                     entry_map.insert(to.clone(), entry);
-                    applied_operations += 1;
+                    changed.push(entry_map[to].clone());
+                    deleted.push(from.clone());
                 }
                 ScenarioOperation::Delete { path } => {
                     entry_map.remove(path).ok_or_else(|| {
@@ -650,22 +650,47 @@ pub async fn benchmark(
                             "delete source missing in scenario: {path}"
                         ))
                     })?;
-                    root = sync_core::tree::update_tree(
-                        &store,
-                        &root,
-                        &[],
-                        std::slice::from_ref(path),
-                    )
-                    .await
-                    .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
-                    applied_operations += 1;
+                    deleted.push(path.clone());
                 }
                 ScenarioOperation::KillAfter { .. } => continue,
             }
+            tree.begin_candidate()
+                .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+            if let Err(error) = tree.apply_candidate(&changed, &deleted).await {
+                let _ = tree.abort_candidate();
+                return Err(HarnessError::ManifestMismatch(error.to_string()));
+            }
+            let gc = tree
+                .commit_candidate()
+                .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+            gc_removed_chunks = gc_removed_chunks.saturating_add(gc.removed);
+            gc_removed_bytes = gc_removed_bytes.saturating_add(gc.bytes_removed);
+            applied_operations += 1;
             operation_latencies.push(elapsed_ns(operation_started.elapsed()));
         }
         let scenario_elapsed_ns = elapsed_ns(scenario_started.elapsed());
         operation_latencies.sort_unstable();
+
+        let final_root_hash = tree
+            .committed_root_hash()
+            .ok_or_else(|| HarnessError::ManifestMismatch("tree has no final root".into()))?;
+        let final_reachable_tree_chunks = tree
+            .committed_chunk_hashes()
+            .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?
+            .len() as u64;
+        let final_tree_chunks = tree.store_len() as u64;
+        let unreachable_tree_chunks = final_tree_chunks.saturating_sub(final_reachable_tree_chunks);
+
+        // Rebuild from the flat final state as an independent semantic oracle.
+        let oracle_store = sync_core::store::MemoryChunkStore::new();
+        let oracle_root = sync_core::tree::build_tree(
+            &oracle_store,
+            entry_map.values().cloned().collect(),
+            "benchmark-vault",
+            "perf-harness",
+        )
+        .await
+        .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
 
         let seconds = enumerate_and_hash_ns.max(1) as f64 / 1_000_000_000.0;
         results.push(BenchmarkIteration {
@@ -674,9 +699,14 @@ pub async fn benchmark(
             files_per_second: plan.files.len() as f64 / seconds,
             mebibytes_per_second: (plan.total_bytes() as f64 / 1_048_576.0) / seconds,
             initial_tree_chunks,
-            final_tree_chunks: store.len() as u64,
+            final_tree_chunks,
+            final_reachable_tree_chunks,
+            unreachable_tree_chunks,
+            gc_removed_chunks,
+            gc_removed_bytes,
             initial_root,
-            final_root: sync_core::hash::hash_to_hex(&root.hash()),
+            final_root: sync_core::hash::hash_to_hex(&final_root_hash),
+            root_matches_flat_oracle: final_root_hash == oracle_root.hash(),
             scenario_operations: applied_operations,
             scenario_elapsed_ns,
             operation_latency_p50_ns: percentile(&operation_latencies, 50),
@@ -686,7 +716,7 @@ pub async fn benchmark(
     }
 
     Ok(BenchmarkReport {
-        schema_version: 1,
+        schema_version: 2,
         harness_version: env!("CARGO_PKG_VERSION").to_owned(),
         workload: plan.workload,
         seed: plan.seed,
@@ -1048,5 +1078,21 @@ mod tests {
         assert_eq!(first_manifest, second_manifest);
         verify(&first, true).unwrap();
         verify(&second, true).unwrap();
+    }
+
+    #[tokio::test]
+    async fn scenario_benchmark_commits_transactionally_without_unreachable_chunks() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("w6");
+        let plan =
+            WorkloadPlan::build(WorkloadId::W6, 42, "0.001".parse::<Scale>().unwrap()).unwrap();
+        materialize(&plan, &output, MaterializeOptions::default()).unwrap();
+
+        let report = benchmark(&output, 1, None).await.unwrap();
+        let iteration = &report.iterations[0];
+        assert_eq!(iteration.scenario_operations, 10);
+        assert_eq!(iteration.unreachable_tree_chunks, 0);
+        assert!(iteration.gc_removed_chunks > 0);
+        assert!(iteration.root_matches_flat_oracle);
     }
 }

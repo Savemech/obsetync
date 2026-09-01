@@ -1,0 +1,35 @@
+{
+  "architecture": "x86_64",
+  "file_count": 10000,
+  "harness_version": "1.10.2",
+  "iterations": [
+    {
+      "enumerate_and_hash_ns": 221452331,
+      "files_per_second": 45156.44497776815,
+      "final_reachable_tree_chunks": 11,
+      "final_root": "361b94d8ac49541bf2179163675f1a0cb3316e99959a34e63c8cb9c7c57033af",
+      "final_tree_chunks": 11,
+      "gc_removed_bytes": 1008560000,
+      "gc_removed_chunks": 20000,
+      "initial_root": "d97de19611eea1cc2a13fa97d46dac7e6bcd18305e4652f3cb8ca9cd6ab61dc5",
+      "initial_tree_chunks": 11,
+      "mebibytes_per_second": 374.59461285525316,
+      "operation_latency_p50_ns": 7167082,
+      "operation_latency_p95_ns": 11931915,
+      "operation_latency_p99_ns": 15419754,
+      "root_matches_flat_oracle": true,
+      "scenario_elapsed_ns": 74353026561,
+      "scenario_operations": 10000,
+      "tree_build_ns": 7207551,
+      "unreachable_tree_chunks": 0
+    }
+  ],
+  "operating_system": "linux",
+  "scale": {
+    "millionths": 1000000
+  },
+  "schema_version": 2,
+  "seed": 819217251961995265,
+  "total_bytes": 86984465,
+  "workload": "W6"
+}
