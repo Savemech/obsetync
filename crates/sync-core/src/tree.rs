@@ -120,6 +120,110 @@ async fn build_leaf_chunks<S: ChunkStore>(
     Ok(hashes)
 }
 
+enum FinalPathState {
+    Upsert(FileEntry),
+    Delete(String),
+}
+
+impl FinalPathState {
+    fn path(&self) -> &str {
+        match self {
+            Self::Upsert(entry) => &entry.path,
+            Self::Delete(path) => path,
+        }
+    }
+}
+
+/// Apply one prefix's final path states in linear time after normalization.
+///
+/// `existing` is strictly path-sorted by the validated tree format. Upserts
+/// are stable-sorted so the last input value for a duplicate path wins, which
+/// preserves the legacy sequential-update behavior. Deletes are applied first
+/// semantically, so an upsert for the same path always wins.
+fn merge_prefix_entries(
+    existing: Vec<FileEntry>,
+    mut sorted_upserts: Vec<FileEntry>,
+    mut deletions: Vec<String>,
+) -> Vec<FileEntry> {
+    debug_assert!(existing.windows(2).all(|pair| pair[0].path < pair[1].path));
+
+    // Stable ordering is required: duplicate paths retain their input order,
+    // allowing the final occurrence to become the final state.
+    if !sorted_upserts
+        .windows(2)
+        .all(|pair| pair[0].path <= pair[1].path)
+    {
+        sorted_upserts.sort_by(|left, right| left.path.cmp(&right.path));
+    }
+    let mut upserts: Vec<FileEntry> = Vec::with_capacity(sorted_upserts.len());
+    for entry in sorted_upserts {
+        if let Some(previous) = upserts.last_mut() {
+            if previous.path == entry.path {
+                *previous = entry;
+                continue;
+            }
+        }
+        upserts.push(entry);
+    }
+
+    if !deletions.windows(2).all(|pair| pair[0] <= pair[1]) {
+        deletions.sort_unstable();
+    }
+    deletions.dedup();
+
+    // Merge the two normalized operation streams. Equality selects Upsert,
+    // matching the old delete-all-then-upsert-all ordering.
+    let mut final_states = Vec::with_capacity(upserts.len() + deletions.len());
+    let mut upserts = upserts.into_iter().peekable();
+    let mut deletions = deletions.into_iter().peekable();
+    while let (Some(upsert), Some(deletion)) = (upserts.peek(), deletions.peek()) {
+        match upsert.path.as_str().cmp(deletion.as_str()) {
+            std::cmp::Ordering::Less => {
+                final_states.push(FinalPathState::Upsert(upserts.next().unwrap()));
+            }
+            std::cmp::Ordering::Equal => {
+                final_states.push(FinalPathState::Upsert(upserts.next().unwrap()));
+                deletions.next();
+            }
+            std::cmp::Ordering::Greater => {
+                final_states.push(FinalPathState::Delete(deletions.next().unwrap()));
+            }
+        }
+    }
+    final_states.extend(upserts.map(FinalPathState::Upsert));
+    final_states.extend(deletions.map(FinalPathState::Delete));
+
+    // One two-pointer pass over existing entries and normalized final states.
+    // Both iterators move monotonically; no retain/find scan is repeated.
+    let capacity = existing.len().saturating_add(final_states.len());
+    let mut merged = Vec::with_capacity(capacity);
+    let mut existing = existing.into_iter().peekable();
+    let mut final_states = final_states.into_iter().peekable();
+    while let (Some(entry), Some(state)) = (existing.peek(), final_states.peek()) {
+        match entry.path.as_str().cmp(state.path()) {
+            std::cmp::Ordering::Less => merged.push(existing.next().unwrap()),
+            std::cmp::Ordering::Equal => {
+                existing.next();
+                if let FinalPathState::Upsert(entry) = final_states.next().unwrap() {
+                    merged.push(entry);
+                }
+            }
+            std::cmp::Ordering::Greater => {
+                if let FinalPathState::Upsert(entry) = final_states.next().unwrap() {
+                    merged.push(entry);
+                }
+            }
+        }
+    }
+    merged.extend(existing);
+    for state in final_states {
+        if let FinalPathState::Upsert(entry) = state {
+            merged.push(entry);
+        }
+    }
+    merged
+}
+
 /// Incremental update: apply changes to an existing tree.
 /// Only re-chunks leaf chunks containing changed files.
 /// Returns a new RootNode with updated hashes.
@@ -153,43 +257,31 @@ pub async fn update_tree<S: ChunkStore>(
     let mut new_children = root.children.clone();
     let mut total_files = root.total_files;
 
-    for (prefix, (adds, dels)) in &changes_by_prefix {
-        // Find the existing child for this prefix.
-        let existing_hash = new_children
-            .iter()
-            .find(|(p, _)| p == prefix)
-            .map(|(_, h)| *h);
+    for (prefix, (adds, dels)) in changes_by_prefix {
+        // Root children are canonical and strictly prefix-sorted. Reuse the
+        // binary-search insertion point instead of scanning (and later
+        // sorting) the complete root child list for every changed prefix.
+        let child_position =
+            new_children.binary_search_by(|(child_prefix, _)| child_prefix.cmp(&prefix));
+        let existing_hash = child_position.ok().map(|index| new_children[index].1);
 
         // Load existing entries from the store.
-        let mut entries = if let Some(hash) = existing_hash {
+        let entries = if let Some(hash) = existing_hash {
             load_all_entries(store, &hash).await?
         } else {
             vec![]
         };
 
         let old_count = entries.len() as u64;
-
-        // Apply deletions.
-        for del_path in dels {
-            entries.retain(|e| &e.path != del_path);
-        }
-
-        // Apply additions/modifications.
-        for add in adds {
-            if let Some(existing) = entries.iter_mut().find(|e| e.path == add.path) {
-                *existing = add.clone();
-            } else {
-                entries.push(add.clone());
-            }
-        }
-
-        entries.sort();
+        let entries = merge_prefix_entries(entries, adds, dels);
         let new_count = entries.len() as u64;
         total_files = total_files - old_count + new_count;
 
         if entries.is_empty() {
             // Directory is now empty — remove from root children.
-            new_children.retain(|(p, _)| p != prefix);
+            if let Ok(index) = child_position {
+                new_children.remove(index);
+            }
         } else {
             // Rebuild leaf chunks for this prefix.
             let leaf_hashes = build_leaf_chunks(store, &entries).await?;
@@ -210,11 +302,9 @@ pub async fn update_tree<S: ChunkStore>(
             };
 
             // Update or insert the child in root.
-            if let Some(child) = new_children.iter_mut().find(|(p, _)| p == prefix) {
-                child.1 = new_hash;
-            } else {
-                new_children.push((prefix.clone(), new_hash));
-                new_children.sort_by(|a, b| a.0.cmp(&b.0));
+            match child_position {
+                Ok(index) => new_children[index].1 = new_hash,
+                Err(index) => new_children.insert(index, (prefix, new_hash)),
             }
         }
     }
@@ -290,9 +380,115 @@ mod tests {
     use super::*;
     use crate::hash::hash_bytes;
     use crate::store::MemoryChunkStore;
+    use std::collections::BTreeMap;
 
     fn make_entry(path: &str) -> FileEntry {
         FileEntry::new(path.to_string(), hash_bytes(path.as_bytes()), 1000, 100)
+    }
+
+    fn make_revision(path: &str, revision: u64) -> FileEntry {
+        FileEntry::new(
+            path.to_owned(),
+            hash_bytes(format!("{path}:{revision}").as_bytes()),
+            revision,
+            revision + 1,
+        )
+    }
+
+    fn map_oracle(
+        existing: &[FileEntry],
+        changed: &[FileEntry],
+        deleted: &[String],
+    ) -> Vec<FileEntry> {
+        let mut expected: BTreeMap<String, FileEntry> = existing
+            .iter()
+            .cloned()
+            .map(|entry| (entry.path.clone(), entry))
+            .collect();
+        for path in deleted {
+            expected.remove(path);
+        }
+        for entry in changed {
+            expected.insert(entry.path.clone(), entry.clone());
+        }
+        expected.into_values().collect()
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestRng(u64);
+
+    impl TestRng {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0
+        }
+
+        fn below(&mut self, upper: usize) -> usize {
+            (self.next() as usize) % upper
+        }
+    }
+
+    #[test]
+    fn prefix_merge_preserves_legacy_final_state_rules() {
+        let existing = vec![
+            make_revision("dir/a.md", 1),
+            make_revision("dir/b.md", 1),
+            make_revision("dir/c.md", 1),
+        ];
+        let changed = vec![
+            make_revision("dir/b.md", 2),
+            make_revision("dir/d.md", 1),
+            make_revision("dir/b.md", 3),
+        ];
+        let deleted = vec![
+            "dir/b.md".to_owned(),
+            "dir/c.md".to_owned(),
+            "dir/c.md".to_owned(),
+            "dir/missing.md".to_owned(),
+        ];
+
+        let actual = merge_prefix_entries(existing.clone(), changed.clone(), deleted.clone());
+        assert_eq!(actual, map_oracle(&existing, &changed, &deleted));
+        assert_eq!(
+            actual
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            ["dir/a.md", "dir/b.md", "dir/d.md"]
+        );
+        assert_eq!(actual[1], make_revision("dir/b.md", 3));
+    }
+
+    #[test]
+    fn prefix_merge_matches_map_oracle_for_random_operations() {
+        let mut rng = TestRng(0x6f62_7365_7479_6e63);
+        for case in 0..1_000u64 {
+            let existing_count = rng.below(300);
+            let existing: Vec<_> = (0..existing_count)
+                .map(|index| make_revision(&format!("dir/{index:04}.md"), case))
+                .collect();
+            let changed: Vec<_> = (0..rng.below(200))
+                .map(|revision| {
+                    let index = rng.below(450);
+                    make_revision(
+                        &format!("dir/{index:04}.md"),
+                        case * 1_000 + revision as u64,
+                    )
+                })
+                .collect();
+            let deleted: Vec<_> = (0..rng.below(200))
+                .map(|_| format!("dir/{:04}.md", rng.below(450)))
+                .collect();
+
+            assert_eq!(
+                merge_prefix_entries(existing.clone(), changed.clone(), deleted.clone()),
+                map_oracle(&existing, &changed, &deleted),
+                "final-state mismatch in generated case {case}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -512,5 +708,118 @@ mod tests {
         let store = MemoryChunkStore::new();
         let err = load_all_entries(&store, &hash_bytes(b"unknown")).await;
         assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn update_tree_matches_flat_rebuild_across_random_batches() {
+        let store = MemoryChunkStore::new();
+        let initial: Vec<_> = (0..250)
+            .map(|index| {
+                let path = if index % 7 == 0 {
+                    format!("root-{index:04}.md")
+                } else {
+                    format!("dir-{}/{index:04}.md", index % 5)
+                };
+                make_revision(&path, 0)
+            })
+            .collect();
+        let mut flat: BTreeMap<String, FileEntry> = initial
+            .iter()
+            .cloned()
+            .map(|entry| (entry.path.clone(), entry))
+            .collect();
+        let mut root = build_tree(&store, initial, "vault", "device")
+            .await
+            .unwrap();
+        let mut rng = TestRng(0x7472_6565_2d76_3121);
+
+        for batch in 1..=100u64 {
+            let path_for = |index: usize| {
+                if index % 7 == 0 {
+                    format!("root-{index:04}.md")
+                } else {
+                    format!("dir-{}/{index:04}.md", index % 5)
+                }
+            };
+            let changed: Vec<_> = (0..1 + rng.below(25))
+                .map(|revision| {
+                    let path = path_for(rng.below(400));
+                    make_revision(&path, batch * 1_000 + revision as u64)
+                })
+                .collect();
+            let deleted: Vec<_> = (0..rng.below(25))
+                .map(|_| path_for(rng.below(400)))
+                .collect();
+
+            for path in &deleted {
+                flat.remove(path);
+            }
+            for entry in &changed {
+                flat.insert(entry.path.clone(), entry.clone());
+            }
+            root = update_tree(&store, &root, &changed, &deleted)
+                .await
+                .unwrap();
+
+            let oracle_store = MemoryChunkStore::new();
+            let oracle = build_tree(
+                &oracle_store,
+                flat.values().cloned().collect(),
+                "vault",
+                "device",
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                root.hash(),
+                oracle.hash(),
+                "root mismatch after batch {batch}"
+            );
+            assert_eq!(root.total_files, flat.len() as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn update_tree_handles_mass_delete_and_more_than_ten_leaves() {
+        let store = MemoryChunkStore::new();
+        let count = TARGET_CHUNK_ENTRIES * 10 + 25;
+        let initial: Vec<_> = (0..count)
+            .map(|index| make_revision(&format!("wide/{index:05}.md"), 1))
+            .collect();
+        let root = build_tree(&store, initial.clone(), "vault", "device")
+            .await
+            .unwrap();
+        let deleted: Vec<_> = (0..8_000)
+            .map(|index| format!("wide/{index:05}.md"))
+            .chain(std::iter::repeat_n("wide/00042.md".to_owned(), 20))
+            .collect();
+        let changed = vec![
+            make_revision("wide/09000.md", 2),
+            make_revision("wide/09000.md", 3),
+            make_revision("wide/12000.md", 1),
+            make_revision("wide/00042.md", 4),
+        ];
+
+        let updated = update_tree(&store, &root, &changed, &deleted)
+            .await
+            .unwrap();
+        let expected = map_oracle(&initial, &changed, &deleted);
+        let oracle_store = MemoryChunkStore::new();
+        let oracle = build_tree(&oracle_store, expected.clone(), "vault", "device")
+            .await
+            .unwrap();
+        assert_eq!(updated.hash(), oracle.hash());
+        assert_eq!(updated.total_files, expected.len() as u64);
+
+        let wide_hash = updated
+            .children
+            .iter()
+            .find(|(prefix, _)| prefix == "wide/")
+            .unwrap()
+            .1;
+        assert_eq!(
+            load_all_entries(&store, &wide_hash).await.unwrap(),
+            expected
+        );
     }
 }
