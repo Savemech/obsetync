@@ -1,12 +1,13 @@
-# Tree v2 range-Merkle prototype
+# Tree v2 range-Merkle format
 
-Tree v2 is an isolated Slice 11 prototype. It proves the index layout and
-algorithms needed to avoid Tree v1's whole-prefix rebuild and diff costs, but it
-is not yet a production root format. The plugin and server continue to publish,
-persist, merge, and roll back Tree v1 roots until the mixed-version migration in
-Slice 12 is complete.
+Tree v2 began as the isolated Slice 11 prototype documented in this file. Slice
+12 completed the mixed-version migration: the plugin and server can now build,
+validate, persist, diff, merge, inspect, and roll back v1 and v2 roots. Tree v2
+is deliberately not enabled by version upgrade alone. A vault stays on Tree v1
+until every enrolled device reports support over its authenticated session and
+an operator explicitly projects the current semantic state into v2.
 
-## Why the prototype uses a range tree
+## Why Tree v2 uses a range tree
 
 Tree v1 places at most 1,000 entries in each fixed-position leaf under a
 top-level path prefix. A content edit changes one leaf, but inserting or deleting
@@ -24,8 +25,8 @@ has two useful consequences:
   boundary reappears.
 
 The implementation is in `sync_core::tree_v2`. It intentionally has distinct
-node magics and a distinct semantic root domain so that prototype bytes cannot
-be mistaken for Tree v1 FlatBuffers.
+node magics and a distinct semantic root domain so that v2 bytes cannot be
+mistaken for Tree v1 FlatBuffers.
 
 ## Canonical layout
 
@@ -51,7 +52,7 @@ Internal nodes use the `OVI2` domain and store ordered, non-overlapping range
 descriptors of one common child height. The semantic root hash uses the `OVR2`
 domain and commits to the version, total file count, and complete top descriptor.
 
-The current measured prototype parameters are:
+The current format parameters are:
 
 | Property | Limit |
 |---|---:|
@@ -107,12 +108,12 @@ loaded leaves/entries, scanned resynchronization leaves, replacement leaves, and
 new internal nodes.
 
 Leaf payload I/O is proportional to the resynchronization window, not the vault.
-The prototype still enumerates leaf descriptors and reconstructs the small
+The implementation still enumerates leaf descriptors and reconstructs the small
 descriptor levels, so its current CPU term is `O(number of range descriptors +
-affected leaf records)`, rather than the final `O(log N + affected leaf bytes)`
-target. Slice 12 can preserve the traversed parent spine and resynchronize each
-internal level locally; immutable nodes make that refinement retry-safe without
-changing the proven leaf format.
+affected leaf records)`, rather than the eventual `O(log N + affected leaf
+bytes)` target. A future format-preserving optimization can retain the traversed
+parent spine and resynchronize each internal level locally; immutable nodes make
+that refinement retry-safe without changing the leaf format.
 
 ## Recursive range diff
 
@@ -139,8 +140,12 @@ duplicate or unordered entries, overlapping ranges, inconsistent heights,
 declared-size mismatch, file-count mismatch, and excessive traversal depth or
 cardinality.
 
-Updates write immutable candidate nodes only. No production root points at these
-prototype nodes, so a failed prototype operation cannot alter a published vault.
+Updates write immutable candidate nodes behind a separate candidate root. The
+plugin promotes that root only after server acceptance; commit and abort both
+mark the selected graph and sweep unreachable candidate nodes. On the server,
+root history and the current pointer are published only after validation,
+content checks, and the per-vault write transaction complete. A failed operation
+therefore cannot partially replace the published root.
 
 ## Property and benchmark evidence
 
@@ -169,21 +174,27 @@ most 3,457 diff records instead of approximately 200,000 and loads at most 1,729
 entries during update. Insertion and anchor deletion create at most 3 and 4 new
 reachable v2 nodes, versus 102 and 100 Tree v1 nodes respectively.
 
-These results select the path-based range tree over the radix alternative for
+These results selected the path-based range tree over the radix alternative for
 the migration slice. They are algorithmic evidence on one host, not a substitute
 for the A17, M1, Snapdragon, and x86 hardware gate.
 
-## Explicitly deferred to Slice 12
+## Production migration and rollout
 
-The prototype does not yet change any production behavior. Slice 12 must add:
+Slice 12 added:
 
-- a persisted RootNode v2 schema and strict dual decoder;
-- v1↔v2 diff and three-way merge behavior;
-- candidate upload, reachability, history, rollback, and garbage collection;
+- a persisted `OVR2` root envelope and strict `VersionedRoot` dual decoder;
+- v1↔v2 semantic projection plus version-aware diff and three-way merge;
+- transactional candidate upload, reachability, history, rollback, and garbage
+  collection;
 - authenticated device capability tracking and an all-device fleet gate;
-- a shadow-build audit before activation and a clear upgrade-required response
-  for old clients after explicit activation;
-- downgrade through a verified v1 projection or explicit v1 rollback, never an
-  implicit incompatible publication.
+- a semantic audit during explicit activation and a clear HTTP 426 response for
+  old plugin sessions without changing their enrollment identity;
+- downgrade through a verified server-generated v1 projection or an explicit v1
+  rollback, never an implicit incompatible publication.
 
-Until those conditions pass, Tree v1 remains the only publishable root format.
+Tree v1 remains the default and the compatibility fallback. An active v2 vault
+rejects roots of the other format and old sessions receive an upgrade-required
+response containing explicit guidance to update or reload, not re-enroll. The
+server's bounded OBD1 transport pages are production-ready for both formats;
+feeding those pages directly from `range_page` without first materializing the
+complete recursive v2 delta remains a future memory optimization.

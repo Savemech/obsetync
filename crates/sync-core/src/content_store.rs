@@ -53,8 +53,8 @@ pub struct ChunkRef {
 
 /// Disk-based content store.
 /// Layout:
-///   <base>/<first2hex>/<rest>           — small files / sub-file chunks
-///   <base>/manifests/<first2hex>/<rest>  — file manifests (JSON)
+///   `<base>/<first2hex>/<rest>`           — small files / sub-file chunks
+///   `<base>/manifests/<first2hex>/<rest>` — file manifests (JSON)
 pub struct DiskContentStore {
     base: std::path::PathBuf,
 }

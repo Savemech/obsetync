@@ -15,7 +15,7 @@ pub trait ChunkStore {
 }
 
 /// Disk-based chunk store.
-/// Layout: <base>/<first2hex>/<remaining60hex>
+/// Layout: `<base>/<first2hex>/<remaining60hex>`
 pub struct DiskChunkStore {
     base: std::path::PathBuf,
 }

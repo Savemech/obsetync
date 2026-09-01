@@ -132,9 +132,10 @@ SyncRouter.post_diff_page(OBQ1)
   → final client GET /root/{vault}/{to_root} retrieves matching cached root
 ```
 
-Tree v1 still materializes/recomputes its complete delta for each page. This is
-an intentional transitional producer: the wire and client heap are bounded
-now; Tree v2 replaces it with range/cursor traversal in the following slices.
+The bridge still materializes/recomputes a complete delta for each page. Tree v2
+uses recursive range alignment to skip unchanged subtrees, but does not yet feed
+the OBD1 encoder directly from `range_page`. The wire and client heap are bounded
+now; a direct range-to-page producer remains a server-memory optimization.
 
 ### Push (PUT /api/v1/root/{vault_id})
 ```

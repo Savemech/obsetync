@@ -1,9 +1,11 @@
-//! Experimental Tree v2 range Merkle tree.
+//! Tree v2 range Merkle tree.
 //!
-//! This module is deliberately not wired into the production root format yet.
-//! Slice 11 uses it to prove deterministic path-only boundaries, localized
-//! updates, recursive range diff, strict validation, and measurable churn
-//! before Slice 12 adds mixed-version persistence/migration.
+//! Slice 11 established deterministic path-only boundaries, localized updates,
+//! recursive range diff, strict validation, and bounded churn. Slice 12 wires
+//! the format into [`crate::versioned_root::VersionedRoot`] and the transactional
+//! WASM/server paths. Publication remains explicit and fleet-gated: Tree v1 is
+//! retained until every enrolled device reports support and an operator projects
+//! the current semantic state into v2.
 
 use crate::chunk::{ChunkError, FileEntry};
 use crate::diff::{self, DiffResult, DiffStats, FileDelta};
@@ -498,8 +500,10 @@ pub async fn compute_deltas<S: ChunkStore>(
     Ok(compute_deltas_with_stats(store, from, to).await?.deltas)
 }
 
-/// Load one bounded semantic page after an exact path cursor. This proves the
-/// prototype can drive a future diff iterator without flattening the tree.
+/// Load one bounded semantic page after an exact path cursor. This is the range
+/// traversal primitive for a future direct range-to-wire diff producer; the
+/// current server bridge still materializes the recursive v2 delta before the
+/// transport codec emits bounded pages.
 pub async fn range_page<S: ChunkStore>(
     store: &S,
     root: &TreeV2Root,

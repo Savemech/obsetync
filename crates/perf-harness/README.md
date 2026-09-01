@@ -79,8 +79,8 @@ through the production Rust codec, and fails instead of writing a report if a
 page exceeds either cap, a cursor stops making progress, or the final record
 count differs from the input.
 
-Compare the production Tree v1 algorithms with the isolated path-CDC range
-Tree v2 prototype on 100,000 ordered paths:
+Compare the production Tree v1 algorithms with the fleet-gated path-CDC range
+Tree v2 format on 100,000 ordered paths:
 
 ```bash
 cargo run -p perf-harness --release -- tree-v2-bench \

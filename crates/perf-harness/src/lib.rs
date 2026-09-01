@@ -962,10 +962,11 @@ pub async fn benchmark_prefix_merge(
 }
 
 /// Exercise the production OBD1 encoder over a W1-sized synthetic delta and
-/// report the largest independently releasable page. Tree-v1 diff
-/// materialization is deliberately outside the timed section; Slice 11/12
-/// replace that producer, while this gate proves the transport/client
-/// retention boundary today.
+/// report the largest independently releasable page. Tree diff materialization
+/// is deliberately outside the timed section: both formats currently return a
+/// complete delta to the bridge, while this gate proves the transport/client
+/// retention boundary. A direct Tree-v2 range-to-page producer is a separate
+/// future optimization.
 pub fn benchmark_diff_pages(
     records: usize,
     page_cap_bytes: usize,
@@ -1070,7 +1071,7 @@ pub fn benchmark_diff_pages(
     })
 }
 
-/// Compare Tree v1 and the isolated Tree v2 prototype on W5-shaped local
+/// Compare Tree v1 and the production-capable Tree v2 format on W5-shaped local
 /// changes. Construction, graph accounting, and semantic audits are outside
 /// the timed regions; update and diff timings cover production algorithms.
 pub async fn benchmark_tree_v2(

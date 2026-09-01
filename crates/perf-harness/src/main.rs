@@ -97,7 +97,7 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
-    /// Compare Tree v1 with the path-CDC range Tree v2 prototype.
+    /// Compare Tree v1 with the production-capable path-CDC range Tree v2.
     TreeV2Bench {
         #[arg(long, default_value_t = 100_000)]
         entries: usize,
