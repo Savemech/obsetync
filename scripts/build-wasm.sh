@@ -12,27 +12,40 @@ if [[ "$wasm_output" != /* ]]; then
 fi
 mkdir -p "$wasm_output"
 
+# Cargo can otherwise reuse a dependency artifact compiled with +simd128 when
+# the two feature sets are built back-to-back. wasm-pack also optimizes every
+# generated module in its output directory, so a pre-existing SIMD module makes
+# the scalar validator fail. Keep both Cargo graphs and package outputs apart.
+wasm_target_root="${CARGO_TARGET_DIR:-$PWD/target}/wasm-pack"
+scalar_output="$wasm_target_root/pkg-scalar"
+simd_output="$wasm_target_root/pkg-simd"
+mkdir -p "$scalar_output" "$simd_output"
+
 # Universal fallback. Its wasm-opt profile deliberately does not enable SIMD,
 # so accidentally introducing a v128 instruction fails the build.
-wasm-pack build crates/sync-core \
+wasm-pack build \
     --target web \
     --release \
-    --out-dir "$wasm_output" \
+    --out-dir "$scalar_output" \
     --out-name sync_core \
+    crates/sync-core \
     -- \
+    --target-dir "$wasm_target_root/scalar" \
     --features wasm \
     --no-default-features
 
 # Fast path. wasm-pack optimization is skipped here because the universal
 # package profile rejects SIMD by design; optimize explicitly with SIMD enabled.
 simd_rustflags="${RUSTFLAGS:+${RUSTFLAGS} }-C target-feature=+simd128"
-env RUSTFLAGS="$simd_rustflags" wasm-pack build crates/sync-core \
+env RUSTFLAGS="$simd_rustflags" wasm-pack build \
     --target web \
     --release \
     --no-opt \
-    --out-dir "$wasm_output" \
+    --out-dir "$simd_output" \
     --out-name sync_core_simd \
+    crates/sync-core \
     -- \
+    --target-dir "$wasm_target_root/simd" \
     --features wasm-simd \
     --no-default-features
 
@@ -43,6 +56,13 @@ wasm-opt -O \
     --enable-mutable-globals \
     --enable-reference-types \
     --enable-simd \
-    "$wasm_output/sync_core_simd_bg.wasm" \
-    -o "$wasm_output/sync_core_simd_bg.wasm.opt"
-mv "$wasm_output/sync_core_simd_bg.wasm.opt" "$wasm_output/sync_core_simd_bg.wasm"
+    "$simd_output/sync_core_simd_bg.wasm" \
+    -o "$simd_output/sync_core_simd_bg.wasm.opt"
+mv "$simd_output/sync_core_simd_bg.wasm.opt" "$simd_output/sync_core_simd_bg.wasm"
+
+for artifact in sync_core.js sync_core.d.ts sync_core_bg.wasm sync_core_bg.wasm.d.ts; do
+    install -m 0644 "$scalar_output/$artifact" "$wasm_output/$artifact"
+done
+for artifact in sync_core_simd.js sync_core_simd.d.ts sync_core_simd_bg.wasm sync_core_simd_bg.wasm.d.ts; do
+    install -m 0644 "$simd_output/$artifact" "$wasm_output/$artifact"
+done
