@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "runtime": {
+    "platform": "linux-wsl2",
+    "architecture": "x86_64",
+    "kernel": "6.18.33.2-microsoft-standard-WSL2",
+    "rustc": "1.95.0",
+    "cpu": "AMD Ryzen 9 5950X 16-Core Processor",
+    "filesystem_location": "/tmp"
+  },
+  "workload": {
+    "id": "W1",
+    "files": 100000,
+    "bytes": 870400000,
+    "size_distribution": "deterministic round-robin 1..16 KiB",
+    "objects_per_group": 256,
+    "groups": 391
+  },
+  "measurement": {
+    "command": "cargo test -p sync-server --release benchmark_w1_segment_storage -- --ignored --nocapture",
+    "scope": "direct production StorageWriter and PackStore; excludes HTTP, AEAD, and tempdir cleanup",
+    "includes": [
+      "payload construction",
+      "server-side BLAKE3 verification",
+      "CRC32C record framing",
+      "append-only segment writes",
+      "group fdatasync waits",
+      "sealed sorted sidecar publication"
+    ],
+    "elapsed_ms": 4688.415,
+    "files_per_second": 21329.172,
+    "mib_per_second": 177.049,
+    "speedup_over_slice6_group_journal": 2.4807
+  },
+  "durability": {
+    "group_fdatasyncs": 391,
+    "pack_appends": 100000,
+    "payload_bytes": 870400000,
+    "loose_writes": 0,
+    "success_ack_only_after_group_fdatasync": true
+  },
+  "layout": {
+    "segments": 4,
+    "sealed_sidecars": 3,
+    "segment_target_bytes": 268435456,
+    "segment_hard_limit_bytes": 402653184,
+    "sidecar_order": "kind then raw 32-byte hash"
+  },
+  "restart": {
+    "elapsed_ms": 198.817,
+    "payload_bytes_rehashed": 68239360,
+    "payload_mib_rehashed": 65.078125,
+    "sealed_payload_bytes_rehashed": 0,
+    "policy": "load sealed sidecars; validate and recover only the bounded active tail"
+  },
+  "bounds": {
+    "queue_bytes": 67108864,
+    "queue_messages": 64,
+    "group_target_bytes": 16777216,
+    "group_latency_ms": 5,
+    "max_object_bytes": 67108864,
+    "observed_queue_peak_objects": 256,
+    "final_queue_depth_objects": 0
+  },
+  "invariants": {
+    "all_object_hashes_verified_before_append": true,
+    "check_path_uses_verified_index_without_payload_read": true,
+    "get_rechecks_crc32c_and_blake3": true,
+    "retry_is_content_addressed_and_idempotent": true,
+    "torn_active_tail_is_truncated": true,
+    "post_sync_unpublished_records_are_recovered": true,
+    "sealed_sidecar_corruption_is_rebuilt": true,
+    "payload_corruption_is_hidden": true,
+    "loose_copy_deleted_only_after_verified_pack_read": true,
+    "legacy_group_journal_migrates_before_api_start": true
+  }
+}

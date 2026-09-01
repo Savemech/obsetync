@@ -54,6 +54,16 @@ instead of the legacy loose writer's 200,000 file-plus-directory barriers.
 Crash tests separately cover torn tails, post-sync/pre-publication recovery,
 partial publication, corrupt committed groups, and response loss after publish.
 
+`W1-pack-storage-slice7.json` replaces the transitional journal plus 100,000
+loose mirrors with four append-only segments and three sorted sidecar indexes.
+The same 870.4 MB W1 workload completes in 4.69 seconds at 21,329 files/s and
+177.05 MiB/s: 2.48x the Slice 6 writer while retaining the same 391 group
+`fdatasync` barriers. A restart loads sealed sidecars and scans only the bounded
+active tail: 199 ms and 65.08 MiB rehashed in this run, with zero sealed payload
+bytes rehashed. Recovery tests cover torn tails, durable unpublished records,
+response loss, corrupt sidecars, framed payload corruption, bounded loose
+import, and the Slice 6 journal migration.
+
 This Linux/x86_64 run is implementation evidence, not the final cross-hardware
 release report. A17, M1, Snapdragon, cold/warm cache, power, and network fields
 are added by the final hardware gate.

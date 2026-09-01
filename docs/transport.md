@@ -190,14 +190,27 @@ application. Packs are idempotent, mixed ACKs are legal, and progress moves only
 after stored/already-present ACKs.
 
 The server feeds both bulk uploads and stable single-object uploads into one
-bounded dedicated storage writer. A whole accepted group is appended to a
-checksummed journal and crosses exactly one `fdatasync` before any success ACK
-can be returned. Loose files are atomic read mirrors, not the durability
-boundary: startup replays every complete journal group before opening the API,
-and truncates an incomplete final group to its previous complete boundary.
-Corruption inside a complete group fails startup closed. Queue exhaustion maps
-to the retryable storage status (or HTTP 503 on a legacy endpoint), preserving
-backpressure without weakening idempotent retry semantics.
+bounded dedicated storage writer. A whole accepted group is framed into the
+active append-only segment and crosses exactly one `fdatasync` before any
+success ACK can be returned. Each record carries its kind, raw content address,
+lengths, CRC32C trailer, and zero padding; BLAKE3 remains the semantic address.
+Sealed segments publish a sorted checksummed sidecar atomically, so startup
+loads their metadata without rereading payloads. Only the bounded active tail
+is scanned; an incomplete last record is truncated, while a fully framed bad
+record is omitted from visibility. A durable record lost between `fdatasync`
+and index publication is reconstructed on restart.
+
+Checks use the verified index. GET performs an exact record read and rechecks
+header/index agreement, CRC32C, and BLAKE3 before returning bytes; failure hides
+that location so a normal check/re-upload repairs it. A periodic scrub applies
+the same rule. During rolling migration reads are pack-first with verified
+loose fallback. The background importer is byte/count bounded and deletes a
+loose object only after a successful pack ACK, a verified pack-only reread, and
+a directory sync. The previous `OWG1` group journal is migrated synchronously
+before the API opens because it may contain acknowledged bytes without a loose
+mirror. Queue exhaustion maps to the retryable storage status (or HTTP 503 on a
+legacy endpoint), preserving backpressure without weakening idempotent retry
+semantics.
 
 ## Replay protection and concurrency
 
