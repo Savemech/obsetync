@@ -881,6 +881,11 @@ export class ObsetyncSyncEngine {
         let scanFailed = false;
 
         try {
+            if (this.syncBase.clearDiffPageCheckpoint()) {
+                // An operator-requested rebuild deliberately abandons any
+                // interrupted snapshot cursor before deriving disk truth.
+                await this.syncBase.checkpoint();
+            }
             const endTree = perf.phase("tree_update");
             const entries = this.syncBase.allPaths().map((p) => {
                 const e = this.syncBase.getEntry(p)!;
@@ -1292,9 +1297,14 @@ export class ObsetyncSyncEngine {
         }
 
         const adopt = async (hash: string) => {
+            const clearedDiffCheckpoint = this.syncBase.clearDiffPageCheckpoint();
+            let baseChanged = false;
             if (this.treeBaseRoot !== hash) {
                 this.treeBaseRoot = hash;
                 this.syncBase.setTreeBaseRoot(hash);
+                baseChanged = true;
+            }
+            if (baseChanged || clearedDiffCheckpoint) {
                 await this.syncBase.save();
             }
             if (this.pushBlocked) {
@@ -1333,6 +1343,9 @@ export class ObsetyncSyncEngine {
             // adopt, instead of nagging "Force full rescan" on a false alarm
             // that no rescan can fix (the mtimes just drift again).
             if (result.applied > 0 && result.deltasHadMtime && result.downloaded > 0) {
+                if (this.syncBase.clearDiffPageCheckpoint()) {
+                    await this.syncBase.checkpoint();
+                }
                 this.pushBlocked = true;
                 console.error(
                     `[obsetync] tree root ${this.getTreeRootHash()?.slice(0, 16)} != ` +
@@ -1365,11 +1378,16 @@ export class ObsetyncSyncEngine {
                         `tree=${treeCount} sync-base=${baseCount}`,
                     );
                     await adopt(result.newRootHash);
+                } else if (this.syncBase.clearDiffPageCheckpoint()) {
+                    await this.syncBase.checkpoint();
                 }
                 return;
             }
 
             this.pushBlocked = true;
+            if (this.syncBase.clearDiffPageCheckpoint()) {
+                await this.syncBase.checkpoint();
+            }
             console.error(
                 `[obsetync] tree/sync-base divergence: tree=${treeCount} files, ` +
                 `sync-base=${baseCount} — pushes blocked`,
@@ -1379,6 +1397,13 @@ export class ObsetyncSyncEngine {
                 "Run 'Force full rescan' in settings to recover.",
                 10000,
             );
+            return;
+        }
+
+        // No verifiable parity means the fixed snapshot must be replayed on
+        // the next pull; retaining a completed cursor would skip that work.
+        if (this.syncBase.clearDiffPageCheckpoint()) {
+            await this.syncBase.checkpoint();
         }
     }
 

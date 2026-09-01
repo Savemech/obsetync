@@ -139,6 +139,8 @@ export interface PerfOperation {
     readonly operationId: string;
     readonly kind: PerfOperationKind;
     setWorkload(workload: PerfWorkload): void;
+    /** Negotiated plaintext cap for each binary diff page in this operation. */
+    setDiffPageBytes(bytes: number): void;
     increment(delta: PerfIncrement): void;
     phase(name: PerfPhase): () => void;
     addPhase(name: PerfPhase, durationMs: number): void;
@@ -305,6 +307,11 @@ class PerfOperationHandle implements PerfOperation {
             this.workload[key] = finiteNonNegative(value, key);
             this.workloadKnown[key] = true;
         }
+    }
+
+    setDiffPageBytes(bytes: number): void {
+        if (this.finished) return;
+        this.profile.diffPageBytes = finiteNonNegative(bytes, "diffPageBytes");
     }
 
     increment(delta: PerfIncrement): void {

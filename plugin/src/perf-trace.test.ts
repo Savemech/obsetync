@@ -51,6 +51,7 @@ function run(): void {
     });
     push.observePeakBatchBytes(128);
     push.observePeakBatchBytes(64);
+    push.setDiffPageBytes(524_288);
     push.setWasmChunks({ before: 20, reachable: 12, after: 12 });
     for (let i = 0; i < 95; i++) push.observeEventLoopLag(2);
     for (let i = 0; i < 5; i++) push.observeEventLoopLag(70);
@@ -76,7 +77,10 @@ function run(): void {
     assert.equal(first[0].wasmChunksAfter, 12);
     assert.equal(first[0].eventLoopLagSamples, 100);
     assert.equal(first[0].eventLoopLagP95Ms, 2);
-    assert.deepEqual(first[0].profile, profile);
+    assert.deepEqual(first[0].profile, { ...profile, diffPageBytes: 524_288 });
+    const invalidDiffPage = trace.begin("pull");
+    assert.throws(() => invalidDiffPage.setDiffPageBytes(-1), /diffPageBytes/);
+    invalidDiffPage.finish("cancelled");
 
     // Returned records are detached copies, not mutable access to the ring.
     first[0].phases.read = 999;
@@ -124,7 +128,7 @@ function run(): void {
         );
     }
 
-    console.log("perf-trace.test: 53 assertions passed");
+    console.log("perf-trace.test: 54 assertions passed");
 }
 
 run();

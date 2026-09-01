@@ -54,10 +54,37 @@ async function run(): Promise<void> {
     await recovered.load();
     check(recovered.getHash("done.md") === "a".repeat(64), "WAL checkpoint was not recovered");
     check(recovered.getTreeMtime("done.md") === 9, "server tree mtime was lost in WAL");
+    recovered.setDiffPageCheckpoint({
+        version: 1,
+        vaultId: "vault",
+        fromRoot: "1".repeat(64),
+        toRoot: "2".repeat(64),
+        nextCursorHex: "abcd",
+        complete: false,
+        recordsSeen: 10,
+        filesApplied: 9,
+        bytesTotal: 123,
+        downloaded: 4,
+        bytesDownloaded: 88,
+        deltasHadMtime: true,
+    });
+    await recovered.checkpoint();
 
-    recovered.setEntry("later.md", "b".repeat(64), 20, 5);
-    await recovered.save();
-    check(recovered.entryCount() === 2, "snapshot compaction lost an entry");
+    const cursorRecovered = new ObsetyncSyncBase(app);
+    await cursorRecovered.load();
+    check(cursorRecovered.diffPageCheckpoint?.nextCursorHex === "abcd",
+        "diff page cursor was not recovered from WAL");
+    check(cursorRecovered.diffPageCheckpoint?.filesApplied === 9,
+        "diff page aggregate progress was lost");
+    check(cursorRecovered.clearDiffPageCheckpoint(), "diff page cursor did not clear");
+    await cursorRecovered.checkpoint();
+    const cursorCleared = new ObsetyncSyncBase(app);
+    await cursorCleared.load();
+    check(cursorCleared.diffPageCheckpoint === null, "cleared diff cursor resurrected after restart");
+
+    cursorCleared.setEntry("later.md", "b".repeat(64), 20, 5);
+    await cursorCleared.save();
+    check(cursorCleared.entryCount() === 2, "snapshot compaction lost an entry");
     check(
         adapter.files.get(".obsidian/plugins/obsetync/sync-base.wal.ndjson") === "",
         "snapshot compaction did not clear the WAL",

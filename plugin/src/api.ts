@@ -38,8 +38,16 @@ import {
     WsDataFrameType,
     negotiateWsDataPayloadBytes,
 } from "./ws-data-codec";
+import {
+    decodeDiffPage,
+    encodeDiffPageRequest,
+    negotiateDiffPageLimits,
+    type DiffPage,
+    type DiffPageLimits,
+} from "./diff-page-codec";
 
 export { BulkObjectKind, type BulkUploadRecord } from "./bulk-codec";
+export type { DiffPage } from "./diff-page-codec";
 
 export interface FileDelta {
     action: "added" | "modified" | "deleted" | "renamed";
@@ -146,6 +154,9 @@ export class ObsetyncApi {
     /** undefined = capabilities not fetched; null = no authenticated
      *  ws-data-v1 offer. */
     private wsDataFrameBytes: number | null | undefined;
+    /** Authenticated binary diff page limits, independently negotiated from
+     *  the bulk object path. */
+    private diffPageLimits: DiffPageLimits | null | undefined;
     private wsDataLane: ObsetyncWsDataLane | null = null;
     private wsDataFallbackLogAfter = 0;
     private readonly sequences: DurableSequenceAllocator;
@@ -260,6 +271,19 @@ export class ObsetyncApi {
         return new Uint8Array(await res.arrayBuffer());
     }
 
+    /** Fetch the immutable root that owns a paged-diff snapshot. */
+    async getRootAt(
+        vaultId: string,
+        rootHash: string,
+        perf?: PerfOperation,
+    ): Promise<Uint8Array | null> {
+        const path = `/api/v1/root/${vaultId}/${rootHash}`;
+        const res = await this.sealed("GET", path, new Uint8Array(), perf);
+        if (res.status === 404) return null;
+        if (!res.ok) throw new Error(`getRootAt failed: ${res.status}`);
+        return new Uint8Array(await res.arrayBuffer());
+    }
+
     /** Recent root history for the rollback UI, newest first. */
     async getHistory(vaultId: string, perf?: PerfOperation): Promise<HistoryEntry[]> {
         const path = `/api/v1/history/${vaultId}`;
@@ -325,6 +349,35 @@ export class ObsetyncApi {
         if (res.status === 404) return null;
         if (!res.ok) throw new Error(`getDiff failed: ${res.status}`);
         return validateFileDeltas(await res.json());
+    }
+
+    /** Fetch one bounded, snapshot-pinned binary diff page. `undefined`
+     *  means the authenticated server lacks paged-diff-v1 and the caller
+     *  should use the legacy JSON endpoint; `null` means the vault is empty. */
+    async getDiffPage(
+        vaultId: string,
+        fromRootHash: string,
+        toRootHash: string | null,
+        cursor: Uint8Array | null,
+        perf?: PerfOperation,
+    ): Promise<DiffPage | null | undefined> {
+        await this.getBulkLimits(perf);
+        const limits = this.diffPageLimits;
+        if (!limits) return undefined;
+        perf?.setDiffPageBytes(limits.maxBytes);
+        const path = `/api/v1/diff-page/${vaultId}`;
+        const request = encodeDiffPageRequest(fromRootHash, toRootHash, cursor, limits);
+        const response = await this.sealed("POST", path, request, perf);
+        if (response.status === 404) return null;
+        if (!response.ok) throw new Error(`getDiffPage failed: ${response.status}`);
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        perf?.observePeakBatchBytes(bytes.byteLength);
+        return decodeDiffPage(bytes, fromRootHash, toRootHash, cursor, limits);
+    }
+
+    async supportsPagedDiff(perf?: PerfOperation): Promise<boolean> {
+        await this.getBulkLimits(perf);
+        return this.diffPageLimits !== null && this.diffPageLimits !== undefined;
     }
 
     // --- Bounded bulk HTTP v1 ---
@@ -663,6 +716,7 @@ export class ObsetyncApi {
             if (response.status === 404 || response.status === 405) {
                 this.bulkLimits = null;
                 this.wsDataFrameBytes = null;
+                this.diffPageLimits = null;
                 this.closeDataLane();
                 return null;
             }
@@ -761,6 +815,7 @@ export class ObsetyncApi {
 
     private applyCapabilityBundle(bundle: any): void {
         this.bulkLimits = negotiateBulkLimits(bundle, this.runtime);
+        this.diffPageLimits = negotiateDiffPageLimits(bundle, this.runtime);
         const frameBytes = negotiateWsDataPayloadBytes(bundle);
         if (frameBytes === null && this.wsDataLane) this.closeDataLane();
         this.wsDataFrameBytes = frameBytes;

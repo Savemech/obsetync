@@ -14,13 +14,33 @@ interface SyncBaseData {
     entries: Record<string, BaseEntry>;
     /** Last server root this exact local tree was verifiably based on. */
     treeBaseRoot?: string | null;
+    /** Last fully-applied binary diff page. Kept in the same snapshot/WAL as
+     *  entry mutations, so a cursor can never outrun local state. */
+    diffPageCheckpoint?: DiffPageCheckpoint | null;
+}
+
+export interface DiffPageCheckpoint {
+    version: 1;
+    vaultId: string;
+    fromRoot: string;
+    toRoot: string;
+    /** Null only when the final page has been applied. */
+    nextCursorHex: string | null;
+    complete: boolean;
+    recordsSeen: number;
+    filesApplied: number;
+    bytesTotal: number;
+    downloaded: number;
+    bytesDownloaded: number;
+    deltasHadMtime: boolean;
 }
 
 type SyncBaseOperation =
     | { op: "set"; path: string; entry: BaseEntry }
     | { op: "remove"; path: string }
     | { op: "timestamp"; value: number }
-    | { op: "tree-root"; value: string | null };
+    | { op: "tree-root"; value: string | null }
+    | { op: "diff-page"; value: DiffPageCheckpoint | null };
 
 const SYNC_BASE_PATH = ".obsidian/plugins/obsetync/sync-base.json";
 const SYNC_BASE_NEXT_PATH = `${SYNC_BASE_PATH}.next`;
@@ -164,6 +184,25 @@ export class ObsetyncSyncBase {
         this.record({ op: "tree-root", value: hash });
     }
 
+    get diffPageCheckpoint(): DiffPageCheckpoint | null {
+        const checkpoint = this.data.diffPageCheckpoint;
+        return isDiffPageCheckpoint(checkpoint) ? { ...checkpoint } : null;
+    }
+
+    setDiffPageCheckpoint(checkpoint: DiffPageCheckpoint): void {
+        if (!isDiffPageCheckpoint(checkpoint)) throw new Error("invalid diff page checkpoint");
+        this.data.diffPageCheckpoint = { ...checkpoint };
+        this.record({ op: "diff-page", value: { ...checkpoint } });
+    }
+
+    /** Returns whether a persisted marker was actually removed. */
+    clearDiffPageCheckpoint(): boolean {
+        if (!this.data.diffPageCheckpoint) return false;
+        this.data.diffPageCheckpoint = null;
+        this.record({ op: "diff-page", value: null });
+        return true;
+    }
+
     get lastSyncTimestamp(): number {
         return this.data.lastSyncTimestamp;
     }
@@ -207,6 +246,14 @@ export class ObsetyncSyncBase {
                     throw new Error("invalid tree root");
                 }
                 this.data.treeBaseRoot = operation.value;
+                break;
+            case "diff-page":
+                if (operation.value !== null && !isDiffPageCheckpoint(operation.value)) {
+                    throw new Error("invalid diff page checkpoint");
+                }
+                this.data.diffPageCheckpoint = operation.value === null
+                    ? null
+                    : { ...operation.value };
                 break;
             default:
                 throw new Error("unknown sync-base WAL operation");
@@ -257,4 +304,30 @@ export class ObsetyncSyncBase {
         this.writeChain = result.then(() => undefined, () => undefined);
         return result;
     }
+}
+
+const ROOT_HASH = /^[0-9a-f]{64}$/;
+const CURSOR_HEX = /^[0-9a-f]*$/;
+
+function isDiffPageCheckpoint(value: unknown): value is DiffPageCheckpoint {
+    if (!value || typeof value !== "object") return false;
+    const row = value as Record<string, unknown>;
+    const cursor = row.nextCursorHex;
+    const counters = [
+        row.recordsSeen,
+        row.filesApplied,
+        row.bytesTotal,
+        row.downloaded,
+        row.bytesDownloaded,
+    ];
+    return row.version === 1 &&
+        typeof row.vaultId === "string" && row.vaultId.length > 0 && row.vaultId.length <= 4096 &&
+        typeof row.fromRoot === "string" && ROOT_HASH.test(row.fromRoot) &&
+        typeof row.toRoot === "string" && ROOT_HASH.test(row.toRoot) &&
+        typeof row.complete === "boolean" &&
+        typeof row.deltasHadMtime === "boolean" &&
+        counters.every((counter) => Number.isSafeInteger(counter) && (counter as number) >= 0) &&
+        ((row.complete === true && cursor === null) ||
+            (row.complete === false && typeof cursor === "string" && cursor.length > 0 &&
+                cursor.length <= 16_532 && cursor.length % 2 === 0 && CURSOR_HEX.test(cursor)));
 }

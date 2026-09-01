@@ -1,12 +1,13 @@
-import { ObsetyncApi, FileDelta, type FileManifest } from "./api";
+import { ObsetyncApi, FileDelta, type DiffPage, type FileManifest } from "./api";
 import { PlatformIO } from "./platform";
-import { ObsetyncSyncBase } from "./sync-base";
+import { ObsetyncSyncBase, type DiffPageCheckpoint } from "./sync-base";
 import { hashFileStreaming, type WasmModule, type WasmTree } from "./push";
 import type { PullWriteExpectation } from "./pull-echo";
 import { conflictCopyPath } from "./conflict-path";
 import type { PerfOperation } from "./perf-trace";
 import { BulkObjectKind } from "./bulk-codec";
 import { planByteBoundedBatches } from "./hash-runtime";
+import { diffCursorFromHex, diffCursorToHex } from "./diff-page-codec";
 
 const CHUNK_THRESHOLD = 1_048_576; // 1MB
 const MAX_CONTENT_CHUNK = 4 * 1_048_576;
@@ -90,6 +91,25 @@ export async function pull(
     isIgnored?: (path: string) => boolean,
     perf?: PerfOperation,
 ): Promise<PullResult> {
+    // New servers stream a fixed snapshot through bounded binary pages. Keep
+    // the legacy JSON path below intact for compatibility with 1.10.x and for
+    // narrowly-scoped tests/mocks that intentionally expose only getDiff().
+    const paged = await pullPagedIfSupported(
+        api,
+        io,
+        syncBase,
+        vaultId,
+        localRootHash,
+        wasm,
+        tree,
+        onProgress,
+        onWritesKnown,
+        skipPaths,
+        isIgnored,
+        perf,
+    );
+    if (paged !== undefined) return paged;
+
     // --- First-time client: bulk-seed from the server ------------------
     //
     // The server's `post_diff` treats an all-zeros device_root as "empty
@@ -355,6 +375,254 @@ export async function pull(
         treeParity: parity(tree, newRootHash),
         deltasHadMtime,
         deferredCount: deferred.length,
+        localDeferredCount,
+        downloaded,
+    };
+}
+
+interface PagedDiffApi {
+    supportsPagedDiff(perf?: PerfOperation): Promise<boolean>;
+    getDiffPage(
+        vaultId: string,
+        fromRootHash: string,
+        toRootHash: string | null,
+        cursor: Uint8Array | null,
+        perf?: PerfOperation,
+    ): Promise<DiffPage | null | undefined>;
+    getRootAt(vaultId: string, rootHash: string, perf?: PerfOperation): Promise<Uint8Array | null>;
+}
+
+/**
+ * Apply a snapshot one bounded page at a time. Entry mutations and the next
+ * cursor enter the same sync-base WAL append, in that order. A torn append can
+ * therefore lose the cursor (causing a safe idempotent replay), but can never
+ * preserve a cursor that skips uncommitted local state.
+ */
+async function pullPagedIfSupported(
+    api: ObsetyncApi,
+    io: PlatformIO,
+    syncBase: ObsetyncSyncBase,
+    vaultId: string,
+    localRootHash: string | null,
+    wasm: WasmModule | null,
+    tree: WasmTree | null,
+    onProgress?: (msg: string) => void,
+    onWritesKnown?: (writes: PullWriteExpectation[]) => void,
+    skipPaths?: PullPathGuard,
+    isIgnored?: (path: string) => boolean,
+    perf?: PerfOperation,
+): Promise<PullResult | undefined> {
+    const candidate = api as unknown as Partial<PagedDiffApi>;
+    if (
+        typeof candidate.supportsPagedDiff !== "function" ||
+        typeof candidate.getDiffPage !== "function" ||
+        typeof candidate.getRootAt !== "function"
+    ) {
+        return undefined;
+    }
+
+    const endCapabilityCheck = perf?.phase("check");
+    let supported: boolean;
+    try {
+        supported = await candidate.supportsPagedDiff.call(api, perf);
+    } finally {
+        endCapabilityCheck?.();
+    }
+    if (!supported) {
+        if (syncBase.clearDiffPageCheckpoint()) await syncBase.checkpoint();
+        return undefined;
+    }
+
+    const fromRoot = (localRootHash ?? ZERO_ROOT).toLowerCase();
+    let checkpoint = syncBase.diffPageCheckpoint;
+    if (checkpoint && (checkpoint.vaultId !== vaultId || checkpoint.fromRoot !== fromRoot)) {
+        syncBase.clearDiffPageCheckpoint();
+        await syncBase.checkpoint();
+        checkpoint = null;
+    }
+    if (checkpoint) perf?.increment({ resumedPages: 1 });
+
+    let toRoot: string | null = checkpoint?.toRoot ?? null;
+    let cursor = checkpoint ? diffCursorFromHex(checkpoint.nextCursorHex) : null;
+    let complete = checkpoint?.complete ?? false;
+    let recordsSeen = checkpoint?.recordsSeen ?? 0;
+    let filesApplied = checkpoint?.filesApplied ?? 0;
+    let bytesTotal = checkpoint?.bytesTotal ?? 0;
+    let downloaded = checkpoint?.downloaded ?? 0;
+    let bytesDownloaded = checkpoint?.bytesDownloaded ?? 0;
+    let deltasHadMtime = checkpoint?.deltasHadMtime ?? true;
+    let deferredCount = 0;
+    let localDeferredCount = 0;
+    let durableCursorAllowed = true;
+    let processedPageThisRun = false;
+
+    if (localRootHash === null) {
+        onProgress?.("first sync: downloading paged snapshot...");
+    }
+
+    while (!complete) {
+        const endCheck = perf?.phase("check");
+        let page: DiffPage | null | undefined;
+        try {
+            page = await candidate.getDiffPage.call(api, vaultId, fromRoot, toRoot, cursor, perf);
+        } finally {
+            endCheck?.();
+        }
+        // A capability-aware server returns null only when the vault has no
+        // current root. Let the legacy empty-vault path preserve its existing
+        // return semantics; undefined also covers a rolled-back server.
+        if (page === null || page === undefined) {
+            if (checkpoint) {
+                syncBase.clearDiffPageCheckpoint();
+                await syncBase.checkpoint();
+            }
+            return undefined;
+        }
+        processedPageThisRun = true;
+        if (toRoot === null) toRoot = page.toRoot;
+        if (page.toRoot !== toRoot) throw new Error("paged diff target changed mid-snapshot");
+
+        const pageBytesTotal = page.deltas.reduce(
+            (sum, delta) => sum + (delta.action === "deleted" ? 0 : delta.size ?? 0),
+            0,
+        );
+        recordsSeen += page.deltas.length;
+        bytesTotal += pageBytesTotal;
+        perf?.setWorkload({ filesTotal: recordsSeen, bytesTotal });
+        if (localRootHash !== null && page.deltas.length > 0) {
+            onProgress?.(`${recordsSeen} changes to apply (paged)`);
+        }
+
+        const { kept, ignoredDeletes, ignoredUpserts } = splitIgnored(page.deltas, isIgnored);
+        for (const delta of ignoredDeletes) syncBase.removeEntry(delta.path);
+        if (ignoredUpserts > 0 || ignoredDeletes.length > 0) {
+            console.log(
+                `[obsetync] paged pull: skipped ${ignoredUpserts} ignored upsert(s), ` +
+                `untracked ${ignoredDeletes.length} ignored deletion(s)`,
+            );
+        }
+
+        const endApply = perf?.phase("apply");
+        let applyResult: Awaited<ReturnType<typeof applyDeltas>>;
+        try {
+            applyResult = await applyDeltas(
+                api,
+                io,
+                syncBase,
+                wasm,
+                kept,
+                onProgress,
+                skipPaths,
+                onWritesKnown,
+                perf,
+            );
+        } finally {
+            endApply?.();
+        }
+        const pageDeferred = applyResult.deferred.length;
+        deferredCount += pageDeferred;
+        localDeferredCount += applyResult.localDeferredCount;
+        downloaded += applyResult.downloaded;
+        bytesDownloaded += applyResult.bytesDownloaded;
+        const pageApplied = kept.length - pageDeferred;
+        filesApplied += pageApplied;
+        perf?.increment({
+            filesCompleted: pageApplied,
+            bytesTransferred: applyResult.bytesDownloaded,
+        });
+
+        const appliedDeltas = excludeDeltas(kept, applyResult.deferred).concat(ignoredDeletes);
+        const endTree = perf?.phase("tree_update");
+        try {
+            deltasHadMtime = rebaseTree(tree, syncBase, appliedDeltas) && deltasHadMtime;
+        } finally {
+            endTree?.();
+        }
+
+        // Once any path is deferred, no later cursor is safe to persist: a
+        // crash must replay from before that page. The current run may still
+        // apply later pages to maximize useful progress.
+        if (pageDeferred > 0) durableCursorAllowed = false;
+        cursor = page.nextCursor;
+        complete = cursor === null;
+        if (durableCursorAllowed) {
+            const next: DiffPageCheckpoint = {
+                version: 1,
+                vaultId,
+                fromRoot,
+                toRoot,
+                nextCursorHex: diffCursorToHex(cursor),
+                complete,
+                recordsSeen,
+                filesApplied,
+                bytesTotal,
+                downloaded,
+                bytesDownloaded,
+                deltasHadMtime,
+            };
+            syncBase.setDiffPageCheckpoint(next);
+        }
+        // This append follows all page entry mutations. It is the durable
+        // page boundary used by mobile renderer-kill recovery.
+        const endCheckpoint = perf?.phase("checkpoint");
+        try {
+            await syncBase.checkpoint();
+        } finally {
+            endCheckpoint?.();
+        }
+    }
+
+    if (!toRoot) throw new Error("completed paged diff has no target root");
+    if (!processedPageThisRun) {
+        // Restart after the final cursor append: rebuild the volatile WASM
+        // tree from WAL-recovered sync-base before checking target parity.
+        const endTree = perf?.phase("tree_update");
+        try {
+            deltasHadMtime = rebaseTree(tree, syncBase, []) && deltasHadMtime;
+        } finally {
+            endTree?.();
+        }
+    }
+
+    const rootBytes = await candidate.getRootAt.call(api, vaultId, toRoot, perf);
+    if (!rootBytes) throw new Error("paged diff snapshot root expired before completion");
+    if (wasm) {
+        const actualRoot = wasm.wasm_root_hash_from_bytes(rootBytes);
+        if (actualRoot !== toRoot) {
+            throw new Error("paged diff snapshot root bytes failed hash verification");
+        }
+    }
+
+    syncBase.setLastSyncTimestamp(Date.now());
+    perf?.setWorkload({
+        filesTotal: recordsSeen,
+        bytesTotal,
+        filesNeeded: downloaded,
+        bytesNeeded: bytesDownloaded,
+    });
+    if (deferredCount > 0) {
+        // Do not strand a completed cursor past files that were never applied.
+        // Already-written paths remain useful cache hits on the safe replay.
+        syncBase.clearDiffPageCheckpoint();
+        await syncBase.save();
+    } else {
+        // Keep the completed marker until adoptPullResult durably advances
+        // treeBaseRoot and clears it in the same snapshot.
+        await syncBase.checkpoint();
+    }
+    onProgress?.(
+        localRootHash === null
+            ? `first sync: applied ${filesApplied} files`
+            : `${filesApplied} files applied from paged snapshot`,
+    );
+
+    return {
+        newRootHash: toRoot,
+        newRootBytes: rootBytes,
+        applied: filesApplied,
+        treeParity: parity(tree, toRoot),
+        deltasHadMtime,
+        deferredCount,
         localDeferredCount,
         downloaded,
     };

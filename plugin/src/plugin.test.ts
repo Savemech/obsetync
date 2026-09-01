@@ -10,6 +10,8 @@ import "./large-transfer.test";
 import "./sync-base.test";
 import "./transport-sequence.test";
 import "./operation-checkpoint.test";
+import "./diff-page-codec.test";
+import "./paged-pull.test";
 import "./secure.test";
 import "./scan-planner.test";
 import "./delta-validation.test";

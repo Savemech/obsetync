@@ -16,11 +16,11 @@ C4Component
         Component(sync_plugin, "ObsetyncPlugin", "main.ts", "Obsidian Plugin entry point. Initialises WASM, wires all components together, registers commands (sync-now, full-rescan, show-conflicts), manages status bar.")
         Component(sync_engine, "ObsetyncSyncEngine", "sync.ts", "Core orchestrator. Attaches listeners before the first network await, coalesces one metadata-only dirty record per path, protects edits arriving during pull, audits all metadata drift and offline deletions, and keeps an honest verified tree base.")
         Component(push_engine, "PushEngine", "push.ts", "Bounded 5-phase push: batch hash/check, ordered byte/count-bounded object packs, streaming FastCDC planning, one tree.update_batch, then putRoot. Chunk records always precede their manifest.")
-        Component(pull_engine, "PullEngine", "pull.ts", "Validates and applies server deltas with cache/local-hash/bulk-download tiers. Small misses and sub-1 MiB chunks use bounded cursor pages; every object is hashed before an apply/checkpoint. Unknown local bytes remain visible as a conflict copy.")
-        Component(sync_api, "ObsetyncApi", "api.ts", "AEAD HTTP client with authenticated capability negotiation. Bulk-v1 uses strict binary codecs and 8 MiB desktop / 2 MiB mobile retention budgets; absent or oversized fast paths fall back to stable single-object endpoints.")
+        Component(pull_engine, "PullEngine", "pull.ts", "Consumes a fixed historical diff snapshot one bounded OBD1 page at a time, then applies cache/local-hash/bulk-download tiers. Each applied page and its next cursor are WAL-checkpointed before progress; unknown local bytes remain visible as a conflict copy.")
+        Component(sync_api, "ObsetyncApi", "api.ts · diff-page-codec.ts", "AEAD HTTP client with authenticated capability negotiation. Strict binary codecs bound bulk objects and paged diffs; mobile clamps OBD1 plaintext to 512 KiB and desktop to the authenticated 2 MiB server limit. Stable endpoints remain as fallbacks.")
         Component(ws_data_lane, "WS Data Lane", "ws-data.ts · ws-data-codec.ts", "Optional socket independent of realtime. Multiplexes bulk RPCs by request id under negotiated request/byte credits and bufferedAmount hysteresis; reconnect/backoff falls through to bulk HTTP.")
         Component(secure_channel, "ObsetyncSecureChannel", "secure.ts", "Wire-v2 channel: pinned-static + rotating-server double DH, per-message HKDF/AES-GCM keys, encrypted bearer/sequence/status, and request-nonce response binding. One client ephemeral keypair per channel.")
-        Component(sync_base, "ObsetyncSyncBase", "sync-base.ts", "Last-synced path metadata plus verified treeBaseRoot. Atomic rotated JSON snapshot + append-only idempotent WAL checkpoints let a large pull resume without replaying completed batches.")
+        Component(sync_base, "ObsetyncSyncBase", "sync-base.ts", "Last-synced path metadata plus verified treeBaseRoot and the fixed-root OBD1 continuation. Atomic rotated JSON snapshot + append-only idempotent WAL checkpoints let a large pull resume without skipping or retaining completed pages.")
         Component(journal, "ObsetyncJournal", "journal.ts", "Serialized append-only event/ack WAL. Exact per-path id watermarks cannot erase a newer edit while an older push is in flight; torn tails are recovered and records compact periodically.")
         Component(platform_io, "PlatformIO", "platform.ts", "Adapter I/O, binary append, recoverable staging replacement, cached bulk stat, and desktop absolute-path streaming. Mobile whole-file source reads are capped; restore writes are chunked.")
         Component(operation_checkpoint, "OperationCheckpoint", "operation-checkpoint.ts", "Durable active-phase/progress breadcrumb for pull, push, reconcile, and full scan. An orphaned marker on next launch identifies where an iOS renderer/Jetsam termination occurred.")
@@ -53,9 +53,9 @@ C4Component
     Rel(push_engine, sync_base, "Reads hash/mtime/size · saves after successful push")
     Rel(push_engine, wasm_core, "wasm_hash_batch (small files) · WasmChunker (large) · tree.update_batch · tree.root_bytes")
 
-    Rel(pull_engine, sync_api, "getDiff · getContent · getContentChunk · getManifest · getRoot")
+    Rel(pull_engine, sync_api, "getDiffPage/getRootAt · getContent · getContentChunk · getManifest; legacy getDiff fallback")
     Rel(pull_engine, platform_io, "writeFile · renameFile · deleteFile · stat · mkdir")
-    Rel(pull_engine, sync_base, "Tier-1: getEntry() cache check · tier-2: setEntry() repair · save() after pull")
+    Rel(pull_engine, sync_base, "Apply path mutations, then append exact next OBD1 cursor in the same ordered WAL; adopt tree base only after final parity")
     Rel(pull_engine, wasm_core, "Tier-2: hashFileStreaming (64 KB slices) · wasm_root_hash_from_bytes")
 
     Rel(sync_api, secure_channel, "Encrypts every request body · decrypts every response")
@@ -76,11 +76,11 @@ C4Component
 | **ObsetyncPlugin** | `main.ts` | Obsidian `Plugin` subclass. `onload()` initialises WASM synchronously (base64 Uint8Array → `initWasm()`), creates all component instances, starts `ObsetyncSyncEngine`, registers three commands, adds the status-bar element. `onunload()` stops the engine and removes listeners. |
 | **ObsetyncSyncEngine** | `sync.ts` | The orchestrator. Separates last-observed server root from the verified tree merge base, coalesces dirty paths in `DirtyPathSet`, and serializes mutation of the WASM tree. Startup sequence: `attachVaultListeners → pullRemote → recoverFromJournal → metadataScan`; `forceSync` runs `pull → reconcileContent → pushPending`. The scan compares every current stat with sync-base instead of trusting wall-clock direction, so copied-in files with old mtimes, backwards mtimes, and offline deletions are found. |
 | **PushEngine** | `push.ts` | Processes byte-bounded small-file batches and each large file alone. Missing small blobs, chunks, manifests, and index nodes are submitted as ordered records; the API splits them by the negotiated byte/count caps while preserving chunk-before-manifest dependencies. Progress and tree state advance only after every record receives a stored/already-present ACK, and one `putRoot` commits the candidate. |
-| **PullEngine** | `pull.ts` | Gets a validated `FileDelta[]`, safely crosses ignore boundaries, and resolves cache/local-hash tiers before collecting genuine misses. Small files use bounded cursor download pages with duplicate hashes fetched once. Large restores batch only eligible sub-1 MiB chunks, verify each chunk independently, and durably checkpoint each append; larger legacy chunks stay one-at-a-time. Unknown overwrite targets move to a visible conflict path, and only proved-complete operations advance sync-base. |
-| **ObsetyncApi** | `api.ts` | Every protected call reserves a durable sequence, tunnels its semantic method through wire POST, and decrypts the semantic response. Once per cached session it discovers authenticated capabilities; `bulk-http-v1` is locally capped at 256 objects and 8 MiB on desktop or 2 MiB on mobile. Strict codecs reject malformed packs/pages, mixed ACKs distinguish permanent from retryable failures, and missing/old endpoints or oversized records transparently use the stable single-object API. |
+| **PullEngine** | `pull.ts` | When `paged-diff-v1` is authenticated, consumes a server-frozen `(fromRoot,toRoot)` snapshot as bounded `OBD1` pages instead of retaining a whole JSON delta. Each page is validated, applied, rebased into the volatile WASM tree, and persisted to sync-base before its exact continuation cursor is durable. A restart resumes that target without re-fetching earlier pages; a completed cursor can reconstruct the volatile tree after a kill before base adoption. Deferred paths deliberately keep the cursor before their page so no change is skipped. Legacy servers still use `getDiff`. Content application then uses the existing cache/local-hash tiers, bounded bulk pages, per-object hashes, and conflict-copy protection. |
+| **ObsetyncApi** | `api.ts`, `diff-page-codec.ts` | Every protected call reserves a durable sequence, tunnels its semantic method through wire POST, and decrypts the semantic response. Authenticated negotiation enables `bulk-http-v1`, `ws-data-v1`, and `paged-diff-v1` independently. Diff requests use `OBQ1`; strict `OBD1` decoding rejects byte/record/path-limit violations, truncation, trailing data, non-canonical varints, unsafe paths/u64 values, duplicate or unordered keys, cursor mismatch, and root substitution. Mobile clamps a page to 512 KiB and desktop to the authenticated 2 MiB server cap. Historical-root reads bind final parity to the frozen target. Missing capabilities retain stable fallbacks. |
 | **WS Data Lane** | `ws-data.ts`, `ws-data-codec.ts` | Lazily mints an independent single-use ticket, performs strict `OBW1` HELLO negotiation, atomically reserves request/plaintext-byte credits, serializes AEAD sequence use, and correlates out-of-order responses by request id. It pauses above the socket high watermark, bounds waiting callers, closes on crypto/structural failure, and makes every unknown result retry through bulk HTTP/content-address checks. |
 | **ObsetyncSecureChannel** | `secure.ts` | Wire-v2 client. Combines DH against the pinned static server key and rotating memory-only server key, derives per-message AES-GCM keys with HKDF-SHA256, binds method/path and request nonce in AAD, carries durable sequences, and decrypts the encrypted semantic status. Uses `@noble/curves` for X25519 and SubtleCrypto for HKDF/AES-GCM; see `transport.md`. |
-| **ObsetyncSyncBase** | `sync-base.ts` | In-memory `path → {hash, local mtime, size, optional server tree mtime}` plus timestamp and verified `treeBaseRoot`. Batch mutations first append to `sync-base.wal.ndjson`; `save()` rotates `.next → main` with `.bak` recovery and only then clears the idempotent WAL. |
+| **ObsetyncSyncBase** | `sync-base.ts` | In-memory `path → {hash, local mtime, size, optional server tree mtime}` plus timestamp, verified `treeBaseRoot`, and a versioned fixed-root diff checkpoint. Batch mutations and the cursor that follows them append to `sync-base.wal.ndjson` in that order; a torn tail therefore replays work but cannot persist progress ahead of local state. `save()` rotates `.next → main` with `.bak` recovery and only then clears the idempotent WAL. |
 | **ObsetyncJournal** | `journal.ts` | Append-only NDJSON event/ack WAL with monotonic ids. A successful push appends exact per-path acknowledgement watermarks, so a later edit on the same path survives. Parseable records before a torn final append recover on startup; periodic compaction keeps only pending final states. |
 | **PlatformIO** | `platform.ts` | Uniform adapter I/O including `appendFile` and recoverable `replaceFile`. Desktop can expose an absolute path for true 64 KiB streaming hashes. Mobile has no ranged DataAdapter read, so source files are whole-buffer and capped at 128 MiB; chunked restore remains bounded. |
 | **OperationCheckpoint** | `operation-checkpoint.ts` | Persists the current phase and rate-limited progress. Normal completion removes the active marker; startup promotes an orphan to `last-interruption.json`, making otherwise silent iOS renderer kills diagnosable. |
@@ -117,14 +117,24 @@ ObsetyncSyncEngine.forceSync
   → pushPending()           # push.ts for any dirty local changes
 ```
 
-### Pull (applyDeltas — three tiers)
+### Pull (snapshot pages, then apply tiers)
 ```
-PullEngine: for each added/modified file delta:
-  guard   → recheck journal/in-flight edits; preserve unknown local bytes as conflict copy
-  tier-1  → ObsetyncSyncBase.getEntry()           → matches? zero work
-  tier-2  → desktop fs stream / bounded mobile read → wasm.Hasher → matches? repair sync-base
-  tier-3  → small: bounded getObjects pages + per-object hash verify + write
-          → large: manifest + bounded eligible chunk pages + per-chunk checkpoint → replace
+PullEngine:
+  negotiate paged-diff-v1
+    → OBQ1(fromRoot, zero target, no cursor) → first OBD1 freezes toRoot
+    → for each bounded page:
+        validate roots/order/caps/cursor before applying any record
+        guard journal/in-flight edits; preserve unknown bytes as conflict copy
+        tier-1 sync-base match → zero content work
+        tier-2 local hash match → repair sync-base
+        tier-3 bounded object/chunk pages → hash verify → write/replace
+        sync-base path mutations → WAL, then exact next cursor → WAL
+        rebase only this page into the volatile WASM tree
+    → fetch immutable root bytes for toRoot and verify semantic tree parity
+    → treeBaseRoot adoption + cursor clear in one sync-base save
+
+  no paged capability:
+    → legacy whole getDiff path with the same apply tiers and safety guards
 ```
 
 ---
