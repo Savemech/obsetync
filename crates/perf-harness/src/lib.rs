@@ -365,6 +365,25 @@ pub struct PrefixMergeBenchmarkIteration {
     pub roots_match: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffPageBenchmarkReport {
+    pub schema_version: u8,
+    pub harness_version: String,
+    pub operating_system: String,
+    pub architecture: String,
+    pub records: u64,
+    pub page_cap_bytes: u64,
+    pub record_cap: u64,
+    pub pages: u64,
+    pub max_plain_page_bytes: u64,
+    pub max_page_records: u64,
+    pub total_wire_bytes: u64,
+    pub encode_elapsed_ns: u64,
+    pub all_records_emitted_once: bool,
+    pub every_page_within_cap: bool,
+    pub client_retention_model: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum HarnessError {
     #[error("invalid scale {0:?}; expected a decimal in (0, 1] with at most six digits")]
@@ -898,6 +917,115 @@ pub async fn benchmark_prefix_merge(
     })
 }
 
+/// Exercise the production OBD1 encoder over a W1-sized synthetic delta and
+/// report the largest independently releasable page. Tree-v1 diff
+/// materialization is deliberately outside the timed section; Slice 11/12
+/// replace that producer, while this gate proves the transport/client
+/// retention boundary today.
+pub fn benchmark_diff_pages(
+    records: usize,
+    page_cap_bytes: usize,
+    record_cap: usize,
+) -> Result<DiffPageBenchmarkReport, HarnessError> {
+    use sync_core::diff::FileDelta;
+    use sync_core::diff_page::{self, DiffPageRequest};
+
+    if records == 0 || records > 2_000_000 {
+        return Err(HarnessError::ManifestMismatch(
+            "diff page benchmark records must be in 1..=2,000,000".into(),
+        ));
+    }
+    if !(diff_page::MIN_PAGE_BYTES..=diff_page::MAX_PAGE_BYTES).contains(&page_cap_bytes)
+        || record_cap == 0
+        || record_cap > diff_page::MAX_PAGE_RECORDS
+    {
+        return Err(HarnessError::ManifestMismatch(
+            "diff page benchmark caps exceed production bounds".into(),
+        ));
+    }
+
+    let from_root = [1; 32];
+    let to_root = [2; 32];
+    let mut deltas: Vec<_> = (0..records)
+        .map(|index| {
+            let path = format!("notes/{index:08}.md");
+            FileDelta::Added {
+                hash: sync_core::hash::hash_bytes(path.as_bytes()),
+                path,
+                size: 1_024 + (index % 8_192) as u64,
+                mtime_ms: 1_800_000_000_000 + index as u64,
+            }
+        })
+        .collect();
+    diff_page::sort_and_validate_deltas(&mut deltas)
+        .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+
+    let mut request = DiffPageRequest {
+        from_root,
+        to_root: None,
+        max_records: record_cap,
+        max_plain_bytes: page_cap_bytes,
+        cursor: None,
+    };
+    let started = Instant::now();
+    let mut pages = 0usize;
+    let mut emitted = 0usize;
+    let mut max_page_bytes = 0usize;
+    let mut max_page_records = 0usize;
+    let mut total_wire_bytes = 0usize;
+    let mut every_page_within_cap = true;
+    loop {
+        let page = diff_page::encode_page(from_root, to_root, &deltas, &request)
+            .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+        pages += 1;
+        emitted += page.record_count;
+        max_page_bytes = max_page_bytes.max(page.bytes.len());
+        max_page_records = max_page_records.max(page.record_count);
+        total_wire_bytes = total_wire_bytes.saturating_add(page.bytes.len());
+        every_page_within_cap &= page.bytes.len() <= page_cap_bytes;
+        if !page.has_more {
+            break;
+        }
+        let cursor_len = u16::from_le_bytes(page.bytes[72..74].try_into().unwrap()) as usize;
+        if cursor_len == 0 {
+            return Err(HarnessError::ManifestMismatch(
+                "non-final diff page omitted cursor".into(),
+            ));
+        }
+        let cursor =
+            &page.bytes[diff_page::PAGE_HEADER_BYTES..diff_page::PAGE_HEADER_BYTES + cursor_len];
+        let mut continuation = Vec::with_capacity(diff_page::REQUEST_HEADER_BYTES + cursor_len);
+        continuation.extend_from_slice(diff_page::REQUEST_MAGIC);
+        continuation.extend_from_slice(&from_root);
+        continuation.extend_from_slice(&to_root);
+        continuation.extend_from_slice(&(record_cap as u32).to_le_bytes());
+        continuation.extend_from_slice(&(page_cap_bytes as u32).to_le_bytes());
+        continuation.extend_from_slice(&(cursor_len as u16).to_le_bytes());
+        continuation.extend_from_slice(cursor);
+        request = diff_page::decode_request(&continuation)
+            .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+    }
+    let encode_elapsed_ns = elapsed_ns(started.elapsed());
+
+    Ok(DiffPageBenchmarkReport {
+        schema_version: 1,
+        harness_version: env!("CARGO_PKG_VERSION").to_owned(),
+        operating_system: std::env::consts::OS.to_owned(),
+        architecture: std::env::consts::ARCH.to_owned(),
+        records: records as u64,
+        page_cap_bytes: page_cap_bytes as u64,
+        record_cap: record_cap as u64,
+        pages: pages as u64,
+        max_plain_page_bytes: max_page_bytes as u64,
+        max_page_records: max_page_records as u64,
+        total_wire_bytes: total_wire_bytes as u64,
+        encode_elapsed_ns,
+        all_records_emitted_once: emitted == records,
+        every_page_within_cap,
+        client_retention_model: "one decoded page plus bounded apply/download batch".into(),
+    })
+}
+
 async fn legacy_prefix_update(
     store: &sync_core::store::MemoryChunkStore,
     root: &sync_core::chunk::RootNode,
@@ -1319,5 +1447,15 @@ mod tests {
             .iterations
             .iter()
             .all(|iteration| iteration.linear_update_ns > 0));
+    }
+
+    #[test]
+    fn diff_page_benchmark_enforces_retention_boundary() {
+        let report = benchmark_diff_pages(20_000, 64 * 1024, 1_000).unwrap();
+        assert!(report.pages > 1);
+        assert!(report.all_records_emitted_once);
+        assert!(report.every_page_within_cap);
+        assert!(report.max_plain_page_bytes <= report.page_cap_bytes);
+        assert!(report.max_page_records <= report.record_cap);
     }
 }

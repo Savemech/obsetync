@@ -89,6 +89,18 @@ completes. Admission is fixed at four coarse storage operations and two
 control-I/O operations, with permits acquired before `spawn_blocking`; bulk
 CHECK/PUT/GET submits one operation per pack, never one task per object.
 
+`W5-paged-diff-slice10.json` feeds 85,000 deterministic additions through the
+production OBD1 encoder using the mobile 512 KiB plaintext budget. All records
+are emitted exactly once in 11 independently releasable pages. The largest is
+524,239 bytes (49 bytes below the hard cap) and 7,822 records, also below the
+8,192-record cap. The client decoder rejects over-cap input before allocation
+and the pull loop retains only that decoded page plus its separately bounded
+apply/download batch. Cross-language fixtures, every truncated prefix, unsafe
+paths, non-canonical/overflow lengths, root substitution, moving-current
+snapshot tests, and cold-renderer recovery before and after the final cursor
+cover the semantic and crash gates. Tree v1 still recomputes a materialized
+delta on each page; the Tree v2 slices replace that server-side producer.
+
 This Linux/x86_64 run is implementation evidence, not the final cross-hardware
 release report. A17, M1, Snapdragon, cold/warm cache, power, and network fields
 are added by the final hardware gate.

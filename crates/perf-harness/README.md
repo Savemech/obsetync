@@ -64,6 +64,21 @@ Each iteration builds independent initial stores outside the timed region,
 alternates execution order to reduce cache bias, and rejects the report unless
 both roots match an independently constructed flat-state oracle.
 
+Exercise the production `OBD1` encoder over a large deterministic metadata
+delta and prove that every record is emitted exactly once while no retained
+page crosses the mobile plaintext budget:
+
+```bash
+cargo run -p perf-harness --release -- diff-page-bench \
+  --records 85000 --page-bytes 524288 --page-records 8192 \
+  --output reports/W5-paged-diff.json
+```
+
+The command follows the exact opaque cursor from each response, decodes it
+through the production Rust codec, and fails instead of writing a report if a
+page exceeds either cap, a cursor stops making progress, or the final record
+count differs from the input.
+
 ## Workload semantics
 
 - W1: 100,000 Markdown files, each 1–16 KiB.
