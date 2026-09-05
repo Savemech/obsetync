@@ -1,7 +1,6 @@
 import { App, TAbstractFile, TFile, debounce, Notice } from "obsidian";
 
-/** Yield control to the JS event loop (audio, render, IPC callbacks). */
-const yieldToUI = () => new Promise<void>(r => window.setTimeout(r, 0));
+import { yieldWork as yieldToUI } from "./work-scheduler";
 
 /** Bytes → human-readable short form. Used in status/progress messages. */
 function formatBytes(n: number): string {
@@ -29,6 +28,7 @@ import { SyncPriority } from "./settings";
 import { compileIgnore, type CompiledIgnore } from "./ignore";
 import { PullEchoTracker } from "./pull-echo";
 import { DirtyPathSet, type DirtyFileChange } from "./dirty-set";
+import { materializeFileChanges } from "./file-safety";
 import { OperationCheckpoint } from "./operation-checkpoint";
 import { exactArrayBuffer } from "./binary";
 import { getHashTuning, planByteBoundedBatches } from "./hash-runtime";
@@ -785,7 +785,7 @@ export class ObsetyncSyncEngine {
             const msg = `reconcile: ${done}/${missingSmall.length} files · ${formatBytes(bytes)}`;
             progress(msg);
             notice?.setMessage(`Re-uploading: ${done}/${missingSmall.length} · ${formatBytes(bytes)}`);
-            await yieldToUI();
+            await yieldToUI({ signal: this.hashWorkerAbort.signal, perf });
         }
 
         // --- Step 5: large files — only those whose manifest is actually
@@ -808,7 +808,7 @@ export class ObsetyncSyncEngine {
                     this.hashWorkers && absolutePath &&
                     (!currentStat || currentStat.size !== source.size)
                 ) {
-                    await yieldToUI();
+                    await yieldToUI({ signal: this.hashWorkerAbort.signal, perf });
                     continue;
                 }
                 if (
@@ -846,7 +846,7 @@ export class ObsetyncSyncEngine {
                         perf?.addPhase("read", ranged.workerReadMs);
                         perf?.addPhase("fastcdc", ranged.workerHashMs);
                         if (ranged.status === "drifted") {
-                            await yieldToUI();
+                            await yieldToUI({ signal: this.hashWorkerAbort.signal, perf });
                             continue;
                         }
                         perf?.addPhase("read", ranged.rangeReadMs);
@@ -858,7 +858,7 @@ export class ObsetyncSyncEngine {
                             filesCompleted: 1,
                             bytesTransferred: ranged.uploadedBytes,
                         });
-                        await yieldToUI();
+                        await yieldToUI({ signal: this.hashWorkerAbort.signal, perf });
                         continue;
                     } catch (error) {
                         if (
@@ -891,7 +891,7 @@ export class ObsetyncSyncEngine {
                 endRead?.();
                 perf?.observePeakBatchBytes(data.length);
                 const endChunk = perf?.phase("fastcdc");
-                const info = await chunkFileStreaming(this.wasm, data);
+                const info = await chunkFileStreaming(this.wasm, data, perf, this.hashWorkerAbort.signal);
                 endChunk?.();
                 if (info.file_hash !== hash) continue; // drifted — scan will pick up
                 const chunkHashes = (info.chunks as any[]).map(c => c.hash);
@@ -947,7 +947,7 @@ export class ObsetyncSyncEngine {
             } catch (e) {
                 console.warn(`[obsetync] reconcile skipped large ${path}:`, e);
             }
-            await yieldToUI();
+            await yieldToUI({ signal: this.hashWorkerAbort.signal, perf });
         }
 
         notice?.hide();
@@ -1051,7 +1051,11 @@ export class ObsetyncSyncEngine {
                 (path) => !statMap.has(path) && !this.isExcluded(path),
             );
             endEnumerate();
-            perf.setWorkload({ filesTotal: visibleFiles, bytesTotal: visibleBytes });
+            perf.setWorkload({ filesTotal: visibleFiles + deletedPaths.length, bytesTotal: visibleBytes });
+            // Unchanged fingerprints are already resolved. Hashing progress
+            // advances after each batch instead of remaining at zero until
+            // the complete vault scan returns.
+            perf.increment({ filesCompleted: visibleFiles - toHash.length });
             const plannedTotal = toHash.length + deletedPaths.length;
             console.log(
                 `[obsetync] full scan: ${toHash.length} files need hashing, ` +
@@ -1143,6 +1147,7 @@ export class ObsetyncSyncEngine {
                         : item.stat.size;
                     return sum + residentBytes;
                 }, 0));
+                const endBatch = perf.phase("scan_batch");
                 const results = await Promise.all(
                     batch.map(async ({ path, stat }, batchIndex) => {
                         const base = this.syncBase.getEntry(path);
@@ -1180,7 +1185,7 @@ export class ObsetyncSyncEngine {
                             base,
                         };
                     })
-                );
+                ).finally(endBatch);
 
                 for (const r of results) {
                     if (r.kind === "metadata") {
@@ -1205,9 +1210,10 @@ export class ObsetyncSyncEngine {
                     totalChanges++;
                     changedBytes += r.stat.size;
                 }
+                perf.increment({ filesCompleted: batch.length });
 
                 // Let Electron's audio/render callbacks run between every read group.
-                await yieldToUI();
+                await yieldToUI({ signal: this.hashWorkerAbort.signal, perf });
 
                 // Tick every batch — the slow phase here is the HASHING, and
                 // the old placement (inside the flush guard) meant vaults with
@@ -1244,6 +1250,7 @@ export class ObsetyncSyncEngine {
                 totalChanges++;
             }
             await flushPending();
+            perf.increment({ filesCompleted: deletedPaths.length });
 
             // Compact the bounded metadata checkpoints even when hashing found
             // no publishable content change. Otherwise a metadata-only rescan
@@ -1255,8 +1262,6 @@ export class ObsetyncSyncEngine {
                 filesNeeded: totalChanges,
                 bytesNeeded: changedBytes,
             });
-            perf.increment({ filesCompleted: visibleFiles + deletedPaths.length });
-
             console.log(
                 `[obsetync] full scan complete: ${totalChanges} changes, ` +
                 `${metadataRefreshes} metadata-only entries refreshed`,
@@ -1868,6 +1873,7 @@ export class ObsetyncSyncEngine {
                 perf,
                 this.hashWorkers,
                 () => this.waitForHeavyWork("push", operationId),
+                this.hashWorkerAbort.signal,
             );
             if (result.newRootHash) {
                 this.localRootHash = result.newRootHash;
@@ -1951,31 +1957,12 @@ export class ObsetyncSyncEngine {
      *  an event is reused only if stat still agrees; bytes are never retained
      *  in the queue. */
     private async materializeDirtyChanges(changes: DirtyFileChange[]): Promise<FileChange[]> {
-        const materialized: FileChange[] = [];
-        for (const change of changes) {
-            if (this.isExcluded(change.path)) continue;
-            const stat = await this.io.stat(change.path);
-            if (!stat) {
-                materialized.push({ action: "deleted", path: change.path });
-                continue;
-            }
-
-            const current: FileChange = {
-                action: this.syncBase.getEntry(change.path) ? "modified" : "created",
-                path: change.path,
-                mtime: stat.mtime,
-                size: stat.size,
-            };
-            if (
-                change.hash !== undefined &&
-                change.mtime === stat.mtime &&
-                change.size === stat.size
-            ) {
-                current.hash = change.hash;
-            }
-            materialized.push(current);
-        }
-        return materialized;
+        return materializeFileChanges(
+            changes,
+            (path) => this.io.stat(path),
+            (path) => this.syncBase.getEntry(path) !== null,
+            (path) => this.isExcluded(path),
+        );
     }
 
     /** Preserve OUR losing side of unmergeable conflicts as sibling copies
@@ -2146,6 +2133,8 @@ export class ObsetyncSyncEngine {
             for (const path of plan.deleted) {
                 this.pendingChanges.add({ action: "deleted", path });
             }
+            perf.setWorkload({ filesTotal: visibleFiles + plan.deleted.length });
+            perf.increment({ filesCompleted: visibleFiles - plan.toHash.length + plan.deleted.length });
 
             let found = plan.deleted.length;
             let changedBytes = 0;
@@ -2179,6 +2168,7 @@ export class ObsetyncSyncEngine {
                                 : item.stat.size;
                             return sum + residentBytes;
                         }, 0));
+                        const endBatch = perf.phase("scan_batch");
                         const results = await Promise.all(
                             batch.map(async ({ path, stat }, batchIndex) => {
                                 const knownHash = this.syncBase.getHash(path);
@@ -2214,7 +2204,7 @@ export class ObsetyncSyncEngine {
                                     knownHash,
                                 };
                             }),
-                        );
+                        ).finally(endBatch);
                         for (const result of results) {
                             if (result.kind === "metadata") {
                                 if (this.syncBase.refreshLocalMetadata(
@@ -2238,11 +2228,12 @@ export class ObsetyncSyncEngine {
                             if (result.hash !== undefined) change.hash = result.hash;
                             this.pendingChanges.add(change);
                         }
+                        perf.increment({ filesCompleted: batch.length });
                         if (metadataRefreshesSinceCheckpoint >= 500) {
                             await this.syncBase.checkpoint();
                             metadataRefreshesSinceCheckpoint = 0;
                         }
-                        await yieldToUI();
+                        await yieldToUI({ signal: this.hashWorkerAbort.signal, perf });
                         const done = Math.min(i + readConcurrency, plan.toHash.length);
                         this.onStatusUpdate(`⟳ scan ${done}/${plan.toHash.length}`);
                         notice?.setMessage(
@@ -2268,7 +2259,6 @@ export class ObsetyncSyncEngine {
                 filesNeeded: found,
                 bytesNeeded: changedBytes,
             });
-            perf.increment({ filesCompleted: visibleFiles + plan.deleted.length });
             shouldPush = found > 0;
             if (shouldPush) {
                 console.log(`[obsetync] metadata scan found ${found} unsynced changes`);
@@ -2323,7 +2313,7 @@ export class ObsetyncSyncEngine {
         ) {
             // Adapter events can arrive just before applyContentDelta records
             // its post-write stat. Give that continuation one event-loop turn.
-            await yieldToUI();
+            await yieldToUI({ signal: this.hashWorkerAbort.signal });
             const base = this.syncBase.getEntry(file.path);
             return base && base.mtime === file.stat.mtime && base.size === file.stat.size
                 ? base.hash
@@ -2383,7 +2373,9 @@ export class ObsetyncSyncEngine {
                 }
             }
 
-            const hash = await hashFileStreaming(path, this.io, this.wasm, perf, perfWeight);
+            const hash = await hashFileStreaming(
+                path, this.io, this.wasm, perf, perfWeight, this.hashWorkerAbort.signal,
+            );
             const after = await this.io.stat(path);
             if (
                 after &&
@@ -2493,6 +2485,7 @@ export class ObsetyncSyncEngine {
 
         this.eventRefs.push(
             this.app.vault.on("delete", async (file: TAbstractFile) => {
+                if (!(file instanceof TFile)) return;
                 if (this.isExcluded(file.path) || this.pullEchoes.consumeDelete(file.path)) return;
                 this.localEventsInFlight.add(file.path);
                 try {

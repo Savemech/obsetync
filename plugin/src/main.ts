@@ -15,6 +15,7 @@ import {
     perfTrace,
 } from "./perf-trace";
 import { configureHashTuning, getHashTuning, type HashTuning } from "./hash-runtime";
+import { disposeWorkScheduler, workSchedulerSnapshot } from "./work-scheduler";
 import { createWasmLoader, type WasmSelection } from "./wasm-runtime";
 import {
     createDesktopHashWorkerPool,
@@ -144,6 +145,7 @@ export default class ObsetyncPlugin extends Plugin {
 
         const environment = detectResourceEnvironment(runtime, detectedArchitecture);
         const initiallyVisible = typeof document === "undefined" || !document.hidden;
+        perfTrace.setVisible(initiallyVisible);
         this.visibilityGate = new ResourceVisibilityGate(runtime, initiallyVisible);
         this.resourceGovernor = new AdaptiveResourceGovernor(environment, {
             recoveryHint: this.settings.resourceRecoveryHint,
@@ -172,6 +174,7 @@ export default class ObsetyncPlugin extends Plugin {
         if (typeof document !== "undefined") {
             this.registerDomEvent(document, "visibilitychange", () => {
                 const visible = !document.hidden;
+                perfTrace.setVisible(visible);
                 this.resourceGovernor.setVisible(visible);
                 this.visibilityGate.setVisible(visible);
             });
@@ -235,6 +238,7 @@ export default class ObsetyncPlugin extends Plugin {
             console.warn("[obsetync] hash worker close failed during unload:", e);
         }
         this.hashWorkers = null;
+        disposeWorkScheduler();
         this.unsubscribePerf?.();
         this.unsubscribePerf = null;
         this.visibilityGate?.dispose();
@@ -287,6 +291,8 @@ export default class ObsetyncPlugin extends Plugin {
         push(`WASM:              ${this.wasm ? `loaded (${perfTrace.getProfile().wasmMode})` : "not loaded"}`);
         const workerStats = this.hashWorkers?.stats();
         push(`Hash workers:      ${workerStats ? `${workerStats.ready}/${workerStats.limit} ready · ${workerStats.workers}/${workerStats.capacity} resident · ${workerStats.active} active · ${workerStats.queued} queued` : "renderer fallback"}`);
+        const scheduler = workSchedulerSnapshot();
+        push(`Work scheduler:    ${scheduler.backend} · ${scheduler.pendingJobs}/${scheduler.maxPendingJobs} queued · fallbacks ${scheduler.fallbackCount}`);
         push(`Plugin id:         ${this.manifest.id}`);
         push(`Plugin version:    ${this.manifest.version}`);
         push("");

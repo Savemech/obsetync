@@ -11,6 +11,14 @@ export type PerfOperationKind = "push" | "pull" | "scan" | "reconcile";
 export type PerfOutcome = "success" | "error" | "cancelled";
 
 export type PerfPhase =
+    | "scheduler_wait"
+    | "ws_connect"
+    | "ws_credit_wait"
+    | "ws_send_queue"
+    | "ws_buffer_wait"
+    | "ws_ack_wait"
+    | "scan_batch"
+    | "prepare_batch"
     | "enumerate"
     | "stat"
     | "read"
@@ -131,10 +139,33 @@ export interface PerfOperationRecord {
     phases: Partial<Record<PerfPhase, number>>;
     eventLoopLagP95Ms: number | null;
     eventLoopLagSamples: number;
+    /** Probe intervals crossing hidden/visible transitions are not UI lag. */
+    eventLoopLagExcludedSamples?: number;
     peakBatchBytes: number;
     wasmChunksBefore: number | null;
     wasmChunksReachable: number | null;
     wasmChunksAfter: number | null;
+}
+
+/** Detached, path-free view of work that has not returned yet. */
+export interface PerfActiveOperation {
+    operationId: string;
+    kind: PerfOperationKind;
+    durationMs: number;
+    sinceProgressMs: number;
+    visible: boolean;
+    filesTotal: number | null;
+    filesCompleted: number;
+    bytesTransferred: number;
+    requestCount: number;
+    wsFrameCount: number;
+    retries: number;
+    /** Wall duration of the continuous interval with at least one open span.
+     * Concurrent spans overlap: these values must not be added to wall time. */
+    activePhases: Array<{ name: PerfPhase; count: number; durationMs: number }>;
+    phases: Partial<Record<PerfPhase, number>>;
+    eventLoopLagP95Ms: number | null;
+    eventLoopLagExcludedSamples: number;
 }
 
 export interface PerfOperation {
@@ -254,6 +285,9 @@ class PerfOperationHandle implements PerfOperation {
     private readonly startedAt: number;
     private readonly startedMono: number;
     private readonly phases: Partial<Record<PerfPhase, number>> = {};
+    // One entry per phase kind, not per file/request: telemetry stays bounded
+    // even when an operation has many concurrent spans of the same phase.
+    private readonly activePhases = new Map<PerfPhase, { count: number; started: number }>();
     private readonly lag = new EventLoopLagHistogram();
     private readonly values: Required<PerfIncrement> = {
         filesCompleted: 0,
@@ -285,6 +319,10 @@ class PerfOperationHandle implements PerfOperation {
     private finished = false;
     private lagTimer: ReturnType<typeof setTimeout> | null = null;
     private nextLagProbeAt: number | null = null;
+    private lagProbeVisible = true;
+    private lagProbeVisibilityEpoch = 0;
+    private excludedLagSamples = 0;
+    private lastProgressMono: number;
 
     constructor(
         id: string,
@@ -294,12 +332,15 @@ class PerfOperationHandle implements PerfOperation {
         private readonly wallNow: () => number,
         monitorEventLoop: boolean,
         private readonly eventLoopIntervalMs: number,
+        private readonly isVisible: () => boolean,
+        private readonly visibilityEpoch: () => number,
         private readonly onFinish: (record: PerfOperationRecord) => void,
     ) {
         this.operationId = id;
         this.kind = kind;
         this.startedAt = wallNow();
         this.startedMono = monotonicNow();
+        this.lastProgressMono = this.startedMono;
         if (monitorEventLoop) this.scheduleLagProbe();
     }
 
@@ -320,6 +361,9 @@ class PerfOperationHandle implements PerfOperation {
 
     increment(delta: PerfIncrement): void {
         if (this.finished) return;
+        if ((delta.filesCompleted ?? 0) > 0 || (delta.bytesTransferred ?? 0) > 0) {
+            this.lastProgressMono = this.monotonicNow();
+        }
         if (delta.filesCompleted !== undefined) {
             this.values.filesCompleted += finiteNonNegative(
                 delta.filesCompleted,
@@ -388,10 +432,15 @@ class PerfOperationHandle implements PerfOperation {
     phase(name: PerfPhase): () => void {
         if (this.finished) return NOOP_PHASE_END;
         const started = this.monotonicNow();
+        const active = this.activePhases.get(name);
+        if (active) active.count++;
+        else this.activePhases.set(name, { count: 1, started });
         let closed = false;
         return () => {
             if (closed || this.finished) return;
             closed = true;
+            const active = this.activePhases.get(name);
+            if (active && --active.count === 0) this.activePhases.delete(name);
             this.addPhase(name, Math.max(0, this.monotonicNow() - started));
         };
     }
@@ -404,7 +453,35 @@ class PerfOperationHandle implements PerfOperation {
 
     observeEventLoopLag(lagMs: number): void {
         if (this.finished) return;
+        if (!this.isVisible()) {
+            finiteNonNegative(lagMs, "eventLoopLag");
+            this.excludedLagSamples++;
+            return;
+        }
         this.lag.observe(lagMs);
+    }
+
+    snapshot(): PerfActiveOperation {
+        const now = this.monotonicNow();
+        return {
+            operationId: this.operationId,
+            kind: this.kind,
+            durationMs: Math.max(0, now - this.startedMono),
+            sinceProgressMs: Math.max(0, now - this.lastProgressMono),
+            visible: this.isVisible(),
+            filesTotal: this.workloadKnown.filesTotal ? this.workload.filesTotal : null,
+            filesCompleted: this.values.filesCompleted,
+            bytesTransferred: this.values.bytesTransferred,
+            requestCount: this.values.requestCount,
+            wsFrameCount: this.values.wsFrameCount,
+            retries: this.values.retries,
+            activePhases: Array.from(this.activePhases, ([name, active]) => ({
+                name, count: active.count, durationMs: Math.max(0, now - active.started),
+            })),
+            phases: { ...this.phases },
+            eventLoopLagP95Ms: this.lag.p95(),
+            eventLoopLagExcludedSamples: this.excludedLagSamples,
+        };
     }
 
     observePeakBatchBytes(bytes: number): void {
@@ -439,7 +516,7 @@ class PerfOperationHandle implements PerfOperation {
         ) {
             // A synchronous phase can block the scheduled callback and then
             // finish before it runs. Preserve that terminal lag sample.
-            this.lag.observe(Math.max(0, finishedMono - this.nextLagProbeAt));
+            this.observeScheduledLag(finishedMono);
         }
         this.finished = true;
         if (this.lagTimer !== null) {
@@ -447,6 +524,7 @@ class PerfOperationHandle implements PerfOperation {
             this.lagTimer = null;
         }
         this.nextLagProbeAt = null;
+        this.activePhases.clear();
 
         const finishedAt = this.wallNow();
         const durationMs = Math.max(0, finishedMono - this.startedMono);
@@ -475,6 +553,7 @@ class PerfOperationHandle implements PerfOperation {
             phases: { ...this.phases },
             eventLoopLagP95Ms: this.lag.p95(),
             eventLoopLagSamples: this.lag.count(),
+            eventLoopLagExcludedSamples: this.excludedLagSamples,
             peakBatchBytes: this.peakBatchBytes,
             wasmChunksBefore: this.wasmChunks?.before ?? null,
             wasmChunksReachable: this.wasmChunks?.reachable ?? null,
@@ -484,16 +563,29 @@ class PerfOperationHandle implements PerfOperation {
 
     private scheduleLagProbe(): void {
         this.nextLagProbeAt = this.monotonicNow() + this.eventLoopIntervalMs;
+        this.lagProbeVisible = this.isVisible();
+        this.lagProbeVisibilityEpoch = this.visibilityEpoch();
         const tick = () => {
             if (this.finished) return;
             const now = this.monotonicNow();
-            this.observeEventLoopLag(Math.max(0, now - this.nextLagProbeAt!));
+            this.observeScheduledLag(now);
             this.nextLagProbeAt = now + this.eventLoopIntervalMs;
+            this.lagProbeVisible = this.isVisible();
+            this.lagProbeVisibilityEpoch = this.visibilityEpoch();
             this.lagTimer = setTimeout(tick, this.eventLoopIntervalMs);
             (this.lagTimer as any)?.unref?.();
         };
         this.lagTimer = setTimeout(tick, this.eventLoopIntervalMs);
         (this.lagTimer as any)?.unref?.();
+    }
+
+    private observeScheduledLag(now: number): void {
+        if (!this.lagProbeVisible || !this.isVisible() ||
+            this.lagProbeVisibilityEpoch !== this.visibilityEpoch()) {
+            this.excludedLagSamples++;
+            return;
+        }
+        this.lag.observe(Math.max(0, now - this.nextLagProbeAt!));
     }
 
 }
@@ -505,10 +597,12 @@ export class PerfTrace {
     private readonly monitorEventLoop: boolean;
     private readonly eventLoopIntervalMs: number;
     private readonly records: PerfOperationRecord[] = [];
-    private readonly active = new Set<string>();
+    private readonly active = new Map<string, PerfOperationHandle>();
     private readonly listeners = new Set<(record: PerfOperationRecord) => void>();
     private profile = cloneProfile(DEFAULT_PERF_PROFILE);
     private sequence = 0;
+    private visible = true;
+    private visibilityGeneration = 0;
 
     constructor(options: PerfTraceOptions = {}) {
         this.maxRecords = options.maxRecords ?? 20;
@@ -534,11 +628,17 @@ export class PerfTrace {
         return cloneProfile(this.profile);
     }
 
+    /** Call on every visibility transition, including before startup work. */
+    setVisible(visible: boolean): void {
+        if (this.visible === visible) return;
+        this.visible = visible;
+        this.visibilityGeneration++;
+    }
+
     begin(kind: PerfOperationKind): PerfOperation {
         const operationId =
             `${kind}-${Math.trunc(this.wallNow()).toString(36)}-${this.sequence++}`;
-        this.active.add(operationId);
-        return new PerfOperationHandle(
+        const operation = new PerfOperationHandle(
             operationId,
             kind,
             cloneProfile(this.profile),
@@ -546,6 +646,8 @@ export class PerfTrace {
             this.wallNow,
             this.monitorEventLoop,
             this.eventLoopIntervalMs,
+            () => this.visible,
+            () => this.visibilityGeneration,
             (record) => {
                 this.active.delete(operationId);
                 this.records.push(record);
@@ -561,6 +663,8 @@ export class PerfTrace {
                 }
             },
         );
+        this.active.set(operationId, operation);
+        return operation;
     }
 
     /** Observe completed aggregate records. One faulty listener is isolated. */
@@ -573,12 +677,22 @@ export class PerfTrace {
         return this.records.map(cloneRecord);
     }
 
+    activeSnapshots(limit = 5): PerfActiveOperation[] {
+        const safeLimit = Number.isFinite(limit) ? Math.max(0, Math.trunc(limit)) : 0;
+        const snapshots: PerfActiveOperation[] = [];
+        for (const operation of this.active.values()) {
+            if (snapshots.length >= safeLimit) break;
+            snapshots.push(operation.snapshot());
+        }
+        return snapshots;
+    }
+
     clear(): void {
         this.records.length = 0;
     }
 
     formatDebug(limit = 5): string[] {
-        const safeLimit = Math.max(0, Math.trunc(limit));
+        const safeLimit = Number.isFinite(limit) ? Math.max(0, Math.trunc(limit)) : 0;
         const p = this.profile;
         const lines = [
             `Profile:            ${p.runtime}/${p.architecture} · WASM ${p.wasmMode}`,
@@ -586,8 +700,22 @@ export class PerfTrace {
                 `network ${p.networkConcurrency} · feed ${formatBytes(p.feedBytes)} · ` +
                 `batch ${p.batchBytes > 0 ? formatBytes(p.batchBytes) : "legacy/count-bound"}`,
             `Active operations:  ${this.active.size}`,
+            `Visibility:         ${this.visible ? "visible" : "hidden"} · crossing/hidden lag probes excluded`,
         ];
-        const recent = this.records.slice(-safeLimit);
+        for (const active of this.activeSnapshots(safeLimit)) {
+            lines.push(
+                `  ${active.kind} running ${formatDuration(active.durationMs)}` +
+                ` · files ${active.filesCompleted}/${active.filesTotal ?? "?"}` +
+                ` · transfer ${formatBytes(active.bytesTransferred)}` +
+                ` · no file/byte progress ${formatDuration(active.sinceProgressMs)}` +
+                ` · req ${active.requestCount} · WS frames ${active.wsFrameCount}`,
+            );
+            const phases = active.activePhases.map((phase) =>
+                `${phase.name} ${formatDuration(phase.durationMs)}` +
+                (phase.count > 1 ? ` (${phase.count} spans)` : ""));
+            lines.push(`    Active phases: ${phases.join(" · ") || "between instrumented phases"}`);
+        }
+        const recent = safeLimit > 0 ? this.records.slice(-safeLimit) : [];
         if (recent.length === 0) {
             lines.push("Recent operations:   (none)");
             return lines;
@@ -609,7 +737,10 @@ export class PerfTrace {
             lines.push(
                 `  ${record.kind} ${record.outcome} ${formatDuration(record.durationMs)}` +
                     `${files}${bytes} · req ${record.requestCount} · retry ${record.retries}` +
-                    ` · pressure ${record.backpressureEvents}${lag}`,
+                    ` · pressure ${record.backpressureEvents}${lag}` +
+                    ((record.eventLoopLagExcludedSamples ?? 0) > 0
+                        ? ` · hidden/crossing lag samples skipped ${record.eventLoopLagExcludedSamples}`
+                        : ""),
             );
         }
         return lines;

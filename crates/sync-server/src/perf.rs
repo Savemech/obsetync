@@ -1,5 +1,6 @@
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 const RELAXED: Ordering = Ordering::Relaxed;
@@ -22,6 +23,12 @@ pub struct ServerPerfCounters {
     handler_ns: AtomicU64,
     response_seal_ns: AtomicU64,
     response_seal_failures: AtomicU64,
+
+    ws_data_accepted: AtomicU64,
+    ws_data_completed: AtomicU64,
+    ws_data_errors: AtomicU64,
+    ws_data_inflight_rpcs: AtomicU64,
+    ws_data_responses_sending: AtomicU64,
 
     loose_reads: AtomicU64,
     loose_writes: AtomicU64,
@@ -80,6 +87,58 @@ pub struct ServerPerfSnapshot {
     pub requests: RequestPerfSnapshot,
     pub storage: StoragePerfSnapshot,
     pub diff: DiffPerfSnapshot,
+    pub ws_data: WsDataPerfSnapshot,
+}
+
+/// Only admitted object RPCs are counted: auth, malformed frames and rejected
+/// credit requests are excluded. Atomic fields are sampled independently.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WsDataPerfSnapshot {
+    pub accepted: u64,
+    /// Non-error RPC responses flushed to the local socket, not peer receipt.
+    pub completed: u64,
+    /// Admitted RPCs ending in an error reply, send failure, cancellation or
+    /// disconnect. Each admitted RPC has exactly one terminal outcome.
+    pub errors: u64,
+    /// Includes execution, queued responses and response transmission.
+    pub inflight_rpcs: u64,
+    /// Admitted RPC responses currently being sealed/flushed locally.
+    pub responses_sending: u64,
+}
+
+pub struct WsDataRpcGuard {
+    counters: Arc<ServerPerfCounters>,
+    succeeded: bool,
+}
+
+impl WsDataRpcGuard {
+    pub fn finish(mut self, succeeded: bool) {
+        self.succeeded = succeeded;
+    }
+}
+
+impl Drop for WsDataRpcGuard {
+    fn drop(&mut self) {
+        let terminal = if self.succeeded {
+            &self.counters.ws_data_completed
+        } else {
+            &self.counters.ws_data_errors
+        };
+        terminal.fetch_add(1, RELAXED);
+        self.counters.ws_data_inflight_rpcs.fetch_sub(1, RELAXED);
+    }
+}
+
+pub struct WsDataResponseGuard<'a> {
+    counters: &'a ServerPerfCounters,
+}
+
+impl Drop for WsDataResponseGuard<'_> {
+    fn drop(&mut self) {
+        self.counters
+            .ws_data_responses_sending
+            .fetch_sub(1, RELAXED);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -137,6 +196,20 @@ pub struct DiffPerfSnapshot {
 }
 
 impl ServerPerfCounters {
+    pub fn begin_ws_data_rpc(self: &Arc<Self>) -> WsDataRpcGuard {
+        self.ws_data_accepted.fetch_add(1, RELAXED);
+        self.ws_data_inflight_rpcs.fetch_add(1, RELAXED);
+        WsDataRpcGuard {
+            counters: self.clone(),
+            succeeded: false,
+        }
+    }
+
+    pub fn begin_ws_data_response(&self) -> WsDataResponseGuard<'_> {
+        self.ws_data_responses_sending.fetch_add(1, RELAXED);
+        WsDataResponseGuard { counters: self }
+    }
+
     pub fn request_started(&self) {
         self.requests_total.fetch_add(1, RELAXED);
     }
@@ -364,6 +437,13 @@ impl ServerPerfCounters {
                 pages: load(&self.diff_pages),
                 elapsed_ns: load(&self.diff_elapsed_ns),
             },
+            ws_data: WsDataPerfSnapshot {
+                accepted: load(&self.ws_data_accepted),
+                completed: load(&self.ws_data_completed),
+                errors: load(&self.ws_data_errors),
+                inflight_rpcs: load(&self.ws_data_inflight_rpcs),
+                responses_sending: load(&self.ws_data_responses_sending),
+            },
         }
     }
 }
@@ -439,5 +519,67 @@ mod tests {
                 "private field leaked: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn ws_rpc_remains_inflight_until_response_is_flushed() {
+        let counters = Arc::new(ServerPerfCounters::default());
+        let rpc = counters.begin_ws_data_rpc();
+        assert_eq!(counters.snapshot().ws_data.accepted, 1);
+        assert_eq!(counters.snapshot().ws_data.inflight_rpcs, 1);
+        let sending = counters.begin_ws_data_response();
+        assert_eq!(counters.snapshot().ws_data.responses_sending, 1);
+        assert_eq!(counters.snapshot().ws_data.completed, 0);
+        assert_eq!(counters.snapshot().ws_data.inflight_rpcs, 1);
+        drop(sending);
+        rpc.finish(true);
+        let snapshot = counters.snapshot().ws_data;
+        assert_eq!(snapshot.completed, 1);
+        assert_eq!(snapshot.errors, 0);
+        assert_eq!(snapshot.inflight_rpcs, 0);
+        assert_eq!(snapshot.responses_sending, 0);
+    }
+
+    #[test]
+    fn ws_error_replies_and_dropped_rpcs_have_one_error_outcome() {
+        let counters = Arc::new(ServerPerfCounters::default());
+        counters.begin_ws_data_rpc().finish(false);
+        let rpc = counters.begin_ws_data_rpc();
+        let sending = counters.begin_ws_data_response();
+        drop(sending);
+        drop(rpc);
+        let snapshot = counters.snapshot().ws_data;
+        assert_eq!(snapshot.accepted, 2);
+        assert_eq!(snapshot.completed, 0);
+        assert_eq!(snapshot.errors, 2);
+        assert_eq!(snapshot.inflight_rpcs, 0);
+        assert_eq!(snapshot.responses_sending, 0);
+    }
+
+    #[tokio::test]
+    async fn abort_during_ws_response_send_releases_both_gauges() {
+        let counters = Arc::new(ServerPerfCounters::default());
+        let task_counters = counters.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let rpc = task_counters.begin_ws_data_rpc();
+            let sending = task_counters.begin_ws_data_response();
+            started_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop(sending);
+            rpc.finish(true);
+        });
+        started_rx.await.unwrap();
+        let blocked = counters.snapshot().ws_data;
+        assert_eq!(blocked.inflight_rpcs, 1);
+        assert_eq!(blocked.responses_sending, 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let stopped = counters.snapshot().ws_data;
+        assert_eq!(stopped.accepted, 1);
+        assert_eq!(stopped.completed, 0);
+        assert_eq!(stopped.errors, 1);
+        assert_eq!(stopped.inflight_rpcs, 0);
+        assert_eq!(stopped.responses_sending, 0);
     }
 }

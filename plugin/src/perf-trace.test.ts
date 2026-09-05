@@ -102,7 +102,13 @@ function run(): void {
     const debug = trace.formatDebug();
     assert.ok(debug.some((line) => line.includes("desktop/arm64")));
     assert.ok(debug.some((line) => line.includes("scan error")));
-    assert.ok(debug.every((line) => !line.includes("/") || line.includes("desktop/arm64")));
+    // Slashes in numeric progress or visibility labels are not file paths.
+    // The exported telemetry schema must not expose identifying fields.
+    for (const record of trace.recent()) {
+        for (const key of ["path", "filename", "serverUrl", "token", "payload", "error"]) {
+            assert.ok(!(key in record), `private field in performance export: ${key}`);
+        }
+    }
 
     trace.clear();
     assert.equal(trace.recent().length, 0);
@@ -138,6 +144,86 @@ function run(): void {
     assert.equal(blockedTrace.recent()[0].eventLoopLagSamples, 1);
     assert.ok((blockedTrace.recent()[0].eventLoopLagP95Ms ?? 0) >= 100);
 
+    // A span that crosses visibility transitions is not evidence of a busy
+    // foreground event loop, even when it finishes after becoming visible.
+    const visibilityTrace = new PerfTrace({
+        monotonicNow: () => blockedMono,
+        eventLoopIntervalMs: 25,
+    });
+    const crossing = visibilityTrace.begin("scan");
+    visibilityTrace.setVisible(false);
+    blockedMono += 60_000;
+    visibilityTrace.setVisible(true);
+    crossing.finish();
+    assert.equal(visibilityTrace.recent()[0].eventLoopLagSamples, 0);
+    assert.equal(visibilityTrace.recent()[0].eventLoopLagP95Ms, null);
+    assert.equal(visibilityTrace.recent()[0].eventLoopLagExcludedSamples, 1);
+
+    // A complete visible interval afterwards is still measured. Repeated
+    // notifications of the same state must not hide actual terminal lag.
+    const visibleAgain = visibilityTrace.begin("scan");
+    visibilityTrace.setVisible(true);
+    blockedMono += 140;
+    visibleAgain.finish();
+    assert.equal(visibilityTrace.recent()[1].eventLoopLagSamples, 1);
+    assert.ok((visibilityTrace.recent()[1].eventLoopLagP95Ms ?? 0) >= 100);
+    assert.equal(visibilityTrace.recent()[1].eventLoopLagExcludedSamples, 0);
+
+    visibilityTrace.setVisible(false);
+    const hidden = visibilityTrace.begin("push");
+    blockedMono += 60_000;
+    hidden.finish();
+    assert.equal(visibilityTrace.recent()[2].eventLoopLagSamples, 0);
+    assert.equal(visibilityTrace.recent()[2].eventLoopLagExcludedSamples, 1);
+
+    let liveNow = 0;
+    const liveTrace = new PerfTrace({
+        monotonicNow: () => liveNow,
+        monitorEventLoop: false,
+    });
+    const live = liveTrace.begin("push");
+    live.setWorkload({ filesTotal: 100 });
+    const endFirst = live.phase("read");
+    liveNow = 10;
+    const endSecond = live.phase("read");
+    const endAck = live.phase("ws_ack_wait");
+    liveNow = 40;
+    live.increment({ filesCompleted: 2, bytesTransferred: 12 });
+    liveNow = 50;
+    const snapshot = liveTrace.activeSnapshots()[0];
+    assert.equal(snapshot.durationMs, 50);
+    assert.equal(snapshot.sinceProgressMs, 10);
+    assert.equal(snapshot.filesCompleted, 2);
+    assert.deepEqual(snapshot.activePhases, [
+        { name: "read", count: 2, durationMs: 50 },
+        { name: "ws_ack_wait", count: 1, durationMs: 40 },
+    ]);
+    snapshot.activePhases[0].count = 99;
+    snapshot.phases.read = 999;
+    assert.equal(liveTrace.activeSnapshots()[0].activePhases[0].count, 2);
+    assert.equal(liveTrace.activeSnapshots()[0].phases.read, undefined);
+    assert.ok(liveTrace.formatDebug().some(line => line.includes("ws_ack_wait 40ms")));
+    endFirst();
+    endFirst();
+    assert.equal(liveTrace.activeSnapshots()[0].activePhases[0].count, 1);
+    assert.equal(liveTrace.activeSnapshots()[0].phases.read, 50);
+    liveNow = 60;
+    endSecond();
+    endAck();
+    assert.deepEqual(liveTrace.activeSnapshots()[0].activePhases, []);
+    assert.equal(liveTrace.activeSnapshots()[0].phases.read, 100);
+    assert.deepEqual(liveTrace.activeSnapshots(0), []);
+    assert.deepEqual(liveTrace.activeSnapshots(-1), []);
+    assert.deepEqual(liveTrace.activeSnapshots(Number.NaN), []);
+    assert.deepEqual(liveTrace.activeSnapshots(Number.POSITIVE_INFINITY), []);
+    assert.ok(!liveTrace.formatDebug(0).some(line => line.includes("running")));
+    const lateEnd = live.phase("scheduler_wait");
+    live.finish();
+    lateEnd();
+    assert.deepEqual(liveTrace.activeSnapshots(), []);
+    assert.equal(liveTrace.recent().length, 1);
+    assert.ok(!liveTrace.formatDebug(0).some(line => line.includes("push success")));
+
     assert.throws(
         () => new PerfTrace({ maxRecords: 0, monitorEventLoop: false }),
         /maxRecords/,
@@ -161,7 +247,7 @@ function run(): void {
         );
     }
 
-    console.log("perf-trace.test: 60 assertions passed");
+    console.log("perf-trace.test: passed");
 }
 
 run();

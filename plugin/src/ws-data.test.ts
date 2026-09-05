@@ -9,6 +9,7 @@ import {
     decodeWsDataFrame,
     encodeWsDataFrame,
 } from "./ws-data-codec";
+import { PerfTrace } from "./perf-trace";
 
 const check = (condition: unknown, message: string) => {
     if (!condition) throw new Error(message);
@@ -213,6 +214,8 @@ async function localGovernorCapStaysBelowServerCredits(): Promise<void> {
     let localLimit = 1;
     let backpressureEvents = 0;
     const perf = {
+        phase: () => () => {},
+        addPhase: () => {},
         increment(delta: { backpressureEvents?: number }) {
             backpressureEvents += delta.backpressureEvents ?? 0;
         },
@@ -263,6 +266,8 @@ async function byteCreditsAndSocketWatermarksApplyBackpressure(): Promise<void> 
     let socket: FakeSocket | null = null;
     let backpressureEvents = 0;
     const perf = {
+        phase: () => () => {},
+        addPhase: () => {},
         increment(delta: { backpressureEvents?: number }) {
             backpressureEvents += delta.backpressureEvents ?? 0;
         },
@@ -367,6 +372,162 @@ async function socketLossRejectsUnknownResultAndReconnectsFresh(): Promise<void>
     lane.close();
 }
 
+async function liveTelemetryTracksCreditAckAndSessionReuse(): Promise<void> {
+    let now = 0;
+    const trace = new PerfTrace({ monotonicNow: () => now, monitorEventLoop: false });
+    let socket: FakeSocket | null = null;
+    const lane = new ObsetyncWsDataLane({
+        baseUrl: "http://server:27182",
+        runtime: "desktop",
+        advertisedPayloadBytes: 4096,
+        openSession,
+        localRequestLimit: () => 1,
+        socketFactory: () => {
+            socket = new FakeSocket("hold", {
+                maxInflightRequests: 2, maxPayloadBytes: 1024, maxInflightBytes: 4096,
+            });
+            return socket;
+        },
+    });
+    try {
+        const first = trace.begin("push");
+        const second = trace.begin("pull");
+        const firstRequest = lane.request(
+            WsDataFrameType.PutPack, new Uint8Array([1]), WsDataFrameType.PutAck, first);
+        const secondRequest = lane.request(
+            WsDataFrameType.GetPack, new Uint8Array([2]), WsDataFrameType.GetResult, second);
+        await eventually(() => socket?.rpcFrames.length === 1, "first RPC did not send");
+        now = 120;
+        const active = trace.activeSnapshots();
+        ok(active[0].activePhases.some(p => p.name === "ws_ack_wait"), "sent RPC lacks live ACK wait");
+        ok(active[1].activePhases.some(p => p.name === "ws_credit_wait"), "queued RPC lacks live credit wait");
+        socket!.releaseHeldInReverse();
+        await firstRequest;
+        first.finish();
+        await eventually(() => socket?.rpcFrames.length === 2, "second RPC did not reuse session");
+        now = 200;
+        ok(trace.activeSnapshots()[0].activePhases.some(p => p.name === "ws_ack_wait"),
+            "credit waiter did not transition to ACK wait");
+        socket!.releaseHeldInReverse();
+        await secondRequest;
+        ok(trace.activeSnapshots()[0].activePhases.length === 0, "successful RPC leaked live phases");
+        second.finish();
+        const records = trace.recent();
+        ok(records[1].wsFrameCount === 2, "reused session response attributed to original operation");
+        ok(records[1].wireBytesSent > 0 && records[1].wireBytesReceived > 0,
+            "reused session wire bytes missing");
+        ok(records[1].phases.ws_credit_wait === 120, "credit wait duration incorrect");
+        ok(records[1].phases.ws_ack_wait === 80, "ACK wait duration incorrect");
+        ok(records[1].phases.decrypt !== undefined, "decrypt duration missing from RPC owner");
+
+        const cancelled = trace.begin("push");
+        const result = lane.request(
+            WsDataFrameType.PutPack, new Uint8Array([3]), WsDataFrameType.PutAck, cancelled)
+            .then(() => false, () => true);
+        await eventually(() => socket?.rpcFrames.length === 3, "closing RPC did not send");
+        lane.close();
+        ok(await result, "socket close did not reject request");
+        ok(trace.activeSnapshots()[0].activePhases.length === 0, "socket close leaked ACK/queue phase");
+        cancelled.finish("cancelled");
+    } finally {
+        lane.close();
+    }
+}
+
+async function closeUnderBufferPressureClearsLiveWaitImmediately(): Promise<void> {
+    const trace = new PerfTrace({ monitorEventLoop: false });
+    const perf = trace.begin("push");
+    let socket: FakeSocket | null = null;
+    const lane = new ObsetyncWsDataLane({
+        baseUrl: "http://server:27182", runtime: "desktop", advertisedPayloadBytes: 4096,
+        openSession,
+        socketFactory: () => {
+            socket = new FakeSocket("echo", {
+                maxInflightRequests: 1, maxPayloadBytes: 1024, maxInflightBytes: 4096,
+            });
+            socket.bufferedAmount = 8192;
+            return socket;
+        },
+    });
+    const result = lane.request(
+        WsDataFrameType.PutPack, new Uint8Array([1]), WsDataFrameType.PutAck, perf)
+        .then(() => false, () => true);
+    try {
+        await eventually(() => trace.activeSnapshots()[0].activePhases.some(
+            p => p.name === "ws_buffer_wait"), "buffer pressure did not become visible");
+        lane.close();
+        ok(await result, "close under buffer pressure did not reject RPC");
+        // No extra timer turn: a hidden tab may not run that timer for a minute.
+        ok(trace.activeSnapshots()[0].activePhases.length === 0,
+            "closed socket retained a live buffer wait until its timer resumed");
+        ok(socket!.rpcFrames.length === 0, "buffered request was sent after closure");
+    } finally {
+        lane.close();
+        perf.finish("cancelled");
+    }
+}
+
+async function oldHandshakeDecryptCannotReplaceNewSession(): Promise<void> {
+    const sockets: FakeSocket[] = [];
+    const barriers: Array<{ started: boolean; release?: () => void }> = [
+        { started: false }, { started: false },
+    ];
+    let sessionIndex = 0;
+    const lane = new ObsetyncWsDataLane({
+        baseUrl: "http://server:27182", runtime: "desktop", advertisedPayloadBytes: 4096,
+        backoffStartMs: 1,
+        openSession: async () => {
+            const barrier = barriers[sessionIndex++];
+            return {
+                ticket: "aa".repeat(32),
+                session: {
+                    sealBytes: async (bytes: Uint8Array) => bytes.slice(),
+                    openBytes: async (bytes: Uint8Array) => {
+                        const frame = decodeWsDataFrame(bytes, 4096);
+                        if (frame.type === WsDataFrameType.HelloAck) {
+                            barrier.started = true;
+                            await new Promise<void>(resolve => { barrier.release = resolve; });
+                        }
+                        return bytes.slice();
+                    },
+                },
+            };
+        },
+        socketFactory: () => {
+            const socket = new FakeSocket("echo", {
+                maxInflightRequests: 1,
+                maxPayloadBytes: sockets.length === 0 ? 1024 : 2048,
+                maxInflightBytes: 8192,
+            });
+            sockets.push(socket);
+            return socket;
+        },
+    });
+    try {
+        const first = lane.request(WsDataFrameType.CheckObjects,
+            new Uint8Array([1]), WsDataFrameType.CheckResult).then(() => false, () => true);
+        await eventually(() => barriers[0].started, "first handshake did not reach decrypt");
+        sockets[0].onerror?.();
+        ok(await first, "failed handshake did not reject first RPC");
+        await new Promise<void>(resolve => setTimeout(resolve, 3));
+        const second = lane.request(WsDataFrameType.CheckObjects,
+            new Uint8Array([2]), WsDataFrameType.CheckResult)
+            .then(value => ({ value, error: null }), error => ({ value: null, error }));
+        await eventually(() => barriers[1].started, "new handshake did not reach decrypt");
+        barriers[0].release!();
+        await new Promise<void>(resolve => setTimeout(resolve, 0));
+        ok(lane.getState() === "connecting" && lane.getLimits() === null,
+            "old decrypted HELLO_ACK changed the new session state");
+        barriers[1].release!();
+        const outcome = await second;
+        ok(outcome.error === null && outcome.value?.[0] === 2, "new session failed after stale decrypt");
+        ok(lane.getLimits()?.maxPayloadBytes === 2048, "new session inherited stale limits");
+    } finally {
+        for (const barrier of barriers) barrier.release?.();
+        lane.close();
+    }
+}
+
 void (async () => {
     await multiplexesByRequestIdAndHonorsCredits();
     await remoteRpcErrorDoesNotPoisonTheSession();
@@ -374,6 +535,9 @@ void (async () => {
     await byteCreditsAndSocketWatermarksApplyBackpressure();
     await malformedErrorRejectsPendingWithoutHanging();
     await socketLossRejectsUnknownResultAndReconnectsFresh();
+    await liveTelemetryTracksCreditAckAndSessionReuse();
+    await closeUnderBufferPressureClearsLiveWaitImmediately();
+    await oldHandshakeDecryptCannotReplaceNewSession();
     console.log(`ws-data.test: ${assertions} assertions passed`);
 })().catch((error) => {
     setTimeout(() => { throw error; }, 0);

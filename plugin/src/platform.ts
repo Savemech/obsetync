@@ -1,16 +1,19 @@
 import { App, Platform } from "obsidian";
 import { exactArrayBuffer } from "./binary";
+import {
+    collectAdapterFileStats,
+    isMissingPathError,
+    PathIsDirectoryError,
+    readFileStat,
+    type FileStat,
+} from "./file-safety";
+export type { FileStat } from "./file-safety";
 
 const LEGACY_APPEND_LIMIT = 32 * 1024 * 1024;
 /** Mobile DataAdapter has no ranged reads. Refuse a single allocation large
  *  enough to plausibly trigger Jetsam on older 2 GB devices; large remote
  *  restores remain chunked and do not use readFile(). */
 const MOBILE_WHOLE_FILE_LIMIT = 128 * 1024 * 1024;
-
-export interface FileStat {
-    mtime: number;
-    size: number;
-}
 
 export interface PlatformIO {
     readFile(path: string): Promise<Uint8Array>;
@@ -21,6 +24,7 @@ export interface PlatformIO {
     replaceFile(stagingPath: string, targetPath: string): Promise<void>;
     deleteFile(path: string): Promise<void>;
     renameFile(oldPath: string, newPath: string): Promise<void>;
+    /** Null means confirmed absence. Directories and IO failures reject. */
     stat(path: string): Promise<FileStat | null>;
     /** Return stats for all vault files from the in-memory cache — synchronous, no IPC. */
     statBulk(): Map<string, FileStat>;
@@ -63,19 +67,18 @@ export class ObsetyncDesktopIO implements PlatformIO {
         // builds expose appendBinary. The fallback must materialize both the
         // old partial and its replacement, so cap it before an old iPad turns
         // a missing API into an opaque Jetsam restart.
-        const stat = await adapter.stat(path);
+        const stat = await this.stat(path);
         if ((stat?.size ?? 0) + data.length > LEGACY_APPEND_LIMIT) {
             throw new Error(
                 "Obsidian is too old for memory-safe large-file resume " +
                 "(appendBinary unavailable); update Obsidian and retry",
             );
         }
-        let previous = new Uint8Array();
-        try {
-            previous = new Uint8Array(await adapter.readBinary(path));
-        } catch {
-            // New staging file.
-        }
+        // A failed read of existing staging data must not turn into an empty
+        // prefix and overwrite the recoverable partial download.
+        const previous = stat
+            ? new Uint8Array(await adapter.readBinary(path))
+            : new Uint8Array();
         const combined = new Uint8Array(previous.length + data.length);
         combined.set(previous);
         combined.set(data, previous.length);
@@ -126,8 +129,11 @@ export class ObsetyncDesktopIO implements PlatformIO {
     async deleteFile(path: string): Promise<void> {
         try {
             await this.app.vault.adapter.remove(path);
-        } catch {
-            // File already gone — ignore.
+        } catch (error) {
+            if (isMissingPathError(error)) return;
+            // Mobile adapters may omit errno. Preserve idempotent deletion
+            // only when a fresh stat confirms absence, not by error text.
+            if (await this.stat(path) !== null) throw error;
         }
     }
 
@@ -138,13 +144,7 @@ export class ObsetyncDesktopIO implements PlatformIO {
     }
 
     async stat(path: string): Promise<FileStat | null> {
-        try {
-            const s = await this.app.vault.adapter.stat(path);
-            if (!s) return null;
-            return { mtime: s.mtime, size: s.size };
-        } catch {
-            return null;
-        }
+        return readFileStat(path, (file) => this.app.vault.adapter.stat(file));
     }
 
     async exists(path: string): Promise<boolean> {
@@ -154,8 +154,11 @@ export class ObsetyncDesktopIO implements PlatformIO {
     async mkdir(path: string): Promise<void> {
         try {
             await this.app.vault.adapter.mkdir(path);
-        } catch {
-            // Already exists — ignore.
+        } catch (error) {
+            // Some adapters do not attach EEXIST. Verify the existing type
+            // instead of swallowing permission/IO failures unconditionally.
+            const existing = await this.app.vault.adapter.stat(path);
+            if (existing?.type !== "folder") throw error;
         }
     }
 
@@ -188,19 +191,28 @@ export class ObsetyncDesktopIO implements PlatformIO {
             const fs   = (globalThis as any).require?.('fs')   as typeof import('fs')   | undefined;
             const path = (globalThis as any).require?.('path') as typeof import('path') | undefined;
             if (fs && path) {
+                let rootStat: import('fs').Stats;
+                try {
+                    rootStat = fs.statSync(absRoot);
+                } catch (error) {
+                    if (isMissingPathError(error)) return map;
+                    throw error;
+                }
+                if (!rootStat.isDirectory()) {
+                    throw new Error("expected a directory for configuration listing: .obsidian");
+                }
                 const recurse = (absDir: string, relDir: string) => {
-                    let entries: import('fs').Dirent[];
-                    try { entries = fs.readdirSync(absDir, { withFileTypes: true }); } catch { return; }
+                    const entries = fs.readdirSync(absDir, { withFileTypes: true });
                     for (const e of entries) {
                         const absChild = path.join(absDir, e.name);
                         const relChild = `${relDir}/${e.name}`;
                         if (e.isDirectory()) {
                             recurse(absChild, relChild);
                         } else if (e.isFile()) {
-                            try {
-                                const s = fs.statSync(absChild);
-                                map.set(relChild, { mtime: s.mtimeMs, size: s.size });
-                            } catch { /* skip unreadable */ }
+                            const s = fs.statSync(absChild);
+                            if (s.isDirectory()) throw new PathIsDirectoryError(relChild);
+                            if (!s.isFile()) throw new Error(`expected a regular file: ${relChild}`);
+                            map.set(relChild, { mtime: s.mtimeMs, size: s.size });
                         }
                     }
                 };
@@ -209,19 +221,7 @@ export class ObsetyncDesktopIO implements PlatformIO {
             }
         }
         // Fallback (mobile / no Node.js): use Obsidian adapter recursively.
-        const recurse = async (dir: string) => {
-            let listing: { files: string[]; folders: string[] };
-            try { listing = await this.app.vault.adapter.list(dir); } catch { return; }
-            for (const file of listing.files) {
-                try {
-                    const s = await this.app.vault.adapter.stat(file);
-                    if (s) map.set(file, { mtime: s.mtime, size: s.size });
-                } catch { /* skip */ }
-            }
-            for (const folder of listing.folders) await recurse(folder);
-        };
-        await recurse('.obsidian');
-        return map;
+        return collectAdapterFileStats('.obsidian', this.app.vault.adapter);
     }
 }
 

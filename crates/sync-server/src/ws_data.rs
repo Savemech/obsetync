@@ -152,6 +152,7 @@ struct ActiveRpc {
     bytes: usize,
     cancellation: CancellationToken,
     task: tokio::task::JoinHandle<()>,
+    telemetry: crate::perf::WsDataRpcGuard,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -331,17 +332,26 @@ async fn run_session(
             }
             response = response_rx.recv() => {
                 let Some(response) = response else { break };
-                if let Some(active_rpc) = active.remove(&response.request_id) {
+                let active_rpc = active.remove(&response.request_id);
+                if let Some(active_rpc) = active_rpc.as_ref() {
                     active_bytes = active_bytes.saturating_sub(active_rpc.bytes);
                 }
-                if send_frame(
+                // Credit release is unchanged, but telemetry remains in flight
+                // until the local send returns (which does not prove peer receipt).
+                let sending = state.perf.begin_ws_data_response();
+                let sent = send_frame(
                     &mut sink,
                     &mut seal,
                     response.kind,
                     response.request_id,
                     &response.payload,
                     limits.max_payload_bytes,
-                ).await.is_err() {
+                ).await.is_ok();
+                drop(sending);
+                if let Some(active_rpc) = active_rpc {
+                    active_rpc.telemetry.finish(sent && response.kind != FrameType::Error);
+                }
+                if !sent {
                     break;
                 }
             }
@@ -405,6 +415,7 @@ async fn run_session(
                         let request_id = frame.request_id;
                         let request_kind = frame.kind;
                         let max_payload_bytes = limits.max_payload_bytes;
+                        let telemetry = state.perf.begin_ws_data_rpc();
                         let task = tokio::spawn(async move {
                             let response = tokio::select! {
                                 _ = task_cancellation.cancelled() => RpcResponse {
@@ -426,6 +437,7 @@ async fn run_session(
                             bytes: payload_bytes,
                             cancellation,
                             task,
+                            telemetry,
                         });
                     }
                     Some(Ok(Message::Ping(payload))) => {

@@ -234,6 +234,97 @@ async function acceptedRootCommitsMetadata(): Promise<void> {
     check(record.phases.root_commit !== undefined, "push trace missed root commit");
 }
 
+async function stoppedPushDoesNotStartRootPublication(): Promise<void> {
+    const cases = [
+        "preflight", "read", "content-check", "content-upload",
+        "index-check", "index-upload", "before-root",
+    ] as const;
+    for (const boundary of cases) {
+        const f = fixture();
+        const controller = new AbortController();
+        const replacementHash = "9".repeat(64);
+        let rootRequests = 0;
+        let hashCalls = 0;
+        f.io.getAbsolutePath = () => null;
+        f.io.readFile = async () => {
+            controller.abort();
+            return new Uint8Array([1, 2, 3]);
+        };
+        f.wasm.wasm_hash_batch = () => { hashCalls++; return [replacementHash]; };
+        if (boundary.startsWith("index-")) {
+            f.wasm.wasm_tree_candidate_chunk_hashes = () => ["index"];
+            f.wasm.wasm_tree_new_candidate_chunk_hashes = () => ["index"];
+            f.wasm.wasm_tree_get_chunk = () => new Uint8Array([1]);
+        }
+        const api = {
+            ensureTransportReady: async () => {
+                if (boundary === "preflight") controller.abort();
+            },
+            checkContent: async () => {
+                if (boundary === "content-check") controller.abort();
+                return boundary === "content-upload" ? [replacementHash] : [];
+            },
+            checkChunks: async () => {
+                if (boundary === "index-check") controller.abort();
+                return boundary === "index-upload" ? ["index"] : [];
+            },
+            putObjects: async () => { controller.abort(); },
+            putRoot: async () => {
+                rootRequests++;
+                return { root_hash: "accepted", conflicts: [] };
+            },
+        } as any;
+        const trace = new PerfTrace({ monitorEventLoop: false });
+        const operation = trace.begin("push");
+        let caught: unknown;
+        try {
+            await push(api, f.io, f.syncBase, f.wasm, f.tree, "vault", [{
+                action: "modified",
+                path: "keep.md",
+                hash: boundary === "read" ? undefined : replacementHash,
+                data: boundary === "content-upload" ? new Uint8Array([1, 2, 3]) : undefined,
+                mtime: 3,
+                size: 3,
+            }], "base", (progress) => {
+                if (boundary === "before-root" && progress === "↑ pushing root...") {
+                    controller.abort();
+                }
+            }, operation, undefined, undefined, controller.signal);
+        } catch (error) {
+            caught = error;
+        } finally {
+            operation.finish("cancelled");
+        }
+        check((caught as Error)?.name === "AbortError", `${boundary}: cancellation was lost`);
+        check(rootRequests === 0, `${boundary}: stopped work started root publication`);
+        check(f.commitCalls() === 0, `${boundary}: stopped work committed its candidate`);
+        check(f.abortCalls() === (boundary === "preflight" ? 0 : 1), `${boundary}: wrong candidate cleanup`);
+        check(f.entries.get("keep.md")?.hash === keepHash, `${boundary}: cancellation changed sync-base`);
+        check(f.saves() === 0, `${boundary}: cancellation saved uncommitted metadata`);
+        if (boundary === "read") check(hashCalls === 0, "cancelled read started expensive hashing");
+    }
+}
+
+async function rootAcceptedDuringStopStillCommitsLocally(): Promise<void> {
+    const f = fixture();
+    const controller = new AbortController();
+    const api = {
+        ensureTransportReady: async () => {},
+        putRoot: async () => {
+            controller.abort();
+            return { root_hash: "accepted", conflicts: [] };
+        },
+    } as any;
+    const result = await push(api, f.io, f.syncBase, f.wasm, f.tree, "vault", [
+        { action: "deleted", path: "gone.md" },
+    ], "base", undefined, undefined, undefined, undefined, controller.signal);
+    check(result.newRootHash === "accepted", "accepted in-flight root was discarded on stop");
+    check(f.commitCalls() === 1, "accepted in-flight candidate was not committed locally");
+    check(f.abortCalls() === 0, "accepted in-flight candidate was aborted on stop");
+    check(!f.entries.has("gone.md"), "accepted in-flight deletion was not adopted");
+    check(f.saves() === 1, "accepted in-flight root did not checkpoint sync-base");
+}
+
 async function failedRootDoesNotCommitUpsert(): Promise<void> {
     const f = fixture();
     const replacementHash = "c".repeat(64);
@@ -771,6 +862,8 @@ void terminalPreflightDoesNotMutate()
     .then(workerDriftAbortsCandidate)
     .then(smallFilesReachTransportAsPacksNotPerFilePuts)
     .then(acceptedRootCommitsMetadata)
+    .then(stoppedPushDoesNotStartRootPublication)
+    .then(rootAcceptedDuringStopStillCommitsLocally)
     .then(() => console.log(`push-transaction.test: ${assertions} assertions passed`))
     .catch((error) => {
         console.error(error);

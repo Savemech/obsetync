@@ -65,6 +65,7 @@ interface PendingRequest {
     resolve: (payload: Uint8Array) => void;
     reject: (error: Error) => void;
     timer: ReturnType<typeof globalThis.setTimeout>;
+    perf?: PerfOperation;
 }
 
 interface CreditWaiter {
@@ -137,11 +138,22 @@ export class ObsetyncWsDataLane {
             | WsDataFrameType.GetResult,
         perf?: PerfOperation,
     ): Promise<Uint8Array> {
-        const limits = await this.ensureConnected(perf);
+        const endConnect = perf?.phase("ws_connect");
+        let limits: WsDataLimits;
+        try {
+            limits = await this.ensureConnected(perf);
+        } finally {
+            endConnect?.();
+        }
         if (payload.byteLength > limits.maxPayloadBytes) {
             throw new WsDataUnavailableError("RPC payload exceeds negotiated WS frame limit");
         }
-        await this.acquireCredit(payload.byteLength, limits, perf);
+        const endCredit = perf?.phase("ws_credit_wait");
+        try {
+            await this.acquireCredit(payload.byteLength, limits, perf);
+        } finally {
+            endCredit?.();
+        }
         const socket = this.socket;
         const session = this.session;
         if (!socket || !session || socket.readyState !== SOCKET_OPEN || this.state !== "ready") {
@@ -158,6 +170,14 @@ export class ObsetyncWsDataLane {
             throw new WsDataUnavailableError("WS data request id space exhausted");
         }
         const requestId = this.nextRequestId++;
+        const endSendQueue = perf?.phase("ws_send_queue");
+        let endAckWait: (() => void) | undefined;
+        let endBufferWait: (() => void) | undefined;
+        const finishWaits = () => {
+            endSendQueue?.();
+            endAckWait?.();
+            endBufferWait?.();
+        };
         const promise = new Promise<Uint8Array>((resolve, reject) => {
             const timer = globalThis.setTimeout(() => {
                 this.failCurrent(
@@ -169,27 +189,49 @@ export class ObsetyncWsDataLane {
             this.pending.set(requestId, {
                 expectedType,
                 payloadBytes: payload.byteLength,
-                resolve,
-                reject,
+                resolve: (response) => { finishWaits(); resolve(response); },
+                reject: (error) => { finishWaits(); reject(error); },
                 timer,
+                perf,
             });
         });
 
         this.txChain = this.txChain
             .then(async () => {
-                await this.waitForBufferedAmount(socket, limits, perf);
+                endSendQueue?.();
+                if (this.socket !== socket || !this.pending.has(requestId)) return;
+                if (socket.bufferedAmount > limits.maxInflightBytes) {
+                    endBufferWait = perf?.phase("ws_buffer_wait");
+                }
+                try {
+                    await this.waitForBufferedAmount(socket, limits, perf);
+                } finally {
+                    endBufferWait?.();
+                }
+                if (this.socket !== socket || !this.pending.has(requestId)) return;
                 const plaintext = encodeWsDataFrame(
                     type,
                     requestId,
                     payload,
                     limits.maxPayloadBytes,
                 );
-                const sealed = await session.sealBytes(plaintext);
+                const endEncrypt = perf?.phase("encrypt");
+                let sealed: Uint8Array;
+                try {
+                    sealed = await session.sealBytes(plaintext);
+                } finally {
+                    endEncrypt?.();
+                }
                 if (this.socket !== socket || socket.readyState !== SOCKET_OPEN) {
                     throw new WsDataUnavailableError("WS data lane changed before send");
                 }
+                endAckWait = perf?.phase("ws_ack_wait");
                 socket.send(exactArrayBuffer(sealed));
-                perf?.increment({ wsFrameCount: 1 });
+                perf?.increment({
+                    wsFrameCount: 1,
+                    plaintextBytesSent: plaintext.byteLength,
+                    wireBytesSent: sealed.byteLength,
+                });
             })
             .catch((error) => {
                 this.failCurrent(
@@ -287,6 +329,7 @@ export class ObsetyncWsDataLane {
                 };
 
                 socket.onmessage = (event) => {
+                    if (this.socket !== socket) return;
                     if (!(event.data instanceof ArrayBuffer)) {
                         rejectConnect(
                             new WsDataUnavailableError("WS data server sent plaintext after auth"),
@@ -296,12 +339,19 @@ export class ObsetyncWsDataLane {
                     }
                     const wire = new Uint8Array(event.data);
                     this.rxChain = this.rxChain.then(async () => {
+                        if (this.socket !== socket) return;
+                        const decryptStarted = globalThis.performance?.now?.() ?? Date.now();
                         const plaintext = await session.openBytes(wire);
-                        perf?.increment({ wsFrameCount: 1 });
+                        // Decryption can finish after disconnect/reconnect. An
+                        // old HELLO_ACK must not install limits in a new session.
+                        if (this.socket !== socket) return;
+                        const decryptMs = Math.max(0,
+                            (globalThis.performance?.now?.() ?? Date.now()) - decryptStarted);
                         const maxPayload = this.limits?.maxPayloadBytes ??
                             this.requested.maxPayloadBytes;
                         const frame = decodeWsDataFrame(plaintext, maxPayload);
                         if (!this.limits) {
+                            perf?.increment({ wsFrameCount: 1 });
                             if (frame.type !== WsDataFrameType.HelloAck || frame.requestId !== 0) {
                                 throw new WsDataUnavailableError("WS data expected HELLO_ACK");
                             }
@@ -317,7 +367,7 @@ export class ObsetyncWsDataLane {
                             }
                             return;
                         }
-                        this.handleResponse(frame);
+                        this.handleResponse(frame, wire.byteLength, plaintext.byteLength, decryptMs);
                     }).catch((error) => rejectConnect(
                         error instanceof Error ? error : new Error(String(error)),
                         socket,
@@ -338,7 +388,12 @@ export class ObsetyncWsDataLane {
         });
     }
 
-    private handleResponse(frame: ReturnType<typeof decodeWsDataFrame>): void {
+    private handleResponse(
+        frame: ReturnType<typeof decodeWsDataFrame>,
+        wireBytes: number,
+        plaintextBytes: number,
+        decryptMs: number,
+    ): void {
         if (frame.requestId === 0) {
             throw new WsDataUnavailableError("WS data response reused handshake id");
         }
@@ -355,6 +410,14 @@ export class ObsetyncWsDataLane {
         if (frame.type !== WsDataFrameType.Error && frame.type !== pending.expectedType) {
             throw new WsDataUnavailableError("WS data response type mismatch");
         }
+        // A session outlives its first operation. Attribute response telemetry
+        // to the matched RPC, not the operation that opened this socket.
+        pending.perf?.increment({
+            wsFrameCount: 1,
+            wireBytesReceived: wireBytes,
+            plaintextBytesReceived: plaintextBytes,
+        });
+        pending.perf?.addPhase("decrypt", decryptMs);
         this.pending.delete(frame.requestId);
         globalThis.clearTimeout(pending.timer);
         this.releaseCredit(pending.payloadBytes);

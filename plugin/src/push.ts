@@ -21,6 +21,7 @@ import {
     uploadDesktopMissingRanges,
     type DesktopRangeSource,
 } from "./desktop-ranged-upload";
+import { throwIfWorkAborted, yieldWork } from "./work-scheduler";
 
 /** Streaming Blake3 hasher — feed bounded slices, call finalize(), then free(). */
 export interface WasmHasher {
@@ -215,7 +216,9 @@ export async function push(
     perf?: PerfOperation,
     hashWorkers?: DesktopHashWorkerPool | null,
     beforeHeavyBatch?: () => Promise<void>,
+    signal?: AbortSignal,
 ): Promise<{ newRootHash: string | null; conflicts: any[] }> {
+    throwIfWorkAborted(signal);
     perf?.setWorkload({ filesTotal: changes.length });
     if (changes.length === 0) {
         perf?.setWorkload({
@@ -235,6 +238,7 @@ export async function push(
     } finally {
         endPreflight?.();
     }
+    throwIfWorkAborted(signal);
 
     const total = changes.length;
     console.log(`[obsetync] pushing ${total} changes`);
@@ -321,8 +325,8 @@ export async function push(
     });
     for (const batchChanges of streamBatches) {
         await beforeHeavyBatch?.();
-        // Yield before each batch so Electron's audio/render callbacks can run.
-        await yieldToUI();
+        // A real task boundary lets input/rendering run between bounded batches.
+        await yieldWork({ perf, signal });
 
         // ------------------------------------------------------------------
         // A. Hash resolution — parallel reads, wasm_hash_batch per group.
@@ -338,153 +342,162 @@ export async function push(
         // ------------------------------------------------------------------
         const batchFiles: ObsetyncBatchFile[] = [];
         const unknownSmallReads: ObsetyncRead[] = [];
+        const endPrepare = perf?.phase("prepare_batch");
+        try {
+            for (let i = 0; i < batchChanges.length; i += tuning.readConcurrency) {
+                throwIfWorkAborted(signal);
+                const group = batchChanges.slice(i, i + tuning.readConcurrency);
 
-        for (let i = 0; i < batchChanges.length; i += tuning.readConcurrency) {
-            const group = batchChanges.slice(i, i + tuning.readConcurrency);
-
-            // Partition: known-hash small files skip reading.
-            const skipRead: FileChange[] = [];
-            const needRead: FileChange[] = [];
-            const workerEligible: Array<{ change: FileChange; absolutePath: string }> = [];
-            for (const c of group) {
-                if (c.hash && c.size !== undefined && !wasm.wasm_should_chunk(c.size)) {
-                    skipRead.push(c);
-                } else {
-                    const absolutePath = c.data === undefined && c.size !== undefined &&
-                        c.mtime !== undefined ? io.getAbsolutePath(c.path) : null;
-                    if (hashWorkers && absolutePath) {
-                        workerEligible.push({ change: c, absolutePath });
+                // Partition: known-hash small files skip reading.
+                const skipRead: FileChange[] = [];
+                const needRead: FileChange[] = [];
+                const workerEligible: Array<{ change: FileChange; absolutePath: string }> = [];
+                for (const c of group) {
+                    if (c.hash && c.size !== undefined && !wasm.wasm_should_chunk(c.size)) {
+                        skipRead.push(c);
                     } else {
-                        needRead.push(c);
+                        const absolutePath = c.data === undefined && c.size !== undefined &&
+                            c.mtime !== undefined ? io.getAbsolutePath(c.path) : null;
+                        if (hashWorkers && absolutePath) {
+                            workerEligible.push({ change: c, absolutePath });
+                        } else {
+                            needRead.push(c);
+                        }
                     }
                 }
-            }
 
-            for (const c of skipRead) {
-                batchFiles.push(new ObsetyncBatchFile(c, c.size!, c.mtime ?? Date.now()));
-            }
+                for (const c of skipRead) {
+                    batchFiles.push(new ObsetyncBatchFile(c, c.size!, c.mtime ?? Date.now()));
+                }
 
-            if (workerEligible.length > 0) {
-                const workerResults = await Promise.all(workerEligible.map(async (candidate) => {
-                    try {
-                        const result = await hashWorkers!.run({
-                            absolutePath: candidate.absolutePath,
-                            expectedSize: candidate.change.size!,
-                            expectedMtime: candidate.change.mtime!,
-                            mode: wasm.wasm_should_chunk(candidate.change.size!)
-                                ? "manifest"
-                                : "hash",
-                            feedBytes: tuning.feedBytes,
-                        });
-                        return { candidate, result };
-                    } catch (error) {
-                        if (
-                            error instanceof HashWorkerFileDriftError ||
-                            (error instanceof HashWorkerPoolError && error.code === "CLOSED") ||
-                            (error as Error)?.name === "AbortError"
-                        ) {
-                            throw error;
+                if (workerEligible.length > 0) {
+                    const workerResults = await Promise.all(workerEligible.map(async (candidate) => {
+                        try {
+                            const result = await hashWorkers!.run({
+                                absolutePath: candidate.absolutePath,
+                                expectedSize: candidate.change.size!,
+                                expectedMtime: candidate.change.mtime!,
+                                mode: wasm.wasm_should_chunk(candidate.change.size!)
+                                    ? "manifest"
+                                    : "hash",
+                                feedBytes: tuning.feedBytes,
+                            }, signal);
+                            return { candidate, result };
+                        } catch (error) {
+                            throwIfWorkAborted(signal);
+                            if (
+                                error instanceof HashWorkerFileDriftError ||
+                                (error instanceof HashWorkerPoolError && error.code === "CLOSED") ||
+                                (error as Error)?.name === "AbortError"
+                            ) {
+                                throw error;
+                            }
+                            if (!workerFallbackWarned) {
+                                workerFallbackWarned = true;
+                                console.warn(
+                                    "[obsetync] hash worker unavailable during push; " +
+                                    "using renderer fallback:",
+                                    error,
+                                );
+                            }
+                            needRead.push(candidate.change);
+                            return null;
                         }
-                        if (!workerFallbackWarned) {
-                            workerFallbackWarned = true;
-                            console.warn(
-                                "[obsetync] hash worker unavailable during push; " +
-                                "using renderer fallback:",
-                                error,
-                            );
+                    }));
+                    throwIfWorkAborted(signal);
+                    perf?.observePeakBatchBytes(workerEligible.length * tuning.feedBytes);
+                    for (const row of workerResults) {
+                        if (!row) continue;
+                        const { change } = row.candidate;
+                        perf?.addPhase("read", row.result.read_ms);
+                        if (row.result.mode === "hash") {
+                            perf?.addPhase("hash", row.result.hash_ms);
+                            change.hash = row.result.hash;
+                            batchFiles.push(new ObsetyncBatchFile(
+                                change,
+                                row.result.size,
+                                change.mtime!,
+                            ));
+                        } else {
+                            perf?.addPhase("fastcdc", row.result.hash_ms);
+                            change.hash = row.result.manifest.file_hash;
+                            batchFiles.push(new ObsetyncBatchFile(
+                                change,
+                                row.result.size,
+                                change.mtime!,
+                                row.result.manifest,
+                                undefined,
+                                {
+                                    absolutePath: row.candidate.absolutePath,
+                                    fingerprint: row.result.fingerprint,
+                                },
+                            ));
                         }
-                        needRead.push(candidate.change);
-                        return null;
-                    }
-                }));
-                perf?.observePeakBatchBytes(workerEligible.length * tuning.feedBytes);
-                for (const row of workerResults) {
-                    if (!row) continue;
-                    const { change } = row.candidate;
-                    perf?.addPhase("read", row.result.read_ms);
-                    if (row.result.mode === "hash") {
-                        perf?.addPhase("hash", row.result.hash_ms);
-                        change.hash = row.result.hash;
-                        batchFiles.push(new ObsetyncBatchFile(
-                            change,
-                            row.result.size,
-                            change.mtime!,
-                        ));
-                    } else {
-                        perf?.addPhase("fastcdc", row.result.hash_ms);
-                        change.hash = row.result.manifest.file_hash;
-                        batchFiles.push(new ObsetyncBatchFile(
-                            change,
-                            row.result.size,
-                            change.mtime!,
-                            row.result.manifest,
-                            undefined,
-                            {
-                                absolutePath: row.candidate.absolutePath,
-                                fingerprint: row.result.fingerprint,
-                            },
-                        ));
                     }
                 }
-            }
 
-            if (needRead.length === 0) continue;
+                if (needRead.length === 0) continue;
 
-            // Read files in parallel.
-            const endRead = perf?.phase("read");
-            let reads: Array<{ change: FileChange; data: Uint8Array }>;
-            try {
-                reads = await Promise.all(needRead.map(async c => ({
-                    change: c,
-                    data: c.data ?? await io.readFile(c.path),
-                })));
-            } finally {
-                endRead?.();
-            }
-            const residentReadBytes = reads.reduce((sum, row) => sum + row.data.length, 0);
-            perf?.observePeakBatchBytes(residentReadBytes);
-
-            // Large files — wasm_chunk_file hashes internally.
-            for (const { change, data } of reads.filter(r => wasm.wasm_should_chunk(r.data.length))) {
-                const endChunk = perf?.phase("fastcdc");
-                let chunkInfo: any;
+                // Read files in parallel.
+                const endRead = perf?.phase("read");
+                let reads: Array<{ change: FileChange; data: Uint8Array }>;
                 try {
-                    chunkInfo = await chunkFileStreaming(wasm, data);
+                    reads = await Promise.all(needRead.map(async c => ({
+                        change: c,
+                        data: c.data ?? await io.readFile(c.path),
+                    })));
                 } finally {
-                    endChunk?.();
+                    endRead?.();
                 }
-                change.hash = chunkInfo.file_hash;
-                batchFiles.push(new ObsetyncBatchFile(
-                    change,
-                    data.length,
-                    change.mtime ?? Date.now(),
-                    chunkInfo,
-                    data,
-                ));
+                throwIfWorkAborted(signal);
+                const residentReadBytes = reads.reduce((sum, row) => sum + row.data.length, 0);
+                perf?.observePeakBatchBytes(residentReadBytes);
+
+                // Large files — wasm_chunk_file hashes internally.
+                for (const { change, data } of reads.filter(r => wasm.wasm_should_chunk(r.data.length))) {
+                    const endChunk = perf?.phase("fastcdc");
+                    let chunkInfo: any;
+                    try {
+                        chunkInfo = await chunkFileStreaming(wasm, data, perf, signal);
+                    } finally {
+                        endChunk?.();
+                    }
+                    change.hash = chunkInfo.file_hash;
+                    batchFiles.push(new ObsetyncBatchFile(
+                        change,
+                        data.length,
+                        change.mtime ?? Date.now(),
+                        chunkInfo,
+                        data,
+                    ));
+                }
+
+                // Small files — batch hash unknown-hash ones in ONE wasm_hash_batch call.
+                const smallReads = reads.filter(r => !wasm.wasm_should_chunk(r.data.length));
+                if (smallReads.length === 0) continue;
+
+                // Known-hash small files that were forced to read (preloaded change.data).
+                for (const { change, data } of smallReads.filter(r => r.change.hash)) {
+                    batchFiles.push(new ObsetyncBatchFile(change, data.length, change.mtime ?? Date.now()));
+                }
+
+                unknownSmallReads.push(...smallReads.filter(r => !r.change.hash));
             }
 
-            // Small files — batch hash unknown-hash ones in ONE wasm_hash_batch call.
-            const smallReads = reads.filter(r => !wasm.wasm_should_chunk(r.data.length));
-            if (smallReads.length === 0) continue;
-
-            // Known-hash small files that were forced to read (preloaded change.data).
-            for (const { change, data } of smallReads.filter(r => r.change.hash)) {
-                batchFiles.push(new ObsetyncBatchFile(change, data.length, change.mtime ?? Date.now()));
-            }
-
-            unknownSmallReads.push(...smallReads.filter(r => !r.change.hash));
+            // Read concurrency and WASM call size are independent budgets. Keep
+            // reads parallel, then hash the accumulated small-file payload in
+            // byte-bounded calls so neither bridge overhead nor retained memory
+            // grows with the number of files in this stream batch.
+            batchFiles.push(...hashUnknownSmallReads(wasm, unknownSmallReads, tuning, perf));
+            unknownSmallReads.length = 0;
+        } finally {
+            endPrepare?.();
         }
-
-        // Read concurrency and WASM call size are independent budgets. Keep
-        // reads parallel, then hash the accumulated small-file payload in
-        // byte-bounded calls so neither bridge overhead nor retained memory
-        // grows with the number of files in this stream batch.
-        batchFiles.push(...hashUnknownSmallReads(wasm, unknownSmallReads, tuning, perf));
-        unknownSmallReads.length = 0;
 
         // ------------------------------------------------------------------
         // B. Two batch-check requests for this batch.
         // ------------------------------------------------------------------
+        throwIfWorkAborted(signal);
         const smallHashes = batchFiles
             .filter(f => !f.chunkInfo)
             .map(f => f.change.hash!);
@@ -508,6 +521,7 @@ export async function push(
         } finally {
             endCheck?.();
         }
+        throwIfWorkAborted(signal);
 
         const neededSmallSet  = new Set(neededSmall);
         const neededChunksSet = new Set(neededChunks);
@@ -543,6 +557,7 @@ export async function push(
             largeData,
             rangedSource,
         } of batchFiles) {
+            throwIfWorkAborted(signal);
             if (chunkInfo) {
                 const missingChunks: Array<{ hash: string; offset: number; size: number }> = [];
                 for (const chunk of chunkInfo.chunks as Array<{
@@ -575,6 +590,7 @@ export async function push(
                         records: readonly BulkUploadRecord[],
                     ): Promise<void> => {
                         await beforeHeavyBatch?.();
+                        throwIfWorkAborted(signal);
                         const endUpload = perf?.phase("upload");
                         try {
                             await api.putObjects(records, perf);
@@ -595,6 +611,7 @@ export async function push(
                         async () => {
                             if (!uploadManifest) return;
                             await beforeHeavyBatch?.();
+                            throwIfWorkAborted(signal);
                             const manifestRecord = makeManifestRecord();
                             perf?.observePeakBatchBytes(manifestRecord.data.byteLength);
                             const endUpload = perf?.phase("upload");
@@ -613,6 +630,7 @@ export async function push(
                 let content = largeData;
                 if (missingChunks.length > 0 && !content) {
                     const before = await io.stat(change.path);
+                    throwIfWorkAborted(signal);
                     if (
                         !before || before.size !== size ||
                         Math.abs(before.mtime - mtime) > 1
@@ -627,7 +645,9 @@ export async function push(
                     } finally {
                         endRead?.();
                     }
+                    throwIfWorkAborted(signal);
                     const after = await io.stat(change.path);
+                    throwIfWorkAborted(signal);
                     if (
                         content.length !== size ||
                         !after || after.size !== size ||
@@ -666,6 +686,7 @@ export async function push(
                     } finally {
                         endRead?.();
                     }
+                    throwIfWorkAborted(signal);
                 }
                 perf?.observePeakBatchBytes(data.length);
                 queuedContent.add(change.hash);
@@ -683,6 +704,7 @@ export async function push(
 
         if (uploadRecords.length > 0) {
             await beforeHeavyBatch?.();
+            throwIfWorkAborted(signal);
             const endUpload = perf?.phase("upload");
             try {
                 await api.putObjects(uploadRecords, perf);
@@ -709,6 +731,7 @@ export async function push(
     // D. Apply all tree updates to the candidate in one update_tree call.
     //    O(N + prefix_size) vs O(N × prefix_size) with per-file update_entry.
     // ------------------------------------------------------------------
+    throwIfWorkAborted(signal);
     const beforeRoot = tree.root_hash_hex();
     const beforeFiles = tree.total_files();
     if (allTreeUpdates.length > 0) {
@@ -758,6 +781,7 @@ export async function push(
         } finally {
             endCheck?.();
         }
+        throwIfWorkAborted(signal);
         if (neededChunks.length > 0) {
             onProgress?.(`↑ uploading ${neededChunks.length} index chunks...`);
             const records: BulkUploadRecord[] = [];
@@ -770,11 +794,12 @@ export async function push(
             const endIndexUpload = perf?.phase("tree_index_upload");
             try {
                 await beforeHeavyBatch?.();
+                throwIfWorkAborted(signal);
                 await api.putObjects(records, perf);
             } finally {
                 endIndexUpload?.();
             }
-            await yieldToUI();
+            await yieldWork({ perf, signal });
         }
     }
 
@@ -796,13 +821,16 @@ export async function push(
     const endRootCommit = perf?.phase("root_commit");
     let result: Awaited<ReturnType<ObsetyncApi["putRoot"]>>;
     try {
+        throwIfWorkAborted(signal);
         result = await api.putRoot(vaultId, rootBytes, parentHash, perf);
     } finally {
         endRootCommit?.();
     }
 
     // Server acceptance is the transaction boundary. Only now can the local
-    // committed pointer advance and old immutable chunks be swept.
+    // committed pointer advance and old immutable chunks be swept. If stop
+    // arrived during this request, still adopt/save its accepted result: an
+    // in-flight root publication is not made cancellable by the yield signal.
     const gcStats = tree.commit_candidate();
     candidateOpen = false;
     perf?.setWasmChunks({ after: gcStats.after });
@@ -844,9 +872,6 @@ export async function push(
         throw error;
     }
 }
-
-/** Yield control back to the JS event loop so Obsidian stays responsive. */
-const yieldToUI = () => new Promise<void>(r => window.setTimeout(r, 0));
 
 const monotonicNow = (): number => globalThis.performance?.now?.() ?? Date.now();
 
@@ -897,12 +922,19 @@ export function streamingHash(wasm: WasmModule, data: Uint8Array): string {
 /** Plan FastCDC chunks through small WASM bridge slices. The source buffer is
  *  necessarily whole-file on Obsidian mobile, but WASM never receives a
  *  second whole-file copy and retains a bounded ~4 MiB window. */
-export async function chunkFileStreaming(wasm: WasmModule, data: Uint8Array): Promise<any> {
+export async function chunkFileStreaming(
+    wasm: WasmModule,
+    data: Uint8Array,
+    perf?: PerfOperation,
+    signal?: AbortSignal,
+): Promise<any> {
+    throwIfWorkAborted(signal);
     const chunker = new wasm.WasmChunker();
     try {
         let offset = 0;
         let lastYieldAt = monotonicNow();
         while (offset < data.length) {
+            throwIfWorkAborted(signal);
             const feedBytes = getHashTuning().feedBytes;
             const end = Math.min(data.length, offset + feedBytes);
             const started = monotonicNow();
@@ -911,10 +943,11 @@ export async function chunkFileStreaming(wasm: WasmModule, data: Uint8Array): Pr
             offset = end;
             const afterStep = monotonicNow();
             if (afterStep - lastYieldAt >= getHashTuning().yieldBudgetMs) {
-                await yieldToUI();
+                await yieldWork({ perf, signal });
                 lastYieldAt = monotonicNow();
             }
         }
+        throwIfWorkAborted(signal);
         return chunker.finish();
     } finally {
         chunker.free();
@@ -925,7 +958,8 @@ export async function chunkFileStreaming(wasm: WasmModule, data: Uint8Array): Pr
  * Stream-hash a file directly from disk using Node.js fs (Electron/desktop only).
  * Uses the adaptive platform feed — peak read memory follows that bounded feed
  * regardless of file size.
- * Falls back to readFile + streamingHash on mobile (no Node.js fs).
+ * Falls back to a whole-file read followed by cooperatively yielded hash feeds
+ * on mobile (no Node.js fs); this does not make the source read streaming.
  *
  * This is the nproc-ready path: each Web Worker calls this independently,
  * giving true parallel hashing across cores with zero data crossing thread boundaries.
@@ -936,7 +970,9 @@ export async function hashFileStreaming(
     wasm: WasmModule,
     perf?: PerfOperation,
     perfWeight = 1,
+    signal?: AbortSignal,
 ): Promise<string> {
+    throwIfWorkAborted(signal);
     const absPath = io.getAbsolutePath(path);
     if (absPath) {
         const fs = (globalThis as any).require?.('fs') as typeof import('fs') | undefined;
@@ -946,7 +982,7 @@ export async function hashFileStreaming(
             let hashMs = 0;
             try {
                 await new Promise<void>((resolve, reject) => {
-                    fs.createReadStream(absPath, { highWaterMark: getHashTuning().feedBytes })
+                    fs.createReadStream(absPath, { highWaterMark: getHashTuning().feedBytes, signal })
                         .on('data', (chunk: Buffer | string) => {
                             const buf = chunk as Buffer;
                             const hashStarted = monotonicNow();
@@ -978,10 +1014,33 @@ export async function hashFileStreaming(
     const readStarted = perf ? monotonicNow() : 0;
     const data = await io.readFile(path);
     if (perf) perf.addPhase("read", Math.max(0, monotonicNow() - readStarted) * perfWeight);
-    const hashStarted = perf ? monotonicNow() : 0;
-    const result = streamingHash(wasm, data);
-    if (perf) perf.addPhase("hash", Math.max(0, monotonicNow() - hashStarted) * perfWeight);
-    return result;
+    throwIfWorkAborted(signal);
+    const hasher = new wasm.Hasher();
+    let hashMs = 0;
+    try {
+        let offset = 0;
+        let lastYieldAt = monotonicNow();
+        while (offset < data.length) {
+            throwIfWorkAborted(signal);
+            const end = Math.min(data.length, offset + getHashTuning().feedBytes);
+            const started = monotonicNow();
+            hasher.update(data.subarray(offset, end));
+            hashMs += observeHashStep(end - offset, started);
+            offset = end;
+            if (monotonicNow() - lastYieldAt >= getHashTuning().yieldBudgetMs) {
+                await yieldWork({ perf, signal });
+                lastYieldAt = monotonicNow();
+            }
+        }
+        throwIfWorkAborted(signal);
+        const started = monotonicNow();
+        const result = hasher.finalize();
+        hashMs += Math.max(0, monotonicNow() - started);
+        return result;
+    } finally {
+        if (perf) perf.addPhase("hash", hashMs * perfWeight);
+        hasher.free();
+    }
 }
 
 function throughput(files: number, bytes: number, startMs: number): string {
