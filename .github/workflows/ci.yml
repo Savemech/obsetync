@@ -53,11 +53,11 @@ jobs:
         run: cargo check -p sync-core --target wasm32-unknown-unknown --features wasm --no-default-features --locked
 
   # ---------------------------------------------------------------------------
-  # Plugin: type-check the TypeScript source. Does NOT run the bundler — that's
-  # the release workflow's job. CI just validates that the source compiles.
+  # Plugin: type-check the TypeScript source and run the Node-compatible
+  # regression suite. Production/WASM bundling remains in the release workflow.
   # ---------------------------------------------------------------------------
   plugin:
-    name: Plugin (tsc)
+    name: Plugin (tsc + tests)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -82,6 +82,8 @@ jobs:
       - run: npm ci --no-audit --no-fund
 
       - run: npx tsc --noEmit
+
+      - run: npm test
 
   # ---------------------------------------------------------------------------
   # Docker: verify the multi-stage Dockerfile still builds end-to-end.

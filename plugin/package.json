@@ -6,8 +6,8 @@
   "scripts": {
     "build": "node esbuild.config.mjs production",
     "dev": "node esbuild.config.mjs",
-    "test": "esbuild src/plugin.test.ts --bundle --platform=node --format=cjs | node",
-    "bench:perf": "esbuild src/perf-overhead.bench.ts --bundle --platform=node --format=cjs | node",
+    "test": "node --test scripts/run-tests.test.mjs && node scripts/run-tests.mjs",
+    "bench:perf": "node scripts/run-tests.mjs src/perf-overhead.bench.ts",
     "bench:bulk": "esbuild src/bulk-planner.bench.ts --bundle --platform=node --format=cjs | node",
     "bench:ws-data": "esbuild src/ws-data.bench.ts --bundle --platform=node --format=cjs | node",
     "bench:ranged": "esbuild src/desktop-ranged-upload.bench.ts --bundle --platform=node --format=cjs | node",
