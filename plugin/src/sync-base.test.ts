@@ -54,6 +54,37 @@ async function run(): Promise<void> {
     await recovered.load();
     check(recovered.getHash("done.md") === "a".repeat(64), "WAL checkpoint was not recovered");
     check(recovered.getTreeMtime("done.md") === 9, "server tree mtime was lost in WAL");
+    check(
+        recovered.refreshLocalMetadata("done.md", 50, 4),
+        "verified local metadata refresh was ignored",
+    );
+    check(recovered.getEntry("done.md")?.mtime === 50, "local mtime was not refreshed");
+    check(
+        recovered.getTreeMtime("done.md") === 9,
+        "local metadata refresh changed the committed tree mtime",
+    );
+    check(
+        !recovered.refreshLocalMetadata("done.md", 50, 4),
+        "identical local metadata created a redundant mutation",
+    );
+    const approval = recovered.approveBulkChange("vault", 10_000, 58, 1234);
+    check(approval.changeLimit === 10_100, "bulk approval growth allowance is not bounded");
+    check(
+        recovered.bulkChangeApprovalCovers("vault", 10_100, 58),
+        "persisted approval did not cover its bounded restart workload",
+    );
+    check(
+        !recovered.bulkChangeApprovalCovers("vault", 10_101, 58),
+        "persisted approval covered an oversized workload",
+    );
+    check(
+        !recovered.bulkChangeApprovalCovers("vault", 10_000, 59),
+        "persisted approval covered additional tracked deletions",
+    );
+    check(
+        !recovered.bulkChangeApprovalCovers("another-vault", 10_000, 58),
+        "persisted approval escaped its vault",
+    );
     recovered.setDiffPageCheckpoint({
         version: 1,
         vaultId: "vault",
@@ -76,11 +107,19 @@ async function run(): Promise<void> {
         "diff page cursor was not recovered from WAL");
     check(cursorRecovered.diffPageCheckpoint?.filesApplied === 9,
         "diff page aggregate progress was lost");
+    check(cursorRecovered.getEntry("done.md")?.mtime === 50,
+        "refreshed local metadata was not recovered from WAL");
+    check(cursorRecovered.getTreeMtime("done.md") === 9,
+        "recovered metadata refresh lost the committed tree mtime");
+    check(cursorRecovered.bulkChangeApproval?.approvedAt === 1234,
+        "bulk approval was not recovered from WAL");
     check(cursorRecovered.clearDiffPageCheckpoint(), "diff page cursor did not clear");
+    check(cursorRecovered.clearBulkChangeApproval(), "bulk approval did not clear");
     await cursorRecovered.checkpoint();
     const cursorCleared = new ObsetyncSyncBase(app);
     await cursorCleared.load();
     check(cursorCleared.diffPageCheckpoint === null, "cleared diff cursor resurrected after restart");
+    check(cursorCleared.bulkChangeApproval === null, "cleared bulk approval resurrected after restart");
 
     cursorCleared.setEntry("later.md", "b".repeat(64), 20, 5);
     await cursorCleared.save();

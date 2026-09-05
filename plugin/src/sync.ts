@@ -98,6 +98,14 @@ export class ObsetyncSyncEngine {
     private reenrollmentNoticeShown = false;
     /** Automatic recovery found vault-sized or deletion-heavy work. */
     private bulkChangeReviewRequired = false;
+    /** A persisted Full Rescan approval matched the current recovery plan.
+     *  Keep it active across retry attempts in this engine session and clear
+     *  the durable marker only after the corresponding publish commits. */
+    private bulkChangeApprovalActive = false;
+    /** Journal recovery may consume only a subset of an approved vault scan.
+     *  Clear the marker after a completed full/metadata scan push, never after
+     *  an earlier recovery-only batch. */
+    private bulkChangeApprovalCompletesWithPush = false;
     /** Prevent late async completions from reviving an engine after reload. */
     private stopped = false;
     /** Content-authenticated expectations for adapter writes made by pull.
@@ -240,6 +248,25 @@ export class ObsetyncSyncEngine {
 
     isBulkChangeReviewRequired(): boolean {
         return this.bulkChangeReviewRequired;
+    }
+
+    getBulkChangeApproval(): {
+        approvedAt: number;
+        observedChanges: number;
+        changeLimit: number;
+        trackedDeletionLimit: number;
+        active: boolean;
+    } | null {
+        const approval = this.syncBase.bulkChangeApproval;
+        return approval && approval.vaultId === this.vaultId
+            ? {
+                approvedAt: approval.approvedAt,
+                observedChanges: approval.observedChanges,
+                changeLimit: approval.changeLimit,
+                trackedDeletionLimit: approval.trackedDeletionLimit,
+                active: this.bulkChangeApprovalActive,
+            }
+            : null;
     }
 
     /** Start the sync engine: run startup sequence, attach listeners, start timer. */
@@ -1020,9 +1047,57 @@ export class ObsetyncSyncEngine {
                 if (base && stat.mtime === base.mtime && stat.size === base.size) continue;
                 toHash.push({ path, stat });
             }
+            const deletedPaths = this.syncBase.allPaths().filter(
+                (path) => !statMap.has(path) && !this.isExcluded(path),
+            );
             endEnumerate();
             perf.setWorkload({ filesTotal: visibleFiles, bytesTotal: visibleBytes });
-            console.log(`[obsetync] full scan: ${toHash.length} files need hashing`);
+            const plannedTotal = toHash.length + deletedPaths.length;
+            console.log(
+                `[obsetync] full scan: ${toHash.length} files need hashing, ` +
+                `${deletedPaths.length} tracked deletions`,
+            );
+
+            // Persist the operator's approval BEFORE expensive hashing. If the
+            // renderer/plugin restarts during this scan or its later push, the
+            // next metadata audit may continue the same bounded plan without
+            // asking for another click. A larger deletion plan cannot reuse it.
+            if (
+                bulkReviewWasRequired ||
+                automaticChangeNeedsReview(
+                    plannedTotal,
+                    deletedPaths.length,
+                    this.syncBase.entryCount(),
+                )
+            ) {
+                // Journal recovery may already have queued paths before the
+                // Full Rescan. Count it as a conservative upper bound; the
+                // coalescing dirty set will usually make the real push smaller.
+                const approvedTotal = Math.min(
+                    Number.MAX_SAFE_INTEGER,
+                    plannedTotal + this.pendingChanges.size,
+                );
+                const approval = this.syncBase.approveBulkChange(
+                    this.vaultId,
+                    approvedTotal,
+                    deletedPaths.length,
+                );
+                await this.syncBase.checkpoint();
+                this.bulkChangeApprovalActive = true;
+                this.bulkChangeApprovalCompletesWithPush = true;
+                console.log(
+                    `[obsetync] persisted Full Rescan approval: ` +
+                    `${approval.observedChanges} changes, ` +
+                    `${approval.trackedDeletionLimit} tracked deletions`,
+                );
+            } else if (this.syncBase.bulkChangeApproval) {
+                const resumed = await this.resumeBulkChangeApproval(
+                    "full scan",
+                    plannedTotal,
+                    deletedPaths.length,
+                );
+                if (resumed) this.bulkChangeApprovalCompletesWithPush = true;
+            }
             const hashableTotal = toHash.reduce(
                 (count, item) => count + (item.stat.size < LARGE_FILE_THRESHOLD ? 1 : 0),
                 0,
@@ -1050,6 +1125,8 @@ export class ObsetyncSyncEngine {
             let pending: FileChange[] = [];
             let totalChanges = 0;
             let changedBytes = 0;
+            let metadataRefreshes = 0;
+            let metadataRefreshesSinceCheckpoint = 0;
 
             const flushPending = async () => {
                 if (pending.length === 0) return;
@@ -1072,7 +1149,13 @@ export class ObsetyncSyncEngine {
                         if (stat.size >= LARGE_FILE_THRESHOLD) {
                             // Skip WASM hash — push.ts will hash during upload.
                             // We know it changed because it passed the mtime+size filter.
-                            return { path, stat, hash: undefined as string | undefined, base };
+                            return {
+                                kind: "change" as const,
+                                path,
+                                stat,
+                                hash: undefined as string | undefined,
+                                base,
+                            };
                         }
                         const itemIndex = i + batchIndex;
                         const sampleWeight = hashSampleWeights[itemIndex];
@@ -1082,13 +1165,35 @@ export class ObsetyncSyncEngine {
                             sampleWeight > 0 ? perf : undefined,
                             sampleWeight,
                         );
-                        if (base && stable.hash === base.hash) return null; // unchanged
-                        return { path, stat: stable.stat, hash: stable.hash, base };
+                        if (base && stable.hash === base.hash) {
+                            return {
+                                kind: "metadata" as const,
+                                path,
+                                stat: stable.stat,
+                            };
+                        }
+                        return {
+                            kind: "change" as const,
+                            path,
+                            stat: stable.stat,
+                            hash: stable.hash,
+                            base,
+                        };
                     })
                 );
 
                 for (const r of results) {
-                    if (!r) continue;
+                    if (r.kind === "metadata") {
+                        if (this.syncBase.refreshLocalMetadata(
+                            r.path,
+                            r.stat.mtime,
+                            r.stat.size,
+                        )) {
+                            metadataRefreshes++;
+                            metadataRefreshesSinceCheckpoint++;
+                        }
+                        continue;
+                    }
                     const change: FileChange = {
                         action: r.base ? "modified" : "created",
                         path: r.path,
@@ -1123,28 +1228,39 @@ export class ObsetyncSyncEngine {
                 if (pending.length >= FLUSH_BATCH) {
                     await flushPending();
                 }
-            }
-            await flushPending();
-
-            // Phase 3: deletions — files in sync-base that no longer exist.
-            let deletedCount = 0;
-            for (const path of this.syncBase.allPaths()) {
-                if (!statMap.has(path) && !this.isExcluded(path)) {
-                    pending.push({ action: "deleted", path });
-                    totalChanges++;
-                    deletedCount++;
+                if (metadataRefreshesSinceCheckpoint >= FLUSH_BATCH) {
+                    await this.syncBase.checkpoint();
+                    metadataRefreshesSinceCheckpoint = 0;
                 }
             }
             await flushPending();
+            if (metadataRefreshesSinceCheckpoint > 0) {
+                await this.syncBase.checkpoint();
+            }
+
+            // Phase 3: deletions — files in sync-base that no longer exist.
+            for (const path of deletedPaths) {
+                pending.push({ action: "deleted", path });
+                totalChanges++;
+            }
+            await flushPending();
+
+            // Compact the bounded metadata checkpoints even when hashing found
+            // no publishable content change. Otherwise a metadata-only rescan
+            // leaves a large WAL and repeats the same stat drift on restart.
+            if (metadataRefreshes > 0) await this.syncBase.save();
 
             perf.setWorkload({
-                filesTotal: visibleFiles + deletedCount,
+                filesTotal: visibleFiles + deletedPaths.length,
                 filesNeeded: totalChanges,
                 bytesNeeded: changedBytes,
             });
-            perf.increment({ filesCompleted: visibleFiles + deletedCount });
+            perf.increment({ filesCompleted: visibleFiles + deletedPaths.length });
 
-            console.log(`[obsetync] full scan complete: ${totalChanges} changes`);
+            console.log(
+                `[obsetync] full scan complete: ${totalChanges} changes, ` +
+                `${metadataRefreshes} metadata-only entries refreshed`,
+            );
         } catch (error: any) {
             scanFailed = true;
             perfOutcome = this.stopped ? "cancelled" : "error";
@@ -1171,7 +1287,11 @@ export class ObsetyncSyncEngine {
 
         // Publish once the scan has released exclusive ownership. push()
         // itself streams these path records in bounded file batches.
-        if (this.pendingChanges.size > 0) await this.pushPending(true);
+        if (this.pendingChanges.size > 0) {
+            await this.pushPending(true);
+        } else if (this.bulkChangeApprovalActive) {
+            await this.completeBulkChangeApproval("scan found no content changes");
+        }
     }
 
     // --- Private ---
@@ -1381,6 +1501,54 @@ export class ObsetyncSyncEngine {
         );
     }
 
+    /** Activate a prior explicit approval only when the current plan stays
+     *  inside its vault/count/deletion envelope. A mismatched marker is
+     *  discarded before presenting a fresh review request. */
+    private async resumeBulkChangeApproval(
+        source: string,
+        total: number,
+        trackedDeletions: number,
+    ): Promise<boolean> {
+        const approval = this.syncBase.bulkChangeApproval;
+        if (!approval) return false;
+        if (this.syncBase.bulkChangeApprovalCovers(
+            this.vaultId,
+            total,
+            trackedDeletions,
+        )) {
+            this.bulkChangeApprovalActive = true;
+            this.bulkChangeReviewRequired = false;
+            console.log(
+                `[obsetync] resuming approved ${source}: ${total} changes, ` +
+                `${trackedDeletions} tracked deletions ` +
+                `(approved ${approval.observedChanges}, limit ${approval.changeLimit})`,
+            );
+            return true;
+        }
+
+        console.warn(
+            `[obsetync] saved bulk approval no longer covers ${source}: ` +
+            `${total} changes/${trackedDeletions} tracked deletions vs ` +
+            `limit ${approval.changeLimit}/${approval.trackedDeletionLimit}; ` +
+            `requesting a fresh review`,
+        );
+        if (this.syncBase.clearBulkChangeApproval()) {
+            await this.syncBase.checkpoint();
+        }
+        this.bulkChangeApprovalActive = false;
+        this.bulkChangeApprovalCompletesWithPush = false;
+        return false;
+    }
+
+    private async completeBulkChangeApproval(reason: string): Promise<void> {
+        this.bulkChangeApprovalActive = false;
+        this.bulkChangeApprovalCompletesWithPush = false;
+        this.bulkChangeReviewRequired = false;
+        if (!this.syncBase.clearBulkChangeApproval()) return;
+        await this.syncBase.save();
+        console.log(`[obsetync] approved bulk recovery complete: ${reason}`);
+    }
+
     /**
      * Decide what the pull result means for the verified base (D2/D3 core).
      *
@@ -1535,7 +1703,12 @@ export class ObsetyncSyncEngine {
 
     private async pushPending(allowBulkChange = false): Promise<void> {
         if (this.reenrollmentRequired || this.stopped) return;
-        if (this.bulkChangeReviewRequired && !allowBulkChange) {
+        if (
+            this.bulkChangeReviewRequired &&
+            !allowBulkChange &&
+            !this.bulkChangeApprovalActive &&
+            !this.syncBase.bulkChangeApproval
+        ) {
             console.warn(
                 `[obsetync] push deferred: ${this.pendingChanges.size} changes await Full Rescan review`,
             );
@@ -1631,17 +1804,37 @@ export class ObsetyncSyncEngine {
                     change.action === "deleted" &&
                     this.syncBase.getEntry(change.path) !== null,
             ).length;
+            const needsBulkReview = automaticChangeNeedsReview(
+                batch.length,
+                trackedDeletions,
+                this.syncBase.entryCount(),
+            );
+            const approvalCoversBatch = this.syncBase.bulkChangeApprovalCovers(
+                this.vaultId,
+                batch.length,
+                trackedDeletions,
+            );
+            if (allowBulkChange && approvalCoversBatch) {
+                this.bulkChangeApprovalActive = true;
+            }
             if (
-                !allowBulkChange &&
-                automaticChangeNeedsReview(
+                needsBulkReview &&
+                !(this.bulkChangeApprovalActive && approvalCoversBatch)
+            ) {
+                const resumed = await this.resumeBulkChangeApproval(
+                    "materialized pending batch",
                     batch.length,
                     trackedDeletions,
-                    this.syncBase.entryCount(),
-                )
-            ) {
-                this.pendingChanges.restore(queued);
-                this.requireBulkChangeReview("pending recovery", batch.length, trackedDeletions);
-                return;
+                );
+                if (!resumed) {
+                    this.pendingChanges.restore(queued);
+                    this.requireBulkChangeReview(
+                        "pending recovery",
+                        batch.length,
+                        trackedDeletions,
+                    );
+                    return;
+                }
             }
             this.operationCheckpoint?.progress(
                 operationId ?? "",
@@ -1708,6 +1901,14 @@ export class ObsetyncSyncEngine {
                     .filter((change) => change.journalId !== undefined)
                     .map((change) => ({ path: change.path, throughId: change.journalId! })),
             );
+            if (
+                this.bulkChangeApprovalActive &&
+                this.bulkChangeApprovalCompletesWithPush
+            ) {
+                await this.completeBulkChangeApproval(
+                    `${batch.length} materialized paths committed`,
+                );
+            }
         } catch (e: any) {
             pushFailed = true;
             perfOutcome = this.stopped ? "cancelled" : "error";
@@ -1874,7 +2075,7 @@ export class ObsetyncSyncEngine {
     private async partialMtimeScan(): Promise<void> {
         const lastSync = this.syncBase.lastSyncTimestamp;
         if (lastSync === 0) return; // First ever sync — skip, let pull handle it.
-        if (this.bulkChangeReviewRequired) {
+        if (this.bulkChangeReviewRequired && !this.syncBase.bulkChangeApproval) {
             console.warn("[obsetync] metadata scan skipped while bulk changes await review");
             return;
         }
@@ -1910,8 +2111,23 @@ export class ObsetyncSyncEngine {
             endEnumerate();
             perf.setWorkload({ filesTotal: visibleFiles, bytesTotal: visibleBytes });
 
-            if (metadataScanNeedsReview(plan, this.syncBase.entryCount())) {
-                const total = plan.toHash.length + plan.deleted.length;
+            const total = plan.toHash.length + plan.deleted.length;
+            const needsBulkReview = metadataScanNeedsReview(
+                plan,
+                this.syncBase.entryCount(),
+            );
+            const approvalResumed = this.syncBase.bulkChangeApproval
+                ? await this.resumeBulkChangeApproval(
+                    "metadata scan",
+                    total,
+                    plan.deleted.length,
+                )
+                : false;
+            if (approvalResumed) {
+                this.bulkChangeApprovalCompletesWithPush = true;
+            }
+
+            if (needsBulkReview && !approvalResumed) {
                 perf.setWorkload({
                     filesTotal: visibleFiles + plan.deleted.length,
                     filesNeeded: total,
@@ -1933,6 +2149,8 @@ export class ObsetyncSyncEngine {
 
             let found = plan.deleted.length;
             let changedBytes = 0;
+            let metadataRefreshes = 0;
+            let metadataRefreshesSinceCheckpoint = 0;
             if (plan.toHash.length > 0) {
                 const readConcurrency = getHashTuning().readConcurrency;
                 const hashableTotal = plan.toHash.reduce(
@@ -1966,6 +2184,7 @@ export class ObsetyncSyncEngine {
                                 const knownHash = this.syncBase.getHash(path);
                                 if (stat.size >= LARGE_FILE_THRESHOLD) {
                                     return {
+                                        kind: "change" as const,
                                         path,
                                         stat,
                                         hash: undefined as string | undefined,
@@ -1980,8 +2199,15 @@ export class ObsetyncSyncEngine {
                                     sampleWeight > 0 ? perf : undefined,
                                     sampleWeight,
                                 );
-                                if (stable.hash === knownHash) return null;
+                                if (stable.hash === knownHash) {
+                                    return {
+                                        kind: "metadata" as const,
+                                        path,
+                                        stat: stable.stat,
+                                    };
+                                }
                                 return {
+                                    kind: "change" as const,
                                     path,
                                     stat: stable.stat,
                                     hash: stable.hash,
@@ -1990,7 +2216,17 @@ export class ObsetyncSyncEngine {
                             }),
                         );
                         for (const result of results) {
-                            if (!result) continue;
+                            if (result.kind === "metadata") {
+                                if (this.syncBase.refreshLocalMetadata(
+                                    result.path,
+                                    result.stat.mtime,
+                                    result.stat.size,
+                                )) {
+                                    metadataRefreshes++;
+                                    metadataRefreshesSinceCheckpoint++;
+                                }
+                                continue;
+                            }
                             found++;
                             changedBytes += result.stat.size;
                             const change: FileChange = {
@@ -2001,6 +2237,10 @@ export class ObsetyncSyncEngine {
                             };
                             if (result.hash !== undefined) change.hash = result.hash;
                             this.pendingChanges.add(change);
+                        }
+                        if (metadataRefreshesSinceCheckpoint >= 500) {
+                            await this.syncBase.checkpoint();
+                            metadataRefreshesSinceCheckpoint = 0;
                         }
                         await yieldToUI();
                         const done = Math.min(i + readConcurrency, plan.toHash.length);
@@ -2018,6 +2258,10 @@ export class ObsetyncSyncEngine {
                     notice?.hide();
                 }
             }
+            if (metadataRefreshesSinceCheckpoint > 0) {
+                await this.syncBase.checkpoint();
+            }
+            if (metadataRefreshes > 0) await this.syncBase.save();
 
             perf.setWorkload({
                 filesTotal: visibleFiles + plan.deleted.length,
@@ -2029,6 +2273,12 @@ export class ObsetyncSyncEngine {
             if (shouldPush) {
                 console.log(`[obsetync] metadata scan found ${found} unsynced changes`);
             }
+            if (metadataRefreshes > 0) {
+                console.log(
+                    `[obsetync] metadata scan refreshed ${metadataRefreshes} ` +
+                    `content-identical stat entries`,
+                );
+            }
         } catch (error) {
             perfOutcome = this.stopped ? "cancelled" : "error";
             throw error;
@@ -2036,7 +2286,11 @@ export class ObsetyncSyncEngine {
             perf.finish(perfOutcome);
         }
 
-        if (shouldPush) await this.pushPending();
+        if (shouldPush || (this.bulkChangeApprovalActive && this.pendingChanges.size > 0)) {
+            await this.pushPending(this.bulkChangeApprovalActive);
+        } else if (this.bulkChangeApprovalActive) {
+            await this.completeBulkChangeApproval("metadata scan found no content changes");
+        }
     }
 
     /** Layer 1: attach live vault event listeners.

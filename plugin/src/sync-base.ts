@@ -17,6 +17,19 @@ interface SyncBaseData {
     /** Last fully-applied binary diff page. Kept in the same snapshot/WAL as
      *  entry mutations, so a cursor can never outrun local state. */
     diffPageCheckpoint?: DiffPageCheckpoint | null;
+    /** One explicit operator approval for a vault-sized local recovery.
+     *  It survives renderer/plugin restarts until the approved publish
+     *  commits, but is bounded so it cannot bless a later, larger deletion. */
+    bulkChangeApproval?: BulkChangeApproval | null;
+}
+
+export interface BulkChangeApproval {
+    schema: 1;
+    vaultId: string;
+    approvedAt: number;
+    observedChanges: number;
+    changeLimit: number;
+    trackedDeletionLimit: number;
 }
 
 export interface DiffPageCheckpoint {
@@ -40,7 +53,8 @@ type SyncBaseOperation =
     | { op: "remove"; path: string }
     | { op: "timestamp"; value: number }
     | { op: "tree-root"; value: string | null }
-    | { op: "diff-page"; value: DiffPageCheckpoint | null };
+    | { op: "diff-page"; value: DiffPageCheckpoint | null }
+    | { op: "bulk-approval"; value: BulkChangeApproval | null };
 
 const SYNC_BASE_PATH = ".obsidian/plugins/obsetync/sync-base.json";
 const SYNC_BASE_NEXT_PATH = `${SYNC_BASE_PATH}.next`;
@@ -164,6 +178,17 @@ export class ObsetyncSyncBase {
         this.record({ op: "set", path, entry });
     }
 
+    /** Refresh local stat metadata after hashing proved that content is still
+     *  the committed content. Keep the old tree mtime: changing filesystem
+     *  metadata alone must not fabricate a new server-tree entry. */
+    refreshLocalMetadata(path: string, mtime: number, size: number): boolean {
+        const entry = this.data.entries[path];
+        if (!entry || (entry.mtime === mtime && entry.size === size)) return false;
+        const treeMtime = entry.treeMtime ?? entry.mtime;
+        this.setEntry(path, entry.hash, mtime, size, treeMtime);
+        return true;
+    }
+
     removeEntry(path: string): void {
         delete this.data.entries[path];
         this.record({ op: "remove", path });
@@ -200,6 +225,59 @@ export class ObsetyncSyncBase {
         if (!this.data.diffPageCheckpoint) return false;
         this.data.diffPageCheckpoint = null;
         this.record({ op: "diff-page", value: null });
+        return true;
+    }
+
+    get bulkChangeApproval(): BulkChangeApproval | null {
+        const approval = this.data.bulkChangeApproval;
+        return isBulkChangeApproval(approval) ? { ...approval } : null;
+    }
+
+    /** Persist the scope of an explicit Full Rescan before expensive hashing
+     *  starts. A small count allowance tolerates ordinary edits made while the
+     *  recovery is running; the deletion ceiling stays exact. */
+    approveBulkChange(
+        vaultId: string,
+        total: number,
+        trackedDeletions: number,
+        approvedAt: number = Date.now(),
+    ): BulkChangeApproval {
+        if (!vaultId || !isNonNegativeSafeInteger(total) ||
+            !isNonNegativeSafeInteger(trackedDeletions) || trackedDeletions > total) {
+            throw new Error("invalid bulk change approval");
+        }
+        const growthAllowance = Math.max(100, Math.ceil(total * 0.01));
+        const approval: BulkChangeApproval = {
+            schema: 1,
+            vaultId,
+            approvedAt,
+            observedChanges: total,
+            changeLimit: Math.min(Number.MAX_SAFE_INTEGER, total + growthAllowance),
+            trackedDeletionLimit: trackedDeletions,
+        };
+        this.data.bulkChangeApproval = approval;
+        this.record({ op: "bulk-approval", value: { ...approval } });
+        return { ...approval };
+    }
+
+    bulkChangeApprovalCovers(
+        vaultId: string,
+        total: number,
+        trackedDeletions: number,
+    ): boolean {
+        const approval = this.bulkChangeApproval;
+        return !!approval &&
+            approval.vaultId === vaultId &&
+            isNonNegativeSafeInteger(total) &&
+            isNonNegativeSafeInteger(trackedDeletions) &&
+            trackedDeletions <= approval.trackedDeletionLimit &&
+            total <= approval.changeLimit;
+    }
+
+    clearBulkChangeApproval(): boolean {
+        if (this.data.bulkChangeApproval == null) return false;
+        this.data.bulkChangeApproval = null;
+        this.record({ op: "bulk-approval", value: null });
         return true;
     }
 
@@ -252,6 +330,14 @@ export class ObsetyncSyncBase {
                     throw new Error("invalid diff page checkpoint");
                 }
                 this.data.diffPageCheckpoint = operation.value === null
+                    ? null
+                    : { ...operation.value };
+                break;
+            case "bulk-approval":
+                if (operation.value !== null && !isBulkChangeApproval(operation.value)) {
+                    throw new Error("invalid bulk change approval");
+                }
+                this.data.bulkChangeApproval = operation.value === null
                     ? null
                     : { ...operation.value };
                 break;
@@ -308,6 +394,23 @@ export class ObsetyncSyncBase {
 
 const ROOT_HASH = /^[0-9a-f]{64}$/;
 const CURSOR_HEX = /^[0-9a-f]*$/;
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+    return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isBulkChangeApproval(value: unknown): value is BulkChangeApproval {
+    if (!value || typeof value !== "object") return false;
+    const row = value as Record<string, unknown>;
+    return row.schema === 1 &&
+        typeof row.vaultId === "string" && row.vaultId.length > 0 &&
+        isNonNegativeSafeInteger(row.approvedAt) &&
+        isNonNegativeSafeInteger(row.observedChanges) &&
+        isNonNegativeSafeInteger(row.changeLimit) &&
+        isNonNegativeSafeInteger(row.trackedDeletionLimit) &&
+        row.changeLimit >= row.observedChanges &&
+        row.trackedDeletionLimit <= row.observedChanges;
+}
 
 function isDiffPageCheckpoint(value: unknown): value is DiffPageCheckpoint {
     if (!value || typeof value !== "object") return false;

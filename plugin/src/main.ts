@@ -354,6 +354,15 @@ export default class ObsetyncPlugin extends Plugin {
                 push(`Push blocked:      ${this.syncEngine.isPushBlocked() ? "YES — run Full Rescan" : "no"}`);
                 push(`Re-enroll needed:  ${this.syncEngine.isReenrollmentRequired() ? "YES — automatic sync paused" : "no"}`);
                 push(`Bulk change review: ${this.syncEngine.isBulkChangeReviewRequired() ? "YES — run Full Rescan to confirm" : "no"}`);
+                const bulkApproval = this.syncEngine.getBulkChangeApproval();
+                push(
+                    `Bulk resume approval: ${bulkApproval
+                        ? `${bulkApproval.active ? "active" : "saved"} · ` +
+                            `${bulkApproval.observedChanges} changes · ` +
+                            `delete limit ${bulkApproval.trackedDeletionLimit} · ` +
+                            `approved ${fmt(bulkApproval.approvedAt)}`
+                        : "none"}`,
+                );
                 push(`Tree format:       v${this.tree?.tree_version?.() ?? "?"}`);
                 push(`Tree root hash:    ${trunc(treeRoot, 24)}`);
                 push(`Tree base root:    ${trunc(baseRoot, 24)}`);
