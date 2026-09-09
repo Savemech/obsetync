@@ -473,8 +473,9 @@ jobs:
           file out/sync-server
 
       - name: Verify exact binary provenance
-        run: node scripts/release-provenance.mjs verify-server out/sync-server \
-          '${{ needs.precheck.outputs.version }}' '${{ github.sha }}' clean
+        run: |
+          node scripts/release-provenance.mjs verify-server out/sync-server \
+            '${{ needs.precheck.outputs.version }}' '${{ github.sha }}' clean
 
       - name: Stage server workflow artifact
         uses: actions/upload-artifact@v4

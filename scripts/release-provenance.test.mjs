@@ -16,6 +16,7 @@ import {
 
 const execFile = promisify(execFileCallback);
 const SCRIPT = fileURLToPath(new URL("./release-provenance.mjs", import.meta.url));
+const RELEASE_WORKFLOW = fileURLToPath(new URL("../.github/workflows/release.yml", import.meta.url));
 // The local sandbox reports a non-reentrant Hermes shim as execPath; normal
 // Node and GitHub Actions use the executable directly.
 const NODE = process.execPath.includes("/.hermes/") ? "/usr/local/bin/node" : process.execPath;
@@ -115,4 +116,9 @@ test("CLI creates once, verifies exact inputs, and rejects unsafe output", async
     } finally {
         await rm(directory, { recursive: true, force: true });
     }
+});
+
+test("release workflow keeps continued provenance commands in literal blocks", async () => {
+    const workflow = await readFile(RELEASE_WORKFLOW, "utf8");
+    assert.doesNotMatch(workflow, /^\s*run:\s+node scripts\/release-provenance\.mjs[^\n]*\\\n/gm);
 });

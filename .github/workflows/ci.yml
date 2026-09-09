@@ -91,6 +91,10 @@ jobs:
           cache: npm
           cache-dependency-path: plugin/package-lock.json
 
+      - name: release provenance tests
+        working-directory: ${{ github.workspace }}
+        run: node --test scripts/release-provenance.test.mjs
+
       - run: npm ci --no-audit --no-fund
 
       - run: npx tsc --noEmit
