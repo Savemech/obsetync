@@ -15,6 +15,8 @@ class FakeHost implements WorkSchedulerRuntime {
     timerSchedules = 0;
     failMessageSend = false;
     failTimer = false;
+    clock = 0;
+    now = () => this.clock;
 
     constructor(immediate = false) {
         if (immediate) {
@@ -210,6 +212,93 @@ async function brokenCapabilitiesFallBackWithoutLeaking(): Promise<void> {
     unavailable.dispose();
 }
 
+async function lanesDeadlinesAndAgingAreFair(): Promise<void> {
+    const host = new FakeHost(true);
+    const scheduler = new WorkScheduler({ runtime: host, maxPendingJobs: 16 });
+    const order: string[] = [];
+    const pending: Promise<void>[] = [];
+    const add = (lane: "interactive" | "urgent-file" | "bulk" | "maintenance", label: string) => {
+        pending.push(scheduler.yield({ lane }).then(() => { order.push(label); }));
+    };
+    for (let index = 0; index < 6; index++) add("interactive", `i${index}`);
+    for (let index = 0; index < 3; index++) add("urgent-file", `u${index}`);
+    for (let index = 0; index < 2; index++) add("bulk", `b${index}`);
+    add("maintenance", "m0");
+    assert.deepEqual(scheduler.snapshot().pendingByLane,
+        { interactive: 6, "urgent-file": 3, bulk: 2, maintenance: 1 });
+    assert.equal(host.tasks.size, 1, "lane admission posted more than one host callback");
+    for (let index = 0; index < 12; index++) host.tick();
+    await Promise.all(pending);
+    assert.deepEqual(order, [
+        "i0", "i1", "i2", "i3", "u0", "i4", "u1", "b0",
+        "i5", "u2", "b1", "m0",
+    ], "weighted lane service lost priority or starved a background lane");
+
+    const deadlineOrder: string[] = [];
+    const interactive = scheduler.yield({ lane: "interactive" })
+        .then(() => { deadlineOrder.push("interactive"); });
+    const maintenance = scheduler.yield({ lane: "maintenance", deadlineMs: 10 })
+        .then(() => { deadlineOrder.push("deadline"); });
+    host.clock = 10;
+    host.tick();
+    await Promise.resolve();
+    assert.deepEqual(deadlineOrder, ["deadline"], "expired deadline did not preempt normal weighting");
+    assert.equal(scheduler.snapshot().expiredDeadlines, 1);
+    host.tick();
+    await Promise.all([interactive, maintenance]);
+
+    // Background aging is independent of the service cursor and bounds wait
+    // even when a high-priority producer keeps the queue non-empty.
+    const agedOrder: string[] = [];
+    const agedInteractive = scheduler.yield({ lane: "interactive" })
+        .then(() => { agedOrder.push("interactive"); });
+    const agedBulk = scheduler.yield({ lane: "bulk" })
+        .then(() => { agedOrder.push("bulk"); });
+    host.clock = 510;
+    assert.equal(scheduler.snapshot().oldestWaitMs, 500);
+    host.tick();
+    await Promise.resolve();
+    assert.deepEqual(agedOrder, ["bulk"], "aged bulk did not receive its bounded turn");
+    host.tick();
+    await Promise.all([agedInteractive, agedBulk]);
+    scheduler.dispose();
+
+    const reserveHost = new FakeHost(true);
+    const reserved = new WorkScheduler({ runtime: reserveHost, maxPendingJobs: 16 });
+    const admitted: Promise<void>[] = [];
+    for (let index = 0; index < 12; index++) admitted.push(reserved.yield({ lane: "bulk" }));
+    await assert.rejects(reserved.yield({ lane: "bulk" }), /reserved for urgent work/);
+    admitted.push(reserved.yield({ lane: "urgent-file" }));
+    admitted.push(reserved.yield({ lane: "urgent-file" }));
+    await assert.rejects(reserved.yield({ lane: "urgent-file" }), /reserved for urgent work/);
+    admitted.push(reserved.yield({ lane: "interactive" }));
+    admitted.push(reserved.yield({ lane: "interactive" }));
+    await assert.rejects(reserved.yield({ lane: "interactive" }), /queue is full/);
+    assert.equal(reserved.snapshot().interactiveReserve, 2);
+    assert.equal(reserved.snapshot().urgentFileReserve, 2);
+    for (let index = 0; index < admitted.length; index++) reserveHost.tick();
+    await Promise.all(admitted);
+    reserved.dispose();
+}
+
+async function invalidLanePolicyNeverEntersTheQueue(): Promise<void> {
+    const host = new FakeHost();
+    const scheduler = new WorkScheduler({ runtime: host });
+    await assert.rejects(scheduler.yield({ lane: "unknown" as any }), /Unknown work scheduler lane/);
+    for (const deadlineMs of [-1, 3.5, Number.NaN, 3_600_001]) {
+        await assert.rejects(scheduler.yield({ deadlineMs }), /deadline/);
+    }
+    assert.equal(scheduler.snapshot().pendingJobs, 0);
+    assert.equal(host.tasks.size, 0, "invalid policy posted a native callback");
+    host.clock = 100;
+    const pending = scheduler.yield({ lane: "bulk" });
+    host.clock = 10; // a broken host clock must be clamped, never make age negative
+    assert.equal(scheduler.snapshot().oldestWaitMs, 0);
+    host.tick();
+    await pending;
+    scheduler.dispose();
+}
+
 async function actualNodeYieldIsNotAMicrotask(): Promise<void> {
     const scheduler = new WorkScheduler();
     let resumed = false;
@@ -250,6 +339,7 @@ async function cooperativeHashPreservesBytesAndFreesOnAbort(): Promise<void> {
     const wasm = { Hasher } as unknown as WasmModule;
     const io = {
         getAbsolutePath: () => null,
+        stat: async () => ({ size: bytes.byteLength, mtime: 1 }),
         readFile: async () => bytes,
     } as unknown as PlatformIO;
     const expected = streamingHash(wasm, bytes);
@@ -285,6 +375,8 @@ async function run(): Promise<void> {
     await abortsAreBoundedAndDoNotBlockLaterJobs();
     await disposingCancelsPendingAndReleasesResources();
     await brokenCapabilitiesFallBackWithoutLeaking();
+    await lanesDeadlinesAndAgingAreFair();
+    await invalidLanePolicyNeverEntersTheQueue();
     await actualNodeYieldIsNotAMicrotask();
     await cooperativeHashPreservesBytesAndFreesOnAbort();
     console.log("work-scheduler.test: bounded tasks, fallback, cancellation and hash cleanup passed");

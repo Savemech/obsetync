@@ -40,10 +40,10 @@ tempfile = "3"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-# wasm-opt flags. Rust 1.95 emits bulk-memory / sign-ext ops by default; the
-# wasm-opt bundled with wasm-pack 0.13.1 needs these features explicitly enabled
-# to validate the input. All listed features are supported by every browser
-# that Obsidian targets, so enabling them is safe.
+# wasm-opt parser flags. Rust 1.95 emits bulk-memory / sign-ext ops by default,
+# and the SIMD package requires the SIMD parser feature. Enabling SIMD here does
+# not add SIMD instructions to the scalar build; build-wasm.sh validates that
+# artifact again with SIMD explicitly disabled before publishing it.
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = [
     "-O",
@@ -52,4 +52,5 @@ wasm-opt = [
     "--enable-sign-ext",
     "--enable-mutable-globals",
     "--enable-reference-types",
+    "--enable-simd",
 ]

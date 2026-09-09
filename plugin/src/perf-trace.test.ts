@@ -4,6 +4,8 @@ import {
     PerfTrace,
     perfSampleWeight,
     normalizePerfArchitecture,
+    type PerfOperationWindow,
+    type PerfTimerScheduler,
     type PerfPlatformProfile,
 } from "./perf-trace";
 
@@ -46,6 +48,11 @@ function run(): void {
     push.increment({
         filesCompleted: 10,
         bytesTransferred: 250,
+        preparedFiles: 10,
+        serverConfirmedFiles: 8,
+        rootCommittedPaths: 4,
+        rootCommittedCuts: 2,
+        trackedDeletesCommitted: 1,
         requestCount: 5,
         retries: 1,
         backpressureEvents: 2,
@@ -71,6 +78,11 @@ function run(): void {
     assert.equal(first[0].filesTotal, 10);
     assert.equal(first[0].filesNeeded, 4);
     assert.equal(first[0].bytesTransferred, 250);
+    assert.equal(first[0].preparedFiles, 10);
+    assert.equal(first[0].serverConfirmedFiles, 8);
+    assert.equal(first[0].rootCommittedPaths, 4);
+    assert.equal(first[0].rootCommittedCuts, 2);
+    assert.equal(first[0].trackedDeletesCommitted, 1);
     assert.equal(first[0].dedupRatio, 0.75);
     assert.equal(first[0].peakBatchBytes, 128);
     assert.equal(first[0].backpressureEvents, 2);
@@ -80,6 +92,7 @@ function run(): void {
     assert.equal(first[0].eventLoopLagSamples, 100);
     assert.equal(first[0].eventLoopLagP95Ms, 2);
     assert.deepEqual(first[0].profile, { ...profile, diffPageBytes: 524_288 });
+    assert.ok(trace.formatDebug().some((line) => line.includes("server-confirmed 8")));
     const invalidDiffPage = trace.begin("pull");
     assert.throws(() => invalidDiffPage.setDiffPageBytes(-1), /diffPageBytes/);
     invalidDiffPage.finish("cancelled");
@@ -188,12 +201,15 @@ function run(): void {
     const endSecond = live.phase("read");
     const endAck = live.phase("ws_ack_wait");
     liveNow = 40;
-    live.increment({ filesCompleted: 2, bytesTransferred: 12 });
+    live.increment({ filesCompleted: 2, bytesTransferred: 12, preparedFiles: 2,
+        serverConfirmedFiles: 1 });
     liveNow = 50;
     const snapshot = liveTrace.activeSnapshots()[0];
     assert.equal(snapshot.durationMs, 50);
     assert.equal(snapshot.sinceProgressMs, 10);
     assert.equal(snapshot.filesCompleted, 2);
+    assert.equal(snapshot.preparedFiles, 2);
+    assert.equal(snapshot.serverConfirmedFiles, 1);
     assert.deepEqual(snapshot.activePhases, [
         { name: "read", count: 2, durationMs: 50 },
         { name: "ws_ack_wait", count: 1, durationMs: 40 },
@@ -224,6 +240,15 @@ function run(): void {
     assert.equal(liveTrace.recent().length, 1);
     assert.ok(!liveTrace.formatDebug(0).some(line => line.includes("push success")));
 
+    const boundedCounters = liveTrace.begin("push");
+    boundedCounters.increment({ preparedFiles: Number.MAX_SAFE_INTEGER - 1 });
+    boundedCounters.increment({ preparedFiles: 10 });
+    assert.equal(liveTrace.activeSnapshots().at(-1)?.preparedFiles, Number.MAX_SAFE_INTEGER,
+        "milestone counter did not saturate safely");
+    assert.throws(() => boundedCounters.increment({ serverConfirmedFiles: 0.5 }), /safe integer/);
+    assert.throws(() => boundedCounters.increment({ rootCommittedCuts: -1 }), /safe integer/);
+    boundedCounters.finish();
+
     assert.throws(
         () => new PerfTrace({ maxRecords: 0, monitorEventLoop: false }),
         /maxRecords/,
@@ -247,7 +272,199 @@ function run(): void {
         );
     }
 
+    testWindows();
+    testOverdueProbeCannotContaminateTheNextWindow();
     console.log("perf-trace.test: passed");
+}
+
+function testOverdueProbeCannotContaminateTheNextWindow(): void {
+    let now = 0;
+    let nextTimer = 1;
+    const pending = new Map<ReturnType<typeof setTimeout>, { callback: () => void; delayMs: number }>();
+    const timers: PerfTimerScheduler = {
+        setTimeout(callback, delayMs) {
+            const handle = nextTimer++ as unknown as ReturnType<typeof setTimeout>;
+            pending.set(handle, { callback, delayMs });
+            return handle;
+        },
+        clearTimeout(handle) { pending.delete(handle); },
+    };
+    const fire = (delayMs: number) => {
+        const scheduled = Array.from(pending).find(([, timer]) => timer.delayMs === delayMs);
+        assert.ok(scheduled, `expected a pending ${delayMs}ms timer`);
+        pending.delete(scheduled[0]);
+        scheduled[1].callback();
+    };
+    const trace = new PerfTrace({
+        monotonicNow: () => now,
+        eventLoopIntervalMs: 250,
+        windowIntervalMs: 1_000,
+        timers,
+    });
+    const windows: PerfOperationWindow[] = [];
+    const off = trace.subscribeWindows((window) => windows.push(window));
+    const scan = trace.begin("scan");
+    scan.increment({ filesCompleted: 10 });
+
+    // A suspended/delayed renderer may run its window callback first on resume.
+    // The stale lag callback still refers to the probe scheduled at time zero.
+    now = 60_000;
+    fire(1_000);
+    fire(250);
+    assert.equal(pending.size, 2, "resume queued catch-up timers instead of one lag and one window timer");
+    assert.equal(windows[0].continuousVisible, false);
+    assert.equal(windows[0].eventLoopLagP95Ms, null);
+    for (const instant of [60_250, 60_500, 60_750]) {
+        now = instant;
+        fire(250);
+    }
+    scan.increment({ filesCompleted: 10 });
+    now = 61_000;
+    fire(1_000);
+    assert.equal(windows[1].continuousVisible, true);
+    assert.equal(windows[1].eventLoopLagP95Ms, 1, "old 60s probe cannot become fresh UI overload");
+
+    // The ordinary boundary-crossing callback is excluded too, but a genuine
+    // new delayed probe entirely inside the next window must remain observable.
+    fire(250);
+    now = 61_250;
+    fire(250);
+    now = 61_650;
+    fire(250);
+    now = 62_000;
+    fire(1_000);
+    assert.equal(windows[2].continuousVisible, true);
+    assert.equal(windows[2].eventLoopLagP95Ms, 256);
+    assert.equal(trace.recent().length, 0);
+    scan.finish();
+    assert.equal(trace.recent()[0].eventLoopLagP95Ms, 256,
+        "suspend gap poisoned operation lag or fresh post-resume lag was hidden");
+    assert.equal(trace.recent()[0].eventLoopLagExcludedSamples, 1,
+        "the stale suspended probe was not classified as excluded evidence");
+    off();
+    assert.equal(pending.size, 0, "finish/unsubscribe cancel injected timers");
+}
+
+function testWindows(): void {
+    let now = 0;
+    const trace = new PerfTrace({
+        monotonicNow: () => now,
+        monitorEventLoop: false,
+        monitorWindows: false,
+    });
+    const windows: PerfOperationWindow[] = [];
+    const off = trace.subscribeWindows(window => windows.push(window));
+    const operation = trace.begin("scan");
+    operation.setDemand({ read: 100, hash: 100 });
+    operation.increment({ filesCompleted: 20, bytesTransferred: 100, retries: 1 });
+    operation.observePeakBatchBytes(256);
+    operation.observeEventLoopLag(4);
+    now = 1_000;
+    trace.sampleWindows();
+    assert.deepEqual(windows[0], {
+        sequence: 1, operationId: operation.operationId, kind: "scan", outcome: "success",
+        startedAtMs: 0, endedAtMs: 1_000, durationMs: 1_000, activeDurationMs: 1_000,
+        continuousVisible: true, filesCompleted: 20, bytesTransferred: 100,
+        retries: 1, backpressureEvents: 0, peakBatchBytes: 256,
+        eventLoopLagP95Ms: 4, demand: { read: 100, hash: 100 },
+    });
+    windows[0].demand.read = 999;
+    operation.increment({ filesCompleted: 3, backpressureEvents: 2 });
+    now = 2_000;
+    trace.sampleWindows();
+    assert.equal(windows[1].filesCompleted, 3, "windows contain deltas, not replayed totals");
+    assert.equal(windows[1].bytesTransferred, 0);
+    assert.equal(windows[1].retries, 0);
+    assert.equal(windows[1].backpressureEvents, 2);
+    assert.equal(windows[1].eventLoopLagP95Ms, null, "lag belongs only to its interval");
+    assert.equal(windows[1].peakBatchBytes, 0);
+    assert.equal(windows[1].demand.read, 100, "listener cannot change operation demand");
+
+    trace.setVisible(false);
+    operation.increment({ filesCompleted: 1 });
+    operation.observeEventLoopLag(1000);
+    now = 3_000;
+    trace.sampleWindows();
+    trace.setVisible(true);
+    operation.observeEventLoopLag(3);
+    now = 4_000;
+    trace.sampleWindows();
+    for (const window of windows.slice(2, 4)) {
+        assert.equal(window.continuousVisible, false);
+        assert.equal(window.activeDurationMs, 0);
+        assert.equal(window.eventLoopLagP95Ms, null);
+    }
+    operation.observeEventLoopLag(3);
+    now = 5_000;
+    trace.sampleWindows();
+    assert.equal(windows[4].continuousVisible, true);
+    assert.equal(windows[4].eventLoopLagP95Ms, 4);
+    now = 65_000;
+    trace.sampleWindows();
+    assert.equal(windows[5].durationMs, 60_000);
+    assert.equal(windows[5].activeDurationMs, 0, "late/suspended windows cannot train growth");
+    assert.equal(windows[5].continuousVisible, false);
+    operation.setDemand({});
+    operation.increment({ filesCompleted: 2 });
+    now = 65_500;
+    operation.finish("cancelled");
+    assert.equal(windows[6].outcome, "cancelled");
+    assert.equal(windows[6].filesCompleted, 2);
+    assert.deepEqual(windows[6].demand, {});
+    trace.sampleWindows();
+    operation.finish();
+    assert.equal(windows.length, 7, "terminal interval is delivered once");
+    assert.equal(trace.recent()[0].filesCompleted, 26, "completed totals are unaffected");
+    off();
+
+    const late = trace.begin("push");
+    late.increment({ filesCompleted: 50 });
+    now += 10_000;
+    const lateWindows: PerfOperationWindow[] = [];
+    const offLate = trace.subscribeWindows(window => lateWindows.push(window));
+    now += 1_000;
+    late.increment({ filesCompleted: 1 });
+    trace.sampleWindows();
+    assert.equal(lateWindows[0].durationMs, 1_000);
+    assert.equal(lateWindows[0].filesCompleted, 1, "late subscriber starts at a fresh baseline");
+    offLate();
+    late.increment({ filesCompleted: 10 });
+    now += 1_000;
+    const offAgain = trace.subscribeWindows(window => lateWindows.push(window));
+    now += 1_000;
+    trace.sampleWindows();
+    assert.equal(lateWindows[1].filesCompleted, 0, "unobserved interval is not replayed");
+
+    let isolated = 0;
+    const originalWarn = console.warn;
+    console.warn = () => isolated++;
+    const badListener = trace.subscribeWindows(() => { throw new Error("injected"); });
+    try {
+        late.finish("error");
+    } finally {
+        badListener();
+        offAgain();
+        console.warn = originalWarn;
+    }
+    assert.equal(isolated, 1);
+    assert.equal(lateWindows.at(-1)?.outcome, "error");
+    assert.throws(() => new PerfTrace({ windowIntervalMs: 249 }), /windowIntervalMs/);
+    assert.throws(() => new PerfTrace({ windowIntervalMs: Number.NaN }), /windowIntervalMs/);
+
+    // Concurrent operation intervals deliberately retain their overlap so a
+    // controller can discard duplicate wall time rather than over-train.
+    const offConcurrent = trace.subscribeWindows(window => windows.push(window));
+    const a = trace.begin("push");
+    const b = trace.begin("pull");
+    now += 1_000;
+    trace.sampleWindows();
+    const [wa, wb] = windows.slice(-2);
+    assert.equal(wa.startedAtMs, wb.startedAtMs);
+    assert.equal(wa.endedAtMs, wb.endedAtMs);
+    assert.ok(wb.sequence > wa.sequence);
+    a.finish();
+    b.finish();
+    offConcurrent();
 }
 
 run();

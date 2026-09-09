@@ -11,12 +11,11 @@ use crate::pack_store::{
 };
 use crate::perf::ServerPerfCounters;
 use crate::storage::StorageLayout;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sync_core::hash::FileHash;
 use sync_core::hash::{hash_to_hex, hex_to_hash};
@@ -26,6 +25,20 @@ pub use crate::pack_store::{PackedObject as DurableObject, PackedObjectKind as S
 
 const CHANNEL_MESSAGES: usize = 64;
 const QUEUE_BYTES: u64 = 64 * 1024 * 1024;
+// Bulk cannot consume the final eight message slots / eight MiB. Those are
+// available to bounded control/index work even while object uploads are noisy.
+const BULK_QUEUE_MESSAGES: usize = 56;
+const BULK_QUEUE_BYTES: u64 = 56 * 1024 * 1024;
+const MAX_ACTIVE_OWNERS: usize = 64;
+const OWNER_QUEUE_MESSAGES: usize = 24;
+const OWNER_QUEUE_BYTES: u64 = QUEUE_BYTES;
+const OWNER_BULK_MESSAGES: usize = 16;
+const OWNER_BULK_BYTES: u64 = 16 * 1024 * 1024;
+const OWNER_CONTROL_MESSAGES: usize = 8;
+const OWNER_CONTROL_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_OWNER_KEY_BYTES: usize = 128;
+const MAX_CONTROL_BURST: usize = 8;
+const BULK_AGING: Duration = Duration::from_millis(25);
 const GROUP_TARGET_BYTES: u64 = 16 * 1024 * 1024;
 const GROUP_LATENCY: Duration = Duration::from_millis(5);
 const GROUP_OBJECT_TARGET: usize = 4096;
@@ -61,6 +74,37 @@ impl std::error::Error for StoreError {}
 
 pub type StoreResult = Result<StoreOutcome, StoreError>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriterClass {
+    Control,
+    Bulk,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum WriterOwner {
+    Internal,
+    Authenticated(Arc<str>),
+}
+
+impl WriterOwner {
+    fn authenticated(value: &str) -> Result<Self, StoreError> {
+        if value.is_empty() || value.len() > MAX_OWNER_KEY_BYTES {
+            return Err(StoreError::InvalidObject(
+                "storage writer owner key is invalid".into(),
+            ));
+        }
+        Ok(Self::Authenticated(Arc::from(value)))
+    }
+
+    fn internal() -> Self {
+        Self::Internal
+    }
+
+    fn is_internal(&self) -> bool {
+        matches!(self, Self::Internal)
+    }
+}
+
 #[derive(Clone)]
 pub struct StorageWriter {
     inner: Arc<WriterHandle>,
@@ -68,7 +112,7 @@ pub struct StorageWriter {
 
 struct WriterHandle {
     sender: SyncSender<WriterMessage>,
-    queued_bytes: AtomicU64,
+    queue: Mutex<QueueState>,
     perf: Arc<ServerPerfCounters>,
     store: PackStore,
     read_pool: BlockingPool,
@@ -76,16 +120,35 @@ struct WriterHandle {
 
 struct QueueReservation {
     handle: Arc<WriterHandle>,
+    owner: WriterOwner,
+    class: WriterClass,
     bytes: u64,
     objects: u64,
+}
+
+/// A non-waiting owner/global reservation acquired before an authenticated
+/// request enters blocking validation. It can become exactly one writer
+/// message without a second admission race; dropping it releases every cap.
+pub(crate) struct WriterAdmission {
+    reservation: Option<QueueReservation>,
 }
 
 impl Drop for QueueReservation {
     fn drop(&mut self) {
         self.handle
-            .queued_bytes
-            .fetch_sub(self.bytes, Ordering::AcqRel);
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .release(&self.owner, self.class, self.bytes);
         self.handle.perf.record_writer_queue_remove(self.objects);
+    }
+}
+
+impl QueueReservation {
+    fn record_objects(&mut self, objects: u64) {
+        debug_assert_eq!(self.objects, 0);
+        self.objects = objects;
+        self.handle.perf.record_writer_queue_add(objects);
     }
 }
 
@@ -93,6 +156,24 @@ struct WriterMessage {
     objects: Vec<DurableObject>,
     reply: oneshot::Sender<Vec<StoreResult>>,
     reservation: QueueReservation,
+    enqueued_at: Instant,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct OwnerUsage {
+    messages: usize,
+    bytes: u64,
+    bulk_messages: usize,
+    bulk_bytes: u64,
+}
+
+#[derive(Debug, Default)]
+struct QueueState {
+    messages: usize,
+    bytes: u64,
+    bulk_messages: usize,
+    bulk_bytes: u64,
+    owners: HashMap<WriterOwner, OwnerUsage>,
 }
 
 struct FlatObject {
@@ -133,7 +214,7 @@ impl StorageWriter {
         let (sender, receiver) = mpsc::sync_channel(CHANNEL_MESSAGES);
         let inner = Arc::new(WriterHandle {
             sender,
-            queued_bytes: AtomicU64::new(0),
+            queue: Mutex::new(QueueState::default()),
             perf,
             store: store.clone(),
             read_pool: BlockingPool::new("storage reads", READ_TASK_PARALLELISM),
@@ -157,28 +238,97 @@ impl StorageWriter {
         &self,
         objects: Vec<DurableObject>,
     ) -> Result<Vec<StoreResult>, StoreError> {
+        self.store_batch_owned(WriterOwner::internal(), WriterClass::Control, objects)
+            .await
+    }
+
+    /// Enqueue authenticated API work under a bounded fairness owner. The
+    /// owner key is scheduling-only and is never persisted or returned.
+    pub(crate) async fn store_batch_for(
+        &self,
+        owner: &str,
+        class: WriterClass,
+        objects: Vec<DurableObject>,
+    ) -> Result<Vec<StoreResult>, StoreError> {
+        let owner = WriterOwner::authenticated(owner)?;
+        self.store_batch_owned(owner, class, objects).await
+    }
+
+    async fn store_batch_owned(
+        &self,
+        owner: WriterOwner,
+        class: WriterClass,
+        objects: Vec<DurableObject>,
+    ) -> Result<Vec<StoreResult>, StoreError> {
         if objects.is_empty() {
             return Ok(Vec::new());
         }
-        if objects.len() > MAX_BATCH_OBJECTS {
-            return Err(StoreError::InvalidObject(format!(
-                "batch has {} objects; maximum is {MAX_BATCH_OBJECTS}",
-                objects.len()
-            )));
+        let bytes = batch_reservation_bytes(&objects)?;
+        let admission = self.admit_batch_owned(owner, class, bytes)?;
+        self.store_admitted(admission, objects).await
+    }
+
+    /// Reserve preprocessing ownership synchronously, before a body can wait
+    /// on the bounded blocking pool. `bytes` is the caller's conservative
+    /// charged byte workset (for HTTP, the body plus its payload copy), not a
+    /// post-parse stored-size estimate.
+    pub(crate) fn admit_batch_for(
+        &self,
+        owner: &str,
+        class: WriterClass,
+        bytes: usize,
+    ) -> Result<WriterAdmission, StoreError> {
+        let owner = WriterOwner::authenticated(owner)?;
+        let bytes = u64::try_from(bytes)
+            .map_err(|_| StoreError::InvalidObject("request length overflow".into()))?;
+        self.admit_batch_owned(owner, class, bytes.max(1))
+    }
+
+    fn admit_batch_owned(
+        &self,
+        owner: WriterOwner,
+        class: WriterClass,
+        bytes: u64,
+    ) -> Result<WriterAdmission, StoreError> {
+        Ok(WriterAdmission {
+            reservation: Some(self.reserve_for(owner, class, bytes, 0)?),
+        })
+    }
+
+    /// Convert a preprocessing reservation into one durable writer message.
+    /// Actual stored bytes may be smaller than the admitted preprocessing
+    /// workset, never larger. Every error drops the same reservation exactly
+    /// once.
+    pub(crate) async fn store_admitted(
+        &self,
+        mut admission: WriterAdmission,
+        objects: Vec<DurableObject>,
+    ) -> Result<Vec<StoreResult>, StoreError> {
+        if objects.is_empty() {
+            return Ok(Vec::new());
         }
-        let bytes = objects.iter().try_fold(0u64, |total, object| {
-            let object_bytes = u64::try_from(object.bytes.len())
-                .map_err(|_| StoreError::InvalidObject("object length overflow".into()))?;
-            total
-                .checked_add(object_bytes.max(1))
-                .ok_or_else(|| StoreError::InvalidObject("batch byte length overflow".into()))
-        })?;
-        let reservation = self.reserve(bytes, objects.len() as u64)?;
+        let bytes = batch_reservation_bytes(&objects)?;
+        let mut reservation = admission
+            .reservation
+            .take()
+            .expect("writer admission must own a reservation");
+        if !Arc::ptr_eq(&reservation.handle, &self.inner) {
+            return Err(StoreError::InvalidObject(
+                "storage writer admission owner changed".into(),
+            ));
+        }
+        if bytes > reservation.bytes {
+            return Err(StoreError::InvalidObject(
+                "prepared batch exceeds its request admission".into(),
+            ));
+        }
+        reservation.record_objects(objects.len() as u64);
         let (reply, receive) = oneshot::channel();
         let message = WriterMessage {
             objects,
             reply,
             reservation,
+            enqueued_at: Instant::now(),
         };
         match self.inner.sender.try_send(message) {
             Ok(()) => {}
@@ -422,34 +572,319 @@ impl StorageWriter {
         Ok(())
     }
 
+    #[cfg(test)]
     fn reserve(&self, bytes: u64, objects: u64) -> Result<QueueReservation, StoreError> {
-        if bytes > QUEUE_BYTES {
-            return Err(StoreError::Busy);
-        }
-        let mut current = self.inner.queued_bytes.load(Ordering::Acquire);
-        loop {
-            let Some(next) = current.checked_add(bytes) else {
-                return Err(StoreError::Busy);
-            };
-            if next > QUEUE_BYTES {
-                return Err(StoreError::Busy);
-            }
-            match self.inner.queued_bytes.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(actual) => current = actual,
-            }
-        }
-        self.inner.perf.record_writer_queue_add(objects);
-        Ok(QueueReservation {
-            handle: Arc::clone(&self.inner),
+        self.reserve_for(
+            WriterOwner::internal(),
+            WriterClass::Control,
             bytes,
             objects,
+        )
+    }
+
+    fn reserve_for(
+        &self,
+        owner: WriterOwner,
+        class: WriterClass,
+        bytes: u64,
+        objects: u64,
+    ) -> Result<QueueReservation, StoreError> {
+        self.inner
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reserve(&owner, class, bytes)?;
+        let mut reservation = QueueReservation {
+            handle: Arc::clone(&self.inner),
+            owner,
+            class,
+            bytes,
+            objects: 0,
+        };
+        reservation.record_objects(objects);
+        Ok(reservation)
+    }
+}
+
+fn batch_reservation_bytes(objects: &[DurableObject]) -> Result<u64, StoreError> {
+    if objects.is_empty() {
+        return Ok(1);
+    }
+    if objects.len() > MAX_BATCH_OBJECTS {
+        return Err(StoreError::InvalidObject(format!(
+            "batch has {} objects; maximum is {MAX_BATCH_OBJECTS}",
+            objects.len()
+        )));
+    }
+    objects.iter().try_fold(0u64, |total, object| {
+        let object_bytes = u64::try_from(object.bytes.len())
+            .map_err(|_| StoreError::InvalidObject("object length overflow".into()))?;
+        total
+            .checked_add(object_bytes.max(1))
+            .ok_or_else(|| StoreError::InvalidObject("batch byte length overflow".into()))
+    })
+}
+
+impl QueueState {
+    fn reserve(
+        &mut self,
+        owner: &WriterOwner,
+        class: WriterClass,
+        bytes: u64,
+    ) -> Result<(), StoreError> {
+        let next_messages = self.messages.checked_add(1).ok_or(StoreError::Busy)?;
+        let next_bytes = self.bytes.checked_add(bytes).ok_or(StoreError::Busy)?;
+        if next_messages > CHANNEL_MESSAGES || next_bytes > QUEUE_BYTES {
+            return Err(StoreError::Busy);
+        }
+        if !self.owners.contains_key(owner) && self.owners.len() >= MAX_ACTIVE_OWNERS {
+            return Err(StoreError::Busy);
+        }
+        let current = self.owners.get(owner).copied().unwrap_or_default();
+        if current.messages >= OWNER_QUEUE_MESSAGES
+            || current
+                .bytes
+                .checked_add(bytes)
+                .map_or(true, |value| value > OWNER_QUEUE_BYTES)
+        {
+            return Err(StoreError::Busy);
+        }
+        if class == WriterClass::Bulk {
+            let next_bulk_messages = self.bulk_messages.checked_add(1).ok_or(StoreError::Busy)?;
+            let next_bulk_bytes = self.bulk_bytes.checked_add(bytes).ok_or(StoreError::Busy)?;
+            let next_owner_bulk_bytes = current
+                .bulk_bytes
+                .checked_add(bytes)
+                .ok_or(StoreError::Busy)?;
+            if next_bulk_messages > BULK_QUEUE_MESSAGES
+                || next_bulk_bytes > BULK_QUEUE_BYTES
+                || current.bulk_messages >= OWNER_BULK_MESSAGES
+                || next_owner_bulk_bytes > OWNER_BULK_BYTES
+            {
+                return Err(StoreError::Busy);
+            }
+        } else {
+            let control_messages = current.messages - current.bulk_messages;
+            let control_bytes = current.bytes - current.bulk_bytes;
+            let owner_control_bytes = if owner.is_internal() {
+                QUEUE_BYTES
+            } else {
+                OWNER_CONTROL_BYTES
+            };
+            if control_messages >= OWNER_CONTROL_MESSAGES
+                || control_bytes
+                    .checked_add(bytes)
+                    .map_or(true, |value| value > owner_control_bytes)
+            {
+                return Err(StoreError::Busy);
+            }
+        }
+
+        self.messages = next_messages;
+        self.bytes = next_bytes;
+        if class == WriterClass::Bulk {
+            self.bulk_messages += 1;
+            self.bulk_bytes += bytes;
+        }
+        let usage = self.owners.entry(owner.clone()).or_default();
+        usage.messages += 1;
+        usage.bytes += bytes;
+        if class == WriterClass::Bulk {
+            usage.bulk_messages += 1;
+            usage.bulk_bytes += bytes;
+        }
+        Ok(())
+    }
+
+    fn release(&mut self, owner: &WriterOwner, class: WriterClass, bytes: u64) {
+        self.messages = self
+            .messages
+            .checked_sub(1)
+            .expect("writer message underflow");
+        self.bytes = self
+            .bytes
+            .checked_sub(bytes)
+            .expect("writer byte underflow");
+        if class == WriterClass::Bulk {
+            self.bulk_messages = self
+                .bulk_messages
+                .checked_sub(1)
+                .expect("writer bulk message underflow");
+            self.bulk_bytes = self
+                .bulk_bytes
+                .checked_sub(bytes)
+                .expect("writer bulk byte underflow");
+        }
+        let remove = {
+            let usage = self
+                .owners
+                .get_mut(owner)
+                .expect("writer owner reservation missing");
+            usage.messages = usage
+                .messages
+                .checked_sub(1)
+                .expect("owner message underflow");
+            usage.bytes = usage
+                .bytes
+                .checked_sub(bytes)
+                .expect("owner byte underflow");
+            if class == WriterClass::Bulk {
+                usage.bulk_messages = usage
+                    .bulk_messages
+                    .checked_sub(1)
+                    .expect("owner bulk message underflow");
+                usage.bulk_bytes = usage
+                    .bulk_bytes
+                    .checked_sub(bytes)
+                    .expect("owner bulk byte underflow");
+            }
+            usage.messages == 0
+        };
+        if remove {
+            self.owners.remove(owner);
+        }
+    }
+}
+
+struct Scheduled<T> {
+    enqueued_at: Instant,
+    value: T,
+}
+
+struct OwnerQueues<T> {
+    control: VecDeque<Scheduled<T>>,
+    bulk: VecDeque<Scheduled<T>>,
+}
+
+impl<T> Default for OwnerQueues<T> {
+    fn default() -> Self {
+        Self {
+            control: VecDeque::new(),
+            bulk: VecDeque::new(),
+        }
+    }
+}
+
+struct FairScheduler<T> {
+    owners: HashMap<WriterOwner, OwnerQueues<T>>,
+    control_order: VecDeque<WriterOwner>,
+    bulk_order: VecDeque<WriterOwner>,
+    control_burst: usize,
+    len: usize,
+}
+
+impl<T> Default for FairScheduler<T> {
+    fn default() -> Self {
+        Self {
+            owners: HashMap::new(),
+            control_order: VecDeque::new(),
+            bulk_order: VecDeque::new(),
+            control_burst: 0,
+            len: 0,
+        }
+    }
+}
+
+impl<T> FairScheduler<T> {
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn push(&mut self, owner: WriterOwner, class: WriterClass, enqueued_at: Instant, value: T) {
+        let queues = self.owners.entry(owner.clone()).or_default();
+        let queue = match class {
+            WriterClass::Control => &mut queues.control,
+            WriterClass::Bulk => &mut queues.bulk,
+        };
+        if queue.is_empty() {
+            match class {
+                WriterClass::Control => self.control_order.push_back(owner),
+                WriterClass::Bulk => self.bulk_order.push_back(owner),
+            }
+        }
+        queue.push_back(Scheduled { enqueued_at, value });
+        self.len += 1;
+        debug_assert!(self.owners.len() <= MAX_ACTIVE_OWNERS);
+        debug_assert!(self.len <= CHANNEL_MESSAGES);
+    }
+
+    fn pop(&mut self, now: Instant) -> Option<T> {
+        let has_control = !self.control_order.is_empty();
+        let has_bulk = !self.bulk_order.is_empty();
+        let class = match (has_control, has_bulk) {
+            (false, false) => return None,
+            (true, false) => WriterClass::Control,
+            (false, true) => WriterClass::Bulk,
+            (true, true) if self.bulk_should_run(now) => WriterClass::Bulk,
+            (true, true) => WriterClass::Control,
+        };
+        self.pop_selected(class)
+    }
+
+    fn pop_control_for_group(&mut self, now: Instant) -> Option<T> {
+        if self.control_order.is_empty() || self.bulk_should_run(now) {
+            return None;
+        }
+        self.pop_selected(WriterClass::Control)
+    }
+
+    fn bulk_should_run(&self, now: Instant) -> bool {
+        !self.bulk_order.is_empty()
+            && (self.control_burst >= MAX_CONTROL_BURST
+                || (self.control_burst > 0 && self.bulk_is_aged(now)))
+    }
+
+    fn pop_selected(&mut self, class: WriterClass) -> Option<T> {
+        let value = self.pop_class(class)?;
+        if class == WriterClass::Control {
+            self.control_burst = self.control_burst.saturating_add(1);
+        } else {
+            self.control_burst = 0;
+        }
+        Some(value)
+    }
+
+    fn bulk_is_aged(&self, now: Instant) -> bool {
+        self.bulk_order.iter().any(|owner| {
+            self.owners
+                .get(owner)
+                .and_then(|queues| queues.bulk.front())
+                .is_some_and(|item| now.saturating_duration_since(item.enqueued_at) >= BULK_AGING)
         })
+    }
+
+    fn pop_class(&mut self, class: WriterClass) -> Option<T> {
+        let owner = match class {
+            WriterClass::Control => self.control_order.pop_front()?,
+            WriterClass::Bulk => self.bulk_order.pop_front()?,
+        };
+        let (scheduled, class_has_more, owner_is_empty) = {
+            let queues = self
+                .owners
+                .get_mut(&owner)
+                .expect("scheduled writer owner missing");
+            let queue = match class {
+                WriterClass::Control => &mut queues.control,
+                WriterClass::Bulk => &mut queues.bulk,
+            };
+            let scheduled = queue.pop_front().expect("scheduled writer class empty");
+            (
+                scheduled,
+                !queue.is_empty(),
+                queues.control.is_empty() && queues.bulk.is_empty(),
+            )
+        };
+        if class_has_more {
+            match class {
+                WriterClass::Control => self.control_order.push_back(owner.clone()),
+                WriterClass::Bulk => self.bulk_order.push_back(owner.clone()),
+            }
+        }
+        if owner_is_empty {
+            self.owners.remove(&owner);
+        }
+        self.len = self.len.checked_sub(1).expect("writer scheduler underflow");
+        Some(scheduled.value)
     }
 }
 
@@ -497,31 +932,64 @@ fn sync_directory(path: &Path) -> Result<(), std::io::Error> {
 }
 
 fn writer_loop(receiver: Receiver<WriterMessage>, mut active: ActiveSegment, store: PackStore) {
-    while let Ok(first) = receiver.recv() {
+    let mut scheduler = FairScheduler::default();
+    let mut receiver_open = true;
+    loop {
+        if scheduler.is_empty() {
+            if !receiver_open {
+                break;
+            }
+            match receiver.recv() {
+                Ok(message) => schedule_writer_message(&mut scheduler, message),
+                Err(_) => break,
+            }
+        }
+        drain_writer_channel(&receiver, &mut scheduler, &mut receiver_open);
+        let Some(first) = scheduler.pop(Instant::now()) else {
+            continue;
+        };
         let deadline = Instant::now() + GROUP_LATENCY;
         let mut messages = vec![first];
         let mut bytes = message_bytes(&messages[0]);
         let mut objects = messages[0].objects.len();
-        let mut disconnected = false;
+        let control_group = messages[0].reservation.class == WriterClass::Control;
         // A binary bulk request is already a useful durability group and must
         // not pay an artificial latency timer. Singleton legacy requests wait
         // briefly so concurrent callers can share one barrier.
         let coalesce_singletons = objects == 1;
 
         while coalesce_singletons && bytes < GROUP_TARGET_BYTES && objects < GROUP_OBJECT_TARGET {
+            drain_writer_channel(&receiver, &mut scheduler, &mut receiver_open);
+            let now = Instant::now();
+            let next = if control_group {
+                scheduler.pop_control_for_group(now)
+            } else {
+                scheduler.pop(now)
+            };
+            if let Some(message) = next {
+                bytes = bytes.saturating_add(message_bytes(&message));
+                objects = objects.saturating_add(message.objects.len());
+                messages.push(message);
+                continue;
+            }
+            if !scheduler.is_empty() {
+                // A queued bulk message must not lengthen the durability path
+                // of a control-first group. Commit control now, then serve the
+                // bulk owner according to burst/aging fairness.
+                break;
+            }
+            if !receiver_open {
+                break;
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
             }
             match receiver.recv_timeout(remaining) {
-                Ok(message) => {
-                    bytes = bytes.saturating_add(message_bytes(&message));
-                    objects = objects.saturating_add(message.objects.len());
-                    messages.push(message);
-                }
+                Ok(message) => schedule_writer_message(&mut scheduler, message),
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => {
-                    disconnected = true;
+                    receiver_open = false;
                     break;
                 }
             }
@@ -558,8 +1026,37 @@ fn writer_loop(receiver: Receiver<WriterMessage>, mut active: ActiveSegment, sto
             drop(reservation);
             let _ = reply.send(results);
         }
-        if report.fatal || disconnected {
+        if report.fatal {
             break;
+        }
+    }
+}
+
+fn schedule_writer_message(scheduler: &mut FairScheduler<WriterMessage>, message: WriterMessage) {
+    scheduler.push(
+        message.reservation.owner.clone(),
+        message.reservation.class,
+        message.enqueued_at,
+        message,
+    );
+}
+
+fn drain_writer_channel(
+    receiver: &Receiver<WriterMessage>,
+    scheduler: &mut FairScheduler<WriterMessage>,
+    receiver_open: &mut bool,
+) {
+    if !*receiver_open {
+        return;
+    }
+    loop {
+        match receiver.try_recv() {
+            Ok(message) => schedule_writer_message(scheduler, message),
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                *receiver_open = false;
+                return;
+            }
         }
     }
 }
@@ -1056,6 +1553,384 @@ mod tests {
         let snapshot = perf.snapshot();
         assert_eq!(snapshot.storage.writer_queue_depth, 0);
         assert_eq!(snapshot.storage.writer_queue_peak, 0);
+    }
+
+    #[test]
+    fn fair_scheduler_is_owner_round_robin_control_bounded_and_aging_aware() {
+        #[derive(Debug, PartialEq, Eq)]
+        enum Work {
+            Control(usize),
+            Bulk(usize),
+        }
+
+        let now = Instant::now();
+        let noisy = WriterOwner::authenticated("noisy").unwrap();
+        let neighbor = WriterOwner::authenticated("neighbor").unwrap();
+        let mut scheduler = FairScheduler::default();
+        for index in 0..4 {
+            scheduler.push(noisy.clone(), WriterClass::Bulk, now, Work::Bulk(index));
+        }
+        scheduler.push(neighbor.clone(), WriterClass::Bulk, now, Work::Bulk(100));
+        assert_eq!(scheduler.pop(now), Some(Work::Bulk(0)));
+        assert_eq!(scheduler.pop(now), Some(Work::Bulk(100)));
+        assert_eq!(scheduler.pop(now), Some(Work::Bulk(1)));
+
+        let mut bounded = FairScheduler::default();
+        bounded.push(noisy.clone(), WriterClass::Bulk, now, Work::Bulk(200));
+        for index in 0..=MAX_CONTROL_BURST {
+            bounded.push(
+                neighbor.clone(),
+                WriterClass::Control,
+                now,
+                Work::Control(index),
+            );
+        }
+        for index in 0..MAX_CONTROL_BURST {
+            assert_eq!(bounded.pop(now), Some(Work::Control(index)));
+        }
+        assert_eq!(bounded.pop(now), Some(Work::Bulk(200)));
+        assert_eq!(bounded.pop(now), Some(Work::Control(MAX_CONTROL_BURST)));
+
+        let mut aged = FairScheduler::default();
+        aged.push(
+            noisy,
+            WriterClass::Bulk,
+            now.checked_sub(BULK_AGING).unwrap(),
+            Work::Bulk(300),
+        );
+        aged.push(neighbor, WriterClass::Control, now, Work::Control(300));
+        assert_eq!(aged.pop(now), Some(Work::Control(300)));
+        assert_eq!(aged.pop(now), Some(Work::Bulk(300)));
+        assert!(aged.is_empty());
+    }
+
+    #[test]
+    fn admission_reserves_control_and_enforces_global_owner_caps_with_cleanup() {
+        const MIB: u64 = 1024 * 1024;
+        let noisy = WriterOwner::authenticated("noisy").unwrap();
+        let mut owner_limited = QueueState::default();
+        for _ in 0..OWNER_BULK_MESSAGES {
+            owner_limited
+                .reserve(&noisy, WriterClass::Bulk, MIB)
+                .unwrap();
+        }
+        assert!(matches!(
+            owner_limited.reserve(&noisy, WriterClass::Bulk, 1),
+            Err(StoreError::Busy)
+        ));
+        owner_limited
+            .reserve(&noisy, WriterClass::Control, 1)
+            .unwrap();
+        owner_limited.release(&noisy, WriterClass::Control, 1);
+        for _ in 0..OWNER_BULK_MESSAGES {
+            owner_limited.release(&noisy, WriterClass::Bulk, MIB);
+        }
+        assert_eq!(owner_limited.messages, 0);
+        assert_eq!(owner_limited.bytes, 0);
+        assert!(owner_limited.owners.is_empty());
+
+        let byte_limited = WriterOwner::authenticated("byte-limited").unwrap();
+        owner_limited
+            .reserve(&byte_limited, WriterClass::Bulk, OWNER_BULK_BYTES)
+            .unwrap();
+        assert!(matches!(
+            owner_limited.reserve(&byte_limited, WriterClass::Bulk, 1),
+            Err(StoreError::Busy)
+        ));
+        owner_limited.release(&byte_limited, WriterClass::Bulk, OWNER_BULK_BYTES);
+        assert!(owner_limited.owners.is_empty());
+
+        let control_limited = WriterOwner::authenticated("control-limited").unwrap();
+        owner_limited
+            .reserve(&control_limited, WriterClass::Control, OWNER_CONTROL_BYTES)
+            .unwrap();
+        assert!(matches!(
+            owner_limited.reserve(&control_limited, WriterClass::Control, 1),
+            Err(StoreError::Busy)
+        ));
+        owner_limited.release(&control_limited, WriterClass::Control, OWNER_CONTROL_BYTES);
+        assert!(owner_limited.owners.is_empty());
+
+        let mut saturated = QueueState::default();
+        let mut bulk_owners = Vec::new();
+        for index in 0..BULK_QUEUE_MESSAGES {
+            let owner = WriterOwner::authenticated(&format!("bulk-{}", index / 8)).unwrap();
+            saturated.reserve(&owner, WriterClass::Bulk, MIB).unwrap();
+            bulk_owners.push(owner);
+        }
+        let extra_bulk = WriterOwner::authenticated("extra-bulk").unwrap();
+        assert!(matches!(
+            saturated.reserve(&extra_bulk, WriterClass::Bulk, 1),
+            Err(StoreError::Busy)
+        ));
+        let mut control_owners = Vec::new();
+        for index in 0..(CHANNEL_MESSAGES - BULK_QUEUE_MESSAGES) {
+            let owner = WriterOwner::authenticated(&format!("control-{index}")).unwrap();
+            saturated.reserve(&owner, WriterClass::Control, 1).unwrap();
+            control_owners.push(owner);
+        }
+        assert_eq!(saturated.messages, CHANNEL_MESSAGES);
+        assert_eq!(saturated.bulk_messages, BULK_QUEUE_MESSAGES);
+        assert!(saturated.bytes <= QUEUE_BYTES);
+        assert!(saturated.owners.len() <= MAX_ACTIVE_OWNERS);
+        assert!(matches!(
+            saturated.reserve(
+                &WriterOwner::authenticated("sixty-fifth").unwrap(),
+                WriterClass::Control,
+                1,
+            ),
+            Err(StoreError::Busy)
+        ));
+        for owner in bulk_owners {
+            saturated.release(&owner, WriterClass::Bulk, MIB);
+        }
+        for owner in control_owners {
+            saturated.release(&owner, WriterClass::Control, 1);
+        }
+        assert!(saturated.owners.is_empty());
+
+        let exact = WriterOwner::internal();
+        saturated
+            .reserve(&exact, WriterClass::Control, QUEUE_BYTES)
+            .unwrap();
+        assert!(matches!(
+            saturated.reserve(&extra_bulk, WriterClass::Bulk, 1),
+            Err(StoreError::Busy)
+        ));
+        saturated.release(&exact, WriterClass::Control, QUEUE_BYTES);
+        assert_eq!(saturated.messages, 0);
+        assert_eq!(saturated.bytes, 0);
+        assert!(saturated.owners.is_empty());
+    }
+
+    fn paused_writer(
+        layout: StorageLayout,
+        perf: Arc<ServerPerfCounters>,
+    ) -> (
+        StorageWriter,
+        Receiver<WriterMessage>,
+        ActiveSegment,
+        PackStore,
+    ) {
+        let OpenedPackStore { store, active } = PackStore::open(layout, Arc::clone(&perf)).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(CHANNEL_MESSAGES);
+        let inner = Arc::new(WriterHandle {
+            sender,
+            queue: Mutex::new(QueueState::default()),
+            perf,
+            store: store.clone(),
+            read_pool: BlockingPool::new("paused storage reads", READ_TASK_PARALLELISM),
+        });
+        (StorageWriter { inner }, receiver, active, store)
+    }
+
+    #[test]
+    fn preprocessing_admission_is_bounded_before_enqueue_and_drop_releases_it() {
+        const MIB: usize = 1024 * 1024;
+        let dir = tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        layout.init_directories().unwrap();
+        let perf = Arc::new(ServerPerfCounters::default());
+        let (writer, receiver, _active, _store) = paused_writer(layout, Arc::clone(&perf));
+
+        let mut admissions = Vec::new();
+        for _ in 0..OWNER_BULK_MESSAGES {
+            admissions.push(
+                writer
+                    .admit_batch_for("preprocessing-device", WriterClass::Bulk, MIB)
+                    .unwrap(),
+            );
+        }
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        assert!(matches!(
+            writer.admit_batch_for("preprocessing-device", WriterClass::Bulk, 1),
+            Err(StoreError::Busy)
+        ));
+        {
+            let queue = writer
+                .inner
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(queue.messages, OWNER_BULK_MESSAGES);
+            assert_eq!(queue.bytes, OWNER_BULK_BYTES);
+            assert_eq!(queue.owners.len(), 1);
+        }
+
+        drop(admissions);
+        let queue = writer
+            .inner
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(queue.messages, 0);
+        assert_eq!(queue.bytes, 0);
+        assert!(queue.owners.is_empty());
+        assert_eq!(perf.snapshot().storage.writer_queue_depth, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preprocessing_admission_transfers_once_and_rejects_expansion_cleanly() {
+        let dir = tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        layout.init_directories().unwrap();
+        let perf = Arc::new(ServerPerfCounters::default());
+        let (writer, receiver, _active, _store) = paused_writer(layout, Arc::clone(&perf));
+
+        let too_small = writer
+            .admit_batch_for("expanding-device", WriterClass::Bulk, 1024)
+            .unwrap();
+        let error = writer
+            .store_admitted(too_small, vec![content(71, 2048)])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StoreError::InvalidObject(_)));
+        assert_eq!(
+            writer
+                .inner
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .messages,
+            0
+        );
+
+        let admission = writer
+            .admit_batch_for("transfer-device", WriterClass::Bulk, 4096)
+            .unwrap();
+        let task_writer = writer.clone();
+        let task = tokio::spawn(async move {
+            task_writer
+                .store_admitted(admission, vec![content(72, 4096)])
+                .await
+        });
+        let message = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        {
+            let queue = writer
+                .inner
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(queue.messages, 1);
+            assert_eq!(queue.bytes, 4096);
+        }
+        assert_eq!(perf.snapshot().storage.writer_queue_depth, 1);
+
+        drop(message);
+        assert!(matches!(task.await.unwrap(), Err(StoreError::Closed)));
+        let queue = writer
+            .inner
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(queue.messages, 0);
+        assert_eq!(queue.bytes, 0);
+        assert!(queue.owners.is_empty());
+        assert_eq!(perf.snapshot().storage.writer_queue_depth, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_waiter_keeps_write_owned_until_durable_commit() {
+        let dir = tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        layout.init_directories().unwrap();
+        let perf = Arc::new(ServerPerfCounters::default());
+        let (writer, receiver, active, store) = paused_writer(layout, Arc::clone(&perf));
+        let object = content(70, 4096);
+        let hash = object.hash;
+        let task_writer = writer.clone();
+        let waiter = tokio::spawn(async move {
+            task_writer
+                .store_batch_for("cancelled-device", WriterClass::Bulk, vec![object])
+                .await
+        });
+        for _ in 0..100 {
+            if writer
+                .inner
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .messages
+                == 1
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            writer
+                .inner
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .messages,
+            1
+        );
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            writer
+                .inner
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .messages,
+            1
+        );
+
+        let thread_store = store.clone();
+        let thread = std::thread::spawn(move || writer_loop(receiver, active, thread_store));
+        for _ in 0..100 {
+            if store.contains(StorageObjectKind::Content, &hash)
+                && writer
+                    .inner
+                    .queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .messages
+                    == 0
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(store.contains(StorageObjectKind::Content, &hash));
+        assert_eq!(perf.snapshot().storage.fdatasyncs, 1);
+        assert_eq!(
+            writer
+                .inner
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .messages,
+            0
+        );
+        drop(writer);
+        thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_writer_releases_owner_and_global_reservations() {
+        let dir = tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        layout.init_directories().unwrap();
+        let perf = Arc::new(ServerPerfCounters::default());
+        let (writer, receiver, active, _store) = paused_writer(layout, Arc::clone(&perf));
+        drop(receiver);
+        drop(active);
+        let result = writer
+            .store_batch_for("closed-device", WriterClass::Bulk, vec![content(71, 1024)])
+            .await;
+        assert!(matches!(result, Err(StoreError::Closed)));
+        let queue = writer
+            .inner
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(queue.messages, 0);
+        assert_eq!(queue.bytes, 0);
+        assert!(queue.owners.is_empty());
+        assert_eq!(perf.snapshot().storage.writer_queue_depth, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

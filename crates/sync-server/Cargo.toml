@@ -17,6 +17,7 @@ blake3.workspace = true
 # ws: the Ph2 notify channel (see tasks/realtime-roadmap.md) — server→client
 # "root changed" frames; clients then pull over the sealed HTTP channel.
 axum = { version = "0.8", features = ["ws"] }
+http-body = "1"
 # Split the WebSocket into sink/stream halves so one task can forward
 # broadcast frames while another reads client subs/pings.
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }

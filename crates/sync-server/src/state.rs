@@ -8,6 +8,7 @@ use crate::secure::KEY_LEN;
 use crate::seq_tracker::SequenceTracker;
 use crate::storage::{StorageLayout, VaultStore};
 use crate::storage_writer::StorageWriter;
+use crate::transport_memory::TransportMemoryBudget;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Instant;
@@ -19,6 +20,9 @@ pub struct AppState {
     pub config: ServerConfig,
     pub layout: StorageLayout,
     pub vaults: VaultStore,
+    /// Changes on every process startup, including a restored backup. This
+    /// invalidates unaccepted old submissions, not durable receipt lookup.
+    pub root_incarnation: String,
     /// Raw bytes of the server's X25519 private key. Kept as bytes (not
     /// `StaticSecret`) so we can construct a fresh secret per request without
     /// worrying about Clone or thread-safety. 32 bytes copy per request is
@@ -40,6 +44,10 @@ pub struct AppState {
     /// Dedicated bounded immutable-object writer. One checksummed journal
     /// fdatasync commits a whole group before loose mirrors become visible.
     pub storage_writer: StorageWriter,
+    /// One process-wide owner for all sealed HTTP and bulk WS byte buffers.
+    /// Admission happens before body receive/decrypt or logical frame
+    /// assembly; dropping the phase owner returns capacity on every exit.
+    pub(crate) transport_memory: TransportMemoryBudget,
     /// Wall-clock monotonic start time — used by the admin dashboard to show
     /// uptime. Instant is Copy, so reading from Arc<AppState> needs no lock.
     pub started_at: Instant,
@@ -83,11 +91,13 @@ impl AppState {
         let control_io = blocking_io::control_pool();
         let storage_writer = StorageWriter::start(layout.clone(), Arc::clone(&perf))
             .expect("storage writer journal recovery failed");
+        let transport_memory = TransportMemoryBudget::process_default();
 
         Self {
             config,
             layout,
             vaults,
+            root_incarnation: hex::encode(rand::random::<[u8; 32]>()),
             server_priv_bytes: priv_bytes,
             eph: Arc::new(RwLock::new(eph)),
             sequences,
@@ -95,6 +105,7 @@ impl AppState {
             devices,
             control_io,
             storage_writer,
+            transport_memory,
             started_at: Instant::now(),
             vault_locks: StdMutex::new(HashMap::new()),
             notifiers: StdMutex::new(HashMap::new()),

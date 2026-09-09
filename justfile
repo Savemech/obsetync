@@ -149,9 +149,13 @@ clean-server:
 # part of the surface under test. Set OBSETYNC_E2E_KEEP=1 to leave the stack
 # running after tests finish (handy for ad-hoc curl / inspection).
 e2e: build-image e2e-up
-    -cargo test -p e2e-tests --features e2e -- --test-threads=1 --nocapture
-    @if [ -z "${OBSETYNC_E2E_KEEP:-}" ]; then just e2e-down; \
-     else echo "stack left running (OBSETYNC_E2E_KEEP=1); use 'just e2e-down' to stop"; fi
+    # Preserve the test result across cleanup; if tests passed, cleanup itself remains a gate.
+    @test_status=0; teardown_status=0; \
+     cargo test -p e2e-tests --features e2e -- --test-threads=1 --nocapture || test_status=$?; \
+     if [ -z "${OBSETYNC_E2E_KEEP:-}" ]; then just e2e-down || teardown_status=$?; \
+     else echo "stack left running (OBSETYNC_E2E_KEEP=1); use 'just e2e-down' to stop"; fi; \
+     if [ "$test_status" -ne 0 ]; then exit "$test_status"; fi; \
+     exit "$teardown_status"
 
 # Bring up the e2e stack and block until /health responds.
 e2e-up:

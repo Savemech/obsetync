@@ -60,12 +60,14 @@ impl LeafChunk {
 
     /// Serialize to FlatBuffers bytes.
     pub fn serialize(&self) -> Vec<u8> {
-        let mut builder = FlatBufferBuilder::<flatbuffers::DefaultAllocator>::with_capacity(
-            self.entries.len() * 80,
-        );
+        Self::serialize_entries(&self.entries)
+    }
 
-        let entries: Vec<_> = self
-            .entries
+    pub(crate) fn serialize_entries(entries: &[FileEntry]) -> Vec<u8> {
+        let mut builder =
+            FlatBufferBuilder::<flatbuffers::DefaultAllocator>::with_capacity(entries.len() * 80);
+
+        let entries: Vec<_> = entries
             .iter()
             .map(|e| {
                 let path = builder.create_string(&e.path);
@@ -142,6 +144,56 @@ impl LeafChunk {
         }
 
         Ok(Self { entries })
+    }
+
+    /// Validate a canonical leaf and borrow its search endpoints without
+    /// allocating owned `FileEntry` rows. This checks every path/hash while
+    /// keeping the native primitive bounded by the fixed leaf-size limit.
+    pub(crate) fn validated_path_bounds<'a>(
+        bytes: &'a [u8],
+        expected_prefix: &str,
+        exact_entries: Option<usize>,
+        max_entries: usize,
+    ) -> Result<Option<(&'a str, &'a str)>, ChunkError> {
+        let envelope = flatbuffers::root::<sync_chunk::ChunkEnvelope>(bytes)
+            .map_err(|error| ChunkError::Deserialize(error.to_string()))?;
+        if envelope.node_type() != sync_chunk::NodeType::LeafChunk {
+            return Err(ChunkError::Deserialize(format!(
+                "expected LeafChunk, got {:?}",
+                envelope.node_type()
+            )));
+        }
+        let leaf = envelope
+            .node_as_leaf_chunk()
+            .ok_or_else(|| ChunkError::Deserialize("missing LeafChunk node".into()))?;
+        let entries = leaf.entries();
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        if entries.len() > max_entries || exact_entries.is_some_and(|count| entries.len() != count)
+        {
+            return Err(ChunkError::Deserialize(
+                "leaf entry count is not canonical".into(),
+            ));
+        }
+        let mut previous = None;
+        for entry in entries.iter() {
+            let path = entry.path();
+            let prefix = path.find('/').map_or("", |index| &path[..=index]);
+            if prefix != expected_prefix
+                || previous.is_some_and(|previous_path: &str| previous_path >= path)
+                || entry.hash().len() != 32
+            {
+                return Err(ChunkError::Deserialize(
+                    "leaf path range is not canonical".into(),
+                ));
+            }
+            previous = Some(path);
+        }
+        Ok(Some((
+            entries.get(0).path(),
+            entries.get(entries.len() - 1).path(),
+        )))
     }
 }
 

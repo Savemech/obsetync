@@ -14,9 +14,15 @@ const AVG_CHUNK: u32 = 1024 * 1024; // 1MB
 /// Maximum sub-file chunk size.
 const MAX_CHUNK: u32 = 4 * 1024 * 1024; // 4MB
 
-/// Incremental FastCDC planner. At most MAX_CHUNK + one caller feed remains
-/// buffered; full-file hashing is incremental. Chunk bytes stay in the caller
-/// (the plugin can slice its source buffer only for hashes the server needs).
+/// Fixed payload-buffer allocation per live streaming chunker, including for
+/// files just above FILE_CHUNK_THRESHOLD. Callers separately account for the
+/// incoming feed, hasher state and the growing chunk-reference metadata.
+pub const STREAMING_CHUNKER_WINDOW_BYTES: usize = MAX_CHUNK as usize;
+
+/// Incremental FastCDC planner. The payload buffer never grows beyond one
+/// MAX_CHUNK window, regardless of caller feed size; full-file hashing is
+/// incremental. Chunk bytes stay in the caller (the plugin can slice its source
+/// buffer only for hashes the server needs).
 pub struct StreamingChunker {
     pending: Vec<u8>,
     pending_start: usize,
@@ -30,7 +36,7 @@ pub struct StreamingChunker {
 impl Default for StreamingChunker {
     fn default() -> Self {
         Self {
-            pending: Vec::with_capacity(MAX_CHUNK as usize),
+            pending: Vec::with_capacity(STREAMING_CHUNKER_WINDOW_BYTES),
             pending_start: 0,
             chunks: Vec::new(),
             file_hasher: blake3::Hasher::new(),
@@ -55,21 +61,30 @@ impl StreamingChunker {
             .total_size
             .checked_add(bytes.len() as u64)
             .ok_or("file size overflow")?;
-        self.pending.extend_from_slice(bytes);
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            // Reclaim the consumed prefix BEFORE appending. Extending first
+            // can grow the Vec even when the unconsumed data fits the window.
+            if self.pending_start != 0 {
+                self.pending.copy_within(self.pending_start.., 0);
+                self.pending
+                    .truncate(self.pending.len() - self.pending_start);
+                self.pending_start = 0;
+            }
+            let available = STREAMING_CHUNKER_WINDOW_BYTES - self.pending.len();
+            let take = available.min(remaining.len());
+            self.pending.extend_from_slice(&remaining[..take]);
+            remaining = &remaining[take..];
 
-        // Once MAX_CHUNK bytes are available, FastCDC's first boundary cannot
-        // depend on future input: it either finds a cut earlier or cuts at the
-        // configured maximum. Keep the remainder for the next feed.
-        while self.pending.len() - self.pending_start >= MAX_CHUNK as usize {
-            let first = FastCDC::new(
-                &self.pending[self.pending_start..],
-                MIN_CHUNK,
-                AVG_CHUNK,
-                MAX_CHUNK,
-            )
-            .next()
-            .ok_or("FastCDC produced no chunk")?;
-            self.emit_prefix(first.length);
+            // Once MAX_CHUNK bytes are available, the first boundary cannot
+            // depend on future input: an earlier cut or the configured maximum
+            // is final. A larger caller feed is consumed in bounded windows.
+            if self.pending.len() == STREAMING_CHUNKER_WINDOW_BYTES {
+                let first = FastCDC::new(&self.pending, MIN_CHUNK, AVG_CHUNK, MAX_CHUNK)
+                    .next()
+                    .ok_or("FastCDC produced no chunk")?;
+                self.emit_prefix(first.length);
+            }
         }
         Ok(())
     }
@@ -109,12 +124,6 @@ impl StreamingChunker {
         });
         self.emitted_size += length as u64;
         self.pending_start = end;
-        // Avoid shifting the remainder on every chunk. Compact only after a
-        // full maximum-chunk worth of consumed prefix has accumulated.
-        if self.pending_start >= MAX_CHUNK as usize {
-            self.pending.drain(..self.pending_start);
-            self.pending_start = 0;
-        }
     }
 }
 
@@ -247,6 +256,68 @@ mod tests {
                 assert_eq!(actual.size, expected.size);
             }
         }
+    }
+
+    #[test]
+    fn streaming_chunker_never_grows_its_window_for_arbitrary_feeds() {
+        let mut state = 0x6d2b79f5u32;
+        let data: Vec<u8> = (0..3 * STREAMING_CHUNKER_WINDOW_BYTES + 123)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        let expected = chunk_file(&data).manifest;
+        assert!(expected.chunks[..expected.chunks.len() - 1]
+            .iter()
+            .any(|chunk| chunk.size < MAX_CHUNK));
+
+        for feed_size in [
+            65_537,
+            262_147,
+            1024 * 1024,
+            STREAMING_CHUNKER_WINDOW_BYTES - 1,
+            STREAMING_CHUNKER_WINDOW_BYTES,
+            STREAMING_CHUNKER_WINDOW_BYTES + 1,
+            data.len(),
+        ] {
+            let mut streaming = StreamingChunker::new();
+            let allocation = streaming.pending.as_ptr();
+            assert_eq!(streaming.pending.capacity(), STREAMING_CHUNKER_WINDOW_BYTES);
+            for part in data.chunks(feed_size) {
+                streaming.update(part).unwrap();
+                assert_eq!(streaming.pending.as_ptr(), allocation);
+                assert_eq!(streaming.pending.capacity(), STREAMING_CHUNKER_WINDOW_BYTES);
+                assert!(streaming.pending.len() <= STREAMING_CHUNKER_WINDOW_BYTES);
+            }
+            let actual = streaming.finish().unwrap();
+            assert_eq!(actual.file_hash, expected.file_hash);
+            assert_eq!(actual.total_size, expected.total_size);
+            assert_eq!(actual.chunks.len(), expected.chunks.len());
+            for (actual, expected) in actual.chunks.iter().zip(&expected.chunks) {
+                assert_eq!(actual.hash, expected.hash);
+                assert_eq!(actual.offset, expected.offset);
+                assert_eq!(actual.size, expected.size);
+            }
+            assert_eq!(streaming.pending.as_ptr(), allocation);
+            assert_eq!(streaming.pending.capacity(), STREAMING_CHUNKER_WINDOW_BYTES);
+            assert!(streaming.pending.is_empty());
+        }
+    }
+
+    #[test]
+    fn streaming_chunker_window_is_fixed_even_for_threshold_sized_files() {
+        let mut streaming = StreamingChunker::new();
+        assert_eq!(streaming.pending.capacity(), 4 * 1024 * 1024);
+        streaming
+            .update(&vec![7; FILE_CHUNK_THRESHOLD as usize])
+            .unwrap();
+        assert_eq!(streaming.pending.capacity(), 4 * 1024 * 1024);
+        let manifest = streaming.finish().unwrap();
+        assert_eq!(manifest.total_size, FILE_CHUNK_THRESHOLD);
+        assert_eq!(streaming.pending.capacity(), 4 * 1024 * 1024);
     }
 
     #[test]

@@ -23,8 +23,15 @@ jobs:
   precheck:
     name: Preflight (fmt + tsc + plugin tests)
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release-version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: exact tag commit checkout
+        env:
+          EXPECTED_GIT_COMMIT: ${{ github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_GIT_COMMIT"
 
       # The repo-root manifest.json is what the Obsidian community-plugin bot
       # reads; plugin/manifest.json is what local/dev installs copy. They must
@@ -50,6 +57,21 @@ jobs:
           cache: npm
           cache-dependency-path: plugin/package-lock.json
 
+      - name: release version checker regressions
+        run: node scripts/check-release-version.test.mjs
+
+      - name: release version consistency
+        id: release-version
+        env:
+          OBSETYNC_RELEASE_EVENT_NAME: ${{ github.event_name }}
+          OBSETYNC_RELEASE_REF_NAME: ${{ github.ref_name }}
+        run: |
+          node scripts/check-release-version.mjs
+          echo "version=${OBSETYNC_RELEASE_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: release provenance regressions
+        run: node --test scripts/release-provenance.test.mjs
+
       - name: plugin tsc --noEmit
         working-directory: plugin
         run: |
@@ -60,6 +82,114 @@ jobs:
         working-directory: plugin
         run: npm test
 
+      - name: release artifact manifest tests
+        run: node scripts/release-artifact-manifest.test.mjs
+
+      - name: build identity injection tests
+        working-directory: plugin
+        run: node scripts/build-identity-config.test.mjs
+
+  # A tag is a new GitHub event and does not inherit green branch checks.
+  # Re-run the release-critical Rust, E2E and hermetic Nix gates against the
+  # exact tag commit before any registry or GitHub Release publication.
+  rust:
+    name: Release Rust tests
+    runs-on: ubuntu-latest
+    needs: precheck
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.95.0
+          target: wasm32-unknown-unknown
+          components: clippy
+      - name: workspace clippy
+        env:
+          RUSTFLAGS: ""
+        run: cargo clippy --workspace --locked --all-targets
+      - name: workspace tests
+        env:
+          RUSTFLAGS: ""
+          CC: clang
+        run: cargo test --workspace --locked
+      - name: sync-core wasm feature tests
+        env:
+          RUSTFLAGS: ""
+          CC: clang
+        run: cargo test -p sync-core --features wasm --locked
+
+  e2e:
+    name: Release E2E against exact server image
+    runs-on: ubuntu-latest
+    needs: [precheck, rust]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.95.0
+      - uses: docker/setup-buildx-action@v3
+      - name: Build exact server image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: server
+          load: true
+          tags: obsetync/server:local
+          build-args: |
+            OBSETYNC_BUILD_GIT_COMMIT=${{ github.sha }}
+            OBSETYNC_BUILD_SOURCE_STATE=clean
+            OBSETYNC_BUILD_EXPECTED_COMMIT=${{ github.sha }}
+            OBSETYNC_BUILD_REQUIRE_EXPECTED_COMMIT=1
+            OBSETYNC_BUILD_REQUIRE_CLEAN=1
+            OBSETYNC_BUILD_EXPECTED_VERSION=${{ needs.precheck.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Verify embedded server identity
+        run: |
+          docker run --rm obsetync/server:local build-identity > server-build-identity.json
+          node scripts/release-provenance.mjs verify-server-json server-build-identity.json \
+            '${{ needs.precheck.outputs.version }}' '${{ github.sha }}' clean
+      - name: Bring up E2E stack
+        run: docker compose -f docker-compose.e2e.yml up -d
+      - name: Wait for health
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:27282/health >/dev/null 2>&1; then exit 0; fi
+            sleep 1
+          done
+          docker compose -f docker-compose.e2e.yml logs --tail=120 e2e-server
+          exit 1
+      - name: Run E2E suite
+        env:
+          RUSTFLAGS: ""
+          CC: clang
+        run: cargo test -p e2e-tests --features e2e --locked -- --test-threads=1
+      - name: Dump server logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.e2e.yml logs --tail=300 e2e-server
+      - name: Tear down E2E stack
+        if: always()
+        run: docker compose -f docker-compose.e2e.yml down -v --remove-orphans
+
+  nix-check:
+    name: Release Nix flake check
+    runs-on: ubuntu-latest
+    needs: [precheck, rust]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Check complete flake
+        run: nix flake check --print-build-logs
+      - name: Build and verify exact Nix server
+        run: |
+          nix build .#server --print-build-logs --out-link result-server
+          node scripts/release-provenance.mjs verify-server result-server/bin/sync-server \
+            '${{ needs.precheck.outputs.version }}' '${{ github.sha }}' clean
+
   # ---------------------------------------------------------------------------
   # Plugin artifacts: build main.js + WASM, attach to the GitHub Release.
   # Obsidian's auto-updater (and BRAT) expects individual files at release root.
@@ -68,9 +198,16 @@ jobs:
   plugin:
     name: Build plugin artifacts
     runs-on: ubuntu-latest
-    needs: precheck
+    timeout-minutes: 30
+    needs: [precheck, rust, e2e, nix-check, binary]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Restore exact release server binary
+        uses: actions/download-artifact@v4
+        with:
+          name: server-binary
+          path: native-server
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -79,11 +216,20 @@ jobs:
 
       - name: Install WASM tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y binaryen
+          curl -sSfL https://github.com/WebAssembly/binaryen/releases/download/version_117/binaryen-version_117-x86_64-linux.tar.gz \
+            -o /tmp/binaryen-version_117-x86_64-linux.tar.gz
+          echo "3dc677006555b355ea2da5e82602065a161d5e83eaefd3f759afa00b96e83212  /tmp/binaryen-version_117-x86_64-linux.tar.gz" \
+            | sha256sum -c -
+          sudo tar -xz -C /usr/local/bin --strip-components=2 \
+            -f /tmp/binaryen-version_117-x86_64-linux.tar.gz \
+            binaryen-version_117/bin/wasm-opt
           curl -sSfL https://github.com/rustwasm/wasm-pack/releases/download/v0.13.1/wasm-pack-v0.13.1-x86_64-unknown-linux-musl.tar.gz \
-            | sudo tar -xz -C /usr/local/bin --strip-components=1 \
-                wasm-pack-v0.13.1-x86_64-unknown-linux-musl/wasm-pack
+            -o /tmp/wasm-pack-v0.13.1-x86_64-unknown-linux-musl.tar.gz
+          echo "c539d91ccab2591a7e975bcf82c82e1911b03335c80aa83d67ad25ed2ad06539  /tmp/wasm-pack-v0.13.1-x86_64-unknown-linux-musl.tar.gz" \
+            | sha256sum -c -
+          sudo tar -xz -C /usr/local/bin --strip-components=1 \
+            -f /tmp/wasm-pack-v0.13.1-x86_64-unknown-linux-musl.tar.gz \
+            wasm-pack-v0.13.1-x86_64-unknown-linux-musl/wasm-pack
 
       - uses: actions/setup-node@v4
         with:
@@ -97,11 +243,47 @@ jobs:
       - name: Verify scalar/SIMD parity
         run: node scripts/verify-wasm-parity.mjs plugin/wasm
 
-      - name: Build plugin bundle
+      - name: Verify WASM allocation lifetime and 25k rebuilds
+        run: node scripts/verify-wasm-memory.mjs plugin/wasm
+
+      - name: Install plugin dependencies
+        working-directory: plugin
+        run: npm ci --no-audit --no-fund
+
+      - name: Verify native root mutation complexity
+        working-directory: plugin
+        run: npm run test:native-root-complexity
+
+      - name: Verify native WS data lane
+        working-directory: plugin
+        env:
+          NODE_OPTIONS: --experimental-websocket
+        run: |
+          chmod 0755 "$GITHUB_WORKSPACE/native-server/sync-server"
+          npm run test:native-ws-data -- --binary "$GITHUB_WORKSPACE/native-server/sync-server"
+
+      - name: Verify crash recovery before root commit
+        working-directory: plugin
+        run: npm run test:native-root-crash -- --case objects-before-root --binary "$GITHUB_WORKSPACE/native-server/sync-server"
+
+      - name: Verify crash recovery after accepted root
+        working-directory: plugin
+        run: npm run test:native-root-crash -- --case root-accepted-before-response --binary "$GITHUB_WORKSPACE/native-server/sync-server"
+
+      - name: Test actual browser bundles
         working-directory: plugin
         run: |
-          npm ci --no-audit --no-fund
-          node esbuild.config.mjs production
+          npm run test:browser-probe
+          npm run test:browser-hash-worker
+
+      - name: Build plugin bundle
+        working-directory: plugin
+        env:
+          OBSETYNC_BUILD_GIT_COMMIT: ${{ github.sha }}
+          OBSETYNC_BUILD_EXPECTED_COMMIT: ${{ github.sha }}
+          OBSETYNC_BUILD_REQUIRE_EXPECTED_COMMIT: "1"
+          OBSETYNC_BUILD_REQUIRE_CLEAN: "1"
+        run: node esbuild.config.mjs production
 
       - name: Stage flat release assets
         run: |
@@ -132,20 +314,13 @@ jobs:
           echo "Release assets:"
           ls -la release/
 
-      - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Stage plugin workflow artifact
+        uses: actions/upload-artifact@v4
         with:
-          files: |
-            release/main.js
-            release/manifest.json
-            release/styles.css
-            release/sync_core.js
-            release/sync_core_bg.wasm
-            release/sync_core_simd.js
-            release/sync_core_simd_bg.wasm
-            release/versions.json
-            release/obsetync-*.zip
-          generate_release_notes: true
+          name: plugin-release-assets
+          retention-days: 1
+          path: release/
+          if-no-files-found: error
 
   # ---------------------------------------------------------------------------
   # Docker image: build via the Dockerfile, push to ghcr.io with semver tags.
@@ -153,7 +328,10 @@ jobs:
   docker:
     name: Docker image → ghcr.io
     runs-on: ubuntu-latest
-    needs: precheck
+    needs: [precheck, rust, e2e, nix-check, plugin]
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      repository: ${{ steps.image.outputs.repository }}
     steps:
       - uses: actions/checkout@v4
 
@@ -165,24 +343,39 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Canonical image repository
+        id: image
+        env:
+          SOURCE_REPOSITORY: ghcr.io/${{ github.repository }}
+        run: echo "repository=${SOURCE_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
       - name: Derive tags
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ steps.image.outputs.repository }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=latest
 
-      - uses: docker/build-push-action@v5
+      - name: Build and push exact Dockerfile image
+        id: build
+        uses: docker/build-push-action@v5
         with:
           context: .
           target: server
           push: true
           tags:   ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            OBSETYNC_BUILD_GIT_COMMIT=${{ github.sha }}
+            OBSETYNC_BUILD_SOURCE_STATE=clean
+            OBSETYNC_BUILD_EXPECTED_COMMIT=${{ github.sha }}
+            OBSETYNC_BUILD_REQUIRE_EXPECTED_COMMIT=1
+            OBSETYNC_BUILD_REQUIRE_CLEAN=1
+            OBSETYNC_BUILD_EXPECTED_VERSION=${{ needs.precheck.outputs.version }}
           cache-from: type=gha
           cache-to:   type=gha,mode=max
 
@@ -193,7 +386,10 @@ jobs:
   docker-nix:
     name: Nix Docker image → ghcr.io
     runs-on: ubuntu-latest
-    needs: precheck
+    needs: [precheck, rust, e2e, nix-check, plugin]
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      repository: ${{ steps.push.outputs.repository }}
     steps:
       - uses: actions/checkout@v4
 
@@ -216,7 +412,14 @@ jobs:
       - name: Load into Docker
         run: docker load < result
 
+      - name: Verify loaded Nix image identity
+        run: |
+          docker run --rm obsetync-server:nix build-identity > nix-server-build-identity.json
+          node scripts/release-provenance.mjs verify-server-json nix-server-build-identity.json \
+            '${{ needs.precheck.outputs.version }}' '${{ github.sha }}' clean
+
       - name: Tag + push
+        id: push
         env:
           VERSION: ${{ github.ref_name }}
         run: |
@@ -229,6 +432,10 @@ jobs:
           docker tag obsetync-server:nix "${REPO}:latest"
           docker push "${REPO}:${VERSION_CLEAN}"
           docker push "${REPO}:latest"
+          DIGEST="$(docker buildx imagetools inspect "${REPO}:${VERSION_CLEAN}" --format '{{.Manifest.Digest}}')"
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "repository=$REPO" >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
   # Bare-metal server binary: extract the stripped sync-server for people who
@@ -237,7 +444,7 @@ jobs:
   binary:
     name: Server binary (x86_64-linux)
     runs-on: ubuntu-latest
-    needs: precheck
+    needs: [precheck, rust, e2e, nix-check]
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -248,13 +455,74 @@ jobs:
           docker buildx build \
             --target binary-dist \
             --output type=local,dest=out \
+            --build-arg OBSETYNC_BUILD_GIT_COMMIT='${{ github.sha }}' \
+            --build-arg OBSETYNC_BUILD_SOURCE_STATE=clean \
+            --build-arg OBSETYNC_BUILD_EXPECTED_COMMIT='${{ github.sha }}' \
+            --build-arg OBSETYNC_BUILD_REQUIRE_EXPECTED_COMMIT=1 \
+            --build-arg OBSETYNC_BUILD_REQUIRE_CLEAN=1 \
+            --build-arg OBSETYNC_BUILD_EXPECTED_VERSION='${{ needs.precheck.outputs.version }}' \
             --cache-from type=gha \
             --cache-to type=gha,mode=max \
             .
           ls -la out
           file out/sync-server
 
-      - name: Upload to GitHub Release
+      - name: Verify exact binary provenance
+        run: node scripts/release-provenance.mjs verify-server out/sync-server \
+          '${{ needs.precheck.outputs.version }}' '${{ github.sha }}' clean
+
+      - name: Stage server workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-binary
+          retention-days: 1
+          path: out/sync-server
+          if-no-files-found: error
+
+  release:
+    name: Publish verified GitHub Release
+    runs-on: ubuntu-latest
+    needs: [precheck, plugin, binary, docker, docker-nix]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/download-artifact@v4
+        with:
+          name: plugin-release-assets
+          path: release
+      - uses: actions/download-artifact@v4
+        with:
+          name: server-binary
+          path: release
+      - name: Verify binary and record immutable container outputs
+        run: |
+          chmod 0755 release/sync-server
+          node scripts/release-provenance.mjs verify-server release/sync-server \
+            '${{ needs.precheck.outputs.version }}' '${{ github.sha }}' clean
+          node scripts/release-provenance.mjs create-containers release/container-images.json \
+            '${{ needs.precheck.outputs.version }}' '${{ github.sha }}' \
+            '${{ needs.docker.outputs.repository }}' '${{ needs.docker.outputs.digest }}' \
+            '${{ needs.docker-nix.outputs.repository }}' '${{ needs.docker-nix.outputs.digest }}'
+      - name: Generate and verify complete release artifact manifest
+        run: |
+          node scripts/release-artifact-manifest.mjs generate release "obsetync-${{ github.ref_name }}.zip"
+          node scripts/release-artifact-manifest.mjs verify release "obsetync-${{ github.ref_name }}.zip"
+      - name: Upload verified release assets
         uses: softprops/action-gh-release@v2
         with:
-          files: out/sync-server
+          files: |
+            release/main.js
+            release/manifest.json
+            release/styles.css
+            release/sync_core.js
+            release/sync_core_bg.wasm
+            release/sync_core_simd.js
+            release/sync_core_simd_bg.wasm
+            release/versions.json
+            release/obsetync-*.zip
+            release/sync-server
+            release/container-images.json
+            release/artifact-manifest.json
+          generate_release_notes: true

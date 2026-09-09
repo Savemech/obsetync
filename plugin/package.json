@@ -6,12 +6,20 @@
   "scripts": {
     "build": "node esbuild.config.mjs production",
     "dev": "node esbuild.config.mjs",
-    "test": "node --test scripts/run-tests.test.mjs && node scripts/run-tests.mjs",
+    "test": "node --test scripts/run-tests.test.mjs scripts/build-wasm-contract.test.mjs scripts/native-root-io.test.mjs scripts/native-root-metrics.test.mjs scripts/native-root-instrumentation.test.mjs scripts/native-root-child.test.mjs scripts/native-root-qualification.test.mjs scripts/native-root-auto-diagnostic.test.mjs scripts/native-root-audit-diagnostic.test.mjs scripts/settings-fence.test.mjs scripts/conflict-ui-lifecycle.test.mjs && node scripts/run-tests.mjs && node scripts/test-main-lifecycle.mjs && node scripts/test-wasm-memory.mjs",
+    "test:main-lifecycle": "node scripts/test-main-lifecycle.mjs",
+    "test:native-root-crash": "node scripts/test-native-root-crash-recovery.mjs",
+    "test:native-root-complexity": "node scripts/test-native-root-mutation-complexity.mjs",
+    "test:native-ws-data": "node scripts/test-native-ws-data.mjs",
+    "test:browser-probe": "node --test scripts/browser-probe.test.mjs",
+    "test:browser-hash-worker": "node --test scripts/browser-hash-worker.test.mjs",
+    "test:wasm-memory": "node scripts/test-wasm-memory.mjs",
     "bench:perf": "node scripts/run-tests.mjs src/perf-overhead.bench.ts",
     "bench:bulk": "esbuild src/bulk-planner.bench.ts --bundle --platform=node --format=cjs | node",
     "bench:ws-data": "esbuild src/ws-data.bench.ts --bundle --platform=node --format=cjs | node",
     "bench:ranged": "esbuild src/desktop-ranged-upload.bench.ts --bundle --platform=node --format=cjs | node",
-    "bench:governor": "node scripts/run-resource-governor-bench.mjs"
+    "bench:governor": "node scripts/run-resource-governor-bench.mjs",
+    "bench:native-root": "node scripts/bench-native-root.mjs"
   },
   "dependencies": {
     "@noble/curves": "^1.6.0"

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { PerfTrace, perfSampleWeight } from "./perf-trace";
+import { AdaptiveResourceGovernor } from "./resource-governor";
 
 const FILES = 8_192;
 const BYTES_PER_FILE = 64 * 1024;
@@ -9,13 +10,14 @@ const RUNS_PER_SAMPLE = 2;
 const LIVE_BATCH_FILES = 4;
 const SNAPSHOT_EVERY_FILES = 1_024;
 const DEBUG_EVERY_FILES = 4_096;
+const WINDOW_EVERY_FILES = 2_048;
 const payload = Buffer.allocUnsafe(BYTES_PER_FILE);
 for (let index = 0; index < payload.length; index++) payload[index] = index & 0xff;
 
 let digestSink = 0;
 let telemetrySink = 0;
 
-type Scenario = "sampled-phases" | "live-batches";
+type Scenario = "sampled-phases" | "live-batches" | "active-window-control";
 
 interface PairedTiming {
     baselineMs: number;
@@ -28,7 +30,19 @@ interface PairedTiming {
  * window, and both pay the same outer high-resolution timer cost.
  */
 function pairedWorkload(sample: number, scenario: Scenario): PairedTiming {
-    const trace = new PerfTrace({ maxRecords: 2, monitorEventLoop: false });
+    const trace = new PerfTrace({ maxRecords: 2, monitorEventLoop: false, monitorWindows: false });
+    const governor = scenario === "active-window-control" ? new AdaptiveResourceGovernor({
+        runtime: "desktop", architecture: "x64", os: "linux",
+        hardwareConcurrency: 8, simdAvailable: true,
+    }) : null;
+    const unsubscribe = governor ? trace.subscribeWindows(window => {
+        governor.observeWindow({
+            ...window, operationKind: window.kind,
+            maxConcurrency: { hash: 1 },
+            budget: { limitBytes: 128 * 1024 * 1024, reservedBytes: 0, coveredAxes: [] },
+        });
+        telemetrySink += governor.snapshot().controls.read;
+    }) : undefined;
     const operation = trace.begin("scan");
     operation.setWorkload({
         filesTotal: FILES,
@@ -52,9 +66,10 @@ function pairedWorkload(sample: number, scenario: Scenario): PairedTiming {
 
     const runInstrumented = (index: number) => {
         const started = process.hrtime.bigint();
-        if (scenario === "live-batches" && index % LIVE_BATCH_FILES === 0) {
+        if (scenario !== "sampled-phases" && index % LIVE_BATCH_FILES === 0) {
             endBatch = operation.phase("scan_batch");
             operation.observePeakBatchBytes(LIVE_BATCH_FILES * BYTES_PER_FILE);
+            if (governor) operation.setDemand({ read: FILES - index, hash: FILES - index });
         }
         const sampleWeight = perfSampleWeight(index, FILES);
         const readStarted = sampleWeight > 0 ? performance.now() : 0;
@@ -71,7 +86,7 @@ function pairedWorkload(sample: number, scenario: Scenario): PairedTiming {
         if (sampleWeight > 0) {
             operation.addPhase("hash", (performance.now() - hashStarted) * sampleWeight);
         }
-        if (scenario === "live-batches") {
+        if (scenario !== "sampled-phases") {
             // Include allocation/formatting while a batch is open. These are
             // deliberately occasional, not a hot-loop debug poll per file.
             if (index % SNAPSHOT_EVERY_FILES === 0) {
@@ -80,10 +95,12 @@ function pairedWorkload(sample: number, scenario: Scenario): PairedTiming {
             if (index % DEBUG_EVERY_FILES === 0) {
                 telemetrySink += trace.formatDebug().join("\n").length;
             }
+            if (governor && (index + 1) % WINDOW_EVERY_FILES === 0) trace.sampleWindows();
             if ((index + 1) % LIVE_BATCH_FILES === 0) {
                 endBatch!();
                 endBatch = undefined;
                 operation.increment({ filesCompleted: LIVE_BATCH_FILES });
+                if (governor) operation.setDemand({});
             }
         }
         instrumentedNs += process.hrtime.bigint() - started;
@@ -108,6 +125,7 @@ function pairedWorkload(sample: number, scenario: Scenario): PairedTiming {
     }
     if (scenario === "sampled-phases") operation.increment({ filesCompleted: FILES });
     operation.finish("success");
+    unsubscribe?.();
     return {
         baselineMs: Number(baselineNs) / 1_000_000,
         instrumentedMs: Number(instrumentedNs) / 1_000_000,
@@ -161,7 +179,7 @@ function measureScenario(scenario: Scenario) {
     };
 }
 
-const scenarios = (["sampled-phases", "live-batches"] as const).map(measureScenario);
+const scenarios = (["sampled-phases", "live-batches", "active-window-control"] as const).map(measureScenario);
 const report = {
     schemaVersion: 2,
     filesPerRun: FILES,
@@ -174,6 +192,7 @@ const report = {
     liveBatchFiles: LIVE_BATCH_FILES,
     snapshotEveryFiles: SNAPSHOT_EVERY_FILES,
     debugEveryFiles: DEBUG_EVERY_FILES,
+    windowEveryFiles: WINDOW_EVERY_FILES,
     // This isolates CPU instrumentation cost, not storage, scheduling, mobile
     // memory pressure or UI responsiveness. Open span durations include the
     // interleaved baseline arm and are not used as throughput evidence.

@@ -24,6 +24,16 @@ pub struct ServerPerfCounters {
     response_seal_ns: AtomicU64,
     response_seal_failures: AtomicU64,
 
+    http_receive_admitted: AtomicU64,
+    http_receive_completed: AtomicU64,
+    http_receive_busy: AtomicU64,
+    http_receive_oversized: AtomicU64,
+    http_receive_unknown_length: AtomicU64,
+    http_receive_bounded_failures: AtomicU64,
+    http_receive_inflight: AtomicU64,
+    http_receive_inflight_bytes: AtomicU64,
+    http_receive_peak_bytes: AtomicU64,
+
     ws_data_accepted: AtomicU64,
     ws_data_completed: AtomicU64,
     ws_data_errors: AtomicU64,
@@ -85,9 +95,42 @@ pub struct DiffSample {
 pub struct ServerPerfSnapshot {
     pub schema_version: u8,
     pub requests: RequestPerfSnapshot,
+    pub http_receive: HttpReceivePerfSnapshot,
     pub storage: StoragePerfSnapshot,
     pub diff: DiffPerfSnapshot,
     pub ws_data: WsDataPerfSnapshot,
+}
+
+/// Aggregate sealed-HTTP admission without paths or identities. The owner
+/// covers request receive/decrypt and bounded response aggregation/sealing.
+/// `completed` means the reservation owner was released; request success is
+/// reported separately by `requests.errors`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct HttpReceivePerfSnapshot {
+    pub admitted: u64,
+    pub completed: u64,
+    pub busy: u64,
+    pub oversized: u64,
+    pub unknown_length: u64,
+    pub bounded_receive_failures: u64,
+    pub inflight: u64,
+    pub inflight_bytes: u64,
+    pub peak_bytes: u64,
+}
+
+pub struct HttpReceiveGuard {
+    counters: Arc<ServerPerfCounters>,
+    bytes: u64,
+}
+
+impl Drop for HttpReceiveGuard {
+    fn drop(&mut self) {
+        self.counters.http_receive_completed.fetch_add(1, RELAXED);
+        self.counters.http_receive_inflight.fetch_sub(1, RELAXED);
+        self.counters
+            .http_receive_inflight_bytes
+            .fetch_sub(self.bytes, RELAXED);
+    }
 }
 
 /// Only admitted object RPCs are counted: auth, malformed frames and rejected
@@ -196,6 +239,37 @@ pub struct DiffPerfSnapshot {
 }
 
 impl ServerPerfCounters {
+    pub fn begin_http_receive(self: &Arc<Self>, bytes: usize) -> HttpReceiveGuard {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.http_receive_admitted.fetch_add(1, RELAXED);
+        self.http_receive_inflight.fetch_add(1, RELAXED);
+        let current = self
+            .http_receive_inflight_bytes
+            .fetch_add(bytes, RELAXED)
+            .saturating_add(bytes);
+        update_peak(&self.http_receive_peak_bytes, current);
+        HttpReceiveGuard {
+            counters: self.clone(),
+            bytes,
+        }
+    }
+
+    pub fn record_http_receive_busy(&self) {
+        self.http_receive_busy.fetch_add(1, RELAXED);
+    }
+
+    pub fn record_http_receive_oversized(&self) {
+        self.http_receive_oversized.fetch_add(1, RELAXED);
+    }
+
+    pub fn record_http_receive_unknown_length(&self) {
+        self.http_receive_unknown_length.fetch_add(1, RELAXED);
+    }
+
+    pub fn record_http_receive_bounded_failure(&self) {
+        self.http_receive_bounded_failures.fetch_add(1, RELAXED);
+    }
+
     pub fn begin_ws_data_rpc(self: &Arc<Self>) -> WsDataRpcGuard {
         self.ws_data_accepted.fetch_add(1, RELAXED);
         self.ws_data_inflight_rpcs.fetch_add(1, RELAXED);
@@ -404,6 +478,17 @@ impl ServerPerfCounters {
                 response_seal_ns: load(&self.response_seal_ns),
                 response_seal_failures: load(&self.response_seal_failures),
             },
+            http_receive: HttpReceivePerfSnapshot {
+                admitted: load(&self.http_receive_admitted),
+                completed: load(&self.http_receive_completed),
+                busy: load(&self.http_receive_busy),
+                oversized: load(&self.http_receive_oversized),
+                unknown_length: load(&self.http_receive_unknown_length),
+                bounded_receive_failures: load(&self.http_receive_bounded_failures),
+                inflight: load(&self.http_receive_inflight),
+                inflight_bytes: load(&self.http_receive_inflight_bytes),
+                peak_bytes: load(&self.http_receive_peak_bytes),
+            },
             storage: StoragePerfSnapshot {
                 loose_reads: load(&self.loose_reads),
                 loose_writes: load(&self.loose_writes),
@@ -454,6 +539,16 @@ fn duration_ns(duration: Duration) -> u64 {
 
 fn load(value: &AtomicU64) -> u64 {
     value.load(RELAXED)
+}
+
+fn update_peak(peak: &AtomicU64, value: u64) {
+    let mut observed = peak.load(RELAXED);
+    while value > observed {
+        match peak.compare_exchange_weak(observed, value, RELAXED, RELAXED) {
+            Ok(_) => break,
+            Err(actual) => observed = actual,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -538,6 +633,34 @@ mod tests {
         assert_eq!(snapshot.errors, 0);
         assert_eq!(snapshot.inflight_rpcs, 0);
         assert_eq!(snapshot.responses_sending, 0);
+    }
+
+    #[test]
+    fn http_receive_owner_reports_pressure_and_exact_release() {
+        let counters = Arc::new(ServerPerfCounters::default());
+        counters.record_http_receive_unknown_length();
+        counters.record_http_receive_busy();
+        counters.record_http_receive_oversized();
+        counters.record_http_receive_bounded_failure();
+        let owner = counters.begin_http_receive(4096);
+
+        let active = counters.snapshot().http_receive;
+        assert_eq!(active.admitted, 1);
+        assert_eq!(active.completed, 0);
+        assert_eq!(active.busy, 1);
+        assert_eq!(active.oversized, 1);
+        assert_eq!(active.unknown_length, 1);
+        assert_eq!(active.bounded_receive_failures, 1);
+        assert_eq!(active.inflight, 1);
+        assert_eq!(active.inflight_bytes, 4096);
+        assert_eq!(active.peak_bytes, 4096);
+
+        drop(owner);
+        let released = counters.snapshot().http_receive;
+        assert_eq!(released.completed, 1);
+        assert_eq!(released.inflight, 0);
+        assert_eq!(released.inflight_bytes, 0);
+        assert_eq!(released.peak_bytes, 4096);
     }
 
     #[test]

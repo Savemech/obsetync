@@ -8,6 +8,23 @@ import type { PerfOperation } from "./perf-trace";
 import { BulkObjectKind } from "./bulk-codec";
 import { getHashTuning, planByteBoundedBatches } from "./hash-runtime";
 import { diffCursorFromHex, diffCursorToHex } from "./diff-page-codec";
+import type { TransientWorkScope } from "./transient-memory";
+import { throwIfWorkAborted, yieldWork } from "./work-scheduler";
+import {
+    abortTreeCandidateAfterReachabilityRetirement,
+    beginTreeCandidate,
+    drainTreeReachabilityRetirement,
+} from "./tree-candidate-job";
+import {
+    abortTreeCandidateAfterMutationRetirement,
+    applyTreeCandidateMutation,
+    drainTreeCandidateMutationRetirement,
+    hasPendingTreeCandidateMutationRetirement,
+} from "./tree-candidate-mutation-job";
+import { admitCandidateMutationOutput } from "./candidate-mutation-output-admission";
+import { admitCandidateOpenRoot } from "./candidate-open-root-admission";
+import type { RootTreeResidentAdmission } from "./root-tree-resident-admission";
+import { settleTreeCandidateOutputWithAdmission } from "./tree-output-settlement";
 
 const CHUNK_THRESHOLD = 1_048_576; // 1MB
 const MAX_CONTENT_CHUNK = 4 * 1_048_576;
@@ -15,6 +32,24 @@ const DESKTOP_BULK_DOWNLOAD_BYTES = 8 * 1_048_576;
 const MOBILE_BULK_DOWNLOAD_BYTES = 2 * 1_048_576;
 const BULK_DOWNLOAD_FILES = 256;
 const TRANSFER_DIR = ".obsidian/plugins/obsetync/transfers";
+const STAGING_CHECKPOINT_MAX_BYTES = 16 * 1024;
+const STAGING_QUOTA_BYTES = 4 * 1024 * 1024 * 1024;
+const STAGING_QUOTA_FILES = 128;
+const STAGING_QUOTA_WAITERS = 16;
+
+export const LARGE_TRANSFER_STAGING_LIMITS = {
+    bytes: STAGING_QUOTA_BYTES,
+    files: STAGING_QUOTA_FILES,
+    checkpointBytes: STAGING_CHECKPOINT_MAX_BYTES,
+} as const;
+
+export class LargeTransferStagingQuotaError extends Error {
+    readonly code = "LARGE_TRANSFER_STAGING_QUOTA";
+    constructor(message: string) {
+        super(message);
+        this.name = "LargeTransferStagingQuotaError";
+    }
+}
 
 export async function allSettledBounded<T, R>(
     items: readonly T[],
@@ -68,18 +103,65 @@ export interface PullResult {
     deferredCount: number;
     /** Subset of deferredCount caused by unsynced local edits. */
     localDeferredCount: number;
+    /** Remote upserts intentionally omitted by local policy (currently ignore
+     *  rules). They are not local deletions and therefore also prevent base
+     *  adoption/cursor completion until a preservation model exists. */
+    remoteOmissionCount: number;
     /** Number of files this pull actually fetched from the server. Zero
      *  means every applied delta verified against local disk — the content is
      *  provably identical to the server, so a tree-hash mismatch is metadata
      *  (mtime) only, not a real divergence, and is safe to adopt rather than
      *  pause. */
     downloaded: number;
+    /** A completed paged-diff checkpoint can survive a renderer restart while
+     *  the volatile/cached tree still represents an earlier page. No deltas
+     *  remain to replay into that tree, so the engine must rebuild it from the
+     *  recovered sync-base before evaluating parity or adopting the root. */
+    requiresTreeRebuild?: boolean;
+}
+
+/** Pull already changed disk and/or sync-base, but its matching in-memory
+ * tree transaction failed. The caller must preserve the previous merge base
+ * and reconstruct the volatile tree before doing any more ordinary work. */
+export class PullTreeRebaseError extends Error {
+    readonly code = "PULL_TREE_REBASE_FAILED";
+
+    constructor(readonly rebaseCause: unknown) {
+        super("pull tree rebase failed; volatile tree repair required");
+        this.name = "PullTreeRebaseError";
+    }
 }
 
 /** Set-like live guard. A real Set is accepted, while the sync engine can
  *  provide a dynamic view that also sees editor events arriving mid-pull. */
 export interface PullPathGuard {
     has(path: string): boolean;
+}
+
+interface PullLargeTransferScope {
+    /** Vault and remote diff generation which selected this file. */
+    vaultId: string;
+    rootScope: string;
+}
+
+/** Engine-owned asynchronous mutation boundary. Direct structural callers
+ * may omit it and retain the synchronous V1 compatibility path. Production
+ * supplies a resident ledger, exact wrapper/scope checks, cancellable host
+ * turns for new work, and uncancellable turns for mandatory retirement. */
+export interface PullTreeMutationContext {
+    readonly signal?: AbortSignal;
+    readonly residentAdmission: RootTreeResidentAdmission;
+    cooperate(): Promise<void>;
+    cooperateRetirement(): Promise<void>;
+    assertCurrent(): void;
+}
+
+function assertPullTreeMutationCurrent(mutation?: PullTreeMutationContext): void {
+    if (!mutation) return;
+    throwIfWorkAborted(mutation.signal);
+    mutation.assertCurrent();
+    // A scope callback can synchronously stop its own operation.
+    throwIfWorkAborted(mutation.signal);
 }
 
 /**
@@ -110,15 +192,25 @@ export async function pull(
      *  These paths are skipped on disk AND in the tree. Keeping the previous
      *  treeBaseRoot forces a real server-side three-way merge. */
     skipPaths?: PullPathGuard,
-    /** Slice 2 ignore predicate. Ignored UPSERTS are dropped (never fetched —
-     *  this is what stops a stale device choking on a target/ binary — never
-     *  tracked, never in the tree). Ignored DELETES untrack the path (sync-base
-     *  + tree) WITHOUT deleting disk, so a server-side purge of ignored paths
-     *  converges the fleet while every device keeps its local copy. */
+    /** Slice 2 ignore predicate. Ignored UPSERTS are omitted locally and keep
+     *  the previous verified merge base; they are never misrepresented as
+     *  deletions by adopting a root the local tree cannot reproduce. Ignored
+     *  DELETES untrack the path (sync-base + tree) WITHOUT deleting disk. */
     isIgnored?: (path: string) => boolean,
     perf?: PerfOperation,
     beforeHeavyBatch?: () => Promise<void>,
+    treeMutation?: PullTreeMutationContext,
 ): Promise<PullResult> {
+    if (treeMutation) {
+        if (!tree) throw new TypeError("pull tree mutation context requires a tree owner");
+        // Direct engine calls and future callers share the same boundary:
+        // retained native owners are retired before even a capability probe.
+        // Cleanup keeps its originally captured uncancellable cooperation;
+        // only new work observes the current operation signal/scope.
+        await drainTreeCandidateMutationRetirement(tree);
+        await drainTreeReachabilityRetirement(tree);
+        assertPullTreeMutationCurrent(treeMutation);
+    }
     // New servers stream a fixed snapshot through bounded binary pages. Keep
     // the legacy JSON path below intact for compatibility with 1.10.x and for
     // narrowly-scoped tests/mocks that intentionally expose only getDiff().
@@ -136,7 +228,9 @@ export async function pull(
         isIgnored,
         perf,
         beforeHeavyBatch,
+        treeMutation,
     );
+    assertPullTreeMutationCurrent(treeMutation);
     if (paged !== undefined) return paged;
 
     // --- First-time client: bulk-seed from the server ------------------
@@ -162,7 +256,8 @@ export async function pull(
             // server": otherwise the first later local edit would push with
             // an empty parent and be rejected because a current root exists.
             const endTree = perf?.phase("tree_update");
-            const deltasHadMtime = rebaseTree(tree, syncBase, []);
+            const deltasHadMtime = await rebaseTree(tree, syncBase, [], treeMutation);
+            assertPullTreeMutationCurrent(treeMutation);
             endTree?.();
             let newRootHash: string | null = null;
             let newRootBytes: Uint8Array | null = null;
@@ -190,9 +285,14 @@ export async function pull(
                 deltasHadMtime,
                 deferredCount: 0,
                 localDeferredCount: 0,
+                remoteOmissionCount: 0,
                 downloaded: 0,
             };
         }
+        // The diff already proved that this is not a genuinely empty remote.
+        // Publish that fact before any file work so a renderer kill cannot
+        // turn an incomplete bootstrap into an empty-parent first push.
+        if (syncBase.setVerifiedBaseRequired(true)) await syncBase.checkpoint();
         const { kept, ignoredDeletes, ignoredUpserts } = splitIgnored(deltas, isIgnored);
         for (const d of ignoredDeletes) syncBase.removeEntry(d.path);
         if (ignoredUpserts > 0 || ignoredDeletes.length > 0) {
@@ -215,6 +315,7 @@ export async function pull(
                 onWritesKnown,
                 perf,
                 beforeHeavyBatch,
+                { vaultId, rootScope: ZERO_ROOT },
             );
         } finally {
             endApply?.();
@@ -235,7 +336,8 @@ export async function pull(
         // excludes them; filter the delta list too for the incremental branch.
         const appliedDeltas = excludeDeltas(kept, deferred).concat(ignoredDeletes);
         const endTree = perf?.phase("tree_update");
-        const deltasHadMtime = rebaseTree(tree, syncBase, appliedDeltas);
+        const deltasHadMtime = await rebaseTree(tree, syncBase, appliedDeltas, treeMutation);
+        assertPullTreeMutationCurrent(treeMutation);
         endTree?.();
 
         // Establish newRootHash + raw root bytes from the server's current
@@ -268,6 +370,7 @@ export async function pull(
             deltasHadMtime,
             deferredCount: deferred.length,
             localDeferredCount,
+            remoteOmissionCount: ignoredUpserts,
             downloaded,
         };
     }
@@ -325,6 +428,7 @@ export async function pull(
             deltasHadMtime: false,
             deferredCount: 0,
             localDeferredCount: 0,
+            remoteOmissionCount: 0,
             downloaded: 0,
         };
     }
@@ -353,6 +457,7 @@ export async function pull(
             onWritesKnown,
             perf,
             beforeHeavyBatch,
+            { vaultId, rootScope: localRootHash.toLowerCase() },
         );
     } finally {
         endApply?.();
@@ -375,7 +480,8 @@ export async function pull(
     // with a server that purged them.
     const appliedDeltas = excludeDeltas(kept, deferred).concat(ignoredDeletes);
     const endTree = perf?.phase("tree_update");
-    const deltasHadMtime = rebaseTree(tree, syncBase, appliedDeltas);
+    const deltasHadMtime = await rebaseTree(tree, syncBase, appliedDeltas, treeMutation);
+    assertPullTreeMutationCurrent(treeMutation);
     endTree?.();
 
     // Extract the new root hash from the server's current root bytes so
@@ -407,6 +513,7 @@ export async function pull(
         deltasHadMtime,
         deferredCount: deferred.length,
         localDeferredCount,
+        remoteOmissionCount: ignoredUpserts,
         downloaded,
     };
 }
@@ -443,6 +550,7 @@ async function pullPagedIfSupported(
     isIgnored?: (path: string) => boolean,
     perf?: PerfOperation,
     beforeHeavyBatch?: () => Promise<void>,
+    treeMutation?: PullTreeMutationContext,
 ): Promise<PullResult | undefined> {
     const candidate = api as unknown as Partial<PagedDiffApi>;
     if (
@@ -485,8 +593,13 @@ async function pullPagedIfSupported(
     let deltasHadMtime = checkpoint?.deltasHadMtime ?? true;
     let deferredCount = 0;
     let localDeferredCount = 0;
+    let remoteOmissionCount = 0;
     let durableCursorAllowed = true;
     let processedPageThisRun = false;
+    // Any checkpoint recovered at entry may cover pages which this volatile
+    // tree never observed in this renderer. Even when later pages are processed
+    // now, only a base-derived replacement proves the full resumed prefix.
+    let requiresTreeRebuild = checkpoint !== null;
 
     if (localRootHash === null) {
         onProgress?.("first sync: downloading paged snapshot...");
@@ -514,6 +627,12 @@ async function pullPagedIfSupported(
         processedPageThisRun = true;
         if (toRoot === null) toRoot = page.toRoot;
         if (page.toRoot !== toRoot) throw new Error("paged diff target changed mid-snapshot");
+        if (localRootHash === null && syncBase.setVerifiedBaseRequired(true)) {
+            // Persist the remote-state fence before applying the first page.
+            // Its eventual verified adoption clears the fence atomically with
+            // treeBaseRoot; interruption leaves publication fail-closed.
+            await syncBase.checkpoint();
+        }
 
         const pageBytesTotal = page.deltas.reduce(
             (sum, delta) => sum + (delta.action === "deleted" ? 0 : delta.size ?? 0),
@@ -527,6 +646,7 @@ async function pullPagedIfSupported(
         }
 
         const { kept, ignoredDeletes, ignoredUpserts } = splitIgnored(page.deltas, isIgnored);
+        remoteOmissionCount += ignoredUpserts;
         for (const delta of ignoredDeletes) syncBase.removeEntry(delta.path);
         if (ignoredUpserts > 0 || ignoredDeletes.length > 0) {
             console.log(
@@ -549,6 +669,7 @@ async function pullPagedIfSupported(
                 onWritesKnown,
                 perf,
                 beforeHeavyBatch,
+                { vaultId, rootScope: toRoot!.toLowerCase() },
             );
         } finally {
             endApply?.();
@@ -568,7 +689,8 @@ async function pullPagedIfSupported(
         const appliedDeltas = excludeDeltas(kept, applyResult.deferred).concat(ignoredDeletes);
         const endTree = perf?.phase("tree_update");
         try {
-            deltasHadMtime = rebaseTree(tree, syncBase, appliedDeltas) && deltasHadMtime;
+            deltasHadMtime = await rebaseTree(tree, syncBase, appliedDeltas, treeMutation) && deltasHadMtime;
+            assertPullTreeMutationCurrent(treeMutation);
         } finally {
             endTree?.();
         }
@@ -576,7 +698,7 @@ async function pullPagedIfSupported(
         // Once any path is deferred, no later cursor is safe to persist: a
         // crash must replay from before that page. The current run may still
         // apply later pages to maximize useful progress.
-        if (pageDeferred > 0) durableCursorAllowed = false;
+        if (pageDeferred > 0 || ignoredUpserts > 0) durableCursorAllowed = false;
         cursor = page.nextCursor;
         complete = cursor === null;
         if (durableCursorAllowed) {
@@ -608,14 +730,12 @@ async function pullPagedIfSupported(
 
     if (!toRoot) throw new Error("completed paged diff has no target root");
     if (!processedPageThisRun) {
-        // Restart after the final cursor append: rebuild the volatile WASM
-        // tree from WAL-recovered sync-base before checking target parity.
-        const endTree = perf?.phase("tree_update");
-        try {
-            deltasHadMtime = rebaseTree(tree, syncBase, []) && deltasHadMtime;
-        } finally {
-            endTree?.();
-        }
+        // Restart after the final cursor append: no delta remains with which
+        // to advance a non-empty stale cached tree. Signal the engine's
+        // admitted full replacement from WAL-recovered sync-base instead of
+        // treating rebaseTree(..., []) as a rebuild (it is intentionally a
+        // no-op for a populated tree).
+        requiresTreeRebuild = true;
     }
 
     const rootBytes = await candidate.getRootAt.call(api, vaultId, toRoot, perf);
@@ -634,8 +754,9 @@ async function pullPagedIfSupported(
         filesNeeded: downloaded,
         bytesNeeded: bytesDownloaded,
     });
-    if (deferredCount > 0) {
-        // Do not strand a completed cursor past files that were never applied.
+    if (deferredCount > 0 || remoteOmissionCount > 0) {
+        // Do not strand a completed cursor past files that were never applied
+        // or were intentionally omitted from the local authority scope.
         // Already-written paths remain useful cache hits on the safe replay.
         syncBase.clearDiffPageCheckpoint();
         await syncBase.save();
@@ -654,11 +775,13 @@ async function pullPagedIfSupported(
         newRootHash: toRoot,
         newRootBytes: rootBytes,
         applied: filesApplied,
-        treeParity: parity(tree, toRoot),
+        treeParity: requiresTreeRebuild ? null : parity(tree, toRoot),
         deltasHadMtime,
         deferredCount,
         localDeferredCount,
+        remoteOmissionCount,
         downloaded,
+        requiresTreeRebuild,
     };
 }
 
@@ -770,11 +893,12 @@ function parity(tree: WasmTree | null, serverRootHash: string | null): boolean |
  * Falls back to sync-base's recorded tree-mtime when a delta lacks it
  * (server < 1.4.0); returns whether every upsert carried a server mtime.
  */
-function rebaseTree(
+async function rebaseTree(
     tree: WasmTree | null,
     syncBase: ObsetyncSyncBase,
     deltas: FileDelta[],
-): boolean {
+    mutation?: PullTreeMutationContext,
+): Promise<boolean> {
     let allHadMtime = true;
     for (const d of deltas) {
         if (d.action !== "deleted" && d.mtime_ms === undefined) allHadMtime = false;
@@ -783,6 +907,9 @@ function rebaseTree(
 
     try {
         if (!tree.root_hash_hex()) {
+            if (mutation) {
+                throw new Error("admitted pull rebase requires a populated committed tree");
+            }
             // Bootstrap from sync-base (already delta-updated). Mirrors the
             // first-push bootstrap in push.ts.
             const paths = syncBase.allPaths();
@@ -825,35 +952,192 @@ function rebaseTree(
         }
         if (deletePaths.length === 0 && upserts.length === 0) return allHadMtime;
 
-        try {
-            tree.begin_candidate();
-            if (deletePaths.length > 0) {
-                tree.candidate_delete_batch(JSON.stringify(deletePaths));
-            }
-            if (upserts.length > 0) {
-                tree.candidate_update_batch(JSON.stringify(upserts));
-            }
-            tree.commit_candidate();
-        } catch (error) {
-            // commit_candidate validates the complete graph before advancing
-            // the committed root. If any candidate operation or that final
-            // validation fails, discard all newly-created chunks together.
-            if (tree.has_candidate()) {
-                try {
-                    tree.abort_candidate();
-                } catch (abortError) {
-                    console.error("[obsetync] failed to abort pull tree candidate:", abortError);
+        if (mutation) {
+            await rebaseTreeWithAdmittedMutation(tree, deletePaths, upserts, mutation);
+        } else {
+            try {
+                tree.begin_candidate();
+                if (deletePaths.length > 0) {
+                    tree.candidate_delete_batch(JSON.stringify(deletePaths));
                 }
+                if (upserts.length > 0) {
+                    tree.candidate_update_batch(JSON.stringify(upserts));
+                }
+                tree.commit_candidate();
+            } catch (error) {
+                // Direct structural/V1 callers have no host turn between
+                // candidate ownership and this synchronous compatibility
+                // abort, so no newer candidate can have replaced it.
+                if (tree.has_candidate()) {
+                    try {
+                        tree.abort_candidate();
+                    } catch (abortError) {
+                        console.error("[obsetync] failed to abort pull tree candidate:", abortError);
+                    }
+                }
+                throw error;
             }
-            throw error;
         }
     } catch (e) {
-        // A failed rebase leaves the tree behind disk/sync-base — the caller
-        // sees treeParity=false and blocks pushes rather than publishing a
-        // root derived from a diverged tree.
+        // Disk/sync-base may already contain the applied remote state. Parity
+        // is not a safe substitute for this error: metadata-only fallback can
+        // legitimately adopt a mismatching root. Force the engine through its
+        // admitted base-derived repair before any root/base advancement.
         console.error("[obsetync] tree rebase after pull failed:", e);
+        throw new PullTreeRebaseError(e);
     }
     return allHadMtime;
+}
+
+async function rebaseTreeWithAdmittedMutation(
+    tree: WasmTree,
+    deletePaths: string[],
+    upserts: Array<{ path: string; hash: string; mtime_ms: number; size: number }>,
+    mutation: PullTreeMutationContext,
+): Promise<void> {
+    const revisionReader = tree.candidate_revision;
+    if (typeof revisionReader !== "function") {
+        throw new TypeError("admitted pull rebase requires an exact candidate revision witness");
+    }
+    const readRevision = (): number => {
+        const revision = revisionReader.call(tree);
+        if (!Number.isSafeInteger(revision) || revision < 0) {
+            throw new TypeError("pull candidate revision witness is invalid");
+        }
+        return revision;
+    };
+    let candidateOpen = false;
+    let candidateOwnedRevision: number | undefined;
+    const recordOwnedCandidateRevision = (): void => {
+        const revision = readRevision();
+        candidateOwnedRevision = revision;
+        try {
+            const committed = tree.committed_revision?.();
+            if (!Number.isSafeInteger(committed) || committed! < 0 ||
+                !mutation.residentAdmission.advanceV2CandidateRevision(tree, committed!, revision)) {
+                mutation.residentAdmission.invalidateV2Graph(tree);
+            }
+        } catch {
+            try { mutation.residentAdmission.invalidateV2Graph(tree); } catch { /* optional provenance */ }
+        }
+    };
+    const assertCandidateCurrent = (): void => {
+        mutation.assertCurrent();
+        if (!candidateOpen || tree.has_candidate() !== true ||
+            candidateOwnedRevision === undefined || readRevision() !== candidateOwnedRevision) {
+            throw new Error("pull candidate ownership changed during rebase");
+        }
+    };
+    const assertSettlementOwner = (): void => {
+        if (!candidateOpen || tree.has_candidate() !== true ||
+            candidateOwnedRevision === undefined || readRevision() !== candidateOwnedRevision) {
+            throw new Error("pull candidate ownership changed before settlement");
+        }
+    };
+    const abortCandidate = () => settleTreeCandidateOutputWithAdmission(
+        tree,
+        "abort",
+        mutation.residentAdmission,
+        assertSettlementOwner,
+    );
+    try {
+        const candidateOpenMemoryAvailable =
+            typeof tree.candidate_open_memory_plan_v1_job === "function" &&
+            typeof tree.resume_candidate_open_memory_v1_job === "function";
+        await beginTreeCandidate(tree, {
+            signal: mutation.signal,
+            cooperate: mutation.cooperate,
+            cooperateRetirement: mutation.cooperateRetirement,
+            assertCurrent: mutation.assertCurrent,
+            onOpenMemoryPlan: candidateOpenMemoryAvailable
+                ? plan => admitCandidateOpenRoot(mutation.residentAdmission, tree, plan)
+                : undefined,
+            abortCandidateOpened: candidateOpenMemoryAvailable
+                ? expectedRevision => settleTreeCandidateOutputWithAdmission(
+                    tree,
+                    "abort",
+                    mutation.residentAdmission,
+                    () => {
+                        if (tree.has_candidate() !== true || readRevision() !== expectedRevision) {
+                            throw new Error("pull candidate ownership changed before begin cleanup");
+                        }
+                    },
+                )
+                : undefined,
+            onCandidateOpened: () => {
+                // The callback is synchronous with native publication. Record
+                // the exact visible revision before any later host turn.
+                recordOwnedCandidateRevision();
+                candidateOpen = true;
+            },
+        });
+        if (deletePaths.length > 0) {
+            const payload = JSON.stringify(deletePaths);
+            await applyTreeCandidateMutation(tree, "delete", payload, {
+                signal: mutation.signal,
+                cooperate: mutation.cooperate,
+                cooperateRetirement: mutation.cooperateRetirement,
+                assertCurrent: assertCandidateCurrent,
+                legacy: () => tree.candidate_delete_batch(payload),
+                onCandidateMutated: recordOwnedCandidateRevision,
+                onOutputMemoryPlan: plan =>
+                    admitCandidateMutationOutput(mutation.residentAdmission, tree, plan),
+            });
+        }
+        if (upserts.length > 0) {
+            const payload = JSON.stringify(upserts);
+            await applyTreeCandidateMutation(tree, "update", payload, {
+                signal: mutation.signal,
+                cooperate: mutation.cooperate,
+                cooperateRetirement: mutation.cooperateRetirement,
+                assertCurrent: assertCandidateCurrent,
+                legacy: () => tree.candidate_update_batch(payload),
+                onCandidateMutated: recordOwnedCandidateRevision,
+                onOutputMemoryPlan: plan =>
+                    admitCandidateMutationOutput(mutation.residentAdmission, tree, plan),
+            });
+        }
+        throwIfWorkAborted(mutation.signal);
+        assertCandidateCurrent();
+        // `assertCurrent` and the native ownership getters are synchronous
+        // user/host boundaries. They may stop the engine while validating
+        // the final witness, so sample cancellation again with no await left
+        // before the atomic commit.
+        throwIfWorkAborted(mutation.signal);
+        // No await separates the final ownership witness from atomic native
+        // commit. A live editor change affects the queued local overlay, not
+        // this remote sync-base candidate, so disk is deliberately not read.
+        settleTreeCandidateOutputWithAdmission(tree, "commit", mutation.residentAdmission, () => {
+            // Final observable boundary before the pinned atomic native call.
+            // Unlike cleanup abort, a pull commit remains cancellable here.
+            throwIfWorkAborted(mutation.signal);
+            assertCandidateCurrent();
+            throwIfWorkAborted(mutation.signal);
+        });
+        candidateOpen = false;
+    } catch (error) {
+        if (candidateOpen && candidateOwnedRevision !== undefined) {
+            try {
+                const aborted = hasPendingTreeCandidateMutationRetirement(tree)
+                    ? await abortTreeCandidateAfterMutationRetirement(tree, candidateOwnedRevision, abortCandidate)
+                    : await abortTreeCandidateAfterReachabilityRetirement(tree, candidateOwnedRevision, abortCandidate);
+                if (!aborted) {
+                    console.warn("[obsetync] skipped abort of a newer pull candidate tree");
+                }
+            } catch (abortError) {
+                console.error("[obsetync] failed to retire/abort pull tree candidate:", abortError);
+                if ((typeof error === "object" && error !== null) || typeof error === "function") {
+                    try {
+                        Object.defineProperty(error, "treeCandidateCleanupErrors", {
+                            configurable: true,
+                            value: [abortError],
+                        });
+                    } catch { /* Preserve a frozen/foreign primary error. */ }
+                }
+            }
+        }
+        throw error;
+    }
 }
 
 /** Counters for the three-tier resolution of a content delta. Summed
@@ -887,6 +1171,7 @@ async function applyDeltas(
     onWritesKnown?: (writes: PullWriteExpectation[]) => void,
     perf?: PerfOperation,
     beforeHeavyBatch?: () => Promise<void>,
+    largeTransferScope?: PullLargeTransferScope,
 ): Promise<{
     deferred: FileDelta[];
     downloaded: number;
@@ -1165,6 +1450,7 @@ async function applyDeltas(
                 () => shouldSkip(delta),
                 perf,
                 beforeHeavyBatch,
+                largeTransferScope,
             ))
         );
         results.forEach((r, j) => {
@@ -1201,56 +1487,64 @@ async function applyDeltas(
             }
         });
 
-        if (pending.length > 0) {
-            let downloaded: Map<string, Uint8Array>;
-            try {
-                const endDownload = perf?.phase("download");
+        let downloaded: PullObjects | undefined;
+        try {
+            if (pending.length > 0) {
                 try {
-                    downloaded = await getSmallContentBatch(
-                        api,
-                        pending.map(({ delta }) => delta.hash!),
-                        perf,
-                    );
-                } finally {
-                    endDownload?.();
+                    const endDownload = perf?.phase("download");
+                    try {
+                        downloaded = await getSmallContentBatch(
+                            api,
+                            pending.map(({ delta }) => delta.hash!),
+                            perf,
+                        );
+                    } finally {
+                        endDownload?.();
+                    }
+                } catch {
+                    // A page is the retry unit. Keep every path honest and let the
+                    // existing one-pass recovery retry them independently below.
+                    failed.push(...pending.map(({ delta }) => delta));
+                    await checkpointAndReport(batch.length);
+                    return;
                 }
-            } catch {
-                // A page is the retry unit. Keep every path honest and let the
-                // existing one-pass recovery retry them independently below.
-                failed.push(...pending.map(({ delta }) => delta));
-                await checkpointAndReport(batch.length);
-                return;
-            }
-            const countedHashes = new Set<string>();
-            const applied = await allSettledBounded(
-                pending,
-                activeTuning.applyConcurrency,
-                ({ delta, preparation }) => {
-                const canonicalHash = delta.hash!.toLowerCase();
-                const countTransferredBytes = !countedHashes.has(canonicalHash);
-                countedHashes.add(canonicalHash);
-                return finishContentDownload(
-                    api,
-                    io,
-                    syncBase,
-                    wasm,
-                    delta,
-                    stats,
-                    preparation,
-                    () => shouldSkip(delta),
-                    perf,
-                    downloaded.get(canonicalHash),
-                    countTransferredBytes,
-                    beforeHeavyBatch,
+                const countedHashes = new Set<string>();
+                const applied = await allSettledBounded(
+                    pending,
+                    activeTuning.applyConcurrency,
+                    ({ delta, preparation }) => {
+                        const canonicalHash = delta.hash!.toLowerCase();
+                        const countTransferredBytes = !countedHashes.has(canonicalHash);
+                        countedHashes.add(canonicalHash);
+                        return finishContentDownload(
+                            api,
+                            io,
+                            syncBase,
+                            wasm,
+                            delta,
+                            stats,
+                            preparation,
+                            () => shouldSkip(delta),
+                            perf,
+                            downloaded!.objects.get(canonicalHash),
+                            countTransferredBytes,
+                            beforeHeavyBatch,
+                            downloaded,
+                            largeTransferScope,
+                        );
+                    },
                 );
-                },
-            );
-            applied.forEach((result, index) => {
-                if (result.status === "rejected") failed.push(pending[index].delta);
-                else if (!result.value) deferLocal(pending[index].delta);
-            });
+                applied.forEach((result, index) => {
+                    if (result.status === "rejected") failed.push(pending[index].delta);
+                    else if (!result.value) deferLocal(pending[index].delta);
+                });
+            }
+            await checkpointAndReport(batch.length);
+        } finally {
+            // allSettledBounded drains every native sibling before this owner
+            // is closed, including when one apply fails or a local edit wins.
+            downloaded?.release();
         }
-        await checkpointAndReport(batch.length);
     };
 
     // Small files retain bounded parallelism. Large files run strictly one at
@@ -1302,6 +1596,7 @@ async function applyDeltas(
                     () => shouldSkip(delta),
                     perf,
                     beforeHeavyBatch,
+                    largeTransferScope,
                 );
                 if (!applied) {
                     deferLocal(delta);
@@ -1388,6 +1683,28 @@ interface PendingContentDownload {
     kind: "download";
     size: number;
     preserveExisting: boolean;
+    targetState: LargeTransferTargetState;
+}
+
+export interface LargeTransferTargetState {
+    present: boolean;
+    size: number;
+    mtime: number;
+}
+
+function targetState(stat: Awaited<ReturnType<PlatformIO["stat"]>>): LargeTransferTargetState {
+    return stat
+        ? { present: true, size: stat.size, mtime: stat.mtime }
+        : { present: false, size: 0, mtime: 0 };
+}
+
+function largeTransferFileGeneration(wasm: WasmModule, delta: FileDelta): string {
+    return wasm.wasm_hash(new TextEncoder().encode(JSON.stringify({
+        action: delta.action,
+        hash: delta.hash?.toLowerCase() ?? null,
+        size: delta.size ?? 0,
+        mtime: delta.mtime_ms ?? null,
+    }))).toLowerCase();
 }
 
 /** Resolve the two zero-network tiers first. This separation lets a large
@@ -1489,7 +1806,7 @@ async function prepareContentDelta(
     }
 
     if (shouldDefer?.()) return { kind: "deferred" };
-    return { kind: "download", size, preserveExisting };
+    return { kind: "download", size, preserveExisting, targetState: targetState(stat) };
 }
 
 async function finishContentDownload(
@@ -1505,12 +1822,35 @@ async function finishContentDownload(
     prefetchedSmallData?: Uint8Array,
     countTransferredBytes = true,
     beforeHeavyBatch?: () => Promise<void>,
+    prefetchedObjects?: PullObjects,
+    largeTransferScope?: PullLargeTransferScope,
 ): Promise<boolean> {
     if (!delta.hash) return true;
     const { size, preserveExisting } = preparation;
 
     // --- Tier 3: actual download from server -----------------------------
     if (shouldDefer?.()) return false;
+    if (size < CHUNK_THRESHOLD && !prefetchedObjects) {
+        // Preparation/local hashing has already settled before admission. Do
+        // not start a second global reservation beneath an owned download.
+        const endDownload = perf?.phase("download");
+        let owned: PullObjects;
+        try { owned = await getSmallContentBatch(api, [delta.hash], perf); }
+        finally { endDownload?.(); }
+        try {
+            const applied = await finishContentDownload(
+                api, io, syncBase, wasm, delta, stats, preparation, shouldDefer,
+                perf, owned.objects.get(delta.hash.toLowerCase()), countTransferredBytes,
+                beforeHeavyBatch, owned, largeTransferScope,
+            );
+            if (applied) {
+                const endCheckpoint = perf?.phase("checkpoint");
+                try { await syncBase.checkpoint(); }
+                finally { endCheckpoint?.(); }
+            }
+            return applied;
+        } finally { owned.release(); }
+    }
     if (size >= CHUNK_THRESHOLD) {
         try {
             await applyLargeFile(
@@ -1524,42 +1864,42 @@ async function finishContentDownload(
                 preserveExisting,
                 perf,
                 beforeHeavyBatch,
+                largeTransferScope && {
+                    ...largeTransferScope,
+                    fileGeneration: largeTransferFileGeneration(wasm!, delta),
+                    targetState: preparation.targetState,
+                },
             );
         } catch (error) {
             if (error instanceof LocalEditDuringPull) return false;
             throw error;
         }
     } else {
-        let data: Uint8Array;
-        if (prefetchedSmallData) {
-            data = prefetchedSmallData;
-        } else {
-            const endDownload = perf?.phase("download");
+        const data = prefetchedSmallData;
+        if (!data) throw new Error("small-file content missing from download batch");
+        const applied = await runPullWork(prefetchedObjects?.memory, 3 * data.byteLength + 64 * 1024, async () => {
+            const endHash = perf?.phase("hash");
+            let actualHash: string | null = null;
             try {
-                data = await api.getContent(delta.hash, perf);
+                actualHash = wasm ? wasm.wasm_hash(data).toLowerCase() : null;
             } finally {
-                endDownload?.();
+                endHash?.();
             }
-        }
-        const endHash = perf?.phase("hash");
-        let actualHash: string | null = null;
-        try {
-            actualHash = wasm ? wasm.wasm_hash(data).toLowerCase() : null;
-        } finally {
-            endHash?.();
-        }
-        if (!actualHash || actualHash !== delta.hash.toLowerCase()) {
-            throw new Error(`small-file content hash mismatch for ${delta.path}`);
-        }
-        if (shouldDefer?.()) return false;
-        if (preserveExisting && await io.exists(delta.path)) {
-            const conflictPath = await uniqueLocalConflictPath(io, delta.path);
-            await io.renameFile(delta.path, conflictPath);
-            console.warn(
-                `[obsetync] preserved unsynced local bytes as ${conflictPath} before pull`,
-            );
-        }
-        await io.writeFile(delta.path, data);
+            if (!actualHash || actualHash !== delta.hash!.toLowerCase()) {
+                throw new Error(`small-file content hash mismatch for ${delta.path}`);
+            }
+            if (shouldDefer?.()) return false;
+            if (preserveExisting && await io.exists(delta.path)) {
+                const conflictPath = await uniqueLocalConflictPath(io, delta.path);
+                await io.renameFile(delta.path, conflictPath);
+                console.warn(
+                    `[obsetync] preserved unsynced local bytes as ${conflictPath} before pull`,
+                );
+            }
+            await io.writeFile(delta.path, data);
+            return true;
+        });
+        if (!applied) return false;
     }
     stats.downloaded++;
     if (countTransferredBytes) stats.bytesDownloaded += size;
@@ -1585,6 +1925,7 @@ async function applyContentDelta(
     shouldDefer?: () => boolean,
     perf?: PerfOperation,
     beforeHeavyBatch?: () => Promise<void>,
+    largeTransferScope?: PullLargeTransferScope,
 ): Promise<boolean> {
     const preparation = await prepareContentDelta(
         io,
@@ -1610,6 +1951,8 @@ async function applyContentDelta(
         undefined,
         true,
         beforeHeavyBatch,
+        undefined,
+        largeTransferScope,
     );
 }
 
@@ -1617,19 +1960,43 @@ async function getSmallContentBatch(
     api: ObsetyncApi,
     hashes: readonly string[],
     perf?: PerfOperation,
-): Promise<Map<string, Uint8Array>> {
-    // Test/old embedding compatibility: production ObsetyncApi always has
-    // getObjects, while small pure-unit fixtures may implement only getContent.
-    const bulk = (api as any).getObjects as
-        | ((kind: BulkObjectKind, hashes: readonly string[], perf?: PerfOperation) =>
-            Promise<Map<string, Uint8Array>>)
-        | undefined;
-    if (bulk) return bulk.call(api, BulkObjectKind.Content, hashes, perf);
-    const output = new Map<string, Uint8Array>();
-    await Promise.all([...new Set(hashes.map((hash) => hash.toLowerCase()))].map(async (hash) => {
-        output.set(hash, await api.getContent(hash, perf));
-    }));
-    return output;
+): Promise<PullObjects> {
+    return getPullObjects(api, BulkObjectKind.Content, hashes, (hash) => api.getContent(hash, perf), perf);
+}
+
+interface PullObjects {
+    objects: Map<string, Uint8Array>;
+    /** Missing only on explicit old embedding/pure mock compatibility paths. */
+    memory?: TransientWorkScope;
+    release(): void;
+}
+
+async function runPullWork<T>(memory: TransientWorkScope | undefined, bytes: number,
+    work: () => T | Promise<T>): Promise<T> {
+    return memory ? memory.run(bytes, work) : work();
+}
+
+async function getPullObjects(
+    api: ObsetyncApi,
+    kind: BulkObjectKind,
+    hashes: readonly string[],
+    legacySingle: (hash: string) => Promise<Uint8Array>,
+    perf?: PerfOperation,
+): Promise<PullObjects> {
+    if (typeof api.getObjectsOwned === "function") return api.getObjectsOwned(kind, hashes, perf);
+    // Production always takes the owned API above. Old embeddings and pure
+    // fixtures have no reservation: do not invent one after their allocation.
+    if (typeof api.getObjects === "function") {
+        const objects = await api.getObjects(kind, hashes, perf);
+        return { objects, release() { objects.clear(); } };
+    }
+    const objects = new Map<string, Uint8Array>();
+    // Compatibility still drains every native read on failure.
+    const results = await allSettledBounded([...new Set(hashes.map((hash) => hash.toLowerCase()))],
+        getHashTuning().networkConcurrency, async (hash) => { objects.set(hash, await legacySingle(hash)); });
+    const rejected = results.find((result) => result.status === "rejected");
+    if (rejected?.status === "rejected") throw rejected.reason;
+    return { objects, release() { objects.clear(); } };
 }
 
 class LocalEditDuringPull extends Error {}
@@ -1695,19 +2062,63 @@ async function writeRenameCheckpoint(
     await io.writeFile(path, new TextEncoder().encode(JSON.stringify(checkpoint)));
 }
 
-interface LargeTransferCheckpoint {
-    version: 1;
+export interface LargeTransferResumeScope extends PullLargeTransferScope {
+    /** Remote per-file generation derived from action/hash/size/mtime. */
+    fileGeneration: string;
+    /** Local target generation captured before network work began. */
+    targetState: LargeTransferTargetState;
+}
+
+interface LargeTransferCheckpoint extends LargeTransferResumeScope {
+    version: 2;
     targetPath: string;
     fileHash: string;
+    manifestGeneration: string;
     totalSize: number;
     nextChunk: number;
     bytesWritten: number;
+    /** Written only after every chunk was verified and, for a fresh transfer,
+     * the independently assembled whole-file hash also matched. */
+    completedHash?: string;
+}
+
+interface StagingReservation {
+    io: PlatformIO;
+    targetPath: string;
+    stagingPath: string;
+    checkpointPath: string;
+    plannedBytes: number;
+}
+
+interface StagingLease {
+    release(): void;
+}
+
+const activeStagingReservations = new Set<StagingReservation>();
+let stagingQuotaTail = Promise.resolve();
+let stagingQuotaWaiters = 0;
+
+async function withStagingQuotaLock<T>(work: () => Promise<T>): Promise<T> {
+    if (stagingQuotaWaiters >= STAGING_QUOTA_WAITERS) {
+        throw new LargeTransferStagingQuotaError("staging quota admission queue is full");
+    }
+    stagingQuotaWaiters++;
+    const previous = stagingQuotaTail;
+    let releaseTurn!: () => void;
+    stagingQuotaTail = new Promise<void>((resolve) => { releaseTurn = resolve; });
+    await previous;
+    try {
+        return await work();
+    } finally {
+        stagingQuotaWaiters--;
+        releaseTurn();
+    }
 }
 
 /** Reject manifests that could overlap, leave holes, overrun allocations, or
  *  point at a different content address. Returned values are safe JS ints. */
 export function validateManifest(
-    value: FileManifest,
+    value: unknown,
     expectedHash: string,
     expectedSize?: number,
 ): FileManifest {
@@ -1755,41 +2166,68 @@ export function validateManifest(
     return manifest as FileManifest;
 }
 
+/** Bind restart state to the exact validated chunk layout without building a
+ * second manifest-sized JSON/string buffer. */
+async function largeManifestGeneration(
+    wasm: WasmModule,
+    manifest: FileManifest,
+    perf?: PerfOperation,
+    shouldAbort?: () => boolean,
+): Promise<string> {
+    const encoder = new TextEncoder();
+    const hasher = new wasm.Hasher();
+    const endHash = perf?.phase("hash");
+    try {
+        hasher.update(encoder.encode(`large-manifest-v1\n${manifest.file_hash.toLowerCase()}\n${manifest.total_size}\n`));
+        for (let index = 0; index < manifest.chunks.length; index++) {
+            if (shouldAbort?.()) throw new LocalEditDuringPull();
+            const chunk = manifest.chunks[index];
+            hasher.update(encoder.encode(`${chunk.hash.toLowerCase()}\n${chunk.offset}\n${chunk.size}\n`));
+            if ((index + 1) % 256 === 0) await yieldWork({ perf });
+        }
+        const generation = hasher.finalize().toLowerCase();
+        if (!/^[0-9a-f]{64}$/.test(generation)) {
+            throw new Error("invalid large-file manifest generation");
+        }
+        return generation;
+    } finally {
+        try { hasher.free(); }
+        finally { endHash?.(); }
+    }
+}
+
 async function getManifestForPull(
     api: ObsetyncApi,
     hash: string,
+    expectedSize: number,
     perf?: PerfOperation,
 ): Promise<FileManifest> {
-    const bulk = (api as any).getObjects as
-        | ((kind: BulkObjectKind, hashes: readonly string[], perf?: PerfOperation) =>
-            Promise<Map<string, Uint8Array>>)
-        | undefined;
-    if (!bulk) return api.getManifest(hash, perf);
-    const objects = await bulk.call(api, BulkObjectKind.Manifest, [hash], perf);
-    const bytes = objects.get(hash.toLowerCase());
-    if (!bytes) throw new Error(`manifest ${hash} missing from bulk response`);
-    try {
-        return JSON.parse(new TextDecoder().decode(bytes)) as FileManifest;
-    } catch {
-        throw new Error(`manifest ${hash} is not valid JSON`);
+    if (typeof api.getObjectsOwned !== "function" && typeof api.getObjects !== "function") {
+        return validateManifest(await api.getManifest(hash, perf), hash, expectedSize);
     }
+    const owned = await getPullObjects(api, BulkObjectKind.Manifest, [hash],
+        async () => { throw new Error("manifest bulk API unavailable"); }, perf);
+    try {
+        const bytes = owned.objects.get(hash.toLowerCase());
+        if (!bytes) throw new Error("manifest missing from download batch");
+        return await runPullWork(owned.memory, 4 * bytes.byteLength + 64 * 1024, () => {
+            let manifest: unknown;
+            try { manifest = JSON.parse(new TextDecoder().decode(bytes)); }
+            catch { throw new Error("manifest is not valid JSON"); }
+            // Covers retained bytes and decode work through validation. The
+            // returned metadata graph is not claimed as byte-buffer accounting.
+            return validateManifest(manifest, hash, expectedSize);
+        });
+    } finally { owned.release(); }
 }
 
 async function getContentChunkBatch(
     api: ObsetyncApi,
     hashes: readonly string[],
     perf?: PerfOperation,
-): Promise<Map<string, Uint8Array>> {
-    const bulk = (api as any).getObjects as
-        | ((kind: BulkObjectKind, hashes: readonly string[], perf?: PerfOperation) =>
-            Promise<Map<string, Uint8Array>>)
-        | undefined;
-    if (bulk) return bulk.call(api, BulkObjectKind.ContentChunk, hashes, perf);
-    const output = new Map<string, Uint8Array>();
-    await Promise.all([...new Set(hashes.map((hash) => hash.toLowerCase()))].map(async (hash) => {
-        output.set(hash, await api.getContentChunk(hash, perf));
-    }));
-    return output;
+): Promise<PullObjects> {
+    return getPullObjects(api, BulkObjectKind.ContentChunk, hashes,
+        (hash) => api.getContentChunk(hash, perf), perf);
 }
 
 /** Download a large file into an internal staging file. Each chunk is
@@ -1806,21 +2244,35 @@ export async function applyLargeFile(
     preserveExisting = false,
     perf?: PerfOperation,
     beforeHeavyBatch?: () => Promise<void>,
+    resumeScope?: LargeTransferResumeScope,
 ): Promise<void> {
     if (shouldAbort?.()) throw new LocalEditDuringPull();
     if (!wasm) throw new Error("WASM hash verifier unavailable for large file");
+    const currentTargetState = targetState(await io.stat(path));
+    const effectiveScope: LargeTransferResumeScope = resumeScope
+        ? { ...resumeScope, targetState: { ...resumeScope.targetState } }
+        : { vaultId: "legacy", rootScope: hash.toLowerCase(), fileGeneration: hash.toLowerCase(),
+            targetState: currentTargetState };
+    if (!sameTargetState(currentTargetState, effectiveScope.targetState)) {
+        throw new LocalEditDuringPull();
+    }
+    validateLargeTransferScope(effectiveScope);
     const endManifestDownload = perf?.phase("download");
     let rawManifest: FileManifest;
     try {
-        rawManifest = await getManifestForPull(api, hash, perf);
+        rawManifest = await getManifestForPull(api, hash, expectedSize, perf);
     } finally {
         endManifestDownload?.();
     }
     const manifest = validateManifest(rawManifest, hash, expectedSize);
+    const manifestGeneration = await largeManifestGeneration(wasm, manifest, perf, shouldAbort);
     const endPathHash = perf?.phase("hash");
     let pathHash: string;
     try {
-        pathHash = wasm.wasm_hash(new TextEncoder().encode(path)).slice(0, 16);
+        pathHash = wasm.wasm_hash(new TextEncoder().encode(path)).slice(0, 16).toLowerCase();
+        if (!/^[0-9a-f]{16}$/.test(pathHash)) {
+            throw new Error("invalid large-transfer path generation");
+        }
     } finally {
         endPathHash?.();
     }
@@ -1829,41 +2281,76 @@ export async function applyLargeFile(
     const checkpointPath = `${TRANSFER_DIR}/${transferKey}.checkpoint.json`;
 
     let checkpoint = await readLargeCheckpoint(io, checkpointPath);
+    const checkpointStat = await io.stat(checkpointPath);
     const expectedBytes = (nextChunk: number): number =>
         nextChunk === manifest.chunks.length
             ? manifest.total_size
             : manifest.chunks[nextChunk]?.offset ?? -1;
     const stagingStat = await io.stat(stagingPath);
     const resumable =
-        checkpoint?.version === 1 &&
+        checkpoint?.version === 2 &&
         checkpoint.targetPath === path &&
         checkpoint.fileHash === hash.toLowerCase() &&
+        checkpoint.manifestGeneration === manifestGeneration &&
         checkpoint.totalSize === manifest.total_size &&
+        checkpoint.vaultId === effectiveScope.vaultId &&
+        checkpoint.rootScope === effectiveScope.rootScope &&
+        checkpoint.fileGeneration === effectiveScope.fileGeneration &&
+        sameTargetState(checkpoint.targetState, effectiveScope.targetState) &&
         Number.isInteger(checkpoint.nextChunk) &&
         checkpoint.nextChunk >= 0 &&
         checkpoint.nextChunk <= manifest.chunks.length &&
         checkpoint.bytesWritten === expectedBytes(checkpoint.nextChunk) &&
-        stagingStat?.size === checkpoint.bytesWritten;
-
-    if (!resumable) {
-        await safeDelete(io, stagingPath);
-        await safeDelete(io, checkpointPath);
-        await io.writeFile(stagingPath, new Uint8Array());
-        checkpoint = {
-            version: 1,
-            targetPath: path,
-            fileHash: hash.toLowerCase(),
-            totalSize: manifest.total_size,
-            nextChunk: 0,
-            bytesWritten: 0,
-        };
-        const endCheckpoint = perf?.phase("checkpoint");
-        try {
-            await writeLargeCheckpoint(io, checkpointPath, checkpoint);
-        } finally {
-            endCheckpoint?.();
+        stagingStat?.size === checkpoint.bytesWritten &&
+        (checkpoint.nextChunk < manifest.chunks.length
+            ? checkpoint.completedHash === undefined
+            : checkpoint.completedHash === hash.toLowerCase());
+    if (!resumable && (stagingStat !== null || checkpointStat !== null)) {
+        // A killed append may leave a valid checkpoint with an uncheckpointed
+        // part tail (or no part after external cleanup). It is safe to restart
+        // that exact scoped temp pair, but an orphan part or malformed/wrong-
+        // target checkpoint remains opaque and is never overwritten.
+        if (!checkpointStat || !checkpoint ||
+            !validStoredLargeCheckpoint(checkpoint, transferKey, checkpoint.bytesWritten) ||
+            checkpoint.targetPath !== path) {
+            throw new LargeTransferStagingQuotaError(
+                "current staging pair is malformed and requires explicit repair",
+            );
         }
     }
+
+    const stagingLease = await reserveLargeTransferStaging(
+        io,
+        path,
+        stagingPath,
+        checkpointPath,
+        manifest.total_size,
+        stagingStat?.size ?? null,
+        checkpointStat?.size ?? null,
+    );
+    try {
+        if (!resumable) {
+            if (stagingStat || checkpointStat) {
+                await deleteValidatedInternalPair(io, stagingPath, checkpointPath);
+            }
+            await io.writeFile(stagingPath, new Uint8Array());
+            checkpoint = {
+                version: 2,
+                ...effectiveScope,
+                targetPath: path,
+                fileHash: hash.toLowerCase(),
+                manifestGeneration,
+                totalSize: manifest.total_size,
+                nextChunk: 0,
+                bytesWritten: 0,
+            };
+            const endCheckpoint = perf?.phase("checkpoint");
+            try {
+                await writeLargeCheckpoint(io, checkpointPath, checkpoint);
+            } finally {
+                endCheckpoint?.();
+            }
+        }
 
     // A fresh transfer can prove the manifest's ordered concatenation while
     // bytes are already crossing the WASM boundary. Resumed prefixes were
@@ -1901,7 +2388,7 @@ export async function applyLargeFile(
             await beforeHeavyBatch?.();
             if (shouldAbort?.()) throw new LocalEditDuringPull();
             const endDownload = perf?.phase("download");
-            let downloaded: Map<string, Uint8Array>;
+            let downloaded: PullObjects;
             try {
                 downloaded = await getContentChunkBatch(
                     api,
@@ -1911,40 +2398,54 @@ export async function applyLargeFile(
             } finally {
                 endDownload?.();
             }
-            for (const { chunk, index } of batch) {
-                if (shouldAbort?.()) throw new LocalEditDuringPull();
-                const data = downloaded.get(chunk.hash.toLowerCase());
-                if (!data || data.length !== chunk.size) {
-                    throw new Error(`large-file chunk ${index} length mismatch`);
+            try {
+                for (const { chunk, index } of batch) {
+                    if (shouldAbort?.()) throw new LocalEditDuringPull();
+                    const data = downloaded.objects.get(chunk.hash.toLowerCase());
+                    if (!data || data.length !== chunk.size) {
+                        throw new Error(`large-file chunk ${index} length mismatch`);
+                    }
+                    const endHash = perf?.phase("hash");
+                    let actualHash: string;
+                    try {
+                        actualHash = await runPullWork(downloaded.memory, 2 * data.byteLength + 64 * 1024,
+                            () => wholeHasher ? wholeHasher.update_and_hash(data) : wasm.wasm_hash(data));
+                    } finally {
+                        endHash?.();
+                    }
+                    if (actualHash.toLowerCase() !== chunk.hash.toLowerCase()) {
+                        throw new Error(`large-file chunk ${index} hash mismatch`);
+                    }
+                    if (shouldAbort?.()) throw new LocalEditDuringPull();
+                    // The staging lease already reserves the manifest's full
+                    // final size; validated offsets make every append consume
+                    // that fixed reservation rather than growing quota ad hoc.
+                    if (io.appendFileOwned) {
+                        // Append independently borrows the same work quota; nesting
+                        // it inside the hash run could deadlock at full admission.
+                        await io.appendFileOwned(stagingPath, data, downloaded.memory);
+                    } else {
+                        // Explicit old embedding/test compatibility only. Actual
+                        // PlatformIO implements memory-aware capability checking.
+                        await io.appendFile(stagingPath, data);
+                    }
+                    checkpoint = {
+                        ...checkpoint!,
+                        nextChunk: index + 1,
+                        bytesWritten: chunk.offset + chunk.size,
+                    };
+                    const endCheckpoint = perf?.phase("checkpoint");
+                    try {
+                        await runPullWork(downloaded.memory, 64 * 1024,
+                            () => writeLargeCheckpoint(io, checkpointPath, checkpoint!));
+                    } finally {
+                        endCheckpoint?.();
+                    }
+                    // Apply/checkpoint records independently even though transport
+                    // grouped them; a kill repeats less than one completed pack.
+                    await yieldWork({ perf });
                 }
-                const endHash = perf?.phase("hash");
-                let actualHash: string;
-                try {
-                    actualHash = wholeHasher
-                        ? wholeHasher.update_and_hash(data)
-                        : wasm.wasm_hash(data);
-                } finally {
-                    endHash?.();
-                }
-                if (actualHash.toLowerCase() !== chunk.hash.toLowerCase()) {
-                    throw new Error(`large-file chunk ${index} hash mismatch`);
-                }
-                await io.appendFile(stagingPath, data);
-                checkpoint = {
-                    ...checkpoint!,
-                    nextChunk: index + 1,
-                    bytesWritten: chunk.offset + chunk.size,
-                };
-                const endCheckpoint = perf?.phase("checkpoint");
-                try {
-                    await writeLargeCheckpoint(io, checkpointPath, checkpoint);
-                } finally {
-                    endCheckpoint?.();
-                }
-                // Apply/checkpoint records independently even though transport
-                // grouped them; a kill repeats less than one completed pack.
-                await new Promise<void>((resolve) => globalThis.setTimeout(resolve, 0));
-            }
+            } finally { downloaded.release(); }
         }
         if (wholeHasher) assembledHash = wholeHasher.finalize().toLowerCase();
     } finally {
@@ -1952,11 +2453,18 @@ export async function applyLargeFile(
     }
 
     if (assembledHash !== null && assembledHash !== hash.toLowerCase()) {
-        // Do not leave a completed-looking checkpoint: the next retry must
-        // fetch from chunk zero rather than promoting known-wrong bytes.
-        await safeDelete(io, stagingPath);
-        await safeDelete(io, checkpointPath);
+        // No completion marker exists yet, so even failed cleanup cannot make
+        // a later restart promote these known-wrong bytes.
+        await deleteValidatedInternalPair(io, stagingPath, checkpointPath);
         throw new Error("large-file assembled content hash mismatch");
+    }
+
+    checkpoint = { ...checkpoint!, completedHash: hash.toLowerCase() };
+    const endCompletionCheckpoint = perf?.phase("checkpoint");
+    try {
+        await writeLargeCheckpoint(io, checkpointPath, checkpoint);
+    } finally {
+        endCompletionCheckpoint?.();
     }
 
     const completed = await io.stat(stagingPath);
@@ -1964,6 +2472,9 @@ export async function applyLargeFile(
         throw new Error("large-file staging size mismatch after download");
     }
     if (shouldAbort?.()) throw new LocalEditDuringPull();
+    if (!sameTargetState(targetState(await io.stat(path)), effectiveScope.targetState)) {
+        throw new LocalEditDuringPull();
+    }
     if (preserveExisting && await io.exists(path)) {
         const conflictPath = await uniqueLocalConflictPath(io, path);
         await io.renameFile(path, conflictPath);
@@ -1971,8 +2482,11 @@ export async function applyLargeFile(
             `[obsetync] preserved unsynced local bytes as ${conflictPath} before pull`,
         );
     }
-    await io.replaceFile(stagingPath, path);
-    await safeDelete(io, checkpointPath);
+        await io.replaceFile(stagingPath, path);
+        await safeDelete(io, checkpointPath);
+    } finally {
+        stagingLease.release();
+    }
 }
 
 async function readLargeCheckpoint(
@@ -1980,10 +2494,279 @@ async function readLargeCheckpoint(
     path: string,
 ): Promise<LargeTransferCheckpoint | null> {
     try {
+        const stat = await io.stat(path);
+        if (!stat || !Number.isSafeInteger(stat.size) || stat.size < 0 ||
+            stat.size > STAGING_CHECKPOINT_MAX_BYTES) return null;
         return JSON.parse(new TextDecoder().decode(await io.readFile(path))) as LargeTransferCheckpoint;
     } catch {
         return null;
     }
+}
+
+function validLargeTargetState(value: unknown): value is LargeTransferTargetState {
+    if (!value || typeof value !== "object") return false;
+    const candidate = value as Partial<LargeTransferTargetState>;
+    return typeof candidate.present === "boolean" &&
+        Number.isSafeInteger(candidate.size) && candidate.size! >= 0 &&
+        Number.isFinite(candidate.mtime) && candidate.mtime! >= 0 &&
+        (candidate.present || (candidate.size === 0 && candidate.mtime === 0));
+}
+
+function sameTargetState(left: unknown, right: unknown): boolean {
+    return validLargeTargetState(left) && validLargeTargetState(right) &&
+        left.present === right.present && left.size === right.size && left.mtime === right.mtime;
+}
+
+function validateLargeTransferScope(scope: LargeTransferResumeScope): void {
+    if (typeof scope.vaultId !== "string" || scope.vaultId.length === 0 || scope.vaultId.length > 4096 ||
+        !/^[0-9a-f]{64}$/.test(scope.rootScope) ||
+        !/^[0-9a-f]{64}$/.test(scope.fileGeneration) ||
+        !validLargeTargetState(scope.targetState)) {
+        throw new TypeError("invalid large-transfer resume scope");
+    }
+}
+
+function validStoredLargeCheckpoint(
+    value: LargeTransferCheckpoint | null,
+    transferKey: string,
+    partBytes: number,
+): value is LargeTransferCheckpoint {
+    return value?.version === 2 && typeof value.targetPath === "string" &&
+        value.targetPath.length > 0 && value.targetPath.length <= 4096 &&
+        value.fileHash === transferKey.slice(0, 64) &&
+        /^[0-9a-f]{64}$/.test(value.manifestGeneration) &&
+        Number.isSafeInteger(value.totalSize) && value.totalSize >= 0 &&
+        value.totalSize <= STAGING_QUOTA_BYTES &&
+        Number.isSafeInteger(value.nextChunk) && value.nextChunk >= 0 &&
+        Number.isSafeInteger(value.bytesWritten) && value.bytesWritten >= 0 &&
+        (value.nextChunk === 0) === (value.bytesWritten === 0) &&
+        value.bytesWritten <= value.totalSize && value.bytesWritten === partBytes &&
+        (value.completedHash === undefined || value.completedHash === value.fileHash) &&
+        typeof value.vaultId === "string" && value.vaultId.length > 0 && value.vaultId.length <= 4096 &&
+        /^[0-9a-f]{64}$/.test(value.rootScope) &&
+        /^[0-9a-f]{64}$/.test(value.fileGeneration) &&
+        validLargeTargetState(value.targetState);
+}
+
+function checkedStagingAdd(left: number, right: number): number {
+    const total = left + right;
+    if (!Number.isSafeInteger(total) || total < 0) {
+        throw new LargeTransferStagingQuotaError("staging quota accounting overflow");
+    }
+    return total;
+}
+
+async function deleteValidatedInternalPair(
+    io: PlatformIO,
+    stagingPath: string,
+    checkpointPath: string,
+): Promise<void> {
+    // Retire authority first: if deleting the part subsequently fails, an
+    // orphan temp file is quota-counted but can never look resumable.
+    let failed = false;
+    for (const path of [checkpointPath, stagingPath]) {
+        try { await io.deleteFile(path); }
+        catch { if (await io.stat(path)) failed = true; }
+    }
+    if (failed || await io.stat(stagingPath) || await io.stat(checkpointPath)) {
+        throw new LargeTransferStagingQuotaError("obsolete staging cleanup did not retire its pair");
+    }
+}
+
+/** Reserve the complete eventual pair before creating or appending it.
+ * Enumeration is confined to the plugin's transfer directory and rejects any
+ * shape that cannot be proven to be a bounded internal checkpoint/part pair. */
+async function reserveLargeTransferStaging(
+    io: PlatformIO,
+    targetPath: string,
+    stagingPath: string,
+    currentCheckpointPath: string,
+    totalSize: number,
+    expectedStagingBytes: number | null,
+    expectedCheckpointBytes: number | null,
+): Promise<StagingLease> {
+    if (!Number.isSafeInteger(totalSize) || totalSize < 0) {
+        throw new LargeTransferStagingQuotaError("invalid staged transfer size");
+    }
+    for (const expected of [expectedStagingBytes, expectedCheckpointBytes]) {
+        if (expected !== null && (!Number.isSafeInteger(expected) || expected < 0)) {
+            throw new LargeTransferStagingQuotaError("invalid current staging evidence");
+        }
+    }
+    const plannedBytes = checkedStagingAdd(totalSize, STAGING_CHECKPOINT_MAX_BYTES);
+    return withStagingQuotaLock(async () => {
+        if (!io.listDirectory) {
+            throw new LargeTransferStagingQuotaError("staging quota cannot be proven without directory listing");
+        }
+        let targetActive = false;
+        for (const active of activeStagingReservations) {
+            if (active.io === io && (active.targetPath === targetPath ||
+                active.checkpointPath === currentCheckpointPath)) {
+                targetActive = true;
+                break;
+            }
+        }
+        if (targetActive ||
+            activeStagingReservations.size >= STAGING_QUOTA_WAITERS) {
+            throw new LargeTransferStagingQuotaError("staging transfer admission is busy");
+        }
+        let listing: Awaited<ReturnType<NonNullable<PlatformIO["listDirectory"]>>>;
+        try {
+            listing = await io.listDirectory(TRANSFER_DIR);
+        } catch {
+            // A clean installation has no transfer directory yet. Creating
+            // this exact internal directory and retrying still proves an empty
+            // quota; any persistent listing/permission error remains fail-closed.
+            try {
+                await io.mkdir(TRANSFER_DIR);
+                listing = await io.listDirectory(TRANSFER_DIR);
+            } catch {
+                throw new LargeTransferStagingQuotaError("staging directory cannot be enumerated");
+            }
+        }
+        const entryCount = checkedStagingAdd(listing.files.length, listing.folders.length);
+        if (entryCount > STAGING_QUOTA_FILES || listing.folders.length > 0) {
+            throw new LargeTransferStagingQuotaError("staging directory entry quota cannot be proven");
+        }
+
+        const activePaths = new Set<string>();
+        let usedBytes = 0;
+        let usedFiles = 0;
+        for (const active of activeStagingReservations) {
+            if (active.io === io) {
+                activePaths.add(active.stagingPath);
+                activePaths.add(active.checkpointPath);
+            }
+            usedBytes = checkedStagingAdd(usedBytes, active.plannedBytes);
+            usedFiles = checkedStagingAdd(usedFiles, 2);
+        }
+
+        const evidence = new Map<string, number>();
+        const observePath = async (path: string): Promise<number> => {
+            const known = evidence.get(path);
+            if (known !== undefined) return known;
+            const stat = await io.stat(path);
+            if (!stat || !Number.isSafeInteger(stat.size) || stat.size < 0) {
+                throw new LargeTransferStagingQuotaError("internal staging entry size cannot be proven");
+            }
+            evidence.set(path, stat.size);
+            return stat.size;
+        };
+
+        const prefix = `${TRANSFER_DIR}/`;
+        const pairs = new Map<string, { part?: string; checkpoint?: string }>();
+        const seen = new Set<string>();
+        const accountOpaque = async (path: string): Promise<void> => {
+            usedBytes = checkedStagingAdd(usedBytes, await observePath(path));
+            usedFiles = checkedStagingAdd(usedFiles, 1);
+        };
+        for (const path of listing.files) {
+            if (seen.has(path)) {
+                throw new LargeTransferStagingQuotaError("duplicate staging directory entry");
+            }
+            seen.add(path);
+            if (!path.startsWith(prefix) || path.slice(prefix.length).includes("/")) {
+                throw new LargeTransferStagingQuotaError("staging listing escaped its internal directory");
+            }
+            if (activePaths.has(path)) continue;
+            await observePath(path);
+            if (path === stagingPath || path === currentCheckpointPath) continue;
+            const name = path.slice(prefix.length);
+            const match = /^([0-9a-f]{64}-[0-9a-f]{16})\.(part|checkpoint\.json)$/.exec(name);
+            if (!match) {
+                // Other internal protocols (for example rename checkpoints)
+                // share this directory. Their stat is enough for quota proof;
+                // this maintenance pass never reads or deletes them.
+                await accountOpaque(path);
+                continue;
+            }
+            const pair = pairs.get(match[1]) ?? {};
+            if (match[2] === "part") pair.part = path;
+            else pair.checkpoint = path;
+            pairs.set(match[1], pair);
+        }
+
+        for (const [transferKey, pair] of pairs) {
+            if (!pair.part || !pair.checkpoint) {
+                await accountOpaque(pair.part ?? pair.checkpoint!);
+                continue;
+            }
+            const partBytes = await observePath(pair.part);
+            const checkpointBytes = await observePath(pair.checkpoint);
+            const checkpoint = checkpointBytes <= STAGING_CHECKPOINT_MAX_BYTES
+                ? await readLargeCheckpoint(io, pair.checkpoint)
+                : null;
+            if (validStoredLargeCheckpoint(checkpoint, transferKey, partBytes) &&
+                checkpoint.targetPath === targetPath) {
+                // A different content-addressed key for the exact target is
+                // obsolete. Delete only after its checkpoint and part agree.
+                await deleteValidatedInternalPair(io, pair.part, pair.checkpoint);
+                evidence.delete(pair.part);
+                evidence.delete(pair.checkpoint);
+                continue;
+            }
+            // Malformed, orphaned, oversized and other-target entries remain
+            // opaque owned bytes. They count against quota but are never GC'd.
+            usedBytes = checkedStagingAdd(usedBytes, partBytes);
+            usedBytes = checkedStagingAdd(usedBytes, checkpointBytes);
+            usedFiles = checkedStagingAdd(usedFiles, 2);
+        }
+
+        let confirmed: Awaited<ReturnType<NonNullable<PlatformIO["listDirectory"]>>>;
+        try { confirmed = await io.listDirectory(TRANSFER_DIR); }
+        catch { throw new LargeTransferStagingQuotaError("staging evidence changed after enumeration"); }
+        if (confirmed.folders.length > 0 ||
+            checkedStagingAdd(confirmed.files.length, confirmed.folders.length) > STAGING_QUOTA_FILES) {
+            throw new LargeTransferStagingQuotaError("staging evidence changed after enumeration");
+        }
+        const confirmedPaths = new Set<string>();
+        for (const path of confirmed.files) {
+            if (confirmedPaths.has(path) || !path.startsWith(prefix) ||
+                path.slice(prefix.length).includes("/")) {
+                throw new LargeTransferStagingQuotaError("staging evidence changed after enumeration");
+            }
+            confirmedPaths.add(path);
+            if (activePaths.has(path)) continue;
+            const expected = evidence.get(path);
+            const stat = await io.stat(path);
+            if (expected === undefined || !stat || stat.size !== expected) {
+                throw new LargeTransferStagingQuotaError("staging evidence changed after enumeration");
+            }
+        }
+        for (const path of evidence.keys()) {
+            if (!confirmedPaths.has(path)) {
+                throw new LargeTransferStagingQuotaError("staging evidence changed after enumeration");
+            }
+        }
+        const confirmedCurrentBytes = (path: string): number | null =>
+            confirmedPaths.has(path) ? evidence.get(path) ?? null : null;
+        if (confirmedCurrentBytes(stagingPath) !== expectedStagingBytes ||
+            confirmedCurrentBytes(currentCheckpointPath) !== expectedCheckpointBytes) {
+            throw new LargeTransferStagingQuotaError("current staging pair changed before admission");
+        }
+
+        usedBytes = checkedStagingAdd(usedBytes, plannedBytes);
+        usedFiles = checkedStagingAdd(usedFiles, 2);
+        if (usedBytes > STAGING_QUOTA_BYTES || usedFiles > STAGING_QUOTA_FILES) {
+            throw new LargeTransferStagingQuotaError("staging quota is full");
+        }
+        const reservation = {
+            io,
+            targetPath,
+            stagingPath,
+            checkpointPath: currentCheckpointPath,
+            plannedBytes,
+        };
+        activeStagingReservations.add(reservation);
+        let released = false;
+        return {
+            release() {
+                if (released) return;
+                released = true;
+                activeStagingReservations.delete(reservation);
+            },
+        };
+    });
 }
 
 async function writeLargeCheckpoint(
@@ -1991,7 +2774,11 @@ async function writeLargeCheckpoint(
     path: string,
     checkpoint: LargeTransferCheckpoint,
 ): Promise<void> {
-    await io.writeFile(path, new TextEncoder().encode(JSON.stringify(checkpoint)));
+    const encoded = new TextEncoder().encode(JSON.stringify(checkpoint));
+    if (encoded.byteLength > STAGING_CHECKPOINT_MAX_BYTES) {
+        throw new LargeTransferStagingQuotaError("large-transfer checkpoint exceeds staging quota");
+    }
+    await io.writeFile(path, encoded);
 }
 
 async function safeDelete(io: PlatformIO, path: string): Promise<void> {

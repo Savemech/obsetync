@@ -11,13 +11,13 @@ use crate::chunk::{ChunkError, FileEntry};
 use crate::diff::{self, DiffResult, DiffStats, FileDelta};
 use crate::hash::{hash_bytes, FileHash};
 use crate::store::ChunkStore;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 const LEAF_MAGIC: &[u8; 4] = b"OVL2";
 const INTERNAL_MAGIC: &[u8; 4] = b"OVI2";
 const ROOT_MAGIC: &[u8; 4] = b"OVR2";
-const LEAF_HEADER_BYTES: usize = 8;
-const INTERNAL_HEADER_BYTES: usize = 12;
+pub(crate) const LEAF_HEADER_BYTES: usize = 8;
+pub(crate) const INTERNAL_HEADER_BYTES: usize = 12;
 const STORED_ROOT_HEADER_BYTES: usize = 64;
 const MAX_STORED_ROOT_BYTES: usize = 16 * 1024;
 const MAX_ROOT_ID_BYTES: usize = 1_024;
@@ -32,10 +32,10 @@ pub const MAX_TREE_DEPTH: u16 = 16;
 pub const MAX_VISITED_NODES: usize = 1_000_000;
 pub const MAX_LOADED_ENTRIES: usize = 10_000_000;
 
-const LEAF_ANCHOR_MASK: u64 = 0x7f;
-const MIN_INTERNAL_CHILDREN: usize = 32;
-const MAX_INTERNAL_CHILDREN: usize = 256;
-const INTERNAL_ANCHOR_MASK: u64 = 0x1f;
+pub(crate) const LEAF_ANCHOR_MASK: u64 = 0x7f;
+pub(crate) const MIN_INTERNAL_CHILDREN: usize = 32;
+pub(crate) const MAX_INTERNAL_CHILDREN: usize = 256;
+pub(crate) const INTERNAL_ANCHOR_MASK: u64 = 0x1f;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RangeRef {
@@ -46,6 +46,30 @@ pub struct RangeRef {
     pub serialized_bytes: u32,
     /// Zero names a leaf; every internal level increments it by one.
     pub height: u16,
+}
+
+/// Copy one path through an exact-size allocation request. The allocator may
+/// still return spare capacity; callers use this only to make the requested
+/// endpoint bytes recoverable and independently countable before allocation.
+pub(crate) fn copy_path_with_exact_request(path: &str) -> Result<String, ChunkError> {
+    let mut copy = String::new();
+    copy.try_reserve_exact(path.len())
+        .map_err(|_| invalid("Tree v2 range path allocation failed"))?;
+    copy.push_str(path);
+    Ok(copy)
+}
+
+/// Copy a descriptor without an infallible String allocation. Scalar fields
+/// and the fixed-size hash are copied; both endpoint requests are exact.
+pub(crate) fn copy_range_with_exact_request(range: &RangeRef) -> Result<RangeRef, ChunkError> {
+    Ok(RangeRef {
+        min_path: copy_path_with_exact_request(&range.min_path)?,
+        max_path: copy_path_with_exact_request(&range.max_path)?,
+        hash: range.hash,
+        file_count: range.file_count,
+        serialized_bytes: range.serialized_bytes,
+        height: range.height,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +96,46 @@ pub struct RootNodeV2 {
 }
 
 impl RootNodeV2 {
+    /// Copy the four optional String owners with exact recoverable requests.
+    /// Construct the history wrapper literally: `new` would reset its history.
+    pub(crate) fn try_clone_exact(&self) -> Result<Self, ChunkError> {
+        self.try_clone_with_strings(copy_path_with_exact_request)
+    }
+
+    pub(crate) fn try_clone_with_strings(
+        &self,
+        mut copy: impl FnMut(&str) -> Result<String, ChunkError>,
+    ) -> Result<Self, ChunkError> {
+        let vault_id = copy(&self.vault_id)?;
+        let device_id = copy(&self.device_id)?;
+        let child = self
+            .tree
+            .child
+            .as_ref()
+            .map(|range| {
+                Ok::<_, ChunkError>(RangeRef {
+                    min_path: copy(&range.min_path)?,
+                    max_path: copy(&range.max_path)?,
+                    hash: range.hash,
+                    file_count: range.file_count,
+                    serialized_bytes: range.serialized_bytes,
+                    height: range.height,
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            vault_id,
+            device_id,
+            created_ms: self.created_ms,
+            parent_hash: self.parent_hash,
+            tree: TreeV2Root {
+                version: self.tree.version,
+                total_files: self.tree.total_files,
+                child,
+            },
+        })
+    }
+
     pub fn new(
         vault_id: impl Into<String>,
         device_id: impl Into<String>,
@@ -97,25 +161,7 @@ impl RootNodeV2 {
     }
 
     pub fn serialize(&self) -> Result<Vec<u8>, ChunkError> {
-        self.validate()?;
-        let mut capacity = STORED_ROOT_HEADER_BYTES
-            .checked_add(self.vault_id.len())
-            .and_then(|value| value.checked_add(self.device_id.len()))
-            .ok_or_else(|| invalid("Tree v2 stored root length overflow"))?;
-        if self.parent_hash.is_some() {
-            capacity = capacity
-                .checked_add(32)
-                .ok_or_else(|| invalid("Tree v2 stored root length overflow"))?;
-        }
-        if let Some(child) = &self.tree.child {
-            capacity = capacity
-                .checked_add(2)
-                .and_then(|value| value.checked_add(range_record_len(child)))
-                .ok_or_else(|| invalid("Tree v2 stored root length overflow"))?;
-        }
-        if capacity > MAX_STORED_ROOT_BYTES {
-            return Err(invalid("Tree v2 stored root exceeds the byte cap"));
-        }
+        let capacity = self.serialized_length()?;
 
         let vault_len = u16::try_from(self.vault_id.len())
             .map_err(|_| invalid("Tree v2 vault id is too long"))?;
@@ -150,6 +196,29 @@ impl RootNodeV2 {
         output.extend_from_slice(self.device_id.as_bytes());
         debug_assert_eq!(output.len(), capacity);
         Ok(output)
+    }
+
+    /// Validated, allocation-free size preflight for the bounded root codec.
+    pub(crate) fn serialized_length(&self) -> Result<usize, ChunkError> {
+        self.validate()?;
+        let mut capacity = replacement_root_serialized_length(
+            &self.vault_id,
+            &self.device_id,
+            self.tree
+                .child
+                .as_ref()
+                .map(|child| (child.min_path.as_str(), child.max_path.as_str())),
+        )?;
+        if self.parent_hash.is_some() {
+            capacity = capacity
+                .checked_add(32)
+                .ok_or_else(|| invalid("Tree v2 stored root length overflow"))?;
+        }
+        if capacity > MAX_STORED_ROOT_BYTES {
+            return Err(invalid("Tree v2 stored root exceeds the byte cap"));
+        }
+
+        Ok(capacity)
     }
 
     pub fn deserialize(bytes: &[u8]) -> Result<Self, ChunkError> {
@@ -227,6 +296,38 @@ impl RootNodeV2 {
     }
 }
 
+/// Allocation-free exact size preflight for a replacement root (no parent).
+/// The child hash and scalar fields have fixed widths, so only the endpoint
+/// path lengths are needed before node encoding has produced any hashes.
+pub(crate) fn replacement_root_serialized_length(
+    vault_id: &str,
+    device_id: &str,
+    child_paths: Option<(&str, &str)>,
+) -> Result<usize, ChunkError> {
+    validate_root_id("vault", vault_id, false)?;
+    validate_root_id("device", device_id, true)?;
+    let mut capacity = STORED_ROOT_HEADER_BYTES
+        .checked_add(vault_id.len())
+        .and_then(|value| value.checked_add(device_id.len()))
+        .ok_or_else(|| invalid("Tree v2 stored root length overflow"))?;
+    if let Some((min_path, max_path)) = child_paths {
+        validate_path(min_path)?;
+        validate_path(max_path)?;
+        if min_path > max_path {
+            return Err(invalid("Tree v2 root range is inverted"));
+        }
+        capacity = capacity
+            .checked_add(2 + 48)
+            .and_then(|value| value.checked_add(min_path.len()))
+            .and_then(|value| value.checked_add(max_path.len()))
+            .ok_or_else(|| invalid("Tree v2 stored root length overflow"))?;
+    }
+    if capacity > MAX_STORED_ROOT_BYTES {
+        return Err(invalid("Tree v2 stored root exceeds the byte cap"));
+    }
+    Ok(capacity)
+}
+
 impl TreeV2Root {
     pub fn hash(&self) -> FileHash {
         let mut bytes = Vec::with_capacity(96);
@@ -261,7 +362,7 @@ pub struct UpdateStats {
 }
 
 #[derive(Debug, Clone)]
-enum V2Node {
+pub(crate) enum V2Node {
     Leaf(Vec<FileEntry>),
     Internal {
         child_height: u16,
@@ -560,25 +661,275 @@ pub async fn leaf_ranges<S: ChunkStore>(
     collect_leaf_refs(store, root, &mut budget).await
 }
 
+pub(crate) struct V2ReachabilityCursor {
+    pending: Vec<RangeRef>,
+    expanding: Option<V2ChildExpansion>,
+    reachable: HashSet<FileHash>,
+    descriptors: HashMap<FileHash, RangeRef>,
+    budget: TraversalBudget,
+    completed: usize,
+    seeding_complete: bool,
+    retiring: bool,
+    retiring_pending: Option<std::vec::IntoIter<RangeRef>>,
+    retiring_descriptors: Option<std::collections::hash_map::IntoValues<FileHash, RangeRef>>,
+    retiring_hashes: Option<std::collections::hash_set::IntoIter<FileHash>>,
+    retirement_phase: u8,
+}
+
+struct V2ChildExpansion {
+    children: std::vec::IntoIter<RangeRef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct V2ReachabilityProgress {
+    pub units: usize,
+    pub completed: usize,
+    pub remaining: usize,
+    pub reachable: usize,
+    pub done: bool,
+}
+
+impl V2ReachabilityCursor {
+    pub(crate) fn new(root: &TreeV2Root) -> Result<Self, ChunkError> {
+        validate_root_shape(root)?;
+        Ok(Self {
+            pending: Vec::new(),
+            expanding: None,
+            reachable: HashSet::new(),
+            descriptors: HashMap::new(),
+            budget: TraversalBudget::default(),
+            completed: 0,
+            seeding_complete: false,
+            retiring: false,
+            retiring_pending: None,
+            retiring_descriptors: None,
+            retiring_hashes: None,
+            retirement_phase: 0,
+        })
+    }
+
+    pub(crate) fn seed_root_child(&mut self, range: RangeRef) -> Result<(), ChunkError> {
+        if self.retiring || self.seeding_complete {
+            return Err(invalid("Tree v2 reachability root seeding is complete"));
+        }
+        self.pending.push(range);
+        self.completed = self.completed.saturating_add(1);
+        Ok(())
+    }
+
+    pub(crate) fn finish_seeding(&mut self) {
+        assert!(
+            !self.retiring,
+            "retiring Tree v2 reachability cannot resume"
+        );
+        self.seeding_complete = true;
+    }
+
+    /// Each unit either transfers one decoded child descriptor to the pending
+    /// stack or validates one pending descriptor/node. A single node decode is
+    /// still an indivisible native primitive capped by MAX_NODE_BYTES.
+    pub(crate) async fn step<S: ChunkStore>(
+        &mut self,
+        store: &S,
+        max_units: usize,
+    ) -> Result<V2ReachabilityProgress, ChunkError> {
+        if self.retiring {
+            return Err(invalid("Tree v2 reachability is retiring"));
+        }
+        if max_units == 0 {
+            return Err(invalid("Tree v2 reachability step budget must be positive"));
+        }
+        if !self.seeding_complete {
+            return Err(invalid("Tree v2 reachability root seeding is incomplete"));
+        }
+        let mut units = 0usize;
+        while units < max_units {
+            if let Some(expanding) = &mut self.expanding {
+                let child = expanding
+                    .children
+                    .next()
+                    .expect("active Tree v2 child expansion is non-empty");
+                self.pending.push(child);
+                units += 1;
+                self.completed = self.completed.saturating_add(1);
+                if expanding.children.len() == 0 {
+                    self.expanding = None;
+                }
+                continue;
+            }
+            let Some(range) = self.pending.pop() else {
+                break;
+            };
+            units += 1;
+            self.completed = self.completed.saturating_add(1);
+            if let Some(previous) = self.descriptors.get(&range.hash) {
+                if previous != &range {
+                    return Err(invalid(
+                        "Tree v2 repeated hash has a different child descriptor",
+                    ));
+                }
+                continue;
+            }
+            self.budget.node(range.height)?;
+            match load_node(store, &range).await? {
+                V2Node::Leaf(entries) => self.budget.entries(entries.len())?,
+                V2Node::Internal { children, .. } => {
+                    if !children.is_empty() {
+                        self.expanding = Some(V2ChildExpansion {
+                            children: children.into_iter(),
+                        });
+                    }
+                }
+            }
+            self.reachable.insert(range.hash);
+            self.descriptors.insert(range.hash, range);
+        }
+        Ok(self.progress(units))
+    }
+
+    pub(crate) fn progress(&self, units: usize) -> V2ReachabilityProgress {
+        V2ReachabilityProgress {
+            units,
+            completed: self.completed,
+            remaining: self.pending.len()
+                + self
+                    .expanding
+                    .as_ref()
+                    .map(|value| value.children.len())
+                    .unwrap_or(0),
+            reachable: self.reachable.len(),
+            done: !self.retiring
+                && self.seeding_complete
+                && self.pending.is_empty()
+                && self.expanding.is_none(),
+        }
+    }
+
+    pub(crate) fn finish(self) -> Result<HashSet<FileHash>, ChunkError> {
+        if self.retiring
+            || !self.seeding_complete
+            || !self.pending.is_empty()
+            || self.expanding.is_some()
+        {
+            return Err(invalid("Tree v2 reachability validation is incomplete"));
+        }
+        Ok(self.reachable)
+    }
+
+    pub(crate) fn take_reachable(&mut self) -> Result<HashSet<FileHash>, ChunkError> {
+        if self.retiring
+            || !self.seeding_complete
+            || !self.pending.is_empty()
+            || self.expanding.is_some()
+        {
+            return Err(invalid("Tree v2 reachability validation is incomplete"));
+        }
+        Ok(std::mem::take(&mut self.reachable))
+    }
+
+    /// Permanently close traversal and release at most one descriptor/hash or
+    /// one exhausted backing owner. Hash-table iterator scans, allocator work,
+    /// and one RangeRef's two bounded endpoint Strings remain atomic residuals.
+    pub(crate) fn retire_one(&mut self) -> bool {
+        self.retiring = true;
+        loop {
+            match self.retirement_phase {
+                0 => {
+                    if let Some(expanding) = &mut self.expanding {
+                        if expanding.children.next().is_some() {
+                            return true;
+                        }
+                        self.expanding = None;
+                        self.retirement_phase = 1;
+                        return true;
+                    }
+                    self.retirement_phase = 1;
+                }
+                1 => {
+                    if self.retiring_pending.is_none() {
+                        if self.pending.capacity() == 0 {
+                            self.retirement_phase = 2;
+                            continue;
+                        }
+                        self.retiring_pending = Some(std::mem::take(&mut self.pending).into_iter());
+                    }
+                    if self
+                        .retiring_pending
+                        .as_mut()
+                        .expect("pending retirement phase owns its iterator")
+                        .next()
+                        .is_some()
+                    {
+                        return true;
+                    }
+                    self.retiring_pending = None;
+                    self.retirement_phase = 2;
+                    return true;
+                }
+                2 => {
+                    if self.retiring_descriptors.is_none() {
+                        if self.descriptors.capacity() == 0 {
+                            self.retirement_phase = 3;
+                            continue;
+                        }
+                        self.retiring_descriptors =
+                            Some(std::mem::take(&mut self.descriptors).into_values());
+                    }
+                    if self
+                        .retiring_descriptors
+                        .as_mut()
+                        .expect("descriptor retirement phase owns its iterator")
+                        .next()
+                        .is_some()
+                    {
+                        return true;
+                    }
+                    self.retiring_descriptors = None;
+                    self.retirement_phase = 3;
+                    return true;
+                }
+                3 => {
+                    if self.retiring_hashes.is_none() {
+                        if self.reachable.capacity() == 0 {
+                            self.retirement_phase = 4;
+                            continue;
+                        }
+                        self.retiring_hashes =
+                            Some(std::mem::take(&mut self.reachable).into_iter());
+                    }
+                    if self
+                        .retiring_hashes
+                        .as_mut()
+                        .expect("hash retirement phase owns its iterator")
+                        .next()
+                        .is_some()
+                    {
+                        return true;
+                    }
+                    self.retiring_hashes = None;
+                    self.retirement_phase = 4;
+                    return true;
+                }
+                4 => return false,
+                _ => unreachable!("invalid Tree v2 reachability retirement phase"),
+            }
+        }
+    }
+}
+
 pub async fn reachable_hashes<S: ChunkStore>(
     store: &S,
     root: &TreeV2Root,
 ) -> Result<HashSet<FileHash>, ChunkError> {
-    validate_root_shape(root)?;
-    let mut output = HashSet::new();
-    let mut budget = TraversalBudget::default();
-    let mut pending: Vec<RangeRef> = root.child.iter().cloned().collect();
-    while let Some(range) = pending.pop() {
-        if !output.insert(range.hash) {
-            continue;
-        }
-        budget.node(range.height)?;
-        match load_node(store, &range).await? {
-            V2Node::Leaf(entries) => budget.entries(entries.len())?,
-            V2Node::Internal { children, .. } => pending.extend(children),
-        }
+    let mut cursor = V2ReachabilityCursor::new(root)?;
+    for range in root.child.iter().cloned() {
+        cursor.seed_root_child(range)?;
     }
-    Ok(output)
+    cursor.finish_seeding();
+    while !cursor.progress(0).done {
+        cursor.step(store, usize::MAX).await?;
+    }
+    cursor.finish()
 }
 
 async fn root_from_leaves<S: ChunkStore>(
@@ -604,7 +955,8 @@ async fn root_from_leaves<S: ChunkStore>(
         let mut parents = Vec::with_capacity(segments.len());
         for segment in segments {
             parents.push(
-                store_internal(store, child_height, &ranges[segment.start..segment.end]).await?,
+                store_internal(store, child_height, &mut ranges[segment.start..segment.end])
+                    .await?,
             );
             emitted += 1;
         }
@@ -660,7 +1012,7 @@ async fn store_leaf<S: ChunkStore>(
 async fn store_internal<S: ChunkStore>(
     store: &S,
     child_height: u16,
-    children: &[RangeRef],
+    children: &mut [RangeRef],
 ) -> Result<RangeRef, ChunkError> {
     let bytes = encode_internal(child_height, children)?;
     let hash = hash_bytes(&bytes);
@@ -671,9 +1023,15 @@ async fn store_internal<S: ChunkStore>(
         sum.checked_add(child.file_count)
             .ok_or_else(|| invalid("Tree v2 file count overflow"))
     })?;
+    // The caller owns this complete private level and each child belongs to
+    // exactly one encoded segment. Only after every fallible validation/store
+    // operation succeeds do its boundary allocations become the parent.
+    let min_path = std::mem::take(&mut children[0].min_path);
+    let last = children.len() - 1;
+    let max_path = std::mem::take(&mut children[last].max_path);
     Ok(RangeRef {
-        min_path: children[0].min_path.clone(),
-        max_path: children[children.len() - 1].max_path.clone(),
+        min_path,
+        max_path,
         hash,
         file_count,
         serialized_bytes,
@@ -681,7 +1039,7 @@ async fn store_internal<S: ChunkStore>(
     })
 }
 
-fn encode_leaf(entries: &[FileEntry]) -> Result<Vec<u8>, ChunkError> {
+pub(crate) fn encode_leaf(entries: &[FileEntry]) -> Result<Vec<u8>, ChunkError> {
     validate_entries(entries)?;
     if entries.len() > MAX_LEAF_ENTRIES {
         return Err(invalid("Tree v2 leaf exceeds the entry cap"));
@@ -693,7 +1051,10 @@ fn encode_leaf(entries: &[FileEntry]) -> Result<Vec<u8>, ChunkError> {
     if capacity > MAX_NODE_BYTES {
         return Err(invalid("Tree v2 leaf exceeds the byte cap"));
     }
-    let mut output = Vec::with_capacity(capacity);
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(capacity)
+        .map_err(|_| invalid("Tree v2 leaf allocation failed"))?;
     output.extend_from_slice(LEAF_MAGIC);
     output.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for entry in entries {
@@ -706,7 +1067,10 @@ fn encode_leaf(entries: &[FileEntry]) -> Result<Vec<u8>, ChunkError> {
     Ok(output)
 }
 
-fn encode_internal(child_height: u16, children: &[RangeRef]) -> Result<Vec<u8>, ChunkError> {
+pub(crate) fn encode_internal(
+    child_height: u16,
+    children: &[RangeRef],
+) -> Result<Vec<u8>, ChunkError> {
     if children.is_empty() || children.len() > MAX_INTERNAL_CHILDREN {
         return Err(invalid("Tree v2 internal child count is invalid"));
     }
@@ -720,7 +1084,10 @@ fn encode_internal(child_height: u16, children: &[RangeRef]) -> Result<Vec<u8>, 
     if capacity > MAX_NODE_BYTES {
         return Err(invalid("Tree v2 internal node exceeds the byte cap"));
     }
-    let mut output = Vec::with_capacity(capacity);
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(capacity)
+        .map_err(|_| invalid("Tree v2 internal allocation failed"))?;
     output.extend_from_slice(INTERNAL_MAGIC);
     output.extend_from_slice(&child_height.to_le_bytes());
     output.extend_from_slice(&0u16.to_le_bytes());
@@ -792,49 +1159,66 @@ fn decode_node(bytes: &[u8]) -> Result<V2Node, ChunkError> {
     Err(invalid("unknown Tree v2 node magic"))
 }
 
-async fn load_node<S: ChunkStore>(store: &S, range: &RangeRef) -> Result<V2Node, ChunkError> {
+pub(crate) fn validate_loaded_node(range: &RangeRef, bytes: &[u8]) -> Result<V2Node, ChunkError> {
     validate_range(range)?;
-    let bytes = store.get(&range.hash).await?;
     if bytes.len() != range.serialized_bytes as usize || hash_bytes(&bytes) != range.hash {
         return Err(invalid("Tree v2 child failed content-address validation"));
     }
     let node = decode_node(&bytes)?;
-    let actual = descriptor_for_node(range.hash, bytes.len(), &node)?;
-    if actual != *range {
-        return Err(invalid("Tree v2 child descriptor does not match its bytes"));
-    }
+    validate_descriptor_for_node(range, bytes.len(), &node)?;
     Ok(node)
 }
 
-fn descriptor_for_node(
-    hash: FileHash,
+async fn load_node<S: ChunkStore>(store: &S, range: &RangeRef) -> Result<V2Node, ChunkError> {
+    validate_range(range)?;
+    let bytes = store.get(&range.hash).await?;
+    validate_loaded_node(range, &bytes)
+}
+
+fn validate_descriptor_for_node(
+    range: &RangeRef,
     serialized_bytes: usize,
     node: &V2Node,
-) -> Result<RangeRef, ChunkError> {
-    match node {
-        V2Node::Leaf(entries) => Ok(RangeRef {
-            min_path: entries[0].path.clone(),
-            max_path: entries[entries.len() - 1].path.clone(),
-            hash,
-            file_count: entries.len() as u64,
-            serialized_bytes: serialized_bytes as u32,
-            height: 0,
-        }),
+) -> Result<(), ChunkError> {
+    let serialized_bytes = u32::try_from(serialized_bytes)
+        .map_err(|_| invalid("Tree v2 child length does not fit its descriptor"))?;
+    let matches = match node {
+        V2Node::Leaf(entries) => {
+            let first = entries
+                .first()
+                .expect("validated Tree v2 leaf is non-empty");
+            let last = entries.last().expect("validated Tree v2 leaf is non-empty");
+            range.min_path == first.path
+                && range.max_path == last.path
+                && range.file_count == entries.len() as u64
+                && range.serialized_bytes == serialized_bytes
+                && range.height == 0
+        }
         V2Node::Internal {
             child_height,
             children,
-        } => Ok(RangeRef {
-            min_path: children[0].min_path.clone(),
-            max_path: children[children.len() - 1].max_path.clone(),
-            hash,
-            file_count: children.iter().try_fold(0u64, |sum, child| {
+        } => {
+            let first = children
+                .first()
+                .expect("validated Tree v2 internal node is non-empty");
+            let last = children
+                .last()
+                .expect("validated Tree v2 internal node is non-empty");
+            let file_count = children.iter().try_fold(0u64, |sum, child| {
                 sum.checked_add(child.file_count)
                     .ok_or_else(|| invalid("Tree v2 file count overflow"))
-            })?,
-            serialized_bytes: serialized_bytes as u32,
-            height: child_height + 1,
-        }),
+            })?;
+            range.min_path == first.min_path
+                && range.max_path == last.max_path
+                && range.file_count == file_count
+                && range.serialized_bytes == serialized_bytes
+                && range.height == child_height + 1
+        }
+    };
+    if !matches {
+        return Err(invalid("Tree v2 child descriptor does not match its bytes"));
     }
+    Ok(())
 }
 
 async fn collect_leaf_refs<S: ChunkStore>(
@@ -1071,7 +1455,7 @@ fn gear_word(value: u64) -> u64 {
     mixed ^ (mixed >> 31)
 }
 
-fn validate_root_shape(root: &TreeV2Root) -> Result<(), ChunkError> {
+pub(crate) fn validate_root_shape(root: &TreeV2Root) -> Result<(), ChunkError> {
     if root.version != TREE_VERSION {
         return Err(invalid("unsupported Tree v2 root version"));
     }
@@ -1117,7 +1501,7 @@ fn validate_ranges(ranges: &[RangeRef], expected_height: u16) -> Result<(), Chun
     Ok(())
 }
 
-fn validate_range(range: &RangeRef) -> Result<(), ChunkError> {
+pub(crate) fn validate_range(range: &RangeRef) -> Result<(), ChunkError> {
     validate_path(&range.min_path)?;
     validate_path(&range.max_path)?;
     if range.min_path > range.max_path
@@ -1133,7 +1517,7 @@ fn validate_range(range: &RangeRef) -> Result<(), ChunkError> {
     Ok(())
 }
 
-fn validate_path(path: &str) -> Result<(), ChunkError> {
+pub(crate) fn validate_path(path: &str) -> Result<(), ChunkError> {
     if path.is_empty() || path.len() > MAX_PATH_BYTES || path.starts_with('/') {
         return Err(invalid("Tree v2 path length is invalid"));
     }
@@ -1162,11 +1546,11 @@ fn validate_root_id(kind: &str, value: &str, allow_empty: bool) -> Result<(), Ch
     Ok(())
 }
 
-fn leaf_record_len(entry: &FileEntry) -> usize {
+pub(crate) fn leaf_record_len(entry: &FileEntry) -> usize {
     2 + entry.path.len() + 32 + 8 + 8
 }
 
-fn range_record_len(range: &RangeRef) -> usize {
+pub(crate) fn range_record_len(range: &RangeRef) -> usize {
     2 + 2 + range.min_path.len() + range.max_path.len() + 32 + 8 + 4
 }
 
@@ -1192,12 +1576,14 @@ fn decode_range_ref(reader: &mut Reader<'_>, height: u16) -> Result<RangeRef, Ch
     if min_len == 0 || min_len > MAX_PATH_BYTES || max_len == 0 || max_len > MAX_PATH_BYTES {
         return Err(invalid("Tree v2 range path length is invalid"));
     }
-    let min_path = std::str::from_utf8(reader.take(min_len)?)
-        .map_err(|_| invalid("Tree v2 minimum path is not UTF-8"))?
-        .to_owned();
-    let max_path = std::str::from_utf8(reader.take(max_len)?)
-        .map_err(|_| invalid("Tree v2 maximum path is not UTF-8"))?
-        .to_owned();
+    let min_path = copy_path_with_exact_request(
+        std::str::from_utf8(reader.take(min_len)?)
+            .map_err(|_| invalid("Tree v2 minimum path is not UTF-8"))?,
+    )?;
+    let max_path = copy_path_with_exact_request(
+        std::str::from_utf8(reader.take(max_len)?)
+            .map_err(|_| invalid("Tree v2 maximum path is not UTF-8"))?,
+    )?;
     let hash = reader
         .take(32)?
         .try_into()
@@ -1306,6 +1692,309 @@ mod tests {
         }
         output.sort();
         output
+    }
+
+    async fn stepped_reachable(
+        store: &MemoryChunkStore,
+        root: &TreeV2Root,
+        max_units: usize,
+    ) -> (HashSet<FileHash>, usize) {
+        let mut cursor = V2ReachabilityCursor::new(root).unwrap();
+        for range in root.child.iter().cloned() {
+            cursor.seed_root_child(range).unwrap();
+        }
+        cursor.finish_seeding();
+        while !cursor.progress(0).done {
+            let progress = cursor.step(store, max_units).await.unwrap();
+            assert!(progress.units > 0 && progress.units <= max_units);
+        }
+        let completed = cursor.progress(0).completed;
+        (cursor.finish().unwrap(), completed)
+    }
+
+    #[tokio::test]
+    async fn reachability_cursor_is_step_size_independent() {
+        let store = MemoryChunkStore::new();
+        let root = build_tree(&store, entries(25_000)).await.unwrap();
+        assert_eq!(
+            stepped_reachable(&store, &root, 1).await,
+            stepped_reachable(&store, &root, 256).await
+        );
+    }
+
+    #[tokio::test]
+    async fn reachability_cursor_moves_every_decoded_child_endpoint_buffer() {
+        let store = MemoryChunkStore::new();
+        let root = build_tree(&store, entries(2_000)).await.unwrap();
+        assert!(root.child.as_ref().unwrap().height > 0);
+
+        let mut cursor = V2ReachabilityCursor::new(&root).unwrap();
+        cursor.seed_root_child(root.child.clone().unwrap()).unwrap();
+        cursor.finish_seeding();
+        assert_eq!(cursor.step(&store, 1).await.unwrap().units, 1);
+
+        let endpoint_buffers: Vec<_> = cursor
+            .expanding
+            .as_ref()
+            .unwrap()
+            .children
+            .as_slice()
+            .iter()
+            .map(|range| {
+                (
+                    range.min_path.as_ptr(),
+                    range.min_path.capacity(),
+                    range.max_path.as_ptr(),
+                    range.max_path.capacity(),
+                )
+            })
+            .collect();
+        assert!(endpoint_buffers.len() > 1);
+        let completed = cursor.progress(0).completed;
+        let progress = cursor.step(&store, 1).await.unwrap();
+        assert_eq!(progress.units, 1);
+        assert_eq!(progress.completed, completed + 1);
+        assert_eq!(progress.remaining, endpoint_buffers.len());
+        assert_eq!(cursor.pending.len(), 1);
+        assert_eq!(
+            cursor.expanding.as_ref().unwrap().children.len(),
+            endpoint_buffers.len() - 1
+        );
+        let moved = cursor.pending.last().unwrap();
+        assert_eq!(moved.min_path.as_ptr(), endpoint_buffers[0].0);
+        assert_eq!(moved.min_path.capacity(), endpoint_buffers[0].1);
+        assert_eq!(moved.max_path.as_ptr(), endpoint_buffers[0].2);
+        assert_eq!(moved.max_path.capacity(), endpoint_buffers[0].3);
+
+        let remaining = endpoint_buffers.len() - 1;
+        let progress = cursor.step(&store, remaining).await.unwrap();
+        assert_eq!(progress.units, remaining);
+        assert_eq!(progress.completed, completed + endpoint_buffers.len());
+        assert_eq!(progress.remaining, endpoint_buffers.len());
+        assert!(cursor.expanding.is_none());
+        assert_eq!(cursor.pending.len(), endpoint_buffers.len());
+        for (range, (min_path, min_capacity, max_path, max_capacity)) in
+            cursor.pending.iter().zip(endpoint_buffers)
+        {
+            assert_eq!(range.min_path.as_ptr(), min_path);
+            assert_eq!(range.min_path.capacity(), min_capacity);
+            assert_eq!(range.max_path.as_ptr(), max_path);
+            assert_eq!(range.max_path.capacity(), max_capacity);
+        }
+
+        while !cursor.progress(0).done {
+            cursor.step(&store, 256).await.unwrap();
+        }
+        assert_eq!(cursor.finish().unwrap().len(), store.len());
+    }
+
+    #[test]
+    fn reachability_retirement_v2_drops_at_most_one_owned_descriptor_per_unit() {
+        let root = TreeV2Root {
+            version: TREE_VERSION,
+            total_files: 0,
+            child: None,
+        };
+        let range = |index: u32| RangeRef {
+            min_path: format!("range/{index:04}/a.md"),
+            max_path: format!("range/{index:04}/z.md"),
+            hash: hash_bytes(&index.to_le_bytes()),
+            file_count: 1,
+            serialized_bytes: 64,
+            height: 0,
+        };
+        let mut empty = V2ReachabilityCursor::new(&root).unwrap();
+        assert!(
+            !empty.retire_one(),
+            "empty owners were charged as retirement work"
+        );
+        assert_eq!(empty.retirement_phase, 4);
+        let mut cursor = V2ReachabilityCursor::new(&root).unwrap();
+        cursor.pending = (0..3).map(range).collect();
+        cursor.expanding = Some(V2ChildExpansion {
+            children: (10..15).map(range).collect::<Vec<_>>().into_iter(),
+        });
+        cursor.descriptors = (20..27)
+            .map(|index| {
+                let descriptor = range(index);
+                (descriptor.hash, descriptor)
+            })
+            .collect();
+        cursor.reachable = cursor.descriptors.keys().copied().collect();
+
+        let mut units = 0usize;
+        let mut previous_descriptors: usize = 3 + 5 + 7;
+        let mut previous_hashes: usize = 7;
+        while cursor.retire_one() {
+            units += 1;
+            let descriptors = cursor.pending.len()
+                + cursor
+                    .expanding
+                    .as_ref()
+                    .map_or(0, |owner| owner.children.len())
+                + cursor
+                    .retiring_pending
+                    .as_ref()
+                    .map_or(0, ExactSizeIterator::len)
+                + cursor.descriptors.len()
+                + cursor
+                    .retiring_descriptors
+                    .as_ref()
+                    .map_or(0, ExactSizeIterator::len);
+            let hashes = cursor.reachable.len()
+                + cursor
+                    .retiring_hashes
+                    .as_ref()
+                    .map_or(0, ExactSizeIterator::len);
+            assert!(previous_descriptors.saturating_sub(descriptors) <= 1);
+            assert!(previous_hashes.saturating_sub(hashes) <= 1);
+            previous_descriptors = descriptors;
+            previous_hashes = hashes;
+            assert!(
+                units < 100,
+                "Tree v2 reachability retirement did not converge"
+            );
+        }
+        assert_eq!(units, 5 + 1 + 3 + 1 + 7 + 1 + 7 + 1);
+        assert_eq!(previous_descriptors, 0);
+        assert_eq!(previous_hashes, 0);
+        assert!(!cursor.retire_one());
+        assert!(cursor.seed_root_child(range(99)).is_err());
+        assert!(cursor.finish().is_err());
+    }
+
+    #[test]
+    fn descriptor_validation_checks_leaf_and_internal_fields() {
+        let leaf = V2Node::Leaf(vec![entry("a.md", 1), entry("z.md", 2)]);
+        let leaf_range = RangeRef {
+            min_path: "a.md".into(),
+            max_path: "z.md".into(),
+            hash: hash_bytes(b"leaf"),
+            file_count: 2,
+            serialized_bytes: 97,
+            height: 0,
+        };
+        validate_descriptor_for_node(&leaf_range, 97, &leaf).unwrap();
+
+        let mut mismatch = leaf_range.clone();
+        mismatch.file_count += 1;
+        assert!(validate_descriptor_for_node(&mismatch, 97, &leaf).is_err());
+        mismatch = leaf_range.clone();
+        mismatch.min_path = "0.md".into();
+        assert!(validate_descriptor_for_node(&mismatch, 97, &leaf).is_err());
+        mismatch = leaf_range.clone();
+        mismatch.max_path = "zz.md".into();
+        assert!(validate_descriptor_for_node(&mismatch, 97, &leaf).is_err());
+        mismatch = leaf_range.clone();
+        mismatch.height = 1;
+        assert!(validate_descriptor_for_node(&mismatch, 97, &leaf).is_err());
+        assert!(validate_descriptor_for_node(&leaf_range, 98, &leaf).is_err());
+
+        let children = vec![
+            RangeRef {
+                min_path: "a.md".into(),
+                max_path: "m.md".into(),
+                hash: hash_bytes(b"left"),
+                file_count: 3,
+                serialized_bytes: 80,
+                height: 0,
+            },
+            RangeRef {
+                min_path: "n.md".into(),
+                max_path: "z.md".into(),
+                hash: hash_bytes(b"right"),
+                file_count: 5,
+                serialized_bytes: 81,
+                height: 0,
+            },
+        ];
+        let internal = V2Node::Internal {
+            child_height: 0,
+            children,
+        };
+        let internal_range = RangeRef {
+            min_path: "a.md".into(),
+            max_path: "z.md".into(),
+            hash: hash_bytes(b"internal"),
+            file_count: 8,
+            serialized_bytes: 211,
+            height: 1,
+        };
+        validate_descriptor_for_node(&internal_range, 211, &internal).unwrap();
+
+        let mut mismatch = internal_range.clone();
+        mismatch.file_count -= 1;
+        assert!(validate_descriptor_for_node(&mismatch, 211, &internal).is_err());
+        mismatch = internal_range.clone();
+        mismatch.min_path = "0.md".into();
+        assert!(validate_descriptor_for_node(&mismatch, 211, &internal).is_err());
+        mismatch = internal_range.clone();
+        mismatch.max_path = "zz.md".into();
+        assert!(validate_descriptor_for_node(&mismatch, 211, &internal).is_err());
+        mismatch = internal_range.clone();
+        mismatch.height = 0;
+        assert!(validate_descriptor_for_node(&mismatch, 211, &internal).is_err());
+        assert!(validate_descriptor_for_node(&internal_range, 212, &internal).is_err());
+
+        #[cfg(target_pointer_width = "64")]
+        assert!(
+            validate_descriptor_for_node(&internal_range, u32::MAX as usize + 1, &internal)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn reachability_rejects_one_hash_under_different_descriptors() {
+        let store = MemoryChunkStore::new();
+        let valid = store_leaf(&store, &[entry("z.md", 1)]).await.unwrap();
+        let mut forged = valid.clone();
+        forged.min_path = "a.md".into();
+        forged.max_path = "a.md".into();
+        let parent = store_internal(&store, 0, &mut [forged, valid])
+            .await
+            .unwrap();
+        let root = TreeV2Root {
+            version: TREE_VERSION,
+            total_files: 2,
+            child: Some(parent),
+        };
+        assert!(reachable_hashes(&store, &root).await.is_err());
+        let mut cursor = V2ReachabilityCursor::new(&root).unwrap();
+        cursor.seed_root_child(root.child.clone().unwrap()).unwrap();
+        cursor.finish_seeding();
+        let mut failure = None;
+        while !cursor.progress(0).done {
+            if let Err(error) = cursor.step(&store, 1).await {
+                failure = Some(error);
+                break;
+            }
+        }
+        assert!(failure.is_some());
+    }
+
+    #[tokio::test]
+    async fn internal_parent_moves_private_boundary_endpoint_allocations() {
+        let store = MemoryChunkStore::new();
+        let left = store_leaf(&store, &[entry("a/é.md", 1)]).await.unwrap();
+        let right = store_leaf(&store, &[entry("z/終.md", 2)]).await.unwrap();
+        let mut children = vec![left, right];
+        let min_ptr = children[0].min_path.as_ptr();
+        let min_capacity = children[0].min_path.capacity();
+        let max_ptr = children[1].max_path.as_ptr();
+        let max_capacity = children[1].max_path.capacity();
+
+        let parent = store_internal(&store, 0, &mut children).await.unwrap();
+        assert_eq!(parent.min_path.as_ptr(), min_ptr);
+        assert_eq!(parent.min_path.capacity(), min_capacity);
+        assert_eq!(parent.max_path.as_ptr(), max_ptr);
+        assert_eq!(parent.max_path.capacity(), max_capacity);
+        assert!(children[0].min_path.is_empty());
+        assert!(children[1].max_path.is_empty());
+        let bytes = store.get_chunk(&parent.hash).unwrap();
+        assert!(matches!(
+            validate_loaded_node(&parent, &bytes).unwrap(),
+            V2Node::Internal { .. }
+        ));
     }
 
     #[derive(Clone, Copy)]

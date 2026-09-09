@@ -65,8 +65,8 @@ try {
     if (process.argv.includes("--record")) {
         const artifactNames = {
             "x86-desktop": "x86-resource-governor-slice14.json",
-            "m1-macos": "m1-resource-governor-slice14.json",
-            "snapdragon-windows": "snapdragon-resource-governor-slice14.json",
+            "macos-arm64": "m1-resource-governor-slice14.json",
+            "windows-arm64": "snapdragon-resource-governor-slice14.json",
         };
         const artifactName = artifactNames[report.profile_family];
         if (!artifactName) throw new Error("benchmark reported an unsupported profile family");

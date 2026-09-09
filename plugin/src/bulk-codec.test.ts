@@ -20,9 +20,46 @@ import {
     type BulkUploadRecord,
 } from "./bulk-codec";
 
+let assertions = 0;
 const check = (condition: unknown, message: string) => {
+    assertions++;
     if (!condition) throw new Error(message);
 };
+
+function bulkRejected(operation: () => unknown, expected: RegExp, message: string): void {
+    try {
+        operation();
+    } catch (error) {
+        check(error instanceof Error && expected.test(error.message),
+            `${message}: non-protocol failure ${String(error)}`);
+        return;
+    }
+    check(false, `${message}: input was accepted`);
+}
+
+function deterministicWords(seed: number): () => number {
+    let state = seed >>> 0;
+    return () => {
+        state ^= state << 13;
+        state ^= state >>> 17;
+        state ^= state << 5;
+        return state >>> 0;
+    };
+}
+
+function deterministicBytes(length: number, word: () => number): Uint8Array {
+    const bytes = new Uint8Array(length);
+    for (let index = 0; index < length; index++) bytes[index] = word() & 0xff;
+    return bytes;
+}
+
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
+    if (left.byteLength !== right.byteLength) return false;
+    for (let index = 0; index < left.byteLength; index++) {
+        if (left[index] !== right[index]) return false;
+    }
+    return true;
+}
 
 const limits: BulkCodecLimits = {
     maxObjects: 256,
@@ -200,10 +237,209 @@ function payloadTooLargeRetrySplitIsBalancedAndOrdered(): void {
     check(rejected, "413 split accepted a pack that cannot be divided");
 }
 
+function seededBoundedRoundTrips(): void {
+    const word = deterministicWords(0x4f425031);
+    const propertyLimits: BulkCodecLimits = {
+        maxObjects: 32,
+        maxBytes: 128 * 1024,
+        maxObjectBytes: 4096,
+    };
+    const countEdges = [0, 1, 2, 7, 8, 9, 16, 31, 32];
+    const lengthEdges = [0, 1, 31, 32, 255, 256, 1023, 4096];
+    for (let iteration = 0; iteration < 80; iteration++) {
+        const count = iteration < countEdges.length ? countEdges[iteration] : word() % 17;
+        const records: BulkUploadRecord[] = [];
+        for (let index = 0; index < count; index++) {
+            const length = index < lengthEdges.length
+                ? lengthEdges[(iteration + index) % lengthEdges.length]
+                : word() % 1025;
+            const rawHash = hashToHex(deterministicBytes(32, word));
+            records.push({
+                kind: word() % 4 as BulkObjectKind,
+                hash: (iteration + index) % 2 === 0 ? rawHash : rawHash.toUpperCase(),
+                data: deterministicBytes(length, word),
+                flags: index % 3 === 0 ? 0 : undefined,
+            });
+        }
+        const encoded = encodeBulkUploadPack(records, propertyLimits);
+        check(encoded.byteLength === bulkPackEncodedLength(records),
+            `seeded bulk pack length changed at ${iteration}`);
+        const padded = new Uint8Array(encoded.byteLength + 9);
+        padded.set(encoded, 4);
+        const input = iteration % 2 === 0 ? encoded : padded.subarray(4, 4 + encoded.byteLength);
+        const decoded = decodeBulkUploadPack(input, propertyLimits);
+        check(decoded.length === records.length, `seeded bulk count changed at ${iteration}`);
+        for (let index = 0; index < records.length; index++) {
+            check(decoded[index].kind === records[index].kind &&
+                decoded[index].hash === records[index].hash.toLowerCase(),
+            `seeded bulk identity changed at ${iteration}/${index}`);
+            check(decoded[index].plainLength === records[index].data.byteLength &&
+                decoded[index].storedLength === records[index].data.byteLength &&
+                sameBytes(decoded[index].data, records[index].data),
+            `seeded bulk payload changed at ${iteration}/${index}`);
+        }
+
+        const hashes = records.map(record => record.hash);
+        const checkRequest = encodeBulkCheckRequest(
+            iteration % 4 as BulkObjectKind,
+            hashes,
+            propertyLimits.maxObjects,
+        );
+        check(checkRequest.byteLength === 9 + 32 * hashes.length &&
+            new DataView(checkRequest.buffer).getUint32(5, true) === hashes.length,
+        `seeded bulk check layout changed at ${iteration}`);
+        for (let index = 0; index < hashes.length; index++) {
+            check(hashToHex(checkRequest.subarray(9 + index * 32, 41 + index * 32)) ===
+                hashes[index].toLowerCase(), `seeded bulk check hash changed at ${iteration}/${index}`);
+        }
+
+        const bitmap = new Uint8Array(8 + Math.floor((hashes.length + 7) / 8));
+        bitmap.set(new TextEncoder().encode("OBA1"));
+        new DataView(bitmap.buffer).setUint32(4, hashes.length, true);
+        const expectedNeeded: string[] = [];
+        for (let index = 0; index < hashes.length; index++) {
+            if ((word() & 1) !== 0) {
+                bitmap[8 + (index >>> 3)] |= 1 << (index & 7);
+                expectedNeeded.push(hashes[index]);
+            }
+        }
+        check(JSON.stringify(decodeBulkCheckResponse(bitmap, hashes)) === JSON.stringify(expectedNeeded),
+            `seeded bulk bitmap changed at ${iteration}`);
+
+        const ack = new Uint8Array(8 + count);
+        ack.set(new TextEncoder().encode(BULK_PACK_ACK_MAGIC));
+        new DataView(ack.buffer).setUint32(4, count, true);
+        const expectedStatuses: number[] = [];
+        for (let index = 0; index < count; index++) {
+            const status = word() % 5;
+            ack[8 + index] = status;
+            expectedStatuses.push(status);
+        }
+        check(decodeBulkUploadAck(ack, count).join() === expectedStatuses.join(),
+            `seeded bulk ACK changed at ${iteration}`);
+
+        const cursor = count === 0 ? 0 : word() % (count + 1);
+        const get = encodeBulkGetRequest(
+            iteration % 4 as BulkObjectKind,
+            hashes,
+            cursor,
+            1 + word() % 0xffff_ffff,
+            propertyLimits.maxObjects,
+        );
+        const getView = new DataView(get.buffer);
+        check(get.byteLength === 17 + 32 * hashes.length &&
+            getView.getUint32(5, true) === count && getView.getUint32(9, true) === cursor,
+        `seeded bulk GET layout changed at ${iteration}`);
+    }
+}
+
+function seededMalformedPacksFailClosed(): void {
+    const word = deterministicWords(0x42414431);
+    const propertyLimits: BulkCodecLimits = { maxObjects: 8, maxBytes: 4096, maxObjectBytes: 512 };
+    for (let iteration = 0; iteration < 96; iteration++) {
+        const records: BulkUploadRecord[] = [
+            { kind: BulkObjectKind.Content, hash: hash(iteration), data: deterministicBytes(3, word) },
+            { kind: BulkObjectKind.Manifest, hash: hash(iteration + 1), data: deterministicBytes(5, word) },
+        ];
+        const encoded = encodeBulkUploadPack(records, propertyLimits);
+        let malformed: Uint8Array;
+        let expected: RegExp;
+        switch (iteration % 12) {
+            case 0:
+                malformed = encoded.slice(); malformed[0] ^= 0xff; expected = /bulk message magic/; break;
+            case 1:
+                malformed = encoded.slice(); malformed[4] = 1; expected = /bulk pack flags/; break;
+            case 2:
+                malformed = encoded.slice();
+                new DataView(malformed.buffer).setUint32(6, propertyLimits.maxObjects + 1, true);
+                expected = /bulk pack object count/; break;
+            case 3:
+                malformed = encoded.slice(); new DataView(malformed.buffer).setUint32(6, 3, true);
+                expected = /bulk record headers/; break;
+            case 4:
+                malformed = encoded.slice(); malformed[10] = 4; expected = /bulk object kind/; break;
+            case 5:
+                malformed = encoded.slice(); malformed[11] = 1; expected = /bulk record flags/; break;
+            case 6:
+                malformed = encoded.slice(); new DataView(malformed.buffer).setUint32(44, 4, true);
+                expected = /compressed bulk records/; break;
+            case 7:
+                malformed = encoded.slice();
+                new DataView(malformed.buffer).setUint32(44, propertyLimits.maxObjectBytes + 1, true);
+                new DataView(malformed.buffer).setUint32(48, propertyLimits.maxObjectBytes + 1, true);
+                expected = /bulk record exceeds object byte limit/; break;
+            case 8:
+                malformed = encoded.slice();
+                new DataView(malformed.buffer).setUint32(44, 30, true);
+                new DataView(malformed.buffer).setUint32(48, 30, true);
+                expected = /truncated bulk record (bytes|header)/; break;
+            case 9:
+                malformed = encoded.subarray(0, word() % encoded.byteLength); expected = /bulk|truncated/; break;
+            case 10:
+                malformed = new Uint8Array(encoded.byteLength + 1); malformed.set(encoded);
+                expected = /trailing bytes after bulk pack/; break;
+            default:
+                malformed = encoded.slice(); new DataView(malformed.buffer).setUint32(6, 0, true);
+                expected = /trailing bytes after bulk pack/; break;
+        }
+        bulkRejected(
+            () => decodeBulkUploadPack(malformed, propertyLimits),
+            expected,
+            `seeded malformed bulk pack ${iteration}`,
+        );
+    }
+
+    const headerOnlyPack = encodeBulkUploadPack([
+        { kind: BulkObjectKind.Content, hash: hash(200), data: new Uint8Array() },
+    ], propertyLimits);
+    const headerView = new DataView(headerOnlyPack.buffer);
+    headerView.setUint32(44, 0xffff_ffff, true);
+    headerView.setUint32(48, 0xffff_ffff, true);
+    bulkRejected(
+        () => decodeBulkUploadPack(headerOnlyPack,
+            { maxObjects: 0xffff_ffff, maxBytes: 0xffff_ffff, maxObjectBytes: 0xffff_ffff }),
+        /bulk record bytes overflow/,
+        "bulk pack with a 4-GiB header-only record declaration",
+    );
+
+    const countOnlyPack = new Uint8Array(10);
+    countOnlyPack.set(new TextEncoder().encode(BULK_PACK_MAGIC));
+    new DataView(countOnlyPack.buffer).setUint32(6, 0xffff_ffff, true);
+    bulkRejected(
+        () => decodeBulkUploadPack(countOnlyPack,
+            { maxObjects: 0xffff_ffff, maxBytes: 0xffff_ffff, maxObjectBytes: 1 }),
+        /bulk record headers overflow/,
+        "bulk pack with a 4-billion record declaration",
+    );
+
+    const hugeAck = new Uint8Array(8);
+    hugeAck.set(new TextEncoder().encode(BULK_PACK_ACK_MAGIC));
+    new DataView(hugeAck.buffer).setUint32(4, 0xffff_ffff, true);
+    bulkRejected(
+        () => decodeBulkUploadAck(hugeAck, 0xffff_ffff),
+        /bulk upload ACK count\/length mismatch/,
+        "bulk ACK with a 4-billion status declaration",
+    );
+
+    const hugeDownload = new Uint8Array(12);
+    hugeDownload.set(new TextEncoder().encode(BULK_DOWNLOAD_MAGIC));
+    const downloadView = new DataView(hugeDownload.buffer);
+    downloadView.setUint32(4, 0xffff_ffff, true);
+    downloadView.setUint32(8, 0, true);
+    bulkRejected(
+        () => decodeBulkDownloadResponse(hugeDownload, 0xffff_ffff, 0,
+            { maxObjects: 1, maxBytes: 0xffff_ffff, maxObjectBytes: 1 }),
+        /truncated bulk download bitmap/,
+        "bulk download with a 4-billion bitmap declaration",
+    );
+}
+
 checkCodecPreservesOrderingAndBitmap();
 uploadPackAndAckAreStrict();
 downloadPagesCarryCursorBitmapAndPack();
 malformedAndLimitCasesFailClosed();
 w1RequestCountCollapsesToBoundedPacks();
 payloadTooLargeRetrySplitIsBalancedAndOrdered();
-console.log("bulk-codec.test: 45 assertions passed");
+seededBoundedRoundTrips();
+seededMalformedPacksFailClosed();
+console.log(`bulk-codec.test: ${assertions} assertions passed`);

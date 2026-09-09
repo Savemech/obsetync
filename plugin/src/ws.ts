@@ -43,6 +43,10 @@ export class ObsetyncWsChannel {
     private lastFrameMs = 0;
     private stopped = true;
     private visibilityListener: (() => void) | null = null;
+    private pageHideListener: (() => void) | null = null;
+    private pageShowListener: (() => void) | null = null;
+    private foregroundStale = false;
+    private connectionGeneration = 0;
     /** Serialize decrypts/encrypts so sequence counters match wire order. */
     private rxChain: Promise<void> = Promise.resolve();
     private txChain: Promise<void> = Promise.resolve();
@@ -52,21 +56,32 @@ export class ObsetyncWsChannel {
         private vaultId: string,
         private onRootChanged: (root: string) => void,
         private onPresence: (p: PresenceUpdate) => void = () => {},
+        private onForegroundResume: () => void = () => {},
     ) {}
 
     start(): void {
         this.stopped = false;
-        // Mobile suspends sockets in the background; on resume, reconnect
-        // immediately instead of waiting out a backoff window.
+        this.foregroundStale = document.visibilityState !== "visible";
+        // A host may freeze a socket without delivering close/error. Crossing
+        // a hidden/pagehide epoch therefore invalidates the old session even
+        // when WebSocket.readyState still says OPEN.
         this.visibilityListener = () => {
-            if (document.visibilityState === "visible") this.ensureConnected();
+            if (document.visibilityState === "visible") this.resumeForeground();
+            else this.foregroundStale = true;
         };
         document.addEventListener("visibilitychange", this.visibilityListener);
+        if (typeof window !== "undefined") {
+            this.pageHideListener = () => { this.foregroundStale = true; };
+            this.pageShowListener = () => this.resumeForeground();
+            window.addEventListener("pagehide", this.pageHideListener);
+            window.addEventListener("pageshow", this.pageShowListener);
+        }
         void this.connect();
     }
 
     stop(): void {
         this.stopped = true;
+        this.foregroundStale = false;
         if (this.reconnectTimer !== null) window.clearTimeout(this.reconnectTimer);
         if (this.pingTimer !== null) window.clearInterval(this.pingTimer);
         this.reconnectTimer = null;
@@ -75,6 +90,15 @@ export class ObsetyncWsChannel {
             document.removeEventListener("visibilitychange", this.visibilityListener);
             this.visibilityListener = null;
         }
+        if (this.pageHideListener) {
+            window.removeEventListener("pagehide", this.pageHideListener);
+            this.pageHideListener = null;
+        }
+        if (this.pageShowListener) {
+            window.removeEventListener("pageshow", this.pageShowListener);
+            this.pageShowListener = null;
+        }
+        this.connectionGeneration++;
         try {
             this.ws?.close();
         } catch {
@@ -109,6 +133,31 @@ export class ObsetyncWsChannel {
         void this.connect();
     }
 
+    private resumeForeground(): void {
+        if (this.stopped || !this.foregroundStale) return;
+        this.foregroundStale = false;
+
+        // Invalidate synchronously before asking the engine to pull. This makes
+        // isConnected() false until a fresh authenticated `ready`, so normal
+        // polling cannot be suppressed by a silently dead pre-suspend socket.
+        const previous = this.ws;
+        this.connectionGeneration++;
+        this.ws = null;
+        this.session = null;
+        this.lastFrameMs = 0;
+        if (this.reconnectTimer !== null) window.clearTimeout(this.reconnectTimer);
+        if (this.pingTimer !== null) window.clearInterval(this.pingTimer);
+        this.reconnectTimer = null;
+        this.pingTimer = null;
+        this.backoffMs = BACKOFF_START_MS;
+        this.setState("off");
+        try { previous?.close(); } catch { /* stale socket is already gone */ }
+
+        try { this.onForegroundResume(); }
+        catch (error) { console.warn("[obsetync] ws: foreground recovery callback failed:", error); }
+        void this.connect();
+    }
+
     /** Share what this device is looking at (Ph3). No-op unless connected. */
     sendPresence(file: string | null, state: "active" | "idle"): void {
         this.sendSealed({
@@ -136,12 +185,14 @@ export class ObsetyncWsChannel {
     private sendSealed(frame: unknown): void {
         const ws = this.ws;
         const session = this.session;
+        const generation = this.connectionGeneration;
         if (!ws || !session || this.state !== "connected") return;
         const json = JSON.stringify(frame);
         this.txChain = this.txChain
             .then(async () => {
                 const sealed = await session.seal(json);
-                if (this.ws === ws && ws.readyState === WebSocket.OPEN) {
+                if (generation === this.connectionGeneration && this.ws === ws &&
+                    ws.readyState === WebSocket.OPEN) {
                     ws.send(sealed.buffer as ArrayBuffer);
                 }
             })
@@ -150,7 +201,9 @@ export class ObsetyncWsChannel {
 
     private async connect(): Promise<void> {
         if (this.stopped) return;
+        const generation = ++this.connectionGeneration;
         this.setState("connecting");
+        this.lastFrameMs = 0;
 
         // 1. Key exchange + ticket over the sealed HTTP channel.
         let ticket: string;
@@ -169,17 +222,21 @@ export class ObsetyncWsChannel {
             );
         } catch (e) {
             console.warn("[obsetync] ws: ticket/keys failed, backing off:", e);
-            this.scheduleReconnect();
+            this.scheduleReconnect(generation);
             return;
         }
-        if (this.stopped) return;
+        if (this.stopped || generation !== this.connectionGeneration) return;
 
         let ws: WebSocket;
         try {
             ws = new WebSocket(this.wsUrl());
         } catch (e) {
             console.warn("[obsetync] ws: connect failed:", e);
-            this.scheduleReconnect();
+            this.scheduleReconnect(generation);
+            return;
+        }
+        if (this.stopped || generation !== this.connectionGeneration) {
+            try { ws.close(); } catch { /* superseded before ownership */ }
             return;
         }
         ws.binaryType = "arraybuffer";
@@ -188,15 +245,17 @@ export class ObsetyncWsChannel {
         this.rxChain = Promise.resolve();
         this.txChain = Promise.resolve();
         let ready = false;
+        let gone = false;
 
         ws.onopen = () => {
-            if (this.stopped) return;
+            if (this.stopped || generation !== this.connectionGeneration || this.ws !== ws) return;
             // Plaintext auth frame — the single-use ticket's only trip over
             // the wire; everything after is sealed.
             ws.send(JSON.stringify({ v: 2, t: "auth", ticket }));
         };
 
         ws.onmessage = (ev: MessageEvent) => {
+            if (this.stopped || generation !== this.connectionGeneration || this.ws !== ws) return;
             if (!(ev.data instanceof ArrayBuffer)) {
                 // Plaintext frames only carry pre-auth "bye" errors.
                 console.warn("[obsetync] ws: server said:", String(ev.data).slice(0, 200));
@@ -205,7 +264,9 @@ export class ObsetyncWsChannel {
             const data = new Uint8Array(ev.data);
             this.rxChain = this.rxChain
                 .then(async () => {
+                    if (this.stopped || generation !== this.connectionGeneration || this.ws !== ws) return;
                     const inner = await session.open(data);
+                    if (this.stopped || generation !== this.connectionGeneration || this.ws !== ws) return;
                     this.lastFrameMs = Date.now();
                     const frame = JSON.parse(inner) as {
                         t?: string;
@@ -271,6 +332,9 @@ export class ObsetyncWsChannel {
         };
 
         const onGone = () => {
+            if (gone) return;
+            gone = true;
+            if (this.stopped || generation !== this.connectionGeneration) return;
             if (this.pingTimer !== null) {
                 window.clearInterval(this.pingTimer);
                 this.pingTimer = null;
@@ -282,19 +346,20 @@ export class ObsetyncWsChannel {
             if (!ready) {
                 console.warn("[obsetync] ws: closed before ready (auth rejected?)");
             }
-            this.scheduleReconnect();
+            this.scheduleReconnect(generation);
         };
         ws.onclose = onGone;
         ws.onerror = onGone;
     }
 
-    private scheduleReconnect(): void {
-        if (this.stopped) return;
+    private scheduleReconnect(generation = this.connectionGeneration): void {
+        if (this.stopped || generation !== this.connectionGeneration) return;
         if (this.reconnectTimer !== null) return; // one pending attempt at a time
         this.setState("backoff");
         const delay = this.backoffMs;
         this.backoffMs = Math.min(this.backoffMs * 2, BACKOFF_CAP_MS);
         this.reconnectTimer = window.setTimeout(() => {
+            if (generation !== this.connectionGeneration) return;
             this.reconnectTimer = null;
             void this.connect();
         }, delay);

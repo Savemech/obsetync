@@ -86,13 +86,13 @@ async fn dashboard(State(state): State<SharedState>) -> Html<String> {
 
     // Vault inventory: list each vault + size of its current root (if any).
     let vaults_dir = state.layout.base.join("vaults");
-    let mut vaults: Vec<(String, Option<u64>, Option<u64>)> = Vec::new();
+    let mut vaults = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&vaults_dir) {
         for e in entries.filter_map(|e| e.ok()) {
             if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 let name = e.file_name().to_string_lossy().to_string();
-                let (size, mtime) = current_root_stats(&state, &name);
-                vaults.push((name, size, mtime));
+                let stats = current_root_stats(&state, &name);
+                vaults.push((name, stats));
             }
         }
     }
@@ -144,12 +144,21 @@ async fn dashboard(State(state): State<SharedState>) -> Html<String> {
 
     let vault_rows: String = vaults
         .iter()
-        .map(|(name, size, mtime)| {
+        .map(|(name, stats)| {
+            let (size, mtime) = match stats {
+                CurrentRootStats::Empty => ("(empty)".into(), "never".into()),
+                CurrentRootStats::Available { bytes, modified_ms } => (
+                    format_bytes(*bytes),
+                    modified_ms
+                        .map(format_time)
+                        .unwrap_or_else(|| "unknown".into()),
+                ),
+                CurrentRootStats::ReadError => ("Read error".into(), "unknown".into()),
+            };
             format!(
                 "<tr><td><a href='/admin/vaults/{name}'>{name}</a></td>\
                  <td>{}</td><td>{}</td></tr>",
-                size.map(format_bytes).unwrap_or_else(|| "(empty)".into()),
-                mtime.map(format_time).unwrap_or_else(|| "never".into()),
+                size, mtime,
             )
         })
         .collect();
@@ -483,8 +492,15 @@ async fn vault_list(State(state): State<SharedState>) -> Html<String> {
         for entry in entries.filter_map(|e| e.ok()) {
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 let name = entry.file_name().to_string_lossy().to_string();
-                let has_root = state.vaults.get_current_root(&name).is_some();
-                vaults.push((name, has_root));
+                let status = match state.vaults.try_get_current_root(&name) {
+                    Ok(Some(_)) => "Active",
+                    Ok(None) => "Empty",
+                    Err(error) => {
+                        tracing::warn!(vault = %name, error = %error, "admin inventory cannot read current root");
+                        "Read error"
+                    }
+                };
+                vaults.push((name, status));
             }
         }
     }
@@ -492,8 +508,7 @@ async fn vault_list(State(state): State<SharedState>) -> Html<String> {
 
     let rows: String = vaults
         .iter()
-        .map(|(name, has_root)| {
-            let status = if *has_root { "Active" } else { "Empty" };
+        .map(|(name, status)| {
             format!("<tr><td><a href='/admin/vaults/{name}'>{name}</a></td><td>{status}</td></tr>")
         })
         .collect();
@@ -518,7 +533,7 @@ async fn vault_detail(
     State(state): State<SharedState>,
     Path(vault_id): Path<String>,
 ) -> Result<Html<String>, ServerErrorHtml> {
-    let current = state.vaults.get_current_root(&vault_id);
+    let current = admin_current_root(&state, &vault_id)?;
     let current_hex = current
         .map(|h| hash_to_hex(&h))
         .unwrap_or_else(|| "none".into());
@@ -591,7 +606,23 @@ async fn vault_detail(
         })
         .collect();
 
-    let current_version = state.vaults.get_current_version(&vault_id);
+    // Reuse the checked head identity rather than issuing a second lossy
+    // current-root read while constructing the tree controls.
+    let current_version = match current {
+        Some(hash) => {
+            let bytes = state
+                .vaults
+                .get_root(&vault_id, &hash)
+                .ok_or_else(|| ServerErrorHtml("current root data missing".into()))?;
+            let root = sync_core::versioned_root::VersionedRoot::deserialize(&bytes)
+                .map_err(|error| ServerErrorHtml(format!("corrupt current root: {error}")))?;
+            if root.vault_id() != vault_id || root.hash() != hash {
+                return Err(ServerErrorHtml("current root identity mismatch".into()));
+            }
+            Some(root.version())
+        }
+        None => None,
+    };
     let fleet = state.devices.fleet_capability("tree-v2");
     let tree_controls = match current_version {
         Some(1) if fleet.ready() => format!(
@@ -677,6 +708,10 @@ async fn rollback_vault(
     let vault_lock = state.vault_lock(&vault_id);
     let _vault_guard = vault_lock.lock().await;
 
+    // An explicit rollback may replace a known current root (or an actually
+    // absent one), but must not erase an unreadable root/receipt head.
+    admin_current_root(&state, &vault_id)?;
+
     if root.version() == sync_core::versioned_root::TREE_V2 {
         let fleet = state.devices.fleet_capability("tree-v2");
         if !fleet.ready() {
@@ -732,9 +767,7 @@ async fn project_tree_version(
         }
     }
 
-    let current_hash = state
-        .vaults
-        .get_current_root(&vault_id)
+    let current_hash = admin_current_root(&state, &vault_id)?
         .ok_or_else(|| ServerErrorHtml("vault has no current root".into()))?;
     let current_bytes = state
         .vaults
@@ -827,9 +860,7 @@ async fn purge_vault(
     let vault_lock = state.vault_lock(&vault_id);
     let _vault_guard = vault_lock.lock().await;
 
-    let current_hash = state
-        .vaults
-        .get_current_root(&vault_id)
+    let current_hash = admin_current_root(&state, &vault_id)?
         .ok_or_else(|| ServerErrorHtml("vault has no current root".into()))?;
     let current_bytes = state
         .vaults
@@ -837,6 +868,9 @@ async fn purge_vault(
         .ok_or_else(|| ServerErrorHtml("current root data missing".into()))?;
     let current_root = sync_core::versioned_root::VersionedRoot::deserialize(&current_bytes)
         .map_err(|e| ServerErrorHtml(format!("corrupt current root: {}", e)))?;
+    if current_root.vault_id() != vault_id || current_root.hash() != current_hash {
+        return Err(ServerErrorHtml("current root identity mismatch".into()));
+    }
 
     let (mut new_root, removed, kept) =
         crate::bridge::run_versioned_purge(state.storage_writer.clone(), current_root, patterns)
@@ -1250,27 +1284,58 @@ fn dir_stats(path: &std::path::Path) -> (u64, u64) {
     (bytes, count)
 }
 
-/// Size + last-modified-ms (epoch) of the current root blob for a vault.
-/// Returns (None, None) if the vault has no current root.
-fn current_root_stats(
-    state: &crate::state::SharedState,
+fn admin_current_root(
+    state: &SharedState,
     vault_id: &str,
-) -> (Option<u64>, Option<u64>) {
-    let hash = match state.vaults.get_current_root(vault_id) {
-        Some(h) => h,
-        None => return (None, None),
+) -> Result<Option<sync_core::hash::FileHash>, ServerErrorHtml> {
+    state
+        .vaults
+        .try_get_current_root(vault_id)
+        .map_err(|error| ServerErrorHtml(format!("current root read failed: {error}")))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CurrentRootStats {
+    Empty,
+    Available {
+        bytes: u64,
+        modified_ms: Option<u64>,
+    },
+    ReadError,
+}
+
+/// Diagnostic statistics, never publication authority. Missing current is
+/// empty; failed current/blob reads remain visibly unknown instead.
+fn current_root_stats(state: &crate::state::SharedState, vault_id: &str) -> CurrentRootStats {
+    let hash = match state.vaults.try_get_current_root(vault_id) {
+        Ok(Some(hash)) => hash,
+        Ok(None) => return CurrentRootStats::Empty,
+        Err(error) => {
+            tracing::warn!(vault = %vault_id, error = %error, "admin statistics cannot read current root");
+            return CurrentRootStats::ReadError;
+        }
     };
     let path = state.layout.vault_root_path(vault_id, &hash);
     match std::fs::metadata(&path) {
-        Ok(m) => {
+        Ok(m) if m.is_file() => {
             let mtime_ms = m
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as u64);
-            (Some(m.len()), mtime_ms)
+            CurrentRootStats::Available {
+                bytes: m.len(),
+                modified_ms: mtime_ms,
+            }
         }
-        Err(_) => (None, None),
+        Ok(_) => {
+            tracing::warn!(vault = %vault_id, "admin statistics current root blob is not a file");
+            CurrentRootStats::ReadError
+        }
+        Err(error) => {
+            tracing::warn!(vault = %vault_id, error = %error, "admin statistics cannot read current root blob");
+            CurrentRootStats::ReadError
+        }
     }
 }
 
@@ -1407,6 +1472,173 @@ mod tests {
     fn dir_stats_empty_dir_zero() {
         let dir = tempdir().unwrap();
         assert_eq!(dir_stats(dir.path()), (0, 0));
+    }
+
+    fn current_root_fixture() -> (tempfile::TempDir, SharedState, sync_core::hash::FileHash) {
+        let dir = tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        layout.init_directories().unwrap();
+        crate::box_key::init_box_keypair(&layout).unwrap();
+        crate::devices::register_device(&layout, "device", "Desktop", &"a".repeat(64)).unwrap();
+        let state = Arc::new(AppState::new(ServerConfig::new(dir.path().to_path_buf())));
+        let root = sync_core::versioned_root::empty_root(
+            sync_core::versioned_root::TREE_V1,
+            "read-error",
+            "device",
+        )
+        .unwrap();
+        let hash = root.hash();
+        state
+            .vaults
+            .store_root("read-error", &hash, &root.serialize().unwrap())
+            .unwrap();
+        state.vaults.set_current_root("read-error", &hash).unwrap();
+        state
+            .devices
+            .report_capabilities("device", [4; 32], Some("read-error"), &["tree-v2".into()])
+            .unwrap();
+        (dir, state, hash)
+    }
+
+    fn assert_current_read_error<T>(result: Result<T, ServerErrorHtml>) {
+        let error = match result {
+            Ok(_) => panic!("unreadable current root was accepted"),
+            Err(error) => error,
+        };
+        assert!(
+            error.0.starts_with("current root read failed:"),
+            "{}",
+            error.0
+        );
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn unreadable_current_is_not_empty_and_blocks_admin_mutations() {
+        // A valid checksum must not make an unknown schema writable. Include a
+        // native read error (directory at the current path), not just bad JSON.
+        for mode in ["corrupt", "unknown-schema", "read-error"] {
+            let (_dir, state, hash) = current_root_fixture();
+            let vault = "read-error";
+            let current = state.layout.vault_current_path(vault);
+            let original_root = state.vaults.get_root(vault, &hash).unwrap();
+            let replacement = match mode {
+                "corrupt" => b"not a current root".to_vec(),
+                "unknown-schema" => {
+                    let payload = serde_json::json!({
+                        "schema": 999, "vault_id": vault,
+                        "root_hash": hash_to_hex(&hash), "receipts": {}
+                    })
+                    .to_string();
+                    let mut checksum = blake3::Hasher::new();
+                    checksum.update(b"obsetync:root-head:v1\0");
+                    checksum.update(payload.as_bytes());
+                    format!(
+                        "OBSETYNC_ROOT_HEAD_V1\n{}\n{payload}",
+                        checksum.finalize().to_hex(),
+                    )
+                    .into_bytes()
+                }
+                _ => Vec::new(),
+            };
+            if mode == "unknown-schema" {
+                let error = crate::root_head::decode(vault, &replacement).unwrap_err();
+                assert!(error.to_string().contains("unsupported root head schema"));
+            }
+            if mode == "read-error" {
+                std::fs::remove_file(&current).unwrap();
+                std::fs::create_dir(&current).unwrap();
+            } else {
+                std::fs::write(&current, &replacement).unwrap();
+            }
+
+            assert_current_read_error(vault_detail(State(state.clone()), Path(vault.into())).await);
+            assert_current_read_error(explorer(State(state.clone()), Path(vault.into())).await);
+            assert_current_read_error(
+                rollback_vault(
+                    State(state.clone()),
+                    Path(vault.into()),
+                    Form(RollbackForm {
+                        root_hash: hash_to_hex(&hash),
+                    }),
+                )
+                .await,
+            );
+            assert_current_read_error(
+                purge_vault(
+                    State(state.clone()),
+                    Path(vault.into()),
+                    Form(PurgeForm {
+                        patterns: "*.md".into(),
+                    }),
+                )
+                .await,
+            );
+            assert_current_read_error(
+                activate_tree_v2(State(state.clone()), Path(vault.into())).await,
+            );
+            assert_current_read_error(
+                downgrade_tree_v2(State(state.clone()), Path(vault.into())).await,
+            );
+
+            let inventory = vault_list(State(state.clone())).await.0;
+            assert!(inventory.contains("<td>Read error</td>"), "{mode}");
+            assert!(!inventory.contains("<td>Empty</td>"), "{mode}");
+            let dashboard = dashboard(State(state.clone())).await.0;
+            assert!(
+                dashboard.contains("<td>Read error</td><td>unknown</td>"),
+                "{mode}"
+            );
+            assert!(!dashboard.contains("<td>(empty)</td>"), "{mode}");
+            assert_eq!(
+                current_root_stats(&state, vault),
+                CurrentRootStats::ReadError
+            );
+
+            if mode == "read-error" {
+                assert!(current.is_dir());
+            } else {
+                assert_eq!(std::fs::read(&current).unwrap(), replacement, "{mode}");
+            }
+            assert_eq!(state.vaults.get_root(vault, &hash).unwrap(), original_root);
+            assert_eq!(
+                std::fs::read_dir(state.layout.vault_roots_dir(vault))
+                    .unwrap()
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_current_remains_empty_but_missing_root_statistics_are_unknown() {
+        let (_dir, state, hash) = current_root_fixture();
+        let vault = "actually-empty";
+        state.layout.ensure_vault(vault).unwrap();
+        assert_eq!(admin_current_root(&state, vault).unwrap(), None);
+        assert_eq!(current_root_stats(&state, vault), CurrentRootStats::Empty);
+        assert!(vault_detail(State(state.clone()), Path(vault.into()))
+            .await
+            .is_ok());
+        assert!(explorer(State(state.clone()), Path(vault.into()))
+            .await
+            .is_ok());
+        let inventory = vault_list(State(state.clone())).await.0;
+        assert!(inventory.contains("actually-empty</a></td><td>Empty</td>"));
+        assert!(inventory.contains("read-error</a></td><td>Active</td>"));
+
+        assert!(matches!(
+            current_root_stats(&state, "read-error"),
+            CurrentRootStats::Available { .. }
+        ));
+        std::fs::remove_file(state.layout.vault_root_path("read-error", &hash)).unwrap();
+        assert_eq!(
+            current_root_stats(&state, "read-error"),
+            CurrentRootStats::ReadError
+        );
     }
 
     #[tokio::test]
@@ -1734,9 +1966,7 @@ async fn explorer(
     State(state): State<SharedState>,
     Path(vault_id): Path<String>,
 ) -> Result<Html<String>, ServerErrorHtml> {
-    let current_hex = state
-        .vaults
-        .get_current_root(&vault_id)
+    let current_hex = admin_current_root(&state, &vault_id)?
         .map(|h| hash_to_hex(&h))
         .unwrap_or_default();
 

@@ -69,11 +69,28 @@ async fn concurrent_pushes_with_same_parent_lose_nothing() {
 
         // Fire both pushes with both requests genuinely in flight at once.
         let (ra, rb) = tokio::join!(
-            push_vault_snapshot(&a, &vault, &a_files, &parent),
-            push_vault_snapshot(&b, &vault, &b_files, &parent),
+            push_vault_snapshot_with_receive_memory_retry(&a, &vault, &a_files, &parent),
+            push_vault_snapshot_with_receive_memory_retry(&b, &vault, &b_files, &parent),
         );
-        let (_, resp_a) = ra.unwrap();
-        let (_, resp_b) = rb.unwrap();
+        let (_, resp_a, retries_a) = ra.unwrap();
+        let (_, resp_b, retries_b) = rb.unwrap();
+        assert!(
+            retries_a <= 2 && retries_b <= 2,
+            "round {round}: receive-memory retry budget was exceeded: A={retries_a} B={retries_b}",
+        );
+        assert!(
+            resp_a.accepted || resp_a.merged,
+            "round {round}: A did not commit: {resp_a:?}",
+        );
+        assert!(
+            resp_b.accepted || resp_b.merged,
+            "round {round}: B did not commit: {resp_b:?}",
+        );
+        assert_ne!(
+            resp_a.merged, resp_b.merged,
+            "round {round}: same-parent pushes must settle as one fast-forward and one merge: \
+             A={resp_a:?} B={resp_b:?}",
+        );
 
         // A third observer pulls the authoritative state.
         let observer = WireClient::new(

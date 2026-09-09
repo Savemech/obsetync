@@ -47,7 +47,7 @@
 //! No `Authorization` header anywhere. Packet captures cannot fingerprint
 //! which device is talking, only that an obsetync session is active.
 
-use aes_gcm::aead::{Aead, Payload};
+use aes_gcm::aead::{Aead, AeadInPlace, Payload};
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
@@ -330,24 +330,30 @@ pub fn encrypt_response(
     key_bytes.zeroize();
     let aad = build_response_aad(method, path, nonce_req);
 
-    let mut plaintext = Vec::with_capacity(2 + body.len());
-    plaintext.extend_from_slice(&status.to_be_bytes());
-    plaintext.extend_from_slice(body);
-    let encrypted = cipher.encrypt(
-        Nonce::from_slice(&nonce_bytes),
-        Payload {
-            msg: &plaintext,
-            aad: &aad,
-        },
-    );
-    plaintext.zeroize();
-    let ct = encrypted.map_err(|e| SecureError::AeadSeal(e.to_string()))?;
-
-    let mut out = Vec::with_capacity(RESPONSE_HEADER_LEN + ct.len());
+    // Build and encrypt the final wire allocation in place. Keeping separate
+    // plaintext, ciphertext and output Vecs would transiently require three
+    // response-sized allocations in addition to the handler body, defeating
+    // the transport admission bound for large downloads.
+    let output_bytes = RESPONSE_HEADER_LEN
+        .checked_add(2)
+        .and_then(|bytes| bytes.checked_add(body.len()))
+        .and_then(|bytes| bytes.checked_add(TAG_LEN))
+        .ok_or_else(|| SecureError::AeadSeal("response length overflow".into()))?;
+    let mut out = Zeroizing::new(Vec::with_capacity(output_bytes));
     out.push(WIRE_VERSION);
     out.extend_from_slice(&nonce_bytes);
-    out.extend_from_slice(&ct);
-    Ok(out)
+    out.extend_from_slice(&status.to_be_bytes());
+    out.extend_from_slice(body);
+    let tag = cipher
+        .encrypt_in_place_detached(
+            Nonce::from_slice(&nonce_bytes),
+            &aad,
+            &mut out[RESPONSE_HEADER_LEN..],
+        )
+        .map_err(|error| SecureError::AeadSeal(error.to_string()))?;
+    out.extend_from_slice(&tag);
+    debug_assert_eq!(out.len(), output_bytes);
+    Ok(std::mem::take(&mut *out))
 }
 
 /// Helper used by tests to build a client-side request envelope. Lives in the

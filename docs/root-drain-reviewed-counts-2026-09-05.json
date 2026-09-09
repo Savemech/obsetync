@@ -1,0 +1,689 @@
+{
+  "schema": 1,
+  "capturedDate": "2026-09-05",
+  "command": "node scripts/diagnose-root-drain.mjs",
+  "execution": {
+    "repetitions": 3,
+    "sequentialInvocations": true,
+    "isolatedFromOtherProjectTestsAndBuilds": true,
+    "sourceState": "Frozen runtime/test sources; measurements completed before this commit was created",
+    "sourceCheckpoint": "responsive-stage-040",
+    "inputPathsPerInvocation": [
+      600,
+      2500
+    ],
+    "everyInvocationExitCode": 0
+  },
+  "evidence": {
+    "measured": [
+      "Actual ObsetyncSyncEngine drain and production local persistence classes over MemorySegmentedIO",
+      "Transparent observed materialization, stat, planner, readiness, dirty-claim and host-yield work counts",
+      "One full review plus selected revalidation: exactly two stat visits per independent quiet path",
+      "Exact bounded root publication sizes, settled base/journal state and disposed reviewed plan"
+    ],
+    "limitations": [
+      "Synthetic JSON tree and server, one-byte sources, all remote objects already present; not packaged WASM or native filesystem I/O",
+      "The server fixture additionally clones and validates local intent persistence for every root; whole-drain timings include that test-only work",
+      "The 16 ms heartbeat reports Node callback gaps, not active-note commit latency, Obsidian responsiveness or mobile suspension behavior",
+      "Estimated planner metadata bytes are an explicit experimental accounting model, not measured JavaScript heap/RSS or a global ResourceBudget lease",
+      "No old/new timing comparison or throughput acceptance threshold is asserted",
+      "A 25,000-path packaged-WASM/native-persistence and real-device service test remains a separate uncompleted gate"
+    ]
+  },
+  "runs": [
+    {
+      "run": 1,
+      "output": {
+        "diagnostic": "actual-engine-root-drain-work-counts",
+        "node": "v22.23.2",
+        "platform": "linux",
+        "architecture": "x64",
+        "corpus": "independent one-byte notes; all object hashes already present; no concurrent edits",
+        "limitations": [
+          "synthetic JSON tree and server; real production local classes over MemorySegmentedIO",
+          "server fixture clones/validates local intents per request; durations are not a transport baseline",
+          "instrumented bundle; no Obsidian/native storage/mobile/RSS or active-note service guarantee"
+        ],
+        "results": [
+          {
+            "paths": 600,
+            "roots": 3,
+            "publicationSizes": [
+              256,
+              256,
+              88
+            ],
+            "materializationInputLengths": [
+              600,
+              256,
+              256,
+              88
+            ],
+            "materializationPathVisits": 1200,
+            "sourceStatCalls": 1200,
+            "sourceStatVisitsPerPathHistogram": {
+              "2": 600
+            },
+            "cooperativePlans": [
+              {
+                "queued": 600,
+                "ready": 600,
+                "dependencies": 0,
+                "creationDurationMs": 7.693,
+                "selectionDurationMs": 1.01,
+                "preflightRows": 1200,
+                "graphSteps": 3000,
+                "graphNodes": 600,
+                "graphComponents": 600,
+                "cooperationCalls": 25,
+                "selectionComponentVisits": 602,
+                "selectedPaths": 600,
+                "batches": [
+                  256,
+                  256,
+                  88
+                ],
+                "estimatedBuildMetadataBytes": 769552,
+                "finalEstimatedRetainedMetadataBytes": 0,
+                "disposed": true
+              }
+            ],
+            "synchronousPlannerCalls": [],
+            "materializationDurationMs": 4.122,
+            "wholeDrainDurationMs": 407.95,
+            "readiness": {
+              "calls": 5,
+              "yieldedHints": 4,
+              "takeCalls": 0,
+              "restoreCalls": 0
+            },
+            "dirtyQueue": {
+              "claimCalls": 600,
+              "claimInputVisits": 600,
+              "claimedPaths": 600,
+              "maxClaimPaths": 1,
+              "takeCalls": 0,
+              "takeInputVisits": 0,
+              "restoreCalls": 6,
+              "restoreInputVisits": 0,
+              "takeLengths": [],
+              "restoreLengths": [
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+              ]
+            },
+            "hostYieldsRequested": 117,
+            "hostYieldsCompleted": 117,
+            "rootContinuationHostBoundaries": 2,
+            "scheduler": "node-immediate",
+            "syntheticHeartbeat": {
+              "requestedIntervalMs": 16,
+              "callbacks": 19,
+              "callbackGapP50Ms": 20.8,
+              "callbackGapP95Ms": 28.85,
+              "callbackGapMaxMs": 28.85
+            }
+          },
+          {
+            "paths": 2500,
+            "roots": 10,
+            "publicationSizes": [
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              196
+            ],
+            "materializationInputLengths": [
+              2500,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              196
+            ],
+            "materializationPathVisits": 5000,
+            "sourceStatCalls": 5000,
+            "sourceStatVisitsPerPathHistogram": {
+              "2": 2500
+            },
+            "cooperativePlans": [
+              {
+                "queued": 2500,
+                "ready": 2500,
+                "dependencies": 0,
+                "creationDurationMs": 19.77,
+                "selectionDurationMs": 2.425,
+                "preflightRows": 5000,
+                "graphSteps": 12500,
+                "graphNodes": 2500,
+                "graphComponents": 2500,
+                "cooperationCalls": 106,
+                "selectionComponentVisits": 2509,
+                "selectedPaths": 2500,
+                "batches": [
+                  256,
+                  256,
+                  256,
+                  256,
+                  256,
+                  256,
+                  256,
+                  256,
+                  256,
+                  196
+                ],
+                "estimatedBuildMetadataBytes": 1753752,
+                "finalEstimatedRetainedMetadataBytes": 0,
+                "disposed": true
+              }
+            ],
+            "synchronousPlannerCalls": [],
+            "materializationDurationMs": 7.965,
+            "wholeDrainDurationMs": 5147.707,
+            "readiness": {
+              "calls": 19,
+              "yieldedHints": 18,
+              "takeCalls": 0,
+              "restoreCalls": 0
+            },
+            "dirtyQueue": {
+              "claimCalls": 2500,
+              "claimInputVisits": 2500,
+              "claimedPaths": 2500,
+              "maxClaimPaths": 1,
+              "takeCalls": 0,
+              "takeInputVisits": 0,
+              "restoreCalls": 20,
+              "restoreInputVisits": 0,
+              "takeLengths": [],
+              "restoreLengths": [
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+              ]
+            },
+            "hostYieldsRequested": 895,
+            "hostYieldsCompleted": 895,
+            "rootContinuationHostBoundaries": 9,
+            "scheduler": "node-immediate",
+            "syntheticHeartbeat": {
+              "requestedIntervalMs": 16,
+              "callbacks": 173,
+              "callbackGapP50Ms": 23.571,
+              "callbackGapP95Ms": 61.87,
+              "callbackGapMaxMs": 68.085
+            }
+          }
+        ]
+      }
+    },
+    {
+      "run": 2,
+      "output": {
+        "diagnostic": "actual-engine-root-drain-work-counts",
+        "node": "v22.23.2",
+        "platform": "linux",
+        "architecture": "x64",
+        "corpus": "independent one-byte notes; all object hashes already present; no concurrent edits",
+        "limitations": [
+          "synthetic JSON tree and server; real production local classes over MemorySegmentedIO",
+          "server fixture clones/validates local intents per request; durations are not a transport baseline",
+          "instrumented bundle; no Obsidian/native storage/mobile/RSS or active-note service guarantee"
+        ],
+        "results": [
+          {
+            "paths": 600,
+            "roots": 3,
+            "publicationSizes": [
+              256,
+              256,
+              88
+            ],
+            "materializationInputLengths": [
+              600,
+              256,
+              256,
+              88
+            ],
+            "materializationPathVisits": 1200,
+            "sourceStatCalls": 1200,
+            "sourceStatVisitsPerPathHistogram": {
+              "2": 600
+            },
+            "cooperativePlans": [
+              {
+                "queued": 600,
+                "ready": 600,
+                "dependencies": 0,
+                "creationDurationMs": 6.558,
+                "selectionDurationMs": 0.883,
+                "preflightRows": 1200,
+                "graphSteps": 3000,
+                "graphNodes": 600,
+                "graphComponents": 600,
+                "cooperationCalls": 25,
+                "selectionComponentVisits": 602,
+                "selectedPaths": 600,
+                "batches": [
+                  256,
+                  256,
+                  88
+                ],
+                "estimatedBuildMetadataBytes": 769552,
+                "finalEstimatedRetainedMetadataBytes": 0,
+                "disposed": true
+              }
+            ],
+            "synchronousPlannerCalls": [],
+            "materializationDurationMs": 2.531,
+            "wholeDrainDurationMs": 357.393,
+            "readiness": {
+              "calls": 5,
+              "yieldedHints": 4,
+              "takeCalls": 0,
+              "restoreCalls": 0
+            },
+            "dirtyQueue": {
+              "claimCalls": 600,
+              "claimInputVisits": 600,
+              "claimedPaths": 600,
+              "maxClaimPaths": 1,
+              "takeCalls": 0,
+              "takeInputVisits": 0,
+              "restoreCalls": 6,
+              "restoreInputVisits": 0,
+              "takeLengths": [],
+              "restoreLengths": [
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+              ]
+            },
+            "hostYieldsRequested": 117,
+            "hostYieldsCompleted": 117,
+            "rootContinuationHostBoundaries": 2,
+            "scheduler": "node-immediate",
+            "syntheticHeartbeat": {
+              "requestedIntervalMs": 16,
+              "callbacks": 18,
+              "callbackGapP50Ms": 17.963,
+              "callbackGapP95Ms": 25.407,
+              "callbackGapMaxMs": 25.407
+            }
+          },
+          {
+            "paths": 2500,
+            "roots": 10,
+            "publicationSizes": [
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              196
+            ],
+            "materializationInputLengths": [
+              2500,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              196
+            ],
+            "materializationPathVisits": 5000,
+            "sourceStatCalls": 5000,
+            "sourceStatVisitsPerPathHistogram": {
+              "2": 2500
+            },
+            "cooperativePlans": [
+              {
+                "queued": 2500,
+                "ready": 2500,
+                "dependencies": 0,
+                "creationDurationMs": 16.401,
+                "selectionDurationMs": 2.308,
+                "preflightRows": 5000,
+                "graphSteps": 12500,
+                "graphNodes": 2500,
+                "graphComponents": 2500,
+                "cooperationCalls": 106,
+                "selectionComponentVisits": 2509,
+                "selectedPaths": 2500,
+                "batches": [
+                  256,
+                  256,
+                  256,
+                  256,
+                  256,
+                  256,
+                  256,
+                  256,
+                  256,
+                  196
+                ],
+                "estimatedBuildMetadataBytes": 1753752,
+                "finalEstimatedRetainedMetadataBytes": 0,
+                "disposed": true
+              }
+            ],
+            "synchronousPlannerCalls": [],
+            "materializationDurationMs": 7.234,
+            "wholeDrainDurationMs": 5067.486,
+            "readiness": {
+              "calls": 19,
+              "yieldedHints": 18,
+              "takeCalls": 0,
+              "restoreCalls": 0
+            },
+            "dirtyQueue": {
+              "claimCalls": 2500,
+              "claimInputVisits": 2500,
+              "claimedPaths": 2500,
+              "maxClaimPaths": 1,
+              "takeCalls": 0,
+              "takeInputVisits": 0,
+              "restoreCalls": 20,
+              "restoreInputVisits": 0,
+              "takeLengths": [],
+              "restoreLengths": [
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+              ]
+            },
+            "hostYieldsRequested": 895,
+            "hostYieldsCompleted": 895,
+            "rootContinuationHostBoundaries": 9,
+            "scheduler": "node-immediate",
+            "syntheticHeartbeat": {
+              "requestedIntervalMs": 16,
+              "callbacks": 172,
+              "callbackGapP50Ms": 23.17,
+              "callbackGapP95Ms": 59.369,
+              "callbackGapMaxMs": 69.054
+            }
+          }
+        ]
+      }
+    },
+    {
+      "run": 3,
+      "output": {
+        "diagnostic": "actual-engine-root-drain-work-counts",
+        "node": "v22.23.2",
+        "platform": "linux",
+        "architecture": "x64",
+        "corpus": "independent one-byte notes; all object hashes already present; no concurrent edits",
+        "limitations": [
+          "synthetic JSON tree and server; real production local classes over MemorySegmentedIO",
+          "server fixture clones/validates local intents per request; durations are not a transport baseline",
+          "instrumented bundle; no Obsidian/native storage/mobile/RSS or active-note service guarantee"
+        ],
+        "results": [
+          {
+            "paths": 600,
+            "roots": 3,
+            "publicationSizes": [
+              256,
+              256,
+              88
+            ],
+            "materializationInputLengths": [
+              600,
+              256,
+              256,
+              88
+            ],
+            "materializationPathVisits": 1200,
+            "sourceStatCalls": 1200,
+            "sourceStatVisitsPerPathHistogram": {
+              "2": 600
+            },
+            "cooperativePlans": [
+              {
+                "queued": 600,
+                "ready": 600,
+                "dependencies": 0,
+                "creationDurationMs": 6.99,
+                "selectionDurationMs": 0.699,
+                "preflightRows": 1200,
+                "graphSteps": 3000,
+                "graphNodes": 600,
+                "graphComponents": 600,
+                "cooperationCalls": 25,
+                "selectionComponentVisits": 602,
+                "selectedPaths": 600,
+                "batches": [
+                  256,
+                  256,
+                  88
+                ],
+                "estimatedBuildMetadataBytes": 769552,
+                "finalEstimatedRetainedMetadataBytes": 0,
+                "disposed": true
+              }
+            ],
+            "synchronousPlannerCalls": [],
+            "materializationDurationMs": 3.041,
+            "wholeDrainDurationMs": 365.993,
+            "readiness": {
+              "calls": 5,
+              "yieldedHints": 4,
+              "takeCalls": 0,
+              "restoreCalls": 0
+            },
+            "dirtyQueue": {
+              "claimCalls": 600,
+              "claimInputVisits": 600,
+              "claimedPaths": 600,
+              "maxClaimPaths": 1,
+              "takeCalls": 0,
+              "takeInputVisits": 0,
+              "restoreCalls": 6,
+              "restoreInputVisits": 0,
+              "takeLengths": [],
+              "restoreLengths": [
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+              ]
+            },
+            "hostYieldsRequested": 117,
+            "hostYieldsCompleted": 117,
+            "rootContinuationHostBoundaries": 2,
+            "scheduler": "node-immediate",
+            "syntheticHeartbeat": {
+              "requestedIntervalMs": 16,
+              "callbacks": 18,
+              "callbackGapP50Ms": 17.779,
+              "callbackGapP95Ms": 27.87,
+              "callbackGapMaxMs": 27.87
+            }
+          },
+          {
+            "paths": 2500,
+            "roots": 10,
+            "publicationSizes": [
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              196
+            ],
+            "materializationInputLengths": [
+              2500,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              196
+            ],
+            "materializationPathVisits": 5000,
+            "sourceStatCalls": 5000,
+            "sourceStatVisitsPerPathHistogram": {
+              "2": 2500
+            },
+            "cooperativePlans": [
+              {
+                "queued": 2500,
+                "ready": 2500,
+                "dependencies": 0,
+                "creationDurationMs": 17.897,
+                "selectionDurationMs": 2.58,
+                "preflightRows": 5000,
+                "graphSteps": 12500,
+                "graphNodes": 2500,
+                "graphComponents": 2500,
+                "cooperationCalls": 106,
+                "selectionComponentVisits": 2509,
+                "selectedPaths": 2500,
+                "batches": [
+                  256,
+                  256,
+                  256,
+                  256,
+                  256,
+                  256,
+                  256,
+                  256,
+                  256,
+                  196
+                ],
+                "estimatedBuildMetadataBytes": 1753752,
+                "finalEstimatedRetainedMetadataBytes": 0,
+                "disposed": true
+              }
+            ],
+            "synchronousPlannerCalls": [],
+            "materializationDurationMs": 7.977,
+            "wholeDrainDurationMs": 5035.609,
+            "readiness": {
+              "calls": 19,
+              "yieldedHints": 18,
+              "takeCalls": 0,
+              "restoreCalls": 0
+            },
+            "dirtyQueue": {
+              "claimCalls": 2500,
+              "claimInputVisits": 2500,
+              "claimedPaths": 2500,
+              "maxClaimPaths": 1,
+              "takeCalls": 0,
+              "takeInputVisits": 0,
+              "restoreCalls": 20,
+              "restoreInputVisits": 0,
+              "takeLengths": [],
+              "restoreLengths": [
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+              ]
+            },
+            "hostYieldsRequested": 895,
+            "hostYieldsCompleted": 895,
+            "rootContinuationHostBoundaries": 9,
+            "scheduler": "node-immediate",
+            "syntheticHeartbeat": {
+              "requestedIntervalMs": 16,
+              "callbacks": 172,
+              "callbackGapP50Ms": 23.862,
+              "callbackGapP95Ms": 63.098,
+              "callbackGapMaxMs": 69.876
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -52,6 +52,8 @@ pub const RESPONSE_HEADER_LEN: usize = 1 + NONCE_LEN;
 const INFO_C2S: &[u8] = b"obsetync/v2/c2s";
 const INFO_S2C: &[u8] = b"obsetync/v2/s2c";
 const AAD_PREFIX: &[u8] = b"obsetync/v2";
+const ROOT_RECEIVE_MEMORY_RETRIES: usize = 2;
+const ROOT_RECEIVE_MEMORY_MAX_RETRY_AFTER_SECS: u64 = 1;
 
 /// Hex string for a 32-byte hash of all zeros — the "fresh client / no parent"
 /// sentinel the server recognises when prepended to PUT /root and POST /diff.
@@ -310,6 +312,18 @@ impl WireClient {
         semantic_method: &str,
         path: &str,
     ) -> Result<RawResponse> {
+        Ok(self
+            .send_sealed(sealed, semantic_method, path)
+            .await?
+            .response)
+    }
+
+    async fn send_sealed(
+        &self,
+        sealed: &SealedRequest,
+        semantic_method: &str,
+        path: &str,
+    ) -> Result<SealedResponse> {
         let url = format!("{}{}", self.base_url, path);
         let resp = self
             .http
@@ -322,15 +336,22 @@ impl WireClient {
             .context("HTTP send")?;
 
         let status = resp.status();
+        let receive_memory_retry_after = receive_memory_retry_after(status, resp.headers());
         let body = resp.bytes().await?.to_vec();
 
         if status != StatusCode::OK {
-            return Ok(RawResponse { status, body });
+            return Ok(SealedResponse {
+                receive_memory_retry_after: receive_memory_retry_after.filter(|_| body.is_empty()),
+                response: RawResponse { status, body },
+            });
         }
         if body.len() == 256 && body.iter().all(|byte| *byte == 0) {
-            return Ok(RawResponse {
-                status: StatusCode::UNAUTHORIZED,
-                body: b"transport decrypt decoy".to_vec(),
+            return Ok(SealedResponse {
+                receive_memory_retry_after: None,
+                response: RawResponse {
+                    status: StatusCode::UNAUTHORIZED,
+                    body: b"transport decrypt decoy".to_vec(),
+                },
             });
         }
         let (semantic_status, plaintext) = decrypt_response(
@@ -344,10 +365,13 @@ impl WireClient {
         )
         .context("decrypt response")?;
 
-        Ok(RawResponse {
-            status: StatusCode::from_u16(semantic_status)
-                .context("invalid encrypted semantic status")?,
-            body: plaintext,
+        Ok(SealedResponse {
+            receive_memory_retry_after: None,
+            response: RawResponse {
+                status: StatusCode::from_u16(semantic_status)
+                    .context("invalid encrypted semantic status")?,
+                body: plaintext,
+            },
         })
     }
 
@@ -374,26 +398,56 @@ impl WireClient {
         root: &RootNode,
         parent_hex: &str,
     ) -> Result<PutRootResponse> {
+        let (response, _) = self
+            .put_root_with_receive_memory_retry(vault_id, root, parent_hex, 0)
+            .await?;
+        Ok(response)
+    }
+
+    /// PUT a root with a bounded retry for the transport-v2 middleware's
+    /// plaintext receive-memory backpressure response. The exact sealed
+    /// request is reused because this 503 is emitted before decryption and
+    /// replay admission. Transport errors, encrypted semantic 503s, and any
+    /// response without the receive-memory marker are never retried.
+    pub async fn put_root_with_receive_memory_retry(
+        &self,
+        vault_id: &str,
+        root: &RootNode,
+        parent_hex: &str,
+        max_retries: usize,
+    ) -> Result<(PutRootResponse, usize)> {
         if parent_hex.len() != 64 {
             bail!("parent_hex must be 64 chars, got {}", parent_hex.len());
         }
         let mut body = Vec::with_capacity(64 + 256);
         body.extend_from_slice(parent_hex.as_bytes());
         body.extend_from_slice(&root.serialize());
+        let path = format!("/api/v1/root/{}", vault_id);
+        let sealed = self.seal_for_test("PUT", &path, &body)?;
+        let retry_limit = max_retries.min(ROOT_RECEIVE_MEMORY_RETRIES);
+        let mut retries = 0;
 
-        let r = self
-            .raw("PUT", &format!("/api/v1/root/{}", vault_id), &body)
-            .await?;
+        let r = loop {
+            let response = self.send_sealed(&sealed, "PUT", &path).await?;
+            match response.receive_memory_retry_after {
+                Some(delay) if retries < retry_limit => {
+                    retries += 1;
+                    tokio::time::sleep(delay).await;
+                }
+                _ => break response.response,
+            }
+        };
         if !r.status.is_success() {
             bail!(
-                "put_root: {} — {}",
+                "put_root: {} after {} receive-memory retries — {}",
                 r.status,
+                retries,
                 String::from_utf8_lossy(&r.body)
             );
         }
         let resp: PutRootResponse =
             serde_json::from_slice(&r.body).context("parsing put_root JSON")?;
-        Ok(resp)
+        Ok((resp, retries))
     }
 
     pub async fn post_diff(&self, vault_id: &str, device_root_hex: &str) -> Result<DiffResponse> {
@@ -501,6 +555,32 @@ impl WireClient {
 pub struct RawResponse {
     pub status: StatusCode,
     pub body: Vec<u8>,
+}
+
+struct SealedResponse {
+    response: RawResponse,
+    receive_memory_retry_after: Option<Duration>,
+}
+
+fn receive_memory_retry_after(
+    status: StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> Option<Duration> {
+    if status != StatusCode::SERVICE_UNAVAILABLE
+        || headers.get("x-obsetync-backpressure")?.to_str().ok()? != "receive-memory"
+    {
+        return None;
+    }
+    let seconds = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .parse::<u64>()
+        .ok()?;
+    if seconds > ROOT_RECEIVE_MEMORY_MAX_RETRY_AFTER_SECS {
+        return None;
+    }
+    Some(Duration::from_secs(seconds))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -736,6 +816,36 @@ pub async fn push_vault_snapshot(
     files: &[(String, Vec<u8>)],
     parent_hex: &str,
 ) -> Result<(RootNode, PutRootResponse)> {
+    let (root, response, _) =
+        push_vault_snapshot_with_root_retries(client, vault_id, files, parent_hex, 0).await?;
+    Ok((root, response))
+}
+
+/// Concurrency-test variant of [`push_vault_snapshot`] that retries only the
+/// server's explicit pre-receive memory-pressure response.
+pub async fn push_vault_snapshot_with_receive_memory_retry(
+    client: &WireClient,
+    vault_id: &str,
+    files: &[(String, Vec<u8>)],
+    parent_hex: &str,
+) -> Result<(RootNode, PutRootResponse, usize)> {
+    push_vault_snapshot_with_root_retries(
+        client,
+        vault_id,
+        files,
+        parent_hex,
+        ROOT_RECEIVE_MEMORY_RETRIES,
+    )
+    .await
+}
+
+async fn push_vault_snapshot_with_root_retries(
+    client: &WireClient,
+    vault_id: &str,
+    files: &[(String, Vec<u8>)],
+    parent_hex: &str,
+    max_root_retries: usize,
+) -> Result<(RootNode, PutRootResponse, usize)> {
     let (mut root, chunks) = build_root_for_files(vault_id, &client.creds.device_name, files);
     if parent_hex != ZERO_HASH_HEX {
         root.parent_hash = Some(hex_to_hash(parent_hex)?);
@@ -753,8 +863,10 @@ pub async fn push_vault_snapshot(
         client.put_chunk(hash, bytes).await?;
     }
 
-    let resp = client.put_root(vault_id, &root, parent_hex).await?;
-    Ok((root, resp))
+    let (resp, retries) = client
+        .put_root_with_receive_memory_retry(vault_id, &root, parent_hex, max_root_retries)
+        .await?;
+    Ok((root, resp, retries))
 }
 
 /// High-level: pull every file currently visible at `vault_id` as
@@ -790,6 +902,73 @@ pub async fn pull_vault_snapshot(
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+    fn receive_memory_headers(retry_after: &'static str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-obsetync-backpressure",
+            HeaderValue::from_static("receive-memory"),
+        );
+        headers.insert(RETRY_AFTER, HeaderValue::from_static(retry_after));
+        headers
+    }
+
+    #[test]
+    fn retry_after_requires_exact_pre_receive_pressure_response() {
+        let headers = receive_memory_headers("1");
+        assert_eq!(
+            receive_memory_retry_after(StatusCode::SERVICE_UNAVAILABLE, &headers),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            receive_memory_retry_after(StatusCode::TOO_MANY_REQUESTS, &headers),
+            None,
+            "other statuses must not be retried"
+        );
+
+        let mut wrong_pressure = headers.clone();
+        wrong_pressure.insert(
+            "x-obsetync-backpressure",
+            HeaderValue::from_static("storage-writer"),
+        );
+        assert_eq!(
+            receive_memory_retry_after(StatusCode::SERVICE_UNAVAILABLE, &wrong_pressure),
+            None,
+            "other 503 classes must not be retried"
+        );
+    }
+
+    #[test]
+    fn retry_after_must_be_present_valid_and_within_budget() {
+        assert_eq!(
+            receive_memory_retry_after(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &receive_memory_headers("2")
+            ),
+            None,
+            "a server delay beyond the bounded test budget must fail fast"
+        );
+        assert_eq!(
+            receive_memory_retry_after(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &receive_memory_headers("invalid")
+            ),
+            None
+        );
+
+        let mut missing = receive_memory_headers("1");
+        missing.remove(RETRY_AFTER);
+        assert_eq!(
+            receive_memory_retry_after(StatusCode::SERVICE_UNAVAILABLE, &missing),
+            None
+        );
+    }
 }
 
 /// Generate a unique vault id for a test so tests can run sequentially in the

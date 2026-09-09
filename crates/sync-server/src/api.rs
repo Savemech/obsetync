@@ -5,12 +5,16 @@ use crate::bulk::{
 };
 use crate::devices;
 use crate::error::ServerError;
-use crate::perf::{DiffSample, RequestPhase, ServerPerfCounters};
+use crate::perf::{DiffSample, HttpReceiveGuard, RequestPhase, ServerPerfCounters};
+use crate::root_head::RootReceipt;
+use crate::root_outcome::{self, RootCommit};
 use crate::secure;
 use crate::state::SharedState;
 use crate::storage_writer::{
     DurableObject, StorageObjectKind, StorageWriter, StoreError, StoreOutcome, StoreResult,
+    WriterAdmission, WriterClass,
 };
+use crate::transport_memory::{TransportMemoryError, TransportMemoryReservation};
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Path, Request, State},
@@ -20,6 +24,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use http_body::Body as _;
 use sync_core::diff_page::{
     self, MAX_PAGE_BYTES as DIFF_PAGE_BYTES, MAX_PAGE_RECORDS, MAX_PATH_BYTES,
 };
@@ -31,6 +36,156 @@ use x25519_dalek::StaticSecret;
 /// while large manifests and root batches can also exceed small defaults).
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 
+// AES-GCM open briefly owns the sealed input, the full opened plaintext and
+// the authenticated inner-body copy returned by `decrypt_request`. Reserve
+// all three before `to_bytes`; retaining the owner through handler settlement
+// also covers the inner Body after the temporary plaintext is zeroized.
+const HTTP_RECEIVE_BUFFER_COPIES: usize = 3;
+const HTTP_CONTROL_RESPONSE_BYTES: usize = 64 * 1024;
+const HTTP_HISTORY_RESPONSE_BYTES: usize = 32 * 1024;
+const LEGACY_HASH_CHECK_ITEMS: usize = 1_000;
+const LEGACY_HASH_CHECK_REQUEST_BYTES: usize = 128 * 1024;
+const LEGACY_HASH_CHECK_RESPONSE_BYTES: usize = 128 * 1024;
+
+struct HttpReceiveAdmission {
+    _memory: TransportMemoryReservation,
+    _telemetry: HttpReceiveGuard,
+}
+
+struct AdmittedResponseBody {
+    inner: Body,
+    _admission: HttpReceiveAdmission,
+}
+
+impl http_body::Body for AdmittedResponseBody {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+fn attach_http_admission(
+    response: Response,
+    admission: &mut Option<HttpReceiveAdmission>,
+) -> Response {
+    let admission = admission
+        .take()
+        .expect("HTTP transport admission attached exactly once");
+    let (parts, body) = response.into_parts();
+    Response::from_parts(
+        parts,
+        Body::new(AdmittedResponseBody {
+            inner: body,
+            _admission: admission,
+        }),
+    )
+}
+
+fn http_receive_wire_bound(headers: &HeaderMap, body: &Body) -> Result<Option<usize>, ()> {
+    let declared = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .map(|value| {
+            value
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .ok_or(())
+        })
+        .transpose()?;
+    let hinted = body
+        .size_hint()
+        .upper()
+        .map(|bytes| usize::try_from(bytes).map_err(|_| ()))
+        .transpose()?;
+    let bytes = declared.into_iter().chain(hinted).max();
+    if bytes.is_some_and(|bytes| bytes > MAX_BODY_BYTES) {
+        return Err(());
+    }
+    Ok(bytes)
+}
+
+fn http_receive_reservation_bytes(wire_bytes: usize) -> Option<usize> {
+    wire_bytes
+        .max(secure::MIN_REQUEST_LEN)
+        .checked_mul(HTTP_RECEIVE_BUFFER_COPIES)
+}
+
+fn http_response_plaintext_bound(method: &Method, path: &str) -> usize {
+    if method == Method::GET {
+        if path.starts_with("/api/v1/root/") {
+            crate::root_head::MAX_ROOT_HEAD_BYTES
+        } else if path.starts_with("/api/v1/history/") {
+            HTTP_HISTORY_RESPONSE_BYTES
+        } else if path.starts_with("/api/v1/chunk/") || path.starts_with("/api/v1/content/") {
+            // Legacy single-object PUT accepted every pack-store object up to
+            // 64 MiB, including ContentChunk. Keep old stored data readable;
+            // the 4 MiB chunking target is not yet a storage invariant.
+            MAX_BODY_BYTES
+        } else {
+            HTTP_CONTROL_RESPONSE_BYTES
+        }
+    } else if is_legacy_hash_check_path(method, path) {
+        LEGACY_HASH_CHECK_RESPONSE_BYTES
+    } else if (method == Method::PUT && path.starts_with("/api/v1/root/"))
+        || (method == Method::POST && path.starts_with("/api/v1/diff/"))
+        || (method == Method::POST
+            && path.starts_with("/api/v1/crdt/")
+            && !path.ends_with("/compact"))
+    {
+        MAX_BODY_BYTES
+    } else if method == Method::POST && path == "/api/v1/bulk/get" {
+        BULK_REQUEST_BYTES
+    } else if method == Method::POST && path.starts_with("/api/v1/diff-page/") {
+        DIFF_PAGE_BYTES
+    } else {
+        HTTP_CONTROL_RESPONSE_BYTES
+    }
+}
+
+fn is_legacy_hash_check_path(method: &Method, path: &str) -> bool {
+    method == Method::POST
+        && matches!(
+            path,
+            "/api/v1/chunks/check"
+                | "/api/v1/content/check"
+                | "/api/v1/content/manifests/check"
+                | "/api/v1/content/chunks/check"
+        )
+}
+
+fn http_response_reservation_bytes(plaintext_bytes: usize) -> Option<usize> {
+    // Handler Bytes and the final in-place-sealed wire Vec coexist. The
+    // status prefix, response header and GCM tag are charged exactly.
+    let wire_bytes = plaintext_bytes
+        .checked_add(2)?
+        .checked_add(secure::RESPONSE_HEADER_LEN)?
+        .checked_add(secure::TAG_LEN)?;
+    plaintext_bytes.checked_add(wire_bytes)
+}
+
+fn http_transport_reservation_bytes(wire_bytes: usize, response_bytes: usize) -> Option<usize> {
+    // The sealed request is dropped immediately after open and the handler
+    // settles before its response is aggregated, so these peaks are
+    // sequential. One atomic max reservation avoids nested self-deadlock.
+    Some(
+        http_receive_reservation_bytes(wire_bytes)?
+            .max(http_response_reservation_bytes(response_bytes)?),
+    )
+}
+
 /// Authenticated bulk-v1 limits. The legacy sealed middleware accepts larger
 /// single-object requests, while the buffering fast path stays deliberately
 /// small enough for old mobile renderers and bounded server allocations.
@@ -38,6 +193,12 @@ pub(crate) const BULK_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const BULK_OBJECTS: usize = 256;
 pub(crate) const BULK_OBJECT_BYTES: usize = 1024 * 1024 - 1;
 pub(crate) const WS_FRAME_BYTES: usize = 4 * 1024 * 1024;
+const STORAGE_CONTROL_BYTES: usize = 8 * 1024 * 1024;
+// HTTP handlers retain the extracted body while validation may build one
+// owned payload copy for the durable writer. Charge both byte-bearing buffers
+// before entering the blocking pool. Parser metadata remains bounded by the
+// endpoint's object/manifest structural limits, not by this payload ledger.
+const HTTP_STORAGE_PAYLOAD_COPIES: usize = 2;
 fn storage_writer_error(error: StoreError) -> ServerError {
     match error {
         StoreError::InvalidObject(message) => ServerError::BadRequest(message),
@@ -49,18 +210,44 @@ fn storage_writer_error(error: StoreError) -> ServerError {
 
 async fn store_one_object(
     state: &SharedState,
+    admission: WriterAdmission,
     kind: StorageObjectKind,
     hash: FileHash,
     bytes: Vec<u8>,
 ) -> Result<StoreOutcome, ServerError> {
     let mut results = state
         .storage_writer
-        .store_batch(vec![DurableObject { kind, hash, bytes }])
+        .store_admitted(admission, vec![DurableObject { kind, hash, bytes }])
         .await
         .map_err(storage_writer_error)?;
     results
         .pop()
         .ok_or_else(|| ServerError::Internal("storage writer returned no object result".into()))?
+        .map_err(storage_writer_error)
+}
+
+fn admit_object_request(
+    state: &SharedState,
+    owner: &str,
+    kind: StorageObjectKind,
+    bytes: usize,
+) -> Result<WriterAdmission, ServerError> {
+    let retained_payload_bytes = bytes
+        .checked_mul(HTTP_STORAGE_PAYLOAD_COPIES)
+        .ok_or_else(|| ServerError::PayloadTooLarge("HTTP storage workset overflow".into()))?;
+    state
+        .storage_writer
+        .admit_batch_for(
+            owner,
+            if kind == StorageObjectKind::IndexChunk
+                && retained_payload_bytes <= STORAGE_CONTROL_BYTES
+            {
+                WriterClass::Control
+            } else {
+                WriterClass::Bulk
+            },
+            retained_payload_bytes,
+        )
         .map_err(storage_writer_error)
 }
 
@@ -278,8 +465,10 @@ async fn secure_envelope_v1_retired(
 }
 
 /// Transport-v2 middleware. Every post-decrypt outcome is returned as an
-/// encrypted semantic status over wire HTTP 200; failures that prevent opening
-/// the request collapse to one constant 256-byte decoy.
+/// encrypted semantic status over wire HTTP 200. Invalid envelopes collapse
+/// to one constant 256-byte decoy; pre-receive process saturation is the sole
+/// plaintext 503 so a valid client can back off instead of treating pressure
+/// as a stale cryptographic session.
 async fn secure_envelope(
     State(state): State<SharedState>,
     request: Request,
@@ -307,15 +496,87 @@ async fn secure_envelope(
         return decrypt_failure_decoy(state.perf.as_ref());
     };
 
-    let (mut parts, body) = request.into_parts();
-    let body_bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
-        Ok(bytes) => bytes,
-        Err(_) => {
+    let wire_bound = match http_receive_wire_bound(request.headers(), request.body()) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            state.perf.record_http_receive_unknown_length();
+            MAX_BODY_BYTES
+        }
+        Err(()) => {
+            state.perf.record_http_receive_oversized();
             state.perf.record_request_error();
-            tracing::warn!(method = %method, path = %path, "transport-v2 request body unavailable");
+            tracing::warn!(method = %method, path = %path, "transport-v2 request length rejected before receive");
             return decrypt_failure_decoy(state.perf.as_ref());
         }
     };
+    let response_bound = http_response_plaintext_bound(&method, &path);
+    let Some(reserved_bytes) = http_transport_reservation_bytes(wire_bound, response_bound) else {
+        state.perf.record_http_receive_oversized();
+        state.perf.record_request_error();
+        tracing::warn!(method = %method, path = %path, "transport-v2 receive workset overflow");
+        return decrypt_failure_decoy(state.perf.as_ref());
+    };
+    let available_bytes = state.transport_memory.available_bytes();
+    let memory = match state.transport_memory.try_reserve(reserved_bytes) {
+        Ok(owner) => owner,
+        Err(TransportMemoryError::Busy) => {
+            state.perf.record_http_receive_busy();
+            state.perf.record_request_error();
+            tracing::warn!(
+                method = %method,
+                path = %path,
+                reserved_bytes,
+                available_bytes,
+                "transport-v2 receive admission busy"
+            );
+            return receive_busy_response();
+        }
+        Err(TransportMemoryError::Oversized) => {
+            state.perf.record_http_receive_oversized();
+            state.perf.record_request_error();
+            tracing::warn!(
+                method = %method,
+                path = %path,
+                reserved_bytes,
+                capacity_bytes = state.transport_memory.capacity_bytes(),
+                "transport-v2 receive admission exceeds process budget"
+            );
+            return decrypt_failure_decoy(state.perf.as_ref());
+        }
+    };
+    let mut receive_admission = Some(HttpReceiveAdmission {
+        _memory: memory,
+        _telemetry: state.perf.begin_http_receive(reserved_bytes),
+    });
+
+    let (mut parts, body) = request.into_parts();
+    let body_bytes = match axum::body::to_bytes(body, wire_bound).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            state.perf.record_http_receive_bounded_failure();
+            state.perf.record_request_error();
+            tracing::warn!(method = %method, path = %path, "transport-v2 request body unavailable");
+            return attach_http_admission(
+                decrypt_failure_decoy(state.perf.as_ref()),
+                &mut receive_admission,
+            );
+        }
+    };
+    if body_bytes.len() > wire_bound {
+        state.perf.record_http_receive_oversized();
+        state.perf.record_request_error();
+        tracing::warn!(
+            method = %method,
+            path = %path,
+            declared_bytes = wire_bound,
+            received_bytes = body_bytes.len(),
+            "transport-v2 request exceeded declared receive bound"
+        );
+        return attach_http_admission(
+            decrypt_failure_decoy(state.perf.as_ref()),
+            &mut receive_admission,
+        );
+    }
     state
         .perf
         .record_wire_request_bytes(body_bytes.len() as u64);
@@ -334,9 +595,13 @@ async fn secure_envelope(
         Err(error) => {
             state.perf.record_request_error();
             tracing::warn!(method = %method, path = %path, reason = %error, "transport-v2 envelope rejected");
-            return decrypt_failure_decoy(state.perf.as_ref());
+            return attach_http_admission(
+                decrypt_failure_decoy(state.perf.as_ref()),
+                &mut receive_admission,
+            );
         }
     };
+    drop(body_bytes);
     state
         .perf
         .record_plaintext_request_bytes(decrypted.inner_body.len() as u64);
@@ -356,13 +621,14 @@ async fn secure_envelope(
                     .record_request_phase(RequestPhase::TokenReplay, auth_started.elapsed());
                 state.perf.record_request_error();
                 tracing::warn!(method = %method, path = %path, "transport-v2 unknown bearer");
-                return encrypted_semantic_response(
+                return admitted_encrypted_semantic_response(
                     &decrypted,
                     StatusCode::UNAUTHORIZED,
                     br#"{"error":"unknown_bearer"}"#,
                     &method,
                     &path,
                     state.perf.as_ref(),
+                    &mut receive_admission,
                 );
             }
             Err(devices::AuthenticationError::Revoked) => {
@@ -371,13 +637,14 @@ async fn secure_envelope(
                     .record_request_phase(RequestPhase::TokenReplay, auth_started.elapsed());
                 state.perf.record_request_error();
                 tracing::warn!(method = %method, path = %path, "revoked device attempted request");
-                return encrypted_semantic_response(
+                return admitted_encrypted_semantic_response(
                     &decrypted,
                     StatusCode::FORBIDDEN,
                     br#"{"error":"revoked"}"#,
                     &method,
                     &path,
                     state.perf.as_ref(),
+                    &mut receive_admission,
                 );
             }
         };
@@ -410,13 +677,14 @@ async fn secure_envelope(
                         );
                         state.perf.record_request_error();
                         tracing::error!(device = %device_short, reason = %error, "anti-replay reservation task failed");
-                        return encrypted_semantic_response(
+                        return admitted_encrypted_semantic_response(
                             &decrypted,
                             StatusCode::INTERNAL_SERVER_ERROR,
                             br#"{"error":"anti_replay_unavailable"}"#,
                             &method,
                             &path,
                             state.perf.as_ref(),
+                            &mut receive_admission,
                         );
                     }
                 }
@@ -435,13 +703,14 @@ async fn secure_envelope(
                     .perf
                     .record_request_phase(RequestPhase::TokenReplay, auth_started.elapsed());
                 state.perf.record_request_error();
-                return encrypted_semantic_response(
+                return admitted_encrypted_semantic_response(
                     &decrypted,
                     StatusCode::UNAUTHORIZED,
                     body.as_bytes(),
                     &method,
                     &path,
                     state.perf.as_ref(),
+                    &mut receive_admission,
                 );
             }
             Err(error) => {
@@ -450,13 +719,14 @@ async fn secure_envelope(
                     .record_request_phase(RequestPhase::TokenReplay, auth_started.elapsed());
                 state.perf.record_request_error();
                 tracing::error!(device = %device_short, reason = %error, "anti-replay state persistence failed");
-                return encrypted_semantic_response(
+                return admitted_encrypted_semantic_response(
                     &decrypted,
                     StatusCode::INTERNAL_SERVER_ERROR,
                     br#"{"error":"anti_replay_unavailable"}"#,
                     &method,
                     &path,
                     state.perf.as_ref(),
+                    &mut receive_admission,
                 );
             }
         }
@@ -487,7 +757,7 @@ async fn secure_envelope(
     {
         axum::body::Bytes::new()
     } else {
-        match axum::body::to_bytes(response_body, MAX_BODY_BYTES).await {
+        match axum::body::to_bytes(response_body, response_bound).await {
             Ok(bytes) => bytes,
             Err(_) => {
                 state
@@ -495,13 +765,14 @@ async fn secure_envelope(
                     .record_request_phase(RequestPhase::Handler, handler_started.elapsed());
                 state.perf.record_request_error();
                 tracing::error!(device = %device_short, method = %method, path = %path, "handler response body unavailable");
-                return encrypted_semantic_response(
+                return admitted_encrypted_semantic_response(
                     &decrypted,
                     StatusCode::INTERNAL_SERVER_ERROR,
                     br#"{"error":"internal"}"#,
                     &method,
                     &path,
                     state.perf.as_ref(),
+                    &mut receive_admission,
                 );
             }
         }
@@ -528,13 +799,29 @@ async fn secure_envelope(
         elapsed_ms = started.elapsed().as_millis() as u64,
         "transport-v2 sync request"
     );
-    encrypted_semantic_response(
+    admitted_encrypted_semantic_response(
         &decrypted,
         semantic_status,
         &response_bytes,
         &method,
         &path,
         state.perf.as_ref(),
+        &mut receive_admission,
+    )
+}
+
+fn admitted_encrypted_semantic_response(
+    request: &secure::DecryptedRequest,
+    status: StatusCode,
+    body: &[u8],
+    method: &Method,
+    path: &str,
+    perf: &ServerPerfCounters,
+    admission: &mut Option<HttpReceiveAdmission>,
+) -> Response {
+    attach_http_admission(
+        encrypted_semantic_response(request, status, body, method, path, perf),
+        admission,
     )
 }
 
@@ -590,6 +877,19 @@ fn decrypt_failure_decoy(perf: &ServerPerfCounters) -> Response {
         .into_response()
 }
 
+fn receive_busy_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [
+            ("retry-after", "1"),
+            ("cache-control", "no-store"),
+            ("x-obsetync-backpressure", "receive-memory"),
+        ],
+        Body::empty(),
+    )
+        .into_response()
+}
+
 pub fn sync_router(state: SharedState) -> Router {
     // Why every per-method path also has a `.post(...)` dispatcher:
     //
@@ -607,6 +907,9 @@ pub fn sync_router(state: SharedState) -> Router {
         .route("/api/v1/bulk/check", post(post_bulk_check))
         .route("/api/v1/bulk/put", post(post_bulk_put))
         .route("/api/v1/bulk/get", post(post_bulk_get))
+        .route("/api/v1/root-commit/{vault_id}", post(post_root_commit))
+        .route("/api/v1/root-outcome/{vault_id}", post(post_root_outcome))
+        .route("/api/v1/root-cancel/{vault_id}", post(post_root_cancel))
         .route(
             "/api/v1/root/{vault_id}",
             get(get_root).put(put_root).post(root_dispatcher),
@@ -690,6 +993,10 @@ async fn get_server_eph(State(state): State<SharedState>) -> impl IntoResponse {
         .expect("capability bundle is always an object");
     object.insert("Es_pub".into(), serde_json::json!(public));
     object.insert(
+        "server_incarnation".into(),
+        serde_json::json!(state.root_incarnation),
+    );
+    object.insert(
         "rotation_timestamp".into(),
         serde_json::json!(valid_until.saturating_sub(crate::eph_rotation::ROTATION_PERIOD_SECONDS)),
     );
@@ -708,8 +1015,18 @@ async fn get_server_eph(State(state): State<SharedState>) -> impl IntoResponse {
 fn capability_bundle() -> serde_json::Value {
     serde_json::json!({
         // Never advertise a future fast path before this binary can serve it.
-        "capabilities": ["bulk-http-v1", "ws-data-v1", "paged-diff-v1", "tree-v2"],
+        // Keep v1 explicit for old consumers and the fresh-session downgrade;
+        // v2 opts new clients into negotiated canonical fragmentation.
+        "capabilities": SERVER_CAPABILITIES,
         "limits": {
+            "http_wire_body_bytes": MAX_BODY_BYTES,
+            "http_plaintext_response_bytes": MAX_BODY_BYTES,
+            "transport_process_bytes": crate::transport_memory::PROCESS_MEMORY_BYTES,
+            "root_response_bytes": crate::root_head::MAX_ROOT_HEAD_BYTES,
+            "history_response_bytes": HTTP_HISTORY_RESPONSE_BYTES,
+            "legacy_hash_check_request_bytes": LEGACY_HASH_CHECK_REQUEST_BYTES,
+            "legacy_hash_check_response_bytes": LEGACY_HASH_CHECK_RESPONSE_BYTES,
+            "legacy_hash_check_items": LEGACY_HASH_CHECK_ITEMS,
             "bulk_request_bytes": BULK_REQUEST_BYTES,
             "bulk_objects": BULK_OBJECTS,
             "ws_frame_bytes": WS_FRAME_BYTES,
@@ -718,10 +1035,31 @@ fn capability_bundle() -> serde_json::Value {
             "diff_page_bytes": DIFF_PAGE_BYTES,
             "diff_page_records": MAX_PAGE_RECORDS,
             "diff_path_bytes": MAX_PATH_BYTES,
+            "root_commit_request_bytes": root_outcome::MAX_COMMIT_REQUEST_BYTES,
+            "root_commit_root_bytes": root_outcome::MAX_ROOT_BYTES,
+            "root_outcome_query_bytes": root_outcome::MAX_QUERY_BYTES,
+            "root_cancel_request_bytes": root_outcome::MAX_CANCEL_REQUEST_BYTES,
+            "root_outcome_receipt_bytes": crate::root_head::MAX_ROOT_RECEIPT_BYTES,
+            "root_outcome_streams_per_vault": crate::root_head::MAX_ROOT_RECEIPT_DEVICES,
+        },
+        "root_outcome": {
+            "protocol_version": root_outcome::PROTOCOL_VERSION,
+            "retained_per_device": 1,
+            "max_sequence": root_outcome::MAX_SEQUENCE,
         }
     })
 }
 
+pub(crate) const API_VERSION: u8 = 1;
+pub(crate) const SERVER_CAPABILITIES: [&str; 7] = [
+    "bulk-http-v1",
+    "ws-data-v1",
+    "ws-data-v2",
+    "paged-diff-v1",
+    "tree-v2",
+    "root-outcome-v1",
+    "root-cancel-v1",
+];
 const TREE_V2_CAPABILITY: &str = "tree-v2";
 const MAX_CAPABILITY_REPORT_BYTES: usize = 8 * 1024;
 
@@ -790,17 +1128,25 @@ async fn post_capabilities(
         state
             .control_io
             .run(move || {
-                crate::storage::VaultStore::with_perf(layout, perf)
-                    .get_current_version(&vault_id)
-                    .unwrap_or(1)
+                let store = crate::storage::VaultStore::with_perf(layout, perf);
+                let Some(hash) = store.try_get_current_root(&vault_id)? else {
+                    return Ok::<_, ServerError>(1);
+                };
+                let bytes = store
+                    .get_root(&vault_id, &hash)
+                    .ok_or_else(|| ServerError::Internal("current root data missing".into()))?;
+                let root = decode_stored_root(&bytes, "current")?;
+                validate_root_identity(&root, &vault_id, &hash, "current")?;
+                Ok(root.version())
             })
             .await
-            .map_err(|error| ServerError::ServiceUnavailable(error.to_string()))?
+            .map_err(|error| ServerError::ServiceUnavailable(error.to_string()))??
     } else {
         1
     };
     let fleet = state.devices.fleet_capability(TREE_V2_CAPABILITY);
     let mut bundle = capability_bundle();
+    bundle["server_incarnation"] = serde_json::json!(state.root_incarnation);
     bundle["tree"] = serde_json::json!({
         "current_version": current_version,
         "fleet_ready": fleet.ready(),
@@ -935,6 +1281,11 @@ async fn chunk_dispatcher(
     Path(hash): Path<String>,
     request: Request,
 ) -> Response {
+    let device = request
+        .extensions()
+        .get::<DeviceIdExt>()
+        .cloned()
+        .unwrap_or_else(|| DeviceIdExt(String::new()));
     match semantic_method(request.headers()) {
         Some(ref m) if m == Method::GET => match get_chunk(State(state), Path(hash)).await {
             Ok(r) => r.into_response(),
@@ -945,7 +1296,7 @@ async fn chunk_dispatcher(
                 Ok(b) => b,
                 Err(r) => return r,
             };
-            match put_chunk(State(state), Path(hash), body).await {
+            match put_chunk(State(state), axum::Extension(device), Path(hash), body).await {
                 Ok(r) => r.into_response(),
                 Err(e) => e.into_response(),
             }
@@ -959,6 +1310,11 @@ async fn content_dispatcher(
     Path(hash): Path<String>,
     request: Request,
 ) -> Response {
+    let device = request
+        .extensions()
+        .get::<DeviceIdExt>()
+        .cloned()
+        .unwrap_or_else(|| DeviceIdExt(String::new()));
     match semantic_method(request.headers()) {
         Some(ref m) if m == Method::GET => match get_content(State(state), Path(hash)).await {
             Ok(r) => r.into_response(),
@@ -969,7 +1325,7 @@ async fn content_dispatcher(
                 Ok(b) => b,
                 Err(r) => return r,
             };
-            match put_content(State(state), Path(hash), body).await {
+            match put_content(State(state), axum::Extension(device), Path(hash), body).await {
                 Ok(r) => r.into_response(),
                 Err(e) => e.into_response(),
             }
@@ -983,6 +1339,11 @@ async fn manifest_dispatcher(
     Path(hash): Path<String>,
     request: Request,
 ) -> Response {
+    let device = request
+        .extensions()
+        .get::<DeviceIdExt>()
+        .cloned()
+        .unwrap_or_else(|| DeviceIdExt(String::new()));
     match semantic_method(request.headers()) {
         Some(ref m) if m == Method::GET => match get_manifest(State(state), Path(hash)).await {
             Ok(r) => r.into_response(),
@@ -993,7 +1354,7 @@ async fn manifest_dispatcher(
                 Ok(b) => b,
                 Err(r) => return r,
             };
-            match put_manifest(State(state), Path(hash), body).await {
+            match put_manifest(State(state), axum::Extension(device), Path(hash), body).await {
                 Ok(r) => r.into_response(),
                 Err(e) => e.into_response(),
             }
@@ -1007,6 +1368,11 @@ async fn content_chunk_dispatcher(
     Path(hash): Path<String>,
     request: Request,
 ) -> Response {
+    let device = request
+        .extensions()
+        .get::<DeviceIdExt>()
+        .cloned()
+        .unwrap_or_else(|| DeviceIdExt(String::new()));
     match semantic_method(request.headers()) {
         Some(ref m) if m == Method::GET => {
             match get_content_chunk(State(state), Path(hash)).await {
@@ -1019,7 +1385,7 @@ async fn content_chunk_dispatcher(
                 Ok(b) => b,
                 Err(r) => return r,
             };
-            match put_content_chunk(State(state), Path(hash), body).await {
+            match put_content_chunk(State(state), axum::Extension(device), Path(hash), body).await {
                 Ok(r) => r.into_response(),
                 Err(e) => e.into_response(),
             }
@@ -1088,7 +1454,7 @@ async fn get_root(
 ) -> Result<impl IntoResponse, ServerError> {
     let hash = state
         .vaults
-        .get_current_root(&vault_id)
+        .try_get_current_root(&vault_id)?
         .ok_or_else(|| ServerError::NotFound(format!("vault '{}' not found", vault_id)))?;
 
     let data = state
@@ -1144,7 +1510,7 @@ async fn get_history(
             vault_id
         )));
     }
-    let current = state.vaults.get_current_root(&vault_id);
+    let current = state.vaults.try_get_current_root(&vault_id)?;
     if let Some(current_hash) = current {
         let current_data = state
             .vaults
@@ -1167,15 +1533,24 @@ async fn get_history(
     if let Ok(dir) = std::fs::read_dir(&roots_dir) {
         for e in dir.filter_map(|e| e.ok()) {
             let name = e.file_name().to_string_lossy().to_string();
-            if !name.ends_with(".bin") {
+            let Some(hash_hex) = name.strip_suffix(".bin") else {
                 continue;
-            }
-            let Ok(bytes) = std::fs::read(e.path()) else {
+            };
+            let Ok(stored_hash) = hex_to_hash(hash_hex) else {
+                continue;
+            };
+            let Some(bytes) = state.vaults.get_root(&vault_id, &stored_hash) else {
                 continue;
             };
             let Ok(root) = sync_core::versioned_root::VersionedRoot::deserialize(&bytes) else {
                 continue; // skip corrupt entries rather than failing the listing
             };
+            if root.vault_id() != vault_id
+                || root.hash() != stored_hash
+                || crate::root_head::validate_device_id(root.device_id()).is_err()
+            {
+                continue;
+            }
             let hex = hash_to_hex(&root.hash());
             entries.push(serde_json::json!({
                 "root": hex,
@@ -1196,10 +1571,13 @@ async fn get_history(
     });
     entries.truncate(HISTORY_LIMIT);
 
-    Ok((
-        StatusCode::OK,
-        serde_json::json!({ "roots": entries }).to_string(),
-    ))
+    let body = serde_json::json!({ "roots": entries }).to_string();
+    if body.len() > HTTP_HISTORY_RESPONSE_BYTES {
+        return Err(ServerError::Internal(
+            "history response exceeded bounded capacity".into(),
+        ));
+    }
+    Ok((StatusCode::OK, body))
 }
 
 /// POST-tunnel dispatcher for /api/v1/history (see sync_router comment).
@@ -1378,7 +1756,7 @@ async fn post_rollback(
         }
     }
 
-    if let Some(current_hash) = state.vaults.get_current_root(&vault_id) {
+    if let Some(current_hash) = state.vaults.try_get_current_root(&vault_id)? {
         let current_data = state
             .vaults
             .get_root(&vault_id, &current_hash)
@@ -1474,6 +1852,138 @@ async fn put_root(
     axum::Extension(session): axum::Extension<ClientSessionExt>,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
+    let result = publish_root(&state, &vault_id, &device, &session, &body, None).await?;
+    Ok((StatusCode::OK, result.to_string()))
+}
+
+async fn post_root_commit(
+    State(state): State<SharedState>,
+    Path(vault_id): Path<String>,
+    axum::Extension(device): axum::Extension<DeviceIdExt>,
+    axum::Extension(session): axum::Extension<ClientSessionExt>,
+    method: Method,
+    body: axum::body::Bytes,
+) -> Result<Response, ServerError> {
+    if method != Method::POST {
+        return Ok(method_not_allowed("root-commit"));
+    }
+    let (commit, root_body) = root_outcome::decode_commit(&body, &vault_id, &device.0)?;
+    let result = publish_root(
+        &state,
+        &vault_id,
+        &device,
+        &session,
+        &root_body,
+        Some(&commit),
+    )
+    .await?;
+    Ok(axum::Json(result).into_response())
+}
+
+async fn post_root_outcome(
+    State(state): State<SharedState>,
+    Path(vault_id): Path<String>,
+    axum::Extension(device): axum::Extension<DeviceIdExt>,
+    method: Method,
+    body: axum::body::Bytes,
+) -> Result<Response, ServerError> {
+    if method != Method::POST {
+        return Ok(method_not_allowed("root-outcome"));
+    }
+    let query = root_outcome::decode_query(&body)?;
+    let vault_lock = state.vault_lock(&vault_id);
+    let _vault_guard = vault_lock.lock().await;
+    let receipt = state.vaults.get_root_receipt(&vault_id, &device.0)?;
+    let last_sequence = receipt.as_ref().map_or(0, |receipt| receipt.sequence);
+    if let (Some(sequence), Some(receipt)) = (query.sequence, &receipt) {
+        if sequence == receipt.sequence {
+            if query.mutation_id.as_ref() != Some(&receipt.mutation_id)
+                || query.request_hash.as_ref() != Some(&receipt.request_hash)
+            {
+                return Err(ServerError::Conflict(
+                    "root mutation identity does not match stored request".into(),
+                ));
+            }
+            return Ok(axum::Json(root_outcome::terminal_outcome(
+                &state.root_incarnation,
+                receipt,
+            ))
+            .into_response());
+        }
+    }
+    let status = match query.sequence {
+        None => "stream",
+        Some(sequence) if sequence < last_sequence => "expired",
+        Some(_) => "unknown",
+    };
+    Ok(axum::Json(serde_json::json!({
+        "protocol_version": 1, "server_incarnation": state.root_incarnation,
+        "status": status, "last_sequence": last_sequence,
+        "current_root_hash": state.vaults.try_get_current_root(&vault_id)?.map(|hash| hash_to_hex(&hash)),
+    })).into_response())
+}
+
+async fn post_root_cancel(
+    State(state): State<SharedState>,
+    Path(vault_id): Path<String>,
+    axum::Extension(device): axum::Extension<DeviceIdExt>,
+    method: Method,
+    body: axum::body::Bytes,
+) -> Result<Response, ServerError> {
+    if method != Method::POST {
+        return Ok(method_not_allowed("root-cancel"));
+    }
+    let cancellation = root_outcome::decode_cancel(&body, &vault_id, &device.0)?;
+    let vault_lock = state.vault_lock(&vault_id);
+    let _vault_guard = vault_lock.lock().await;
+    let existing = state.vaults.get_root_receipt(&vault_id, &device.0)?;
+    if let Some(terminal) =
+        root_outcome::replay_or_admit(&cancellation, existing.as_ref(), &state.root_incarnation)?
+    {
+        return Ok(axum::Json(terminal).into_response());
+    }
+    let receipt = RootReceipt {
+        sequence: cancellation.sequence,
+        mutation_id: cancellation.mutation_id,
+        request_hash: cancellation.request_hash,
+        result: serde_json::json!({"cancelled":true}),
+    };
+    // Same native publication boundary and per-vault lock as commits. No root
+    // candidate, history rewrite, deletion bypass or notification is involved.
+    state
+        .vaults
+        .cancel_root_with_receipt(&vault_id, &device.0, receipt.clone())
+        .map_err(root_publication_error)?;
+    Ok(axum::Json(root_outcome::terminal_outcome(
+        &state.root_incarnation,
+        &receipt,
+    ))
+    .into_response())
+}
+
+/// The legacy and outcome routes share validation/merge/guard/publication.
+/// The lock spans exact-replay lookup through the actual native commit; it
+/// cannot be released by cancellation while a detached writer is still live.
+async fn publish_root(
+    state: &SharedState,
+    vault_id: &str,
+    device: &DeviceIdExt,
+    session: &ClientSessionExt,
+    body: &[u8],
+    commit: Option<&RootCommit>,
+) -> Result<serde_json::Value, ServerError> {
+    let vault_lock = state.vault_lock(vault_id);
+    let _vault_guard = vault_lock.lock().await;
+    if let Some(commit) = commit {
+        let receipt = state.vaults.get_root_receipt(vault_id, &device.0)?;
+        if let Some(result) =
+            root_outcome::replay_or_admit(commit, receipt.as_ref(), &state.root_incarnation)?
+        {
+            return Ok(result);
+        }
+    }
+    // Read failures must not initialize an existing damaged vault as empty.
+    let current_root_hash = state.vaults.try_get_current_root(vault_id)?;
     // Parent hash is prepended to the body as a 64-byte ASCII prefix (hex
     // or empty, space-padded) so it's covered by the AEAD envelope like
     // the rest of the request — keeping it out of an HTTP header means a
@@ -1488,6 +1998,11 @@ async fn put_root(
         .trim()
         .to_owned();
     let root_bytes = &body[64..];
+    if root_bytes.len() > crate::root_head::MAX_ROOT_HEAD_BYTES {
+        return Err(ServerError::PayloadTooLarge(
+            "root exceeds bounded root capacity".into(),
+        ));
+    }
 
     let mut incoming_root = sync_core::versioned_root::VersionedRoot::deserialize(root_bytes)
         .map_err(|e| ServerError::BadRequest(format!("invalid root: {}", e)))?;
@@ -1536,10 +2051,6 @@ async fn put_root(
     // scan and merge awaits by design — pushes to ONE vault are serialized
     // (ms for fast-forwards, worst-case seconds for a huge merge), different
     // vaults never contend.
-    let vault_lock = state.vault_lock(&vault_id);
-    let _vault_guard = vault_lock.lock().await;
-
-    let current_root_hash = state.vaults.get_current_root(&vault_id);
     // History metadata is server-authored. It is not part of the semantic
     // root hash, so trusting client values would let a replay rewrite the
     // displayed author, timestamp, or parent of an existing state.
@@ -1561,38 +2072,37 @@ async fn put_root(
                 .map_err(|error| ServerError::Internal(format!("serialize root: {error}")))?;
             state
                 .vaults
-                .store_root(&vault_id, &incoming_hash, &incoming_bytes)?;
-            state.vaults.set_current_root(&vault_id, &incoming_hash)?;
-            state.notify_root_changed(&vault_id, &hash_to_hex(&incoming_hash));
+                .store_root(vault_id, &incoming_hash, &incoming_bytes)?;
+            let result = commit_root_result(
+                state,
+                vault_id,
+                &device.0,
+                &incoming_hash,
+                serde_json::json!({ "accepted": true, "root_hash": hash_to_hex(&incoming_hash) }),
+                commit,
+            )?;
             tracing::info!(
                 vault = %vault_id,
                 root  = %&hash_to_hex(&incoming_hash)[..16],
                 bytes = incoming_bytes.len(),
                 "put_root: first push accepted"
             );
-            Ok((
-                StatusCode::OK,
-                serde_json::json!({
-                    "accepted": true,
-                    "root_hash": hash_to_hex(&incoming_hash),
-                })
-                .to_string(),
-            ))
+            Ok(result)
         }
         Some(current_hash) => {
             let parent_hash = hex_to_hash(&parent_hex)
                 .map_err(|_| ServerError::BadRequest("invalid X-Parent-Root header".into()))?;
             let current_data = state
                 .vaults
-                .get_root(&vault_id, &current_hash)
+                .get_root(vault_id, &current_hash)
                 .ok_or_else(|| ServerError::Internal("current root data missing".into()))?;
             let current_root = decode_stored_root(&current_data, "current")?;
-            validate_root_identity(&current_root, &vault_id, &current_hash, "current")?;
+            validate_root_identity(&current_root, vault_id, &current_hash, "current")?;
             require_tree_access(
-                &state,
+                state,
                 &device.0,
                 &session.0,
-                &vault_id,
+                vault_id,
                 current_root.version(),
             )?;
             if incoming_root.version() != current_root.version() {
@@ -1608,10 +2118,10 @@ async fn put_root(
                 };
             }
             require_tree_access(
-                &state,
+                state,
                 &device.0,
                 &session.0,
-                &vault_id,
+                vault_id,
                 incoming_root.version(),
             )?;
             incoming_root.set_history_metadata(unix_time_ms(), Some(parent_hash), device.0.clone());
@@ -1624,9 +2134,11 @@ async fn put_root(
                 // self-asserted (a client with a stale tree but a fresh root
                 // poller satisfies this check while reverting the vault —
                 // incident 2026-07-13), so gate the commit on a content scan.
+                let result = serde_json::json!({ "accepted": true, "root_hash": hash_to_hex(&incoming_hash) });
+                validate_root_result(state, vault_id, &device.0, &incoming_hash, &result, commit)?;
                 enforce_guard(
-                    &state,
-                    &vault_id,
+                    state,
+                    vault_id,
                     &device.0,
                     current_root,
                     incoming_root.clone(),
@@ -1636,9 +2148,9 @@ async fn put_root(
 
                 state
                     .vaults
-                    .store_root(&vault_id, &incoming_hash, &incoming_bytes)?;
-                state.vaults.set_current_root(&vault_id, &incoming_hash)?;
-                state.notify_root_changed(&vault_id, &hash_to_hex(&incoming_hash));
+                    .store_root(vault_id, &incoming_hash, &incoming_bytes)?;
+                let result =
+                    commit_root_result(state, vault_id, &device.0, &incoming_hash, result, commit)?;
                 tracing::info!(
                     vault = %vault_id,
                     root  = %&hash_to_hex(&incoming_hash)[..16],
@@ -1646,31 +2158,23 @@ async fn put_root(
                     bytes = incoming_bytes.len(),
                     "put_root: fast-forward accepted"
                 );
-                Ok((
-                    StatusCode::OK,
-                    serde_json::json!({
-                        "accepted": true,
-                        "root_hash": hash_to_hex(&incoming_hash),
-                    })
-                    .to_string(),
-                ))
+                Ok(result)
             } else {
                 // Diverged — need to merge.
                 // Find the base (common ancestor).
                 // For now, use the parent hash as the base.
                 // TODO: walk parent chain to find true common ancestor.
-                let base_data =
-                    state
-                        .vaults
-                        .get_root(&vault_id, &parent_hash)
-                        .ok_or_else(|| {
-                            ServerError::BadRequest(
-                                "parent root not found in history — full rescan needed".into(),
-                            )
-                        })?;
+                let base_data = state
+                    .vaults
+                    .get_root(vault_id, &parent_hash)
+                    .ok_or_else(|| {
+                        ServerError::BadRequest(
+                            "parent root not found in history — full rescan needed".into(),
+                        )
+                    })?;
 
                 let base_root = decode_stored_root(&base_data, "base")?;
-                validate_root_identity(&base_root, &vault_id, &parent_hash, "base")?;
+                validate_root_identity(&base_root, vault_id, &parent_hash, "base")?;
 
                 // Run merge via the bridge (handles !Send). The packed store
                 // supplies both tree nodes and small-file merge content.
@@ -1700,9 +2204,20 @@ async fn put_root(
                 // pusher's real tree epoch) silently reverts every file the
                 // stale side "didn't change since base" — scan the outcome
                 // against current before committing it.
+                let conflicts: Vec<_> = merge_result.file_conflicts.iter().map(|c| {
+                    serde_json::json!({ "path": c.path, "base_hash": hash_to_hex(&c.base_hash),
+                        "side_a_hash": hash_to_hex(&c.side_a_hash), "side_b_hash": hash_to_hex(&c.side_b_hash) })
+                }).collect();
+                let result = serde_json::json!({ "merged": true, "root_hash": hash_to_hex(&merged_hash),
+                    "conflicts": conflicts, "auto_resolved": merge_result.auto_resolved_count,
+                    "text_merged": merge_result.text_merged_count });
+                // A deterministic retention refusal must not consume a user's
+                // one-time deletion bypass. IO failures after this check still
+                // retain the existing guard/publication failure semantics.
+                validate_root_result(state, vault_id, &device.0, &merged_hash, &result, commit)?;
                 enforce_guard(
-                    &state,
-                    &vault_id,
+                    state,
+                    vault_id,
                     &device.0,
                     current_for_guard,
                     merge_result.new_root.clone(),
@@ -1715,27 +2230,15 @@ async fn put_root(
                 // their hash excludes history metadata by design.
                 state
                     .vaults
-                    .store_root(&vault_id, &incoming_hash, &incoming_bytes)?;
+                    .store_root(vault_id, &incoming_hash, &incoming_bytes)?;
                 state
                     .vaults
-                    .store_root(&vault_id, &merged_hash, &merged_bytes)?;
+                    .store_root(vault_id, &merged_hash, &merged_bytes)?;
 
-                // Update current.
-                state.vaults.set_current_root(&vault_id, &merged_hash)?;
-                state.notify_root_changed(&vault_id, &hash_to_hex(&merged_hash));
-
-                let conflicts: Vec<_> = merge_result
-                    .file_conflicts
-                    .iter()
-                    .map(|c| {
-                        serde_json::json!({
-                            "path": c.path,
-                            "base_hash": hash_to_hex(&c.base_hash),
-                            "side_a_hash": hash_to_hex(&c.side_a_hash),
-                            "side_b_hash": hash_to_hex(&c.side_b_hash),
-                        })
-                    })
-                    .collect();
+                // Persist the complete result with current, before notifying
+                // clients or acknowledging the request. No split receipt file.
+                let result =
+                    commit_root_result(state, vault_id, &device.0, &merged_hash, result, commit)?;
 
                 tracing::info!(
                     vault = %vault_id,
@@ -1748,20 +2251,73 @@ async fn put_root(
                     "put_root: merged divergent roots"
                 );
 
-                Ok((
-                    StatusCode::OK,
-                    serde_json::json!({
-                        "merged": true,
-                        "root_hash": hash_to_hex(&merged_hash),
-                        "conflicts": conflicts,
-                        "auto_resolved": merge_result.auto_resolved_count,
-                        "text_merged": merge_result.text_merged_count,
-                    })
-                    .to_string(),
-                ))
+                Ok(result)
             }
         }
     }
+}
+
+fn commit_root_result(
+    state: &SharedState,
+    vault: &str,
+    device: &str,
+    root: &FileHash,
+    result: serde_json::Value,
+    commit: Option<&RootCommit>,
+) -> Result<serde_json::Value, ServerError> {
+    let response = if let Some(commit) = commit {
+        let receipt = RootReceipt {
+            sequence: commit.sequence,
+            mutation_id: commit.mutation_id.clone(),
+            request_hash: commit.request_hash.clone(),
+            result,
+        };
+        state
+            .vaults
+            .set_current_root_with_receipt(vault, root, device, receipt.clone())
+            .map_err(root_publication_error)?;
+        root_outcome::terminal_outcome(&state.root_incarnation, &receipt)
+    } else {
+        state.vaults.set_current_root(vault, root)?;
+        result
+    };
+    state.notify_root_changed(vault, &hash_to_hex(root));
+    Ok(response)
+}
+
+fn root_publication_error(error: std::io::Error) -> ServerError {
+    // EINVAL can also come from native sync/rename after publication. Only a
+    // typed pre-publication validation refusal is a deterministic 413.
+    if crate::storage::is_root_publication_refusal(&error) {
+        ServerError::PayloadTooLarge(
+            "root outcome retention limit reached; publication deferred".into(),
+        )
+    } else {
+        ServerError::Io(error)
+    }
+}
+
+fn validate_root_result(
+    state: &SharedState,
+    vault: &str,
+    device: &str,
+    root: &FileHash,
+    result: &serde_json::Value,
+    commit: Option<&RootCommit>,
+) -> Result<(), ServerError> {
+    if let Some(commit) = commit {
+        let receipt = RootReceipt {
+            sequence: commit.sequence,
+            mutation_id: commit.mutation_id.clone(),
+            request_hash: commit.request_hash.clone(),
+            result: result.clone(),
+        };
+        state
+            .vaults
+            .validate_root_receipt(vault, root, device, &receipt)
+            .map_err(root_publication_error)?;
+    }
+    Ok(())
 }
 
 fn unix_time_ms() -> u64 {
@@ -1814,7 +2370,7 @@ async fn post_diff_page(
         Some(hash) => hash,
         None => state
             .vaults
-            .get_current_root(&vault_id)
+            .try_get_current_root(&vault_id)?
             .ok_or_else(|| ServerError::NotFound(format!("vault '{vault_id}' not found")))?,
     };
 
@@ -1892,7 +2448,7 @@ async fn post_diff(
 
     let current_hash = state
         .vaults
-        .get_current_root(&vault_id)
+        .try_get_current_root(&vault_id)?
         .ok_or_else(|| ServerError::NotFound(format!("vault '{}' not found", vault_id)))?;
     let to_root = load_snapshot_root(&state, &vault_id, &current_hash, "current")?;
     require_tree_access(&state, &device.0, &session.0, &vault_id, to_root.version())?;
@@ -2050,11 +2606,15 @@ async fn get_chunk(
 
 async fn put_chunk(
     State(state): State<SharedState>,
+    axum::Extension(device): axum::Extension<DeviceIdExt>,
     Path(hash_hex): Path<String>,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
     let expected =
         hex_to_hash(&hash_hex).map_err(|_| ServerError::BadRequest("invalid hash".into()))?;
+    let body_len = body.len();
+    let admission =
+        admit_object_request(&state, &device.0, StorageObjectKind::IndexChunk, body_len)?;
     let hash_started = std::time::Instant::now();
     let actual = hash_bytes(&body);
     state
@@ -2067,44 +2627,126 @@ async fn put_chunk(
             hash_to_hex(&actual)
         )));
     }
+    let stored = body.to_vec();
+    drop(body);
     store_one_object(
         &state,
+        admission,
         StorageObjectKind::IndexChunk,
         expected,
-        body.to_vec(),
+        stored,
     )
     .await?;
     state.perf.record_request_objects(1);
     tracing::debug!(
         hash = %&hash_hex[..hash_hex.len().min(16)],
-        bytes = body.len(),
+        bytes = body_len,
         "put_chunk: index chunk stored"
     );
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn post_chunks_check(
-    State(state): State<SharedState>,
+struct LegacyHashCheckBatch(Vec<FileHash>);
+
+impl<'de> serde::Deserialize<'de> for LegacyHashCheckBatch {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct BatchVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for BatchVisitor {
+            type Value = LegacyHashCheckBatch;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(
+                    formatter,
+                    "an array of at most {LEGACY_HASH_CHECK_ITEMS} canonical hashes"
+                )
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut hashes = Vec::with_capacity(
+                    sequence
+                        .size_hint()
+                        .unwrap_or_default()
+                        .min(LEGACY_HASH_CHECK_ITEMS),
+                );
+                while let Some(value) = sequence.next_element::<&'de str>()? {
+                    if hashes.len() == LEGACY_HASH_CHECK_ITEMS {
+                        return Err(<A::Error as serde::de::Error>::custom(format!(
+                            "hash check contains more than {LEGACY_HASH_CHECK_ITEMS} items"
+                        )));
+                    }
+                    if value.len() != 64
+                        || !value
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    {
+                        return Err(<A::Error as serde::de::Error>::custom(
+                            "hash check items must be canonical lowercase 64-hex strings",
+                        ));
+                    }
+                    hashes.push(hex_to_hash(value).map_err(|_| {
+                        <A::Error as serde::de::Error>::custom("invalid canonical hash")
+                    })?);
+                }
+                Ok(LegacyHashCheckBatch(hashes))
+            }
+        }
+
+        deserializer.deserialize_seq(BatchVisitor)
+    }
+}
+
+fn parse_legacy_hash_check(body: &[u8]) -> Result<Vec<FileHash>, ServerError> {
+    if body.len() > LEGACY_HASH_CHECK_REQUEST_BYTES {
+        return Err(ServerError::PayloadTooLarge(format!(
+            "legacy hash check exceeds {LEGACY_HASH_CHECK_REQUEST_BYTES} bytes"
+        )));
+    }
+    serde_json::from_slice::<LegacyHashCheckBatch>(body)
+        .map(|batch| batch.0)
+        .map_err(|error| {
+            ServerError::BadRequest(format!("expected canonical JSON array of hashes: {error}"))
+        })
+}
+
+async fn process_legacy_hash_check(
+    state: &SharedState,
     body: axum::body::Bytes,
-) -> Result<impl IntoResponse, ServerError> {
-    let hashes: Vec<String> = serde_json::from_slice(&body)
-        .map_err(|e| ServerError::BadRequest(format!("expected JSON array of hashes: {}", e)))?;
+    kind: StorageObjectKind,
+) -> Result<axum::Json<serde_json::Value>, ServerError> {
+    let hashes = parse_legacy_hash_check(&body)?;
     state.perf.record_request_objects(hashes.len() as u64);
     let writer = state.storage_writer.clone();
     let needed = writer
         .run_blocking(move |writer| {
             hashes
                 .into_iter()
-                .filter(|hash_hex| {
-                    hex_to_hash(hash_hex)
-                        .map(|hash| !writer.contains(StorageObjectKind::IndexChunk, &hash))
-                        .unwrap_or(false)
+                .filter(|hash| {
+                    if kind == StorageObjectKind::Manifest {
+                        !stored_manifest_is_usable(&writer, hash)
+                    } else {
+                        !writer.contains(kind, hash)
+                    }
                 })
+                .map(|hash| hash_to_hex(&hash))
                 .collect::<Vec<_>>()
         })
         .await
         .map_err(|error| ServerError::ServiceUnavailable(error.to_string()))?;
     Ok(axum::Json(serde_json::json!({ "needed": needed })))
+}
+
+async fn post_chunks_check(
+    State(state): State<SharedState>,
+    body: axum::body::Bytes,
+) -> Result<impl IntoResponse, ServerError> {
+    process_legacy_hash_check(&state, body, StorageObjectKind::IndexChunk).await
 }
 
 // --- Content (small files) ---
@@ -2124,11 +2766,14 @@ async fn get_content(
 
 async fn put_content(
     State(state): State<SharedState>,
+    axum::Extension(device): axum::Extension<DeviceIdExt>,
     Path(hash_hex): Path<String>,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
     let expected =
         hex_to_hash(&hash_hex).map_err(|_| ServerError::BadRequest("invalid hash".into()))?;
+    let body_len = body.len();
+    let admission = admit_object_request(&state, &device.0, StorageObjectKind::Content, body_len)?;
     let hash_started = std::time::Instant::now();
     let actual = hash_bytes(&body);
     state
@@ -2137,11 +2782,20 @@ async fn put_content(
     if expected != actual {
         return Err(ServerError::BadRequest("hash mismatch".into()));
     }
-    store_one_object(&state, StorageObjectKind::Content, expected, body.to_vec()).await?;
+    let stored = body.to_vec();
+    drop(body);
+    store_one_object(
+        &state,
+        admission,
+        StorageObjectKind::Content,
+        expected,
+        stored,
+    )
+    .await?;
     state.perf.record_request_objects(1);
     tracing::debug!(
         hash = %&hash_hex[..hash_hex.len().min(16)],
-        bytes = body.len(),
+        bytes = body_len,
         "put_content: small-file blob stored"
     );
     Ok(StatusCode::NO_CONTENT)
@@ -2151,24 +2805,7 @@ async fn post_content_check(
     State(state): State<SharedState>,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
-    let hashes: Vec<String> = serde_json::from_slice(&body)
-        .map_err(|e| ServerError::BadRequest(format!("expected JSON array of hashes: {}", e)))?;
-    state.perf.record_request_objects(hashes.len() as u64);
-    let writer = state.storage_writer.clone();
-    let needed = writer
-        .run_blocking(move |writer| {
-            hashes
-                .into_iter()
-                .filter(|hash_hex| {
-                    hex_to_hash(hash_hex)
-                        .map(|hash| !writer.contains(StorageObjectKind::Content, &hash))
-                        .unwrap_or(false)
-                })
-                .collect::<Vec<_>>()
-        })
-        .await
-        .map_err(|error| ServerError::ServiceUnavailable(error.to_string()))?;
-    Ok(axum::Json(serde_json::json!({ "needed": needed })))
+    process_legacy_hash_check(&state, body, StorageObjectKind::Content).await
 }
 
 // --- Content Manifests ---
@@ -2338,11 +2975,14 @@ async fn get_manifest(
 
 async fn put_manifest(
     State(state): State<SharedState>,
+    axum::Extension(device): axum::Extension<DeviceIdExt>,
     Path(hash_hex): Path<String>,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
     let hash =
         hex_to_hash(&hash_hex).map_err(|_| ServerError::BadRequest("invalid hash".into()))?;
+    let admission =
+        admit_object_request(&state, &device.0, StorageObjectKind::Manifest, body.len())?;
     let writer = state.storage_writer.clone();
     let perf = state.perf.clone();
     let encoded = writer
@@ -2356,7 +2996,14 @@ async fn put_manifest(
         .await
         .map_err(|error| ServerError::ServiceUnavailable(error.to_string()))??;
     let encoded_len = encoded.len();
-    store_one_object(&state, StorageObjectKind::Manifest, hash, encoded).await?;
+    store_one_object(
+        &state,
+        admission,
+        StorageObjectKind::Manifest,
+        hash,
+        encoded,
+    )
+    .await?;
     state.perf.record_request_objects(1);
     tracing::debug!(
         hash = %&hash_hex[..hash_hex.len().min(16)],
@@ -2383,11 +3030,15 @@ async fn get_content_chunk(
 
 async fn put_content_chunk(
     State(state): State<SharedState>,
+    axum::Extension(device): axum::Extension<DeviceIdExt>,
     Path(hash_hex): Path<String>,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
     let expected =
         hex_to_hash(&hash_hex).map_err(|_| ServerError::BadRequest("invalid hash".into()))?;
+    let body_len = body.len();
+    let admission =
+        admit_object_request(&state, &device.0, StorageObjectKind::ContentChunk, body_len)?;
     let hash_started = std::time::Instant::now();
     let actual = hash_bytes(&body);
     state
@@ -2396,17 +3047,20 @@ async fn put_content_chunk(
     if expected != actual {
         return Err(ServerError::BadRequest("hash mismatch".into()));
     }
+    let stored = body.to_vec();
+    drop(body);
     store_one_object(
         &state,
+        admission,
         StorageObjectKind::ContentChunk,
         expected,
-        body.to_vec(),
+        stored,
     )
     .await?;
     state.perf.record_request_objects(1);
     tracing::debug!(
         hash = %&hash_hex[..hash_hex.len().min(16)],
-        bytes = body.len(),
+        bytes = body_len,
         "put_content_chunk: sub-file chunk stored"
     );
     Ok(StatusCode::NO_CONTENT)
@@ -2416,24 +3070,7 @@ async fn post_manifests_check(
     State(state): State<SharedState>,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
-    let hashes: Vec<String> = serde_json::from_slice(&body)
-        .map_err(|e| ServerError::BadRequest(format!("expected JSON array of hashes: {}", e)))?;
-    state.perf.record_request_objects(hashes.len() as u64);
-    let writer = state.storage_writer.clone();
-    let needed = writer
-        .run_blocking(move |writer| {
-            hashes
-                .into_iter()
-                .filter(|hash_hex| {
-                    hex_to_hash(hash_hex)
-                        .map(|hash| !stored_manifest_is_usable(&writer, &hash))
-                        .unwrap_or(false)
-                })
-                .collect::<Vec<_>>()
-        })
-        .await
-        .map_err(|error| ServerError::ServiceUnavailable(error.to_string()))?;
-    Ok(axum::Json(serde_json::json!({ "needed": needed })))
+    process_legacy_hash_check(&state, body, StorageObjectKind::Manifest).await
 }
 
 fn stored_manifest_is_usable(writer: &StorageWriter, file_hash: &FileHash) -> bool {
@@ -2454,24 +3091,7 @@ async fn post_content_chunks_check(
     State(state): State<SharedState>,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
-    let hashes: Vec<String> = serde_json::from_slice(&body)
-        .map_err(|e| ServerError::BadRequest(format!("expected JSON array of hashes: {}", e)))?;
-    state.perf.record_request_objects(hashes.len() as u64);
-    let writer = state.storage_writer.clone();
-    let needed = writer
-        .run_blocking(move |writer| {
-            hashes
-                .into_iter()
-                .filter(|hash_hex| {
-                    hex_to_hash(hash_hex)
-                        .map(|hash| !writer.contains(StorageObjectKind::ContentChunk, &hash))
-                        .unwrap_or(false)
-                })
-                .collect::<Vec<_>>()
-        })
-        .await
-        .map_err(|error| ServerError::ServiceUnavailable(error.to_string()))?;
-    Ok(axum::Json(serde_json::json!({ "needed": needed })))
+    process_legacy_hash_check(&state, body, StorageObjectKind::ContentChunk).await
 }
 
 // --- Bounded binary bulk HTTP v1 -----------------------------------------
@@ -2672,9 +3292,16 @@ fn prepare_bulk_put(
 
 pub(crate) async fn process_bulk_put(
     state: &SharedState,
+    owner: &str,
     body: axum::body::Bytes,
     max_request_bytes: usize,
 ) -> Result<Vec<u8>, ServerError> {
+    if body.len() > max_request_bytes {
+        return Err(ServerError::PayloadTooLarge(
+            "bulk upload pack exceeds byte limit".into(),
+        ));
+    }
+    let admission = admit_object_request(state, owner, StorageObjectKind::Content, body.len())?;
     let writer = state.storage_writer.clone();
     let perf = state.perf.clone();
     let prepared = writer
@@ -2695,9 +3322,14 @@ pub(crate) async fn process_bulk_put(
     } = prepared;
 
     let writer_results: Vec<StoreResult> = if writer_objects.is_empty() {
+        drop(admission);
         Vec::new()
     } else {
-        match state.storage_writer.store_batch(writer_objects).await {
+        match state
+            .storage_writer
+            .store_admitted(admission, writer_objects)
+            .await
+        {
             Ok(results) => results,
             Err(error) => vec![Err(error); record_for_writer_object.len()],
         }
@@ -2729,9 +3361,10 @@ pub(crate) async fn process_bulk_put(
 
 async fn post_bulk_put(
     State(state): State<SharedState>,
+    axum::Extension(device): axum::Extension<DeviceIdExt>,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
-    let response = process_bulk_put(&state, body, BULK_REQUEST_BYTES).await?;
+    let response = process_bulk_put(&state, &device.0, body, BULK_REQUEST_BYTES).await?;
     Ok((
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
@@ -2892,6 +3525,12 @@ async fn post_bulk_get(
 
 #[cfg(test)]
 mod integration_tests {
+    include!("api_root_outcome_tests.rs");
+    #[test]
+    fn native_invalid_input_is_not_misclassified_as_retention_refusal() {
+        let error = std::io::Error::new(std::io::ErrorKind::InvalidInput, "native sync failed");
+        assert!(matches!(root_publication_error(error), ServerError::Io(_)));
+    }
     use super::*;
     use crate::box_key;
     use crate::config::ServerConfig;
@@ -2923,6 +3562,10 @@ mod integration_tests {
     }
 
     fn setup() -> Env {
+        setup_with_transport_capacity(crate::transport_memory::PROCESS_MEMORY_BYTES)
+    }
+
+    fn setup_with_transport_capacity(transport_capacity: usize) -> Env {
         let tmp = TempDir::new().unwrap();
         let layout = StorageLayout::new(tmp.path());
         layout.init_directories().unwrap();
@@ -2936,7 +3579,10 @@ mod integration_tests {
         devices::register_device(&layout, &device_id, "test-device", &bearer).unwrap();
 
         let config = ServerConfig::new(tmp.path().to_path_buf());
-        let state = Arc::new(AppState::new(config));
+        let mut app_state = AppState::new(config);
+        app_state.transport_memory =
+            crate::transport_memory::TransportMemoryBudget::with_capacity(transport_capacity);
+        let state = Arc::new(app_state);
 
         use rand::TryRngCore;
         let mut seed = [0u8; 32];
@@ -2997,11 +3643,13 @@ mod integration_tests {
         path: &str,
         wire_body: Vec<u8>,
     ) -> (StatusCode, Vec<u8>) {
+        let wire_len = wire_body.len();
         let req = HttpRequest::builder()
             .method("POST")
             .uri(path)
             .header("X-Obsetync-Method", semantic_method)
             .header("Content-Type", "application/octet-stream")
+            .header(axum::http::header::CONTENT_LENGTH, wire_len)
             .body(Body::from(wire_body))
             .unwrap();
 
@@ -3068,6 +3716,460 @@ mod integration_tests {
             path,
             &opened_request.nonce_req,
         )
+    }
+
+    async fn admission_probe(
+        State(state): State<SharedState>,
+        body: axum::body::Bytes,
+    ) -> StatusCode {
+        assert_eq!(body.as_ref(), b"probe");
+        let snapshot = state.perf.snapshot();
+        assert_eq!(snapshot.http_receive.inflight, 1);
+        assert!(snapshot.http_receive.inflight_bytes > 0);
+        assert!(
+            state.transport_memory.available_bytes() < state.transport_memory.capacity_bytes(),
+            "HTTP handler ran after receive admission was released"
+        );
+        StatusCode::NO_CONTENT
+    }
+
+    #[test]
+    fn http_receive_workset_covers_three_simultaneous_envelope_buffers() {
+        assert_eq!(http_receive_reservation_bytes(1024), Some(3072));
+        assert_eq!(
+            http_receive_reservation_bytes(1),
+            Some(secure::MIN_REQUEST_LEN * HTTP_RECEIVE_BUFFER_COPIES)
+        );
+        assert_eq!(
+            http_response_reservation_bytes(1024),
+            Some(1024 * 2 + secure::RESPONSE_HEADER_LEN + secure::TAG_LEN + 2)
+        );
+        assert_eq!(
+            http_transport_reservation_bytes(1024, 4096),
+            http_response_reservation_bytes(4096)
+        );
+    }
+
+    #[test]
+    fn route_response_caps_preserve_root_and_ws_headroom() {
+        assert_eq!(
+            http_response_plaintext_bound(&Method::GET, "/api/v1/root/vault"),
+            crate::root_head::MAX_ROOT_HEAD_BYTES
+        );
+        assert_eq!(
+            http_response_plaintext_bound(
+                &Method::GET,
+                "/api/v1/root/vault/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            crate::root_head::MAX_ROOT_HEAD_BYTES
+        );
+        assert_eq!(
+            http_response_plaintext_bound(&Method::GET, "/api/v1/history/vault"),
+            HTTP_HISTORY_RESPONSE_BYTES
+        );
+        assert_eq!(
+            http_response_plaintext_bound(&Method::POST, "/api/v1/server-eph"),
+            HTTP_CONTROL_RESPONSE_BYTES
+        );
+        for path in [
+            "/api/v1/chunk/hash",
+            "/api/v1/content/hash",
+            "/api/v1/content/manifest/hash",
+            "/api/v1/content/chunk/hash",
+        ] {
+            assert_eq!(
+                http_response_plaintext_bound(&Method::GET, path),
+                MAX_BODY_BYTES
+            );
+        }
+        for path in [
+            "/api/v1/chunks/check",
+            "/api/v1/content/check",
+            "/api/v1/content/manifests/check",
+            "/api/v1/content/chunks/check",
+        ] {
+            assert_eq!(
+                http_response_plaintext_bound(&Method::POST, path),
+                LEGACY_HASH_CHECK_RESPONSE_BYTES
+            );
+        }
+
+        let budget = crate::transport_memory::TransportMemoryBudget::process_default();
+        let root_get = http_transport_reservation_bytes(
+            secure::MIN_REQUEST_LEN,
+            crate::root_head::MAX_ROOT_HEAD_BYTES,
+        )
+        .unwrap();
+        let ws_receive =
+            crate::ws_data::receive_reservation_bytes(crate::ws_data::MAX_PAYLOAD_BYTES).unwrap();
+        let _first_root = budget.try_reserve(root_get).unwrap();
+        let _second_root = budget.try_reserve(root_get).unwrap();
+        let _ws = budget.try_reserve(ws_receive).unwrap();
+        assert!(budget.available_bytes() > 0);
+    }
+
+    #[test]
+    fn history_response_bound_covers_fifty_maximum_entries() {
+        let entry = serde_json::json!({
+            "root": "a".repeat(64),
+            "parent": "b".repeat(64),
+            "created_ms": u64::MAX,
+            "device_id": "d".repeat(128),
+            "total_files": u64::MAX,
+            "tree_version": u32::MAX,
+            "current": false,
+        });
+        let body = serde_json::json!({ "roots": vec![entry; HISTORY_LIMIT] }).to_string();
+        assert!(body.len() <= HTTP_HISTORY_RESPONSE_BYTES);
+    }
+
+    #[test]
+    fn legacy_hash_check_parser_bounds_bytes_items_and_string_shape() {
+        let hashes = (0..LEGACY_HASH_CHECK_ITEMS)
+            .map(|index| hash_to_hex(&hash_bytes(&index.to_le_bytes())))
+            .collect::<Vec<_>>();
+        let body = serde_json::to_vec(&hashes).unwrap();
+        assert!(body.len() > HTTP_CONTROL_RESPONSE_BYTES);
+        assert!(body.len() <= LEGACY_HASH_CHECK_REQUEST_BYTES);
+        assert_eq!(parse_legacy_hash_check(&body).unwrap().len(), hashes.len());
+
+        let mut too_many = hashes.clone();
+        too_many.push(hash_to_hex(&hash_bytes(b"one-too-many")));
+        assert!(matches!(
+            parse_legacy_hash_check(&serde_json::to_vec(&too_many).unwrap()),
+            Err(ServerError::BadRequest(_))
+        ));
+        assert!(matches!(
+            parse_legacy_hash_check(br#"["a"]"#),
+            Err(ServerError::BadRequest(_))
+        ));
+        assert!(matches!(
+            parse_legacy_hash_check(format!(r#"["{}"]"#, "A".repeat(64)).as_bytes()),
+            Err(ServerError::BadRequest(_))
+        ));
+        assert!(matches!(
+            parse_legacy_hash_check(&vec![b' '; LEGACY_HASH_CHECK_REQUEST_BYTES + 1]),
+            Err(ServerError::PayloadTooLarge(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn all_legacy_hash_checks_return_one_thousand_missing_hashes() {
+        let env = setup();
+        let hashes = (0..LEGACY_HASH_CHECK_ITEMS)
+            .map(|index| hash_to_hex(&hash_bytes(&index.to_le_bytes())))
+            .collect::<Vec<_>>();
+        let request = serde_json::to_vec(&hashes).unwrap();
+        let expected = serde_json::to_value(&hashes).unwrap();
+        for path in [
+            "/api/v1/chunks/check",
+            "/api/v1/content/check",
+            "/api/v1/content/manifests/check",
+            "/api/v1/content/chunks/check",
+        ] {
+            let (status, body) = send_semantic(&env, "POST", path, &request).await;
+            assert_eq!(status, StatusCode::OK.as_u16(), "{path}");
+            assert!(body.len() > HTTP_CONTROL_RESPONSE_BYTES, "{path}");
+            assert!(body.len() <= LEGACY_HASH_CHECK_RESPONSE_BYTES, "{path}");
+            let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(response["needed"], expected, "{path}");
+        }
+    }
+
+    #[test]
+    fn http_receive_busy_response_is_retryable_and_not_cached() {
+        let response = receive_busy_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(axum::http::header::RETRY_AFTER),
+            Some(&axum::http::HeaderValue::from_static("1"))
+        );
+        assert_eq!(
+            response.headers().get(axum::http::header::CACHE_CONTROL),
+            Some(&axum::http::HeaderValue::from_static("no-store"))
+        );
+        assert_eq!(
+            response.headers().get("x-obsetync-backpressure"),
+            Some(&axum::http::HeaderValue::from_static("receive-memory"))
+        );
+    }
+
+    #[tokio::test]
+    async fn http_receive_owner_lives_through_inner_handler_and_then_releases() {
+        let env = setup();
+        let path = "/api/v1/admission-probe";
+        let (wire_body, opened_request) = seal(&env, "POST", path, b"probe");
+        let wire_len = wire_body.len();
+        let expected_reservation = http_transport_reservation_bytes(
+            wire_len,
+            http_response_plaintext_bound(&Method::POST, path),
+        )
+        .unwrap();
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri(path)
+            .header("X-Obsetync-Method", "POST")
+            .header("Content-Type", "application/octet-stream")
+            .header(axum::http::header::CONTENT_LENGTH, wire_len)
+            .body(Body::from(wire_body))
+            .unwrap();
+        let router = Router::new()
+            .route(path, post(admission_probe))
+            .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+            .layer(axum::middleware::from_fn_with_state(
+                env.state.clone(),
+                secure_envelope,
+            ))
+            .with_state(env.state.clone());
+
+        let response = router.oneshot(request).await.unwrap();
+        let handed_off = env.state.perf.snapshot().http_receive;
+        assert_eq!(handed_off.completed, 0);
+        assert_eq!(handed_off.inflight, 1);
+        assert_eq!(handed_off.inflight_bytes, expected_reservation as u64);
+        let wire_response = response.into_body().collect().await.unwrap().to_bytes();
+        let (semantic_status, _) = decrypt_response_for_tests(
+            &wire_response,
+            &opened_request.key_material,
+            opened_request.mode,
+            "POST",
+            path,
+            &opened_request.nonce_req,
+        );
+        assert_eq!(semantic_status, StatusCode::NO_CONTENT.as_u16());
+        assert_eq!(
+            env.state.transport_memory.available_bytes(),
+            env.state.transport_memory.capacity_bytes()
+        );
+        let receive = env.state.perf.snapshot().http_receive;
+        assert_eq!(receive.admitted, 1);
+        assert_eq!(receive.completed, 1);
+        assert_eq!(receive.inflight, 0);
+        assert_eq!(receive.inflight_bytes, 0);
+        assert_eq!(receive.peak_bytes, expected_reservation as u64);
+    }
+
+    #[tokio::test]
+    async fn tiny_bulk_get_reserves_max_response_before_receive_and_recovers() {
+        let env = setup();
+        let capacity = env.state.transport_memory.capacity_bytes();
+        let path = "/api/v1/bulk/get";
+        let request_body = bulk::encode_get_request(
+            ObjectKind::Content,
+            &[hash_bytes(b"missing")],
+            0,
+            BULK_REQUEST_BYTES as u32,
+        )
+        .unwrap();
+        let (wire_body, _) = seal(&env, "POST", path, &request_body);
+        let request_only = http_receive_reservation_bytes(wire_body.len()).unwrap();
+        let reservation = http_transport_reservation_bytes(
+            wire_body.len(),
+            http_response_plaintext_bound(&Method::POST, path),
+        )
+        .unwrap();
+        assert!(reservation > request_only);
+        let blocker = env
+            .state
+            .transport_memory
+            .try_reserve(capacity - reservation + 1)
+            .unwrap();
+        assert!(env.state.transport_memory.available_bytes() >= request_only);
+
+        let (wire_status, wire_response) = dispatch_wire(&env, "POST", path, wire_body).await;
+        assert_eq!(wire_status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(wire_response.is_empty());
+        let rejected = env.state.perf.snapshot().http_receive;
+        assert_eq!(rejected.admitted, 0);
+        assert_eq!(rejected.busy, 1);
+        assert_eq!(rejected.inflight, 0);
+
+        drop(blocker);
+        assert_eq!(env.state.transport_memory.available_bytes(), capacity);
+        let (semantic_status, _) = send_semantic(&env, "POST", path, &request_body).await;
+        assert_eq!(semantic_status, StatusCode::OK.as_u16());
+        let recovered = env.state.perf.snapshot().http_receive;
+        assert_eq!(recovered.admitted, 1);
+        assert_eq!(recovered.completed, 1);
+        assert_eq!(recovered.inflight_bytes, 0);
+        assert_eq!(env.state.transport_memory.available_bytes(), capacity);
+    }
+
+    #[tokio::test]
+    async fn declared_oversize_is_rejected_without_consuming_admission() {
+        let env = setup();
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/v1/capabilities")
+            .header("X-Obsetync-Method", "POST")
+            .header(axum::http::header::CONTENT_LENGTH, MAX_BODY_BYTES + 1)
+            .body(Body::empty())
+            .unwrap();
+        let response = sync_router(env.state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            axum::body::Bytes::from(vec![0; 256])
+        );
+        let receive = env.state.perf.snapshot().http_receive;
+        assert_eq!(receive.oversized, 1);
+        assert_eq!(receive.admitted, 0);
+        assert_eq!(
+            env.state.transport_memory.available_bytes(),
+            env.state.transport_memory.capacity_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn body_larger_than_declared_bound_stops_at_admitted_limit_and_releases() {
+        let env = setup();
+        let path = "/api/v1/capabilities";
+        let declared_bound = 8;
+        let stream = futures_util::stream::iter([
+            Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(b"12345678")),
+            Ok(axum::body::Bytes::from_static(b"9")),
+        ]);
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri(path)
+            .header("X-Obsetync-Method", "POST")
+            .header(axum::http::header::CONTENT_LENGTH, declared_bound)
+            .body(Body::from_stream(stream))
+            .unwrap();
+
+        let response = sync_router(env.state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let active = env.state.perf.snapshot().http_receive;
+        assert_eq!(active.admitted, 1);
+        assert_eq!(active.completed, 0);
+        assert_eq!(active.inflight, 1);
+        assert_eq!(active.bounded_receive_failures, 1);
+        assert_eq!(
+            active.inflight_bytes,
+            http_transport_reservation_bytes(
+                declared_bound,
+                http_response_plaintext_bound(&Method::POST, path),
+            )
+            .unwrap() as u64
+        );
+
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            axum::body::Bytes::from(vec![0; 256])
+        );
+        let released = env.state.perf.snapshot().http_receive;
+        assert_eq!(released.completed, 1);
+        assert_eq!(released.inflight, 0);
+        assert_eq!(released.inflight_bytes, 0);
+        assert_eq!(
+            env.state.transport_memory.available_bytes(),
+            env.state.transport_memory.capacity_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_length_uses_full_bounded_receive_scope() {
+        let env = setup();
+        let path = "/api/v1/capabilities";
+        let (wire_body, opened_request) = seal(&env, "POST", path, b"");
+        let stream = futures_util::stream::once(async move {
+            Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(wire_body))
+        });
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri(path)
+            .header("X-Obsetync-Method", "POST")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let response = sync_router(env.state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        let wire_response = response.into_body().collect().await.unwrap().to_bytes();
+        let (semantic_status, _) = decrypt_response_for_tests(
+            &wire_response,
+            &opened_request.key_material,
+            opened_request.mode,
+            "POST",
+            path,
+            &opened_request.nonce_req,
+        );
+        assert_eq!(semantic_status, StatusCode::OK.as_u16());
+        let receive = env.state.perf.snapshot().http_receive;
+        assert_eq!(receive.unknown_length, 1);
+        assert_eq!(receive.admitted, 1);
+        assert_eq!(receive.completed, 1);
+        assert_eq!(
+            receive.peak_bytes,
+            http_receive_reservation_bytes(MAX_BODY_BYTES).unwrap() as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_handler_releases_http_receive_owner() {
+        let env = setup();
+        let path = "/api/v1/cancelled-admission-probe";
+        let (wire_body, _) = seal(&env, "POST", path, b"probe");
+        let wire_len = wire_body.len();
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri(path)
+            .header("X-Obsetync-Method", "POST")
+            .header(axum::http::header::CONTENT_LENGTH, wire_len)
+            .body(Body::from(wire_body))
+            .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let never_finish = Arc::new(tokio::sync::Notify::new());
+        let handler = {
+            let entered = entered.clone();
+            let never_finish = never_finish.clone();
+            move |body: axum::body::Bytes| {
+                let entered = entered.clone();
+                let never_finish = never_finish.clone();
+                async move {
+                    assert_eq!(body.as_ref(), b"probe");
+                    entered.notify_one();
+                    never_finish.notified().await;
+                    StatusCode::NO_CONTENT
+                }
+            }
+        };
+        let router = Router::new()
+            .route(path, post(handler))
+            .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+            .layer(axum::middleware::from_fn_with_state(
+                env.state.clone(),
+                secure_envelope,
+            ))
+            .with_state(env.state.clone());
+        let task = tokio::spawn(async move { router.oneshot(request).await });
+
+        entered.notified().await;
+        let active = env.state.perf.snapshot().http_receive;
+        assert_eq!(active.inflight, 1);
+        assert!(active.inflight_bytes > 0);
+        assert!(
+            env.state.transport_memory.available_bytes()
+                < env.state.transport_memory.capacity_bytes()
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::task::yield_now().await;
+
+        let released = env.state.perf.snapshot().http_receive;
+        assert_eq!(released.completed, 1);
+        assert_eq!(released.inflight, 0);
+        assert_eq!(released.inflight_bytes, 0);
+        assert_eq!(
+            env.state.transport_memory.available_bytes(),
+            env.state.transport_memory.capacity_bytes()
+        );
     }
 
     /// Regression guard for the 204-strip bug. The semantic 204 now lives
@@ -3367,16 +4469,65 @@ mod integration_tests {
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
             value["capabilities"],
-            serde_json::json!(["bulk-http-v1", "ws-data-v1", "paged-diff-v1", "tree-v2"])
+            serde_json::json!([
+                "bulk-http-v1",
+                "ws-data-v1",
+                "ws-data-v2",
+                "paged-diff-v1",
+                "tree-v2",
+                "root-outcome-v1",
+                "root-cancel-v1"
+            ])
         );
         assert_eq!(value["limits"]["bulk_request_bytes"], BULK_REQUEST_BYTES);
         assert_eq!(value["limits"]["bulk_objects"], BULK_OBJECTS);
+        assert_eq!(value["limits"]["http_wire_body_bytes"], MAX_BODY_BYTES);
+        assert_eq!(
+            value["limits"]["http_plaintext_response_bytes"],
+            MAX_BODY_BYTES
+        );
+        assert_eq!(
+            value["limits"]["transport_process_bytes"],
+            crate::transport_memory::PROCESS_MEMORY_BYTES
+        );
+        assert_eq!(
+            value["limits"]["root_response_bytes"],
+            crate::root_head::MAX_ROOT_HEAD_BYTES
+        );
+        assert_eq!(
+            value["limits"]["history_response_bytes"],
+            HTTP_HISTORY_RESPONSE_BYTES
+        );
+        assert_eq!(
+            value["limits"]["legacy_hash_check_request_bytes"],
+            LEGACY_HASH_CHECK_REQUEST_BYTES
+        );
+        assert_eq!(
+            value["limits"]["legacy_hash_check_response_bytes"],
+            LEGACY_HASH_CHECK_RESPONSE_BYTES
+        );
+        assert_eq!(
+            value["limits"]["legacy_hash_check_items"],
+            LEGACY_HASH_CHECK_ITEMS
+        );
         assert_eq!(value["limits"]["ws_frame_bytes"], WS_FRAME_BYTES);
         assert_eq!(value["limits"]["ws_inflight_requests"], 4);
         assert_eq!(value["limits"]["ws_inflight_bytes"], 32 * 1024 * 1024);
+        let capabilities = value["capabilities"].as_array().unwrap();
+        assert!(capabilities.iter().any(|value| value == "ws-data-v1"));
+        assert!(capabilities.iter().any(|value| value == "ws-data-v2"));
         assert_eq!(value["limits"]["diff_page_bytes"], DIFF_PAGE_BYTES);
         assert_eq!(value["limits"]["diff_page_records"], MAX_PAGE_RECORDS);
         assert_eq!(value["limits"]["diff_path_bytes"], MAX_PATH_BYTES);
+        assert_eq!(value["server_incarnation"], env.state.root_incarnation);
+        assert_eq!(
+            value["limits"]["root_commit_request_bytes"],
+            root_outcome::MAX_COMMIT_REQUEST_BYTES
+        );
+        assert_eq!(
+            value["limits"]["root_commit_root_bytes"],
+            root_outcome::MAX_ROOT_BYTES
+        );
     }
 
     #[tokio::test]
@@ -4220,9 +5371,21 @@ mod integration_tests {
         assert!(bundle["valid_until"].as_u64().is_some());
         assert_eq!(
             bundle["capabilities"],
-            serde_json::json!(["bulk-http-v1", "ws-data-v1", "paged-diff-v1", "tree-v2"])
+            serde_json::json!([
+                "bulk-http-v1",
+                "ws-data-v1",
+                "ws-data-v2",
+                "paged-diff-v1",
+                "tree-v2",
+                "root-outcome-v1",
+                "root-cancel-v1"
+            ])
         );
         assert_eq!(bundle["limits"]["bulk_request_bytes"], BULK_REQUEST_BYTES);
+        let capabilities = bundle["capabilities"].as_array().unwrap();
+        assert!(capabilities.iter().any(|value| value == "ws-data-v1"));
+        assert!(capabilities.iter().any(|value| value == "ws-data-v2"));
+        assert_eq!(bundle["server_incarnation"], env.state.root_incarnation);
     }
 
     /// /health stays plaintext — must survive without the envelope machinery.

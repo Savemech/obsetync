@@ -145,7 +145,7 @@ void (async () => {
     const conservative = selected.profiles.find((item) => item.name === "conservative");
     const adaptive = selected.profiles.find((item) => item.name === "balanced");
     if (!conservative || !adaptive || adaptive.family === "generic") {
-        throw new Error("governor release benchmark requires x86_64, M1, or Windows ARM64");
+        throw new Error("governor release benchmark requires x86_64, macOS ARM64, or Windows ARM64");
     }
     const pool = createDesktopHashWorkerPool(hashWorkerSource, {
         initialWorkers: adaptive.tuning.hashConcurrency,
@@ -177,10 +177,11 @@ void (async () => {
         );
         const worstLag = Math.max(...runs.map((run) => run.event_loop_lag_p95_ms));
         const throughputGate = adaptiveMedian >= conservativeMedian * 0.95;
-        const uiGate = worstLag <= 16;
+        const uiGate = runs.every(run => run.event_loop_lag_samples > 0) && worstLag <= 16;
         const report = {
             schema_version: 1,
-            evidence: "actual production SIMD worker/controller run",
+            evidence: "production SIMD workers with fixed startup profiles; not adaptive-window control",
+            adaptive_window_controller_exercised: false,
             profile_family: adaptive.family,
             runtime: {
                 platform: platform(),

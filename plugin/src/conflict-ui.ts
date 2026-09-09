@@ -17,6 +17,11 @@ export class ObsetyncConflictModal extends Modal {
     private conflicts: ConflictInfo[];
     private io: PlatformIO;
     private onResolved: () => void;
+    private revoked = false;
+    private activeHandlers = 0;
+    private readonly resolving = new Set<ConflictInfo>();
+    private drainWork: Promise<void> | null = null;
+    private resolveDrain: (() => void) | null = null;
 
     constructor(
         app: App,
@@ -48,28 +53,71 @@ export class ObsetyncConflictModal extends Modal {
                     `Conflict copy saved as: ${conflict.preservedAs}`
                 )
                 .addButton((btn) =>
-                    btn.setButtonText("Keep Remote").onClick(async () => {
+                    btn.setButtonText("Keep Remote").onClick(() => this.runResolution(conflict, async () => {
                         // Delete the conflict copy, keep the winner.
                         await this.io.deleteFile(conflict.preservedAs);
-                        this.removeConflict(conflict);
-                    })
+                    }))
                 )
                 .addButton((btn) =>
-                    btn.setButtonText("Keep Local").onClick(async () => {
+                    btn.setButtonText("Keep Local").onClick(() => this.runResolution(conflict, async () => {
                         // Replace winner with preserved copy.
                         const data = await this.io.readFile(conflict.preservedAs);
                         await this.io.writeFile(conflict.original, data);
                         await this.io.deleteFile(conflict.preservedAs);
-                        this.removeConflict(conflict);
-                    })
+                    }))
                 )
                 .addButton((btn) =>
-                    btn.setButtonText("Keep Both").onClick(async () => {
+                    btn.setButtonText("Keep Both").onClick(() => this.runResolution(conflict, async () => {
                         // Just remove from conflict list, files stay as-is.
-                        this.removeConflict(conflict);
-                    })
+                    }))
                 );
         }
+    }
+
+    /** Close UI admission synchronously. Operations that entered before this
+     * cut retain ownership of their complete read/write/delete sequence. */
+    revoke(): void {
+        if (this.revoked) return;
+        this.revoked = true;
+        this.close();
+    }
+
+    /** Repeated terminal owners join the same exact admitted-handler tail. */
+    closeAndDrain(): Promise<void> {
+        this.revoke();
+        if (!this.drainWork) {
+            this.drainWork = new Promise<void>(resolve => { this.resolveDrain = resolve; });
+            this.completeDrainIfReady();
+        }
+        return this.drainWork;
+    }
+
+    private runResolution(conflict: ConflictInfo, operation: () => Promise<void>): Promise<void> {
+        if (this.revoked || !this.conflicts.includes(conflict) || this.resolving.has(conflict)) {
+            return Promise.resolve();
+        }
+        this.resolving.add(conflict);
+        this.activeHandlers++;
+        const release = () => {
+            this.resolving.delete(conflict);
+            this.activeHandlers--;
+            this.completeDrainIfReady();
+        };
+        try {
+            return Promise.resolve(operation()).then(() => {
+                if (!this.revoked) this.removeConflict(conflict);
+            }).finally(release);
+        } catch (error) {
+            release();
+            return Promise.reject(error);
+        }
+    }
+
+    private completeDrainIfReady(): void {
+        if (!this.revoked || this.activeHandlers !== 0 || !this.resolveDrain) return;
+        const resolve = this.resolveDrain;
+        this.resolveDrain = null;
+        resolve();
     }
 
     private removeConflict(conflict: ConflictInfo): void {
@@ -83,7 +131,10 @@ export class ObsetyncConflictModal extends Modal {
     }
 
     onClose(): void {
+        // Obsidian's close button is also a synchronous admission cut.
+        this.revoked = true;
         this.contentEl.empty();
+        this.completeDrainIfReady();
     }
 }
 

@@ -40,6 +40,23 @@
 
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
+        # A plugin derivation sees only ./plugin and therefore has no .git or
+        # repo-root manifest. Preserve clean/dirty/anonymous provenance rather
+        # than making a local Nix build look like a verified release.
+        pluginDirtyRevision = if self ? dirtyRev
+          then builtins.match "([0-9a-f]{40})-dirty" self.dirtyRev
+          else null;
+        pluginBuildIdentity = if self ? rev then {
+          commit = self.rev;
+          sourceState = "clean";
+        } else if pluginDirtyRevision != null then {
+          commit = builtins.elemAt pluginDirtyRevision 0;
+          sourceState = "dirty";
+        } else {
+          commit = "unknown";
+          sourceState = "local-unknown";
+        };
+
         # Source filtered to Cargo-relevant files — keeps build cache stable
         # across plugin edits.
         src = craneLib.cleanCargoSource ./.;
@@ -73,6 +90,15 @@
           pname = "sync-server";
           cargoExtraArgs = "--locked -p sync-server";
           doCheck = false;  # test runs under `nix flake check` instead
+          OBSETYNC_BUILD_GIT_COMMIT = pluginBuildIdentity.commit;
+          OBSETYNC_BUILD_SOURCE_STATE = pluginBuildIdentity.sourceState;
+          OBSETYNC_BUILD_EXPECTED_COMMIT = if pluginBuildIdentity.sourceState == "clean"
+            then pluginBuildIdentity.commit else "";
+          OBSETYNC_BUILD_REQUIRE_EXPECTED_COMMIT = if pluginBuildIdentity.sourceState == "clean"
+            then "1" else "0";
+          OBSETYNC_BUILD_REQUIRE_CLEAN = if pluginBuildIdentity.sourceState == "clean"
+            then "1" else "0";
+          OBSETYNC_BUILD_EXPECTED_VERSION = commonArgs.version;
         });
 
         # ------------------------------------------------------------------
@@ -119,6 +145,9 @@
           buildPhase = ''
             runHook preBuild
 
+            wasm-opt --version \
+              | awk '$1 == "wasm-opt" && $2 == "version" && $3 + 0 >= 117 { ok = 1 } END { exit !ok }'
+
             wasm-bindgen \
               --target web \
               --out-dir bindings \
@@ -131,13 +160,14 @@
               --out-name sync_core_simd \
               ${sync-core-wasm-simd-raw}/lib/sync_core.wasm
 
-            # Optimize with wasm-opt (same feature flags as the Docker path).
+            # Match the parser feature policy enforced by build-wasm.sh.
             wasm-opt -O \
               --enable-bulk-memory \
               --enable-nontrapping-float-to-int \
               --enable-sign-ext \
               --enable-mutable-globals \
               --enable-reference-types \
+              --disable-simd \
               bindings/sync_core_bg.wasm \
               -o bindings/sync_core_bg.wasm.opt
             mv bindings/sync_core_bg.wasm.opt bindings/sync_core_bg.wasm
@@ -172,6 +202,16 @@
           src     = ./plugin;
 
           npmDepsHash = "sha256-jI9ps8wxNeGm4JSV8vts2sOMwxOsSld0LedFJvJIbwA=";
+          OBSETYNC_BUILD_GIT_COMMIT = pluginBuildIdentity.commit;
+          OBSETYNC_BUILD_SOURCE_STATE = pluginBuildIdentity.sourceState;
+          OBSETYNC_BUILD_ALLOW_LOCAL_UNKNOWN = "1";
+          OBSETYNC_BUILD_EXPECTED_COMMIT = if pluginBuildIdentity.sourceState == "clean"
+            then pluginBuildIdentity.commit else "";
+          OBSETYNC_BUILD_REQUIRE_EXPECTED_COMMIT = if pluginBuildIdentity.sourceState == "clean"
+            then "1" else "0";
+          OBSETYNC_BUILD_REQUIRE_CLEAN = if pluginBuildIdentity.sourceState == "clean"
+            then "1" else "0";
+          OBSETYNC_BUILD_EXPECTED_VERSION = "1.11.4";
 
           # Inject the WASM bindings before esbuild runs.
           preBuild = ''
@@ -247,6 +287,11 @@
             Labels     = {
               "org.opencontainers.image.title"       = "obsetync-server";
               "org.opencontainers.image.description" = "Self-hosted Obsidian vault sync server";
+              "org.opencontainers.image.version"     = commonArgs.version;
+              "org.opencontainers.image.revision"    = pluginBuildIdentity.commit;
+              "org.opencontainers.image.source-state" = pluginBuildIdentity.sourceState;
+              "org.opencontainers.image.obsetync-protocol" =
+                "api-v1;transport-v2;tree-v1-v2;ws-data-v1-v2;root-outcome-v1";
             };
           };
         };
@@ -262,7 +307,7 @@
 
         # `nix flake check` runs the test suite across the workspace.
         checks = {
-          inherit sync-server plugin;
+          inherit sync-server plugin sync-core-wasm;
 
           sync-tests = craneLib.cargoTest (commonArgs // {
             inherit cargoArtifacts;

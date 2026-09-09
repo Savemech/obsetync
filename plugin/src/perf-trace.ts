@@ -60,6 +60,11 @@ export const DEFAULT_PERF_PROFILE: PerfPlatformProfile = {
     diffPageBytes: 0,
 };
 
+// Beyond this gap the renderer may have been suspended or timer-throttled.
+// Classify it as unknown scheduling state rather than foreground UI lag;
+// fresh probes after resume still measure a real continuing stall.
+const MAX_TRUSTED_SCHEDULED_LAG_MS = 5_000;
+
 export function normalizePerfArchitecture(
     value: string | null | undefined,
 ): PerfPlatformProfile["architecture"] {
@@ -94,6 +99,16 @@ export interface PerfWorkload {
 export interface PerfIncrement {
     filesCompleted?: number;
     bytesTransferred?: number;
+    /** Volatile preparation completed for an authoritative (not lookahead) path. */
+    preparedFiles?: number;
+    /** All content objects for the path were confirmed by the server. */
+    serverConfirmedFiles?: number;
+    /** Paths included in a server-accepted root mutation. */
+    rootCommittedPaths?: number;
+    /** Number of server-accepted root transaction cuts. */
+    rootCommittedCuts?: number;
+    /** Tracked deletions included in a server-accepted root mutation. */
+    trackedDeletesCommitted?: number;
     plaintextBytesSent?: number;
     plaintextBytesReceived?: number;
     wireBytesSent?: number;
@@ -126,6 +141,11 @@ export interface PerfOperationRecord {
     bytesNeeded: number | null;
     filesCompleted: number;
     bytesTransferred: number;
+    preparedFiles: number;
+    serverConfirmedFiles: number;
+    rootCommittedPaths: number;
+    rootCommittedCuts: number;
+    trackedDeletesCommitted: number;
     plaintextBytesSent: number;
     plaintextBytesReceived: number;
     wireBytesSent: number;
@@ -157,6 +177,11 @@ export interface PerfActiveOperation {
     filesTotal: number | null;
     filesCompleted: number;
     bytesTransferred: number;
+    preparedFiles: number;
+    serverConfirmedFiles: number;
+    rootCommittedPaths: number;
+    rootCommittedCuts: number;
+    trackedDeletesCommitted: number;
     requestCount: number;
     wsFrameCount: number;
     retries: number;
@@ -166,6 +191,30 @@ export interface PerfActiveOperation {
     phases: Partial<Record<PerfPhase, number>>;
     eventLoopLagP95Ms: number | null;
     eventLoopLagExcludedSamples: number;
+}
+
+export type PerfDemand = Partial<Record<"read" | "hash" | "network" | "apply", number>>;
+
+/** Counter deltas for one interval; never another copy of operation totals.
+ * Visible time is an eligibility estimate, not measured CPU time. Intervals
+ * crossing visibility changes or an excessive scheduling gap are untrusted. */
+export interface PerfOperationWindow {
+    sequence: number;
+    startedAtMs: number;
+    endedAtMs: number;
+    operationId: string;
+    kind: PerfOperationKind;
+    outcome: PerfOutcome;
+    durationMs: number;
+    activeDurationMs: number;
+    continuousVisible: boolean;
+    filesCompleted: number;
+    bytesTransferred: number;
+    retries: number;
+    backpressureEvents: number;
+    peakBatchBytes: number;
+    eventLoopLagP95Ms: number | null;
+    demand: PerfDemand;
 }
 
 export interface PerfOperation {
@@ -180,6 +229,8 @@ export interface PerfOperation {
     observeEventLoopLag(lagMs: number): void;
     observePeakBatchBytes(bytes: number): void;
     setWasmChunks(chunks: PerfWasmChunks): void;
+    /** Explicit queued/backlogged work, not a guess from CPU utilization. */
+    setDemand(demand: PerfDemand): void;
     finish(outcome?: PerfOutcome): void;
 }
 
@@ -189,7 +240,21 @@ export interface PerfTraceOptions {
     wallNow?: () => number;
     monitorEventLoop?: boolean;
     eventLoopIntervalMs?: number;
+    windowIntervalMs?: number;
+    monitorWindows?: boolean;
+    /** Injectable scheduling for deterministic callback-order regression tests. */
+    timers?: PerfTimerScheduler;
 }
+
+export interface PerfTimerScheduler {
+    setTimeout(callback: () => void, delayMs: number): ReturnType<typeof setTimeout>;
+    clearTimeout(handle: ReturnType<typeof setTimeout>): void;
+}
+
+const DEFAULT_PERF_TIMERS: PerfTimerScheduler = {
+    setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+    clearTimeout: (handle) => clearTimeout(handle),
+};
 
 const LAG_BUCKET_UPPER_MS = [
     1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1_000, 2_000, 5_000, 10_000,
@@ -221,6 +286,15 @@ function finiteNonNegative(value: number, name: string): number {
         throw new RangeError(`${name} must be a finite non-negative number`);
     }
     return value;
+}
+
+function addBoundedCounter(current: number, delta: number, name: string): number {
+    if (!Number.isSafeInteger(delta) || delta < 0) {
+        throw new RangeError(`${name} must be a non-negative safe integer`);
+    }
+    return current >= Number.MAX_SAFE_INTEGER - delta
+        ? Number.MAX_SAFE_INTEGER
+        : current + delta;
 }
 
 function cloneProfile(profile: PerfPlatformProfile): PerfPlatformProfile {
@@ -289,9 +363,23 @@ class PerfOperationHandle implements PerfOperation {
     // even when an operation has many concurrent spans of the same phase.
     private readonly activePhases = new Map<PerfPhase, { count: number; started: number }>();
     private readonly lag = new EventLoopLagHistogram();
+    private windowLag = new EventLoopLagHistogram();
+    private windowStartedMono: number;
+    private windowVisibilityEpoch: number;
+    private windowVisible: boolean;
+    private windowPeakBatchBytes = 0;
+    private demand: PerfDemand = {};
+    private readonly windowValues = {
+        filesCompleted: 0, bytesTransferred: 0, retries: 0, backpressureEvents: 0,
+    };
     private readonly values: Required<PerfIncrement> = {
         filesCompleted: 0,
         bytesTransferred: 0,
+        preparedFiles: 0,
+        serverConfirmedFiles: 0,
+        rootCommittedPaths: 0,
+        rootCommittedCuts: 0,
+        trackedDeletesCommitted: 0,
         plaintextBytesSent: 0,
         plaintextBytesReceived: 0,
         wireBytesSent: 0,
@@ -334,6 +422,7 @@ class PerfOperationHandle implements PerfOperation {
         private readonly eventLoopIntervalMs: number,
         private readonly isVisible: () => boolean,
         private readonly visibilityEpoch: () => number,
+        private readonly timers: PerfTimerScheduler,
         private readonly onFinish: (record: PerfOperationRecord) => void,
     ) {
         this.operationId = id;
@@ -341,6 +430,9 @@ class PerfOperationHandle implements PerfOperation {
         this.startedAt = wallNow();
         this.startedMono = monotonicNow();
         this.lastProgressMono = this.startedMono;
+        this.windowStartedMono = this.startedMono;
+        this.windowVisibilityEpoch = visibilityEpoch();
+        this.windowVisible = isVisible();
         if (monitorEventLoop) this.scheduleLagProbe();
     }
 
@@ -361,7 +453,10 @@ class PerfOperationHandle implements PerfOperation {
 
     increment(delta: PerfIncrement): void {
         if (this.finished) return;
-        if ((delta.filesCompleted ?? 0) > 0 || (delta.bytesTransferred ?? 0) > 0) {
+        if ((delta.filesCompleted ?? 0) > 0 || (delta.bytesTransferred ?? 0) > 0 ||
+            (delta.preparedFiles ?? 0) > 0 || (delta.serverConfirmedFiles ?? 0) > 0 ||
+            (delta.rootCommittedPaths ?? 0) > 0 || (delta.rootCommittedCuts ?? 0) > 0 ||
+            (delta.trackedDeletesCommitted ?? 0) > 0) {
             this.lastProgressMono = this.monotonicNow();
         }
         if (delta.filesCompleted !== undefined) {
@@ -375,6 +470,17 @@ class PerfOperationHandle implements PerfOperation {
                 delta.bytesTransferred,
                 "bytesTransferred",
             );
+        }
+        for (const key of [
+            "preparedFiles",
+            "serverConfirmedFiles",
+            "rootCommittedPaths",
+            "rootCommittedCuts",
+            "trackedDeletesCommitted",
+        ] as const) {
+            if (delta[key] !== undefined) {
+                this.values[key] = addBoundedCounter(this.values[key], delta[key]!, key);
+            }
         }
         if (delta.plaintextBytesSent !== undefined) {
             this.values.plaintextBytesSent += finiteNonNegative(
@@ -459,6 +565,45 @@ class PerfOperationHandle implements PerfOperation {
             return;
         }
         this.lag.observe(lagMs);
+        this.windowLag.observe(lagMs);
+    }
+
+    setDemand(demand: PerfDemand): void {
+        if (this.finished) return;
+        const next: PerfDemand = {};
+        for (const axis of ["read", "hash", "network", "apply"] as const) {
+            if (demand[axis] !== undefined) {
+                next[axis] = finiteNonNegative(demand[axis]!, `${axis} demand`);
+            }
+        }
+        this.demand = next;
+    }
+
+    takeWindow(sequence: number, maxIntervalMs: number, outcome: PerfOutcome): PerfOperationWindow {
+        const now = this.monotonicNow();
+        const durationMs = Math.max(0, now - this.windowStartedMono);
+        const continuousVisible = this.windowVisible && this.isVisible() &&
+            this.windowVisibilityEpoch === this.visibilityEpoch() && durationMs <= maxIntervalMs;
+        const delta = { filesCompleted: 0, bytesTransferred: 0, retries: 0, backpressureEvents: 0 };
+        for (const key of Object.keys(delta) as Array<keyof typeof delta>) {
+            delta[key] = Math.max(0, this.values[key] - this.windowValues[key]);
+            this.windowValues[key] = this.values[key];
+        }
+        const window: PerfOperationWindow = {
+            sequence, operationId: this.operationId, kind: this.kind, outcome,
+            startedAtMs: this.windowStartedMono, endedAtMs: now,
+            durationMs, activeDurationMs: continuousVisible ? durationMs : 0,
+            continuousVisible, ...delta,
+            peakBatchBytes: this.windowPeakBatchBytes,
+            eventLoopLagP95Ms: continuousVisible ? this.windowLag.p95() : null,
+            demand: { ...this.demand },
+        };
+        this.windowStartedMono = now;
+        this.windowVisibilityEpoch = this.visibilityEpoch();
+        this.windowVisible = this.isVisible();
+        this.windowLag = new EventLoopLagHistogram();
+        this.windowPeakBatchBytes = 0;
+        return window;
     }
 
     snapshot(): PerfActiveOperation {
@@ -472,6 +617,11 @@ class PerfOperationHandle implements PerfOperation {
             filesTotal: this.workloadKnown.filesTotal ? this.workload.filesTotal : null,
             filesCompleted: this.values.filesCompleted,
             bytesTransferred: this.values.bytesTransferred,
+            preparedFiles: this.values.preparedFiles,
+            serverConfirmedFiles: this.values.serverConfirmedFiles,
+            rootCommittedPaths: this.values.rootCommittedPaths,
+            rootCommittedCuts: this.values.rootCommittedCuts,
+            trackedDeletesCommitted: this.values.trackedDeletesCommitted,
             requestCount: this.values.requestCount,
             wsFrameCount: this.values.wsFrameCount,
             retries: this.values.retries,
@@ -490,6 +640,7 @@ class PerfOperationHandle implements PerfOperation {
             this.peakBatchBytes,
             finiteNonNegative(bytes, "peakBatchBytes"),
         );
+        this.windowPeakBatchBytes = Math.max(this.windowPeakBatchBytes, bytes);
     }
 
     setWasmChunks(chunks: PerfWasmChunks): void {
@@ -520,7 +671,7 @@ class PerfOperationHandle implements PerfOperation {
         }
         this.finished = true;
         if (this.lagTimer !== null) {
-            clearTimeout(this.lagTimer);
+            this.timers.clearTimeout(this.lagTimer);
             this.lagTimer = null;
         }
         this.nextLagProbeAt = null;
@@ -572,10 +723,10 @@ class PerfOperationHandle implements PerfOperation {
             this.nextLagProbeAt = now + this.eventLoopIntervalMs;
             this.lagProbeVisible = this.isVisible();
             this.lagProbeVisibilityEpoch = this.visibilityEpoch();
-            this.lagTimer = setTimeout(tick, this.eventLoopIntervalMs);
+            this.lagTimer = this.timers.setTimeout(tick, this.eventLoopIntervalMs);
             (this.lagTimer as any)?.unref?.();
         };
-        this.lagTimer = setTimeout(tick, this.eventLoopIntervalMs);
+        this.lagTimer = this.timers.setTimeout(tick, this.eventLoopIntervalMs);
         (this.lagTimer as any)?.unref?.();
     }
 
@@ -585,7 +736,20 @@ class PerfOperationHandle implements PerfOperation {
             this.excludedLagSamples++;
             return;
         }
-        this.lag.observe(Math.max(0, now - this.nextLagProbeAt!));
+        const lagMs = Math.max(0, now - this.nextLagProbeAt!);
+        if (lagMs > MAX_TRUSTED_SCHEDULED_LAG_MS) {
+            this.excludedLagSamples++;
+            return;
+        }
+        this.lag.observe(lagMs);
+        // The window timer can run before an overdue callback. A still-trusted
+        // pre-baseline delay remains an operation diagnostic, but never becomes
+        // evidence in the fresh control window.
+        const probeStartedAt = this.nextLagProbeAt! - this.eventLoopIntervalMs;
+        if (probeStartedAt >= this.windowStartedMono && this.windowVisible &&
+            this.lagProbeVisibilityEpoch === this.windowVisibilityEpoch) {
+            this.windowLag.observe(lagMs);
+        }
     }
 
 }
@@ -594,11 +758,17 @@ export class PerfTrace {
     private readonly maxRecords: number;
     private readonly monotonicNow: () => number;
     private readonly wallNow: () => number;
+    private readonly timers: PerfTimerScheduler;
     private readonly monitorEventLoop: boolean;
     private readonly eventLoopIntervalMs: number;
     private readonly records: PerfOperationRecord[] = [];
     private readonly active = new Map<string, PerfOperationHandle>();
     private readonly listeners = new Set<(record: PerfOperationRecord) => void>();
+    private readonly windowListeners = new Set<(window: PerfOperationWindow) => void>();
+    private readonly windowIntervalMs: number;
+    private readonly monitorWindows: boolean;
+    private windowTimer: ReturnType<typeof setTimeout> | null = null;
+    private windowSequence = 0;
     private profile = cloneProfile(DEFAULT_PERF_PROFILE);
     private sequence = 0;
     private visible = true;
@@ -613,11 +783,18 @@ export class PerfTrace {
             options.monotonicNow ??
             (() => globalThis.performance?.now?.() ?? Date.now());
         this.wallNow = options.wallNow ?? (() => Date.now());
+        this.timers = options.timers ?? DEFAULT_PERF_TIMERS;
         this.monitorEventLoop = options.monitorEventLoop ?? true;
         this.eventLoopIntervalMs = options.eventLoopIntervalMs ?? 250;
         if (!Number.isFinite(this.eventLoopIntervalMs) || this.eventLoopIntervalMs <= 0) {
             throw new RangeError("eventLoopIntervalMs must be positive");
         }
+        this.windowIntervalMs = options.windowIntervalMs ?? 1_000;
+        if (!Number.isFinite(this.windowIntervalMs) || this.windowIntervalMs < 250 ||
+            this.windowIntervalMs > 5_000) {
+            throw new RangeError("windowIntervalMs must be between 250 and 5000");
+        }
+        this.monitorWindows = options.monitorWindows ?? true;
     }
 
     setProfile(profile: PerfPlatformProfile): void {
@@ -648,8 +825,11 @@ export class PerfTrace {
             this.eventLoopIntervalMs,
             () => this.visible,
             () => this.visibilityGeneration,
+            this.timers,
             (record) => {
+                this.deliverWindow(operation, record.outcome);
                 this.active.delete(operationId);
+                if (this.active.size === 0) this.stopWindowTimer();
                 this.records.push(record);
                 if (this.records.length > this.maxRecords) {
                     this.records.splice(0, this.records.length - this.maxRecords);
@@ -664,6 +844,7 @@ export class PerfTrace {
             },
         );
         this.active.set(operationId, operation);
+        this.scheduleWindowTimer();
         return operation;
     }
 
@@ -671,6 +852,58 @@ export class PerfTrace {
     subscribe(listener: (record: PerfOperationRecord) => void): () => void {
         this.listeners.add(listener);
         return () => this.listeners.delete(listener);
+    }
+
+    /** Only active while subscribed and operations exist. A delayed timer
+     * produces an untrusted interval, never artificial healthy throughput. */
+    subscribeWindows(listener: (window: PerfOperationWindow) => void): () => void {
+        if (this.windowListeners.size === 0) {
+            // A newly attached controller must not receive work/lag accumulated
+            // while nobody observed intervals (including a previous subscription).
+            for (const operation of this.active.values()) {
+                operation.takeWindow(this.windowSequence, 5_000, "success");
+            }
+        }
+        this.windowListeners.add(listener);
+        this.scheduleWindowTimer();
+        return () => {
+            this.windowListeners.delete(listener);
+            if (this.windowListeners.size === 0) this.stopWindowTimer();
+        };
+    }
+
+    /** Deterministic explicit sampling is also used by the regression suite. */
+    sampleWindows(): void {
+        if (this.windowListeners.size === 0) return;
+        for (const operation of this.active.values()) this.deliverWindow(operation, "success");
+    }
+
+    private deliverWindow(operation: PerfOperationHandle, outcome: PerfOutcome): void {
+        if (this.windowListeners.size === 0) return;
+        const window = operation.takeWindow(++this.windowSequence, 5_000, outcome);
+        for (const listener of this.windowListeners) {
+            try {
+                listener({ ...window, demand: { ...window.demand } });
+            } catch (error) {
+                console.warn("[obsetync] performance window listener failed:", error);
+            }
+        }
+    }
+
+    private scheduleWindowTimer(): void {
+        if (!this.monitorWindows || this.windowTimer !== null || this.active.size === 0 ||
+            this.windowListeners.size === 0) return;
+        this.windowTimer = this.timers.setTimeout(() => {
+            this.windowTimer = null;
+            this.sampleWindows();
+            this.scheduleWindowTimer();
+        }, this.windowIntervalMs);
+        (this.windowTimer as any)?.unref?.();
+    }
+
+    private stopWindowTimer(): void {
+        if (this.windowTimer !== null) this.timers.clearTimeout(this.windowTimer);
+        this.windowTimer = null;
     }
 
     recent(): PerfOperationRecord[] {
@@ -703,11 +936,13 @@ export class PerfTrace {
             `Visibility:         ${this.visible ? "visible" : "hidden"} · crossing/hidden lag probes excluded`,
         ];
         for (const active of this.activeSnapshots(safeLimit)) {
+            const milestones = formatMilestones(active);
             lines.push(
                 `  ${active.kind} running ${formatDuration(active.durationMs)}` +
                 ` · files ${active.filesCompleted}/${active.filesTotal ?? "?"}` +
                 ` · transfer ${formatBytes(active.bytesTransferred)}` +
-                ` · no file/byte progress ${formatDuration(active.sinceProgressMs)}` +
+                milestones +
+                ` · no useful progress ${formatDuration(active.sinceProgressMs)}` +
                 ` · req ${active.requestCount} · WS frames ${active.wsFrameCount}`,
             );
             const phases = active.activePhases.map((phase) =>
@@ -734,9 +969,10 @@ export class PerfTrace {
                 record.eventLoopLagP95Ms === null
                     ? ""
                     : ` · lag p95<=${record.eventLoopLagP95Ms}ms`;
+            const milestones = formatMilestones(record);
             lines.push(
                 `  ${record.kind} ${record.outcome} ${formatDuration(record.durationMs)}` +
-                    `${files}${bytes} · req ${record.requestCount} · retry ${record.retries}` +
+                    `${files}${bytes}${milestones} · req ${record.requestCount} · retry ${record.retries}` +
                     ` · pressure ${record.backpressureEvents}${lag}` +
                     ((record.eventLoopLagExcludedSamples ?? 0) > 0
                         ? ` · hidden/crossing lag samples skipped ${record.eventLoopLagExcludedSamples}`
@@ -758,6 +994,21 @@ function formatBytes(bytes: number): string {
     if (bytes < 1_024) return `${Math.round(bytes)} B`;
     if (bytes < 1_048_576) return `${(bytes / 1_024).toFixed(1)} KiB`;
     return `${(bytes / 1_048_576).toFixed(1)} MiB`;
+}
+
+function formatMilestones(value: Pick<PerfActiveOperation,
+    "preparedFiles" | "serverConfirmedFiles" | "rootCommittedPaths" |
+    "rootCommittedCuts" | "trackedDeletesCommitted">): string {
+    const parts: string[] = [];
+    if (value.preparedFiles > 0) parts.push(`prepared ${value.preparedFiles} volatile`);
+    if (value.serverConfirmedFiles > 0) parts.push(`server-confirmed ${value.serverConfirmedFiles}`);
+    if (value.rootCommittedPaths > 0 || value.rootCommittedCuts > 0) {
+        parts.push(`root-committed ${value.rootCommittedPaths} paths/${value.rootCommittedCuts} cuts`);
+    }
+    if (value.trackedDeletesCommitted > 0) {
+        parts.push(`tracked deletes committed ${value.trackedDeletesCommitted}`);
+    }
+    return parts.length > 0 ? ` · milestones ${parts.join(" · ")}` : "";
 }
 
 export const perfTrace = new PerfTrace();

@@ -35,6 +35,12 @@ export interface DesktopRangedUploadOptions {
     maxBufferedBytes?: number;
     maxBufferedRecords?: number;
     openReader?: DesktopRangeReaderOpener;
+    /** Validate the borrowed range bytes before they enter the send queue.
+     * Reject on a hash mismatch. The caller admits any hashing workspace in
+     * its existing scope; this callback must settle only after its native
+     * work has settled, not after an abort/timeout race. Do not mutate or
+     * retain data after completion. This does not verify ranges not read. */
+    verifyRange?: (data: Uint8Array, expectedHash: string) => Promise<void>;
 }
 
 export interface DesktopRangedUploadResult {
@@ -193,12 +199,10 @@ export const openDesktopRangeReader: DesktopRangeReaderOpener = async (source) =
 };
 
 function validateRanges(
-    source: DesktopRangeSource,
+    sourceSize: number,
     ranges: readonly DesktopMissingRange[],
 ): void {
-    if (!validDesktopFileFingerprint(source.fingerprint)) {
-        throw new RangeError("invalid desktop range source fingerprint");
-    }
+    if (!Number.isSafeInteger(sourceSize) || sourceSize < 0) throw new RangeError("invalid range source size");
     let previousEnd = 0;
     const hashes = new Set<string>();
     for (const range of ranges) {
@@ -207,7 +211,7 @@ function validateRanges(
             !Number.isSafeInteger(range.offset) || range.offset < previousEnd ||
             !Number.isSafeInteger(range.size) || range.size <= 0 ||
             range.size > MAX_FASTCDC_CHUNK_BYTES ||
-            range.offset > source.fingerprint.size - range.size
+            range.offset > sourceSize - range.size
         ) {
             throw new RangeError("invalid or overlapping desktop upload ranges");
         }
@@ -216,18 +220,33 @@ function validateRanges(
     }
 }
 
-/** Execute pass 2 of desktop large-file upload. Only ranges selected by the
- * server's missing bitmap are read. ACKed packs are discarded before the next
- * pack is filled; a retry therefore starts from a fresh missing bitmap and
- * naturally resumes at the first object the server still lacks. */
-export async function uploadDesktopMissingRanges(
-    source: DesktopRangeSource,
+export interface BoundedRangeReader {
+    read(offset: number, size: number): Promise<Uint8Array>;
+    verify(): Promise<void>;
+    close(): Promise<void>;
+}
+
+/** Shared bounded queue/ACK discipline for an already-qualified ranged
+ * reader. Source qualification remains platform-specific. */
+export async function uploadMissingRangesWithReader(
+    sourceSize: number,
     ranges: readonly DesktopMissingRange[],
     putRecords: (records: readonly BulkUploadRecord[]) => Promise<void>,
     finalize: () => Promise<void>,
+    openReader: () => Promise<BoundedRangeReader>,
     options: DesktopRangedUploadOptions = {},
 ): Promise<DesktopRangedUploadResult> {
-    validateRanges(source, ranges);
+    validateRanges(sourceSize, ranges);
+    return uploadValidatedMissingRanges(ranges, putRecords, finalize, openReader, options);
+}
+
+async function uploadValidatedMissingRanges(
+    ranges: readonly DesktopMissingRange[],
+    putRecords: (records: readonly BulkUploadRecord[]) => Promise<void>,
+    finalize: () => Promise<void>,
+    openReader: () => Promise<BoundedRangeReader>,
+    options: DesktopRangedUploadOptions,
+): Promise<DesktopRangedUploadResult> {
     const maxBufferedBytes = options.maxBufferedBytes ?? DESKTOP_RANGE_QUEUE_BYTES;
     const maxBufferedRecords = options.maxBufferedRecords ?? DESKTOP_RANGE_QUEUE_RECORDS;
     if (
@@ -239,7 +258,7 @@ export async function uploadDesktopMissingRanges(
         throw new RangeError("invalid desktop range queue bounds");
     }
 
-    const reader = await (options.openReader ?? openDesktopRangeReader)(source);
+    const reader = await openReader();
     let primaryError: unknown;
     let pending: BulkUploadRecord[] = [];
     let pendingBytes = 0;
@@ -275,6 +294,7 @@ export async function uploadDesktopMissingRanges(
             if (data.byteLength !== range.size) {
                 throw driftError("ranged upload returned a truncated chunk");
             }
+            if (options.verifyRange) await options.verifyRange(data, range.hash);
             pending.push({
                 kind: BulkObjectKind.ContentChunk,
                 hash: range.hash,
@@ -313,4 +333,22 @@ export async function uploadDesktopMissingRanges(
             if (primaryError === undefined) throw closeError;
         }
     }
+}
+
+/** Execute pass 2 of desktop large-file upload. Only ranges selected by the
+ * server's missing bitmap are read. ACKed packs are discarded before the next
+ * pack is filled; a retry therefore starts from a fresh missing bitmap and
+ * naturally resumes at the first object the server still lacks. */
+export async function uploadDesktopMissingRanges(
+    source: DesktopRangeSource,
+    ranges: readonly DesktopMissingRange[],
+    putRecords: (records: readonly BulkUploadRecord[]) => Promise<void>,
+    finalize: () => Promise<void>,
+    options: DesktopRangedUploadOptions = {},
+): Promise<DesktopRangedUploadResult> {
+    if (!validDesktopFileFingerprint(source.fingerprint)) {
+        throw new RangeError("invalid desktop range source fingerprint");
+    }
+    return uploadMissingRangesWithReader(source.fingerprint.size, ranges, putRecords, finalize,
+        () => (options.openReader ?? openDesktopRangeReader)(source), options);
 }

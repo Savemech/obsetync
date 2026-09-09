@@ -3,10 +3,12 @@ mod api;
 mod blocking_io;
 mod box_key;
 mod bridge;
+mod build_identity;
 mod bulk;
 mod config;
 mod crdt;
 mod devices;
+mod doc_store;
 mod enrollment;
 mod eph_rotation;
 mod error;
@@ -14,21 +16,25 @@ mod guard;
 mod ignore_match;
 mod pack_store;
 mod perf;
+mod root_head;
+mod root_outcome;
 mod secure;
 mod seq_tracker;
 mod state;
 mod storage;
 mod storage_writer;
+mod transport_memory;
 mod ws;
 mod ws_data;
 mod ws_ticket;
 
 use clap::{Parser, Subcommand};
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "obsetync-server", about = "ObsetyNC sync server")]
+#[command(name = "obsetync-server", about = "ObsetyNC sync server", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -36,6 +42,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Print immutable build and wire-protocol provenance as canonical JSON.
+    BuildIdentity,
     /// Initialize a new server data directory. Creates the X25519 "box"
     /// keypair clients use for encrypted transport + the directory layout.
     Init {
@@ -54,6 +62,9 @@ enum Command {
         /// Path to the data directory.
         #[arg(long)]
         data_dir: PathBuf,
+        /// Bind both listeners to this IP address (default: all IPv4 interfaces).
+        #[arg(long, default_value = "0.0.0.0")]
+        bind_address: IpAddr,
         /// Sync API port (default: 27182).
         #[arg(long, default_value = "27182")]
         sync_port: u16,
@@ -86,6 +97,7 @@ async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::BuildIdentity => println!("{}", build_identity::canonical_json()),
         Command::Init { data_dir } => {
             if let Err(e) = cmd_init(&data_dir) {
                 tracing::error!("init failed: {}", e);
@@ -100,10 +112,11 @@ async fn main() {
         }
         Command::Run {
             data_dir,
+            bind_address,
             sync_port,
             admin_port,
         } => {
-            if let Err(e) = cmd_run(&data_dir, sync_port, admin_port).await {
+            if let Err(e) = cmd_run(&data_dir, bind_address, sync_port, admin_port).await {
                 tracing::error!("server failed: {}", e);
                 std::process::exit(1);
             }
@@ -183,6 +196,7 @@ fn cmd_show_box_pub(data_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>
 
 async fn cmd_run(
     data_dir: &PathBuf,
+    bind_address: IpAddr,
     sync_port: u16,
     admin_port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -196,11 +210,13 @@ async fn cmd_run(
     let sync_app = api::sync_router(state.clone());
     let admin_app = admin::admin_router(state.clone());
 
-    let admin_addr = format!("0.0.0.0:{}", admin_port);
+    let admin_addr = SocketAddr::new(bind_address, admin_port);
     let admin_listener = tokio::net::TcpListener::bind(&admin_addr).await?;
+    let admin_addr = admin_listener.local_addr()?;
 
-    let sync_addr = format!("0.0.0.0:{}", sync_port);
+    let sync_addr = SocketAddr::new(bind_address, sync_port);
     let sync_listener = tokio::net::TcpListener::bind(&sync_addr).await?;
+    let sync_addr = sync_listener.local_addr()?;
 
     println!("Sync API:  http://{} (AEAD-encrypted payloads)", sync_addr);
     println!("Admin GUI: http://{}", admin_addr);
@@ -283,4 +299,71 @@ async fn cmd_run(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn bind_address_defaults_preserve_existing_listeners() {
+        let cli = Cli::try_parse_from(["obsetync-server", "run", "--data-dir", "/fixture"])
+            .expect("default run options");
+        let Command::Run {
+            bind_address,
+            sync_port,
+            admin_port,
+            ..
+        } = cli.command
+        else {
+            panic!("expected run command");
+        };
+        assert_eq!(bind_address, "0.0.0.0".parse::<IpAddr>().unwrap());
+        assert_eq!((sync_port, admin_port), (27182, 27183));
+    }
+
+    #[test]
+    fn bind_address_accepts_loopback_and_ephemeral_ports() {
+        for address in ["127.0.0.1", "::1"] {
+            let cli = Cli::try_parse_from([
+                "obsetync-server",
+                "run",
+                "--data-dir",
+                "/fixture",
+                "--bind-address",
+                address,
+                "--sync-port",
+                "0",
+                "--admin-port",
+                "0",
+            ])
+            .expect("explicit loopback run options");
+            let Command::Run {
+                bind_address,
+                sync_port,
+                admin_port,
+                ..
+            } = cli.command
+            else {
+                panic!("expected run command");
+            };
+            assert_eq!(bind_address, address.parse::<IpAddr>().unwrap());
+            assert_eq!((sync_port, admin_port), (0, 0));
+        }
+    }
+
+    #[test]
+    fn bind_address_rejects_hostnames_and_malformed_addresses() {
+        for address in ["localhost", "127.0.0.1:27182", "999.1.1.1"] {
+            assert!(Cli::try_parse_from([
+                "obsetync-server",
+                "run",
+                "--data-dir",
+                "/fixture",
+                "--bind-address",
+                address,
+            ])
+            .is_err());
+        }
+    }
 }

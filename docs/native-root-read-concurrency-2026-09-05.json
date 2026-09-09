@@ -1,0 +1,162 @@
+{
+  "schema": 2,
+  "kind": "derived-native-root-comparison",
+  "numbers": "selected raw fields, rounded to three decimals where shown",
+  "counterSemantics": {
+    "v1": "sourceOrGenerationDrifts observed terminal recordSyncFailure calls only; absence of later fields is unknown, not zero retained drift",
+    "v2": "sourceOrGenerationDrifts equals retentionsAccepted plus terminalFailures; retentionsAccepted is the exact accepted queue decision, while final completion is proved separately"
+  },
+  "corpus": {
+    "bulkFiles": 25000,
+    "bytesEach": 4096,
+    "treeVersion": 1,
+    "quietRuns": 3,
+    "editsRuns": 3,
+    "edits": "70 create callbacks plus three superseding active-note generations"
+  },
+  "host": {
+    "node": "v22.23.2",
+    "platform": "linux",
+    "architecture": "x64",
+    "osRelease": "6.18.33.2-microsoft-standard-WSL2",
+    "cpuModel": "AMD Ryzen 9 5950X 16-Core Processor",
+    "logicalCpus": 32
+  },
+  "reports": [
+    {
+      "label": "sequential-read baseline",
+      "status": "accepted baseline",
+      "sourceCheckpoint": "responsive-stage-043",
+      "capturedAt": "2026-09-05T15:04:45.820Z",
+      "rawReport": {
+        "capturePath": "/tmp/obsetync-native-root-results-baseline-15.json",
+        "bytes": 700478,
+        "sha256": "ff6cb83b854a3c83a0a12dc5e28233cd74c10df27bebf1718338b9594570d585",
+        "instrumentationBundleSha256": "c4d7b190d9c9a5c0a8bfb041584490a5e036e883895c6a955867e95b498df30e"
+      },
+      "summary": {
+        "quiet": { "medianDrainMs": 98753.623, "medianFilesPerSecond": 253.155, "medianFirstRootMs": 11692.872 },
+        "edits": { "medianDrainMs": 111862.406, "medianFilesPerSecond": 223.489, "medianFirstRootMs": 11939.108, "medianCallbackToAcceptedP95Ms": 1813.156 }
+      },
+      "runs": [
+        { "case": "quiet", "run": 1, "drainMs": 96443.438, "filesPerSecond": 259.219, "firstRootMs": 11132.825, "roots": 98, "terminalDriftsReported": 0, "drains": 1, "plans": 1, "heartbeatP95UpperMs": 20, "maxRssBytes": 285757440 },
+        { "case": "quiet", "run": 2, "drainMs": 98753.623, "filesPerSecond": 253.155, "firstRootMs": 11692.872, "roots": 98, "terminalDriftsReported": 0, "drains": 1, "plans": 1, "heartbeatP95UpperMs": 20, "maxRssBytes": 308473856 },
+        { "case": "quiet", "run": 3, "drainMs": 99677.917, "filesPerSecond": 250.808, "firstRootMs": 11761.899, "roots": 98, "terminalDriftsReported": 0, "drains": 1, "plans": 1, "heartbeatP95UpperMs": 20, "maxRssBytes": 308215808 },
+        { "case": "edits", "run": 1, "drainMs": 101923.351, "filesPerSecond": 245.282, "firstRootMs": 10735.198, "roots": 100, "terminalDriftsReported": 0, "drains": 1, "plans": 1, "callbackToAcceptedP95Ms": 1691.783, "heartbeatP95UpperMs": 20, "maxRssBytes": 310689792 },
+        { "case": "edits", "run": 2, "drainMs": 113687.068, "filesPerSecond": 219.902, "firstRootMs": 12820.655, "roots": 100, "terminalDriftsReported": 0, "drains": 1, "plans": 1, "callbackToAcceptedP95Ms": 2063.497, "heartbeatP95UpperMs": 20, "maxRssBytes": 311414784 },
+        { "case": "edits", "run": 3, "drainMs": 111862.406, "filesPerSecond": 223.489, "firstRootMs": 11939.108, "roots": 100, "terminalDriftsReported": 0, "drains": 1, "plans": 1, "callbackToAcceptedP95Ms": 1813.156, "heartbeatP95UpperMs": 20, "maxRssBytes": 256471040 }
+      ]
+    },
+    {
+      "label": "bounded concurrent reads before drift retention",
+      "status": "rejected candidate: live starvation",
+      "sourceCheckpoint": "responsive-stage-044",
+      "capturedAt": "2026-09-05T16:32:12.743Z",
+      "rawReport": {
+        "capturePath": "/tmp/obsetync-native-root-results-optimized-15.json",
+        "bytes": 709065,
+        "sha256": "950eda263a289483f43acf9e82459accd32d9d83c467b02214a80d1e07825800",
+        "instrumentationBundleSha256": "0b882195c5371c2b9ef8a4a3771c521879d19a6e1d6fff30ab46e34235a99da9"
+      },
+      "summary": {
+        "quiet": { "medianDrainMs": 62632.868, "medianFilesPerSecond": 399.151, "medianFirstRootMs": 5773.092 },
+        "edits": { "medianDrainMs": 68022.708, "medianFilesPerSecond": 367.524, "medianFirstRootMs": 5488.111, "medianCallbackToAcceptedP95Ms": 59934.687 }
+      },
+      "runs": [
+        { "case": "quiet", "run": 1, "drainMs": 63549.988, "filesPerSecond": 393.391, "firstRootMs": 6060.319, "roots": 98, "terminalDriftsReported": 0, "drains": 1, "plans": 1, "heartbeatP95UpperMs": 20, "maxRssBytes": 310005760 },
+        { "case": "quiet", "run": 2, "drainMs": 62632.868, "filesPerSecond": 399.151, "firstRootMs": 5773.092, "roots": 98, "terminalDriftsReported": 0, "drains": 1, "plans": 1, "heartbeatP95UpperMs": 20, "maxRssBytes": 308461568 },
+        { "case": "quiet", "run": 3, "drainMs": 62246.772, "filesPerSecond": 401.627, "firstRootMs": 5646.954, "roots": 98, "terminalDriftsReported": 0, "drains": 1, "plans": 1, "heartbeatP95UpperMs": 32, "maxRssBytes": 310624256 },
+        { "case": "edits", "run": 1, "drainMs": 69375.635, "filesPerSecond": 360.357, "firstRootMs": 5554.364, "roots": 100, "terminalDriftsReported": 1, "drains": 2, "plans": 2, "callbackToAcceptedP95Ms": 61114.511, "heartbeatP95UpperMs": 20, "maxRssBytes": 353939456 },
+        { "case": "edits", "run": 2, "drainMs": 68022.708, "filesPerSecond": 367.524, "firstRootMs": 5431.604, "roots": 100, "terminalDriftsReported": 1, "drains": 2, "plans": 2, "callbackToAcceptedP95Ms": 59934.687, "heartbeatP95UpperMs": 20, "maxRssBytes": 349335552 },
+        { "case": "edits", "run": 3, "drainMs": 62774.698, "filesPerSecond": 398.250, "firstRootMs": 5488.111, "roots": 102, "terminalDriftsReported": 0, "drains": 1, "plans": 1, "callbackToAcceptedP95Ms": 1145.631, "heartbeatP95UpperMs": 20, "maxRssBytes": 311345152 }
+      ]
+    },
+    {
+      "label": "bounded concurrent reads with drain-local drift retention and legacy counters",
+      "status": "accepted implementation run; v2 repeat is authoritative for drift counts",
+      "sourceCheckpoint": "responsive-stage-045",
+      "capturedAt": "2026-09-05T17:20:13.957Z",
+      "rawReport": {
+        "capturePath": "/tmp/obsetync-native-root-results-final-15-responsive-stage-045.json",
+        "bytes": 702836,
+        "sha256": "5873be715f9edd32680a026da36fde797ee75e6d7c333eb52dedb115fea8e6e7",
+        "instrumentationBundleSha256": "64bac68391e7e4b106f20baa86b830fb246f360b07964cdab7a3b9eb250ef73d"
+      },
+      "summary": {
+        "quiet": { "medianDrainMs": 61203.144, "medianFilesPerSecond": 408.476, "medianFirstRootMs": 5620.234 },
+        "edits": { "medianDrainMs": 66744.478, "medianFilesPerSecond": 374.563, "medianFirstRootMs": 5918.945, "medianCallbackToAcceptedP95Ms": 1321.899 }
+      },
+      "runs": [
+        { "case": "quiet", "run": 1, "terminalDriftsReported": 0, "retentionsAcceptedInferred": 0, "drains": 1, "plans": 1 },
+        { "case": "quiet", "run": 2, "terminalDriftsReported": 0, "retentionsAcceptedInferred": 0, "drains": 1, "plans": 1 },
+        { "case": "quiet", "run": 3, "terminalDriftsReported": 0, "retentionsAcceptedInferred": 0, "drains": 1, "plans": 1 },
+        { "case": "edits", "run": 1, "terminalDriftsReported": 0, "retentionsAcceptedInferred": 0, "roots": 102, "continuations": 101, "claimed": 25070, "restored": 0, "drains": 1, "plans": 1 },
+        { "case": "edits", "run": 2, "terminalDriftsReported": 0, "retentionsAcceptedInferred": 1, "roots": 101, "continuations": 101, "claimed": 25094, "restored": 24, "drains": 1, "plans": 1 },
+        { "case": "edits", "run": 3, "terminalDriftsReported": 0, "retentionsAcceptedInferred": 2, "roots": 101, "continuations": 102, "claimed": 25118, "restored": 48, "drains": 1, "plans": 1 }
+      ]
+    },
+    {
+      "label": "bounded concurrent reads with direct drift diagnostics v2",
+      "status": "accepted final local candidate",
+      "sourceCheckpoint": "responsive-stage-046",
+      "capturedAt": "2026-09-05T18:07:25.023Z",
+      "rawReport": {
+        "capturePath": "/tmp/obsetync-native-root-results-final-v2-responsive-stage-046.json",
+        "bytes": 703133,
+        "sha256": "326ae53b8f9b5fa95e34be8610292902fadaae4138e2e781b74cfcd598200206",
+        "instrumentationBundleSha256": "5202120f756d739b77ad685fe7d2b9594670949886af9e06e0f75f4c59b77f13"
+      },
+      "summary": {
+        "quiet": { "medianDrainMs": 65503.511, "medianFilesPerSecond": 381.659, "medianFirstRootMs": 5966.495 },
+        "edits": { "medianDrainMs": 63001.282, "medianFilesPerSecond": 396.817, "medianFirstRootMs": 5418.087, "medianCallbackToAcceptedP95Ms": 1161.922 }
+      },
+      "runs": [
+        { "case": "quiet", "run": 1, "drainMs": 65503.511, "filesPerSecond": 381.659, "firstRootMs": 5966.495, "roots": 98, "sourceDrifts": 0, "retentionsAccepted": 0, "terminalFailures": 0, "continuations": 97, "claimed": 25000, "restored": 0, "drains": 1, "plans": 1, "heartbeatP95UpperMs": 32, "heartbeatMaxMs": 40.685, "maxRssBytes": 291110912 },
+        { "case": "quiet", "run": 2, "drainMs": 67780.539, "filesPerSecond": 368.837, "firstRootMs": 6405.585, "roots": 98, "sourceDrifts": 0, "retentionsAccepted": 0, "terminalFailures": 0, "continuations": 97, "claimed": 25000, "restored": 0, "drains": 1, "plans": 1, "heartbeatP95UpperMs": 32, "heartbeatMaxMs": 48.664, "maxRssBytes": 309108736 },
+        { "case": "quiet", "run": 3, "drainMs": 61505.248, "filesPerSecond": 406.469, "firstRootMs": 5601.577, "roots": 98, "sourceDrifts": 0, "retentionsAccepted": 0, "terminalFailures": 0, "continuations": 97, "claimed": 25000, "restored": 0, "drains": 1, "plans": 1, "heartbeatP95UpperMs": 32, "heartbeatMaxMs": 37.197, "maxRssBytes": 314384384 },
+        { "case": "edits", "run": 1, "drainMs": 63001.282, "filesPerSecond": 396.817, "firstRootMs": 5386.974, "roots": 101, "sourceDrifts": 1, "retentionsAccepted": 1, "terminalFailures": 0, "continuations": 101, "claimed": 25093, "restored": 23, "drains": 1, "plans": 1, "callbackToAcceptedP95Ms": 1176.105, "callbackToDurableAckP95Ms": 1780.316, "heartbeatP95UpperMs": 32, "heartbeatMaxMs": 38.411, "maxRssBytes": 310546432 },
+        { "case": "edits", "run": 2, "drainMs": 62973.245, "filesPerSecond": 396.994, "firstRootMs": 5418.087, "roots": 101, "sourceDrifts": 2, "retentionsAccepted": 2, "terminalFailures": 0, "continuations": 102, "claimed": 25120, "restored": 50, "drains": 1, "plans": 1, "callbackToAcceptedP95Ms": 1161.922, "callbackToDurableAckP95Ms": 1764.486, "heartbeatP95UpperMs": 20, "heartbeatMaxMs": 45.133, "maxRssBytes": 259891200 },
+        { "case": "edits", "run": 3, "drainMs": 63294.027, "filesPerSecond": 394.982, "firstRootMs": 5438.336, "roots": 101, "sourceDrifts": 2, "retentionsAccepted": 2, "terminalFailures": 0, "continuations": 102, "claimed": 25118, "restored": 48, "drains": 1, "plans": 1, "callbackToAcceptedP95Ms": 1150.814, "callbackToDurableAckP95Ms": 1783.272, "heartbeatP95UpperMs": 32, "heartbeatMaxMs": 37.044, "maxRssBytes": 311529472 }
+      ]
+    }
+  ],
+  "comparisonFinalVersusBaselinePercent": {
+    "quietDrain": -33.670,
+    "quietFilesPerSecond": 50.761,
+    "quietFirstRoot": -48.973,
+    "editsDrain": -43.680,
+    "editsFilesPerSecond": 77.556,
+    "editsFirstRoot": -54.619,
+    "editsCallbackToAcceptedP95": -35.917
+  },
+  "rejectedCandidateRegression": {
+    "badMedianCallbackToAcceptedP95Ms": 59934.687,
+    "finalMedianCallbackToAcceptedP95Ms": 1161.922,
+    "improvementFactor": 51.582,
+    "cause": "a pre-dispatch source drift disposed the reviewed owner; a second explicit drain rebuilt a static remaining-backlog plan and lost urgent rank"
+  },
+  "finalInvariants": {
+    "sourceDriftCountersVersion": 2,
+    "allRunsUnexpectedFailures": 0,
+    "allRunsTerminalDriftFailures": 0,
+    "allRunsOneExplicitDrain": true,
+    "allRunsOnePlan": true,
+    "quietSourceStatCallsEach": 100000,
+    "quietMaterializationStatCallsEach": 50000,
+    "quietColdSourceHashesEach": 25000,
+    "editsColdSourceHashesEach": 25070,
+    "allColdRootsExact": true,
+    "allColdPendingJournal": 0,
+    "allColdPendingRootIntent": false,
+    "retentionsAcceptedByEditsRun": [1, 2, 2],
+    "retentionAcceptedDoesNotAloneMeanRetryCompleted": true,
+    "allFinalRunsCompletedAfterAcceptedRetentions": true,
+    "deterministicEngineSuitesExerciseExhaustionAndTerminalFailure": true
+  },
+  "limitations": [
+    "Node heartbeat is not Obsidian input-to-paint, and sampled RSS is not a mobile memory bound.",
+    "Raw report paths are capture-machine locations; SHA-256 identities are recorded because the full reports are not checked into the repository.",
+    "The raw report records its instrumented bundle hash but not its Git revision; sourceSha is a separately recorded local provenance annotation.",
+    "No working vault, Syncthing, production service, remote CI, tag, release, Nix pin or real device was changed by these runs."
+  ]
+}

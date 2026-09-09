@@ -20,6 +20,12 @@ export interface OperationRecord {
     failed?: boolean;
 }
 
+interface CheckpointBarrier {
+    work: () => Promise<void>;
+    resolve: () => void;
+    next: CheckpointBarrier | null;
+}
+
 /**
  * Tiny durable breadcrumb for renderer-level terminations (notably iOS
  * Jetsam). JavaScript gets no exception when the OS kills the process, so an
@@ -28,7 +34,10 @@ export interface OperationRecord {
 export class OperationCheckpoint {
     private current: OperationRecord | null = null;
     private lastInterruption: OperationRecord | null = null;
-    private writeChain: Promise<void> = Promise.resolve();
+    private draining = false;
+    private barrierHead: CheckpointBarrier | null = null;
+    private barrierTail: CheckpointBarrier | null = null;
+    private pendingProgress: OperationRecord | null = null;
     private lastProgressWrite = 0;
     private serial = 0;
 
@@ -40,18 +49,22 @@ export class OperationCheckpoint {
 
     /** Promote an orphaned active marker to durable postmortem evidence. */
     async initialize(): Promise<OperationRecord | null> {
-        const active = await this.readRecord(ACTIVE_PATH);
-        if (active) {
-            this.lastInterruption = active;
-            await this.safeWrite(LAST_INTERRUPTION_PATH, active);
-            await this.safeDelete(ACTIVE_PATH);
-            console.warn(
-                `[obsetync] previous renderer stopped during ${active.phase}: ${active.detail}`,
-            );
-            return { ...active };
-        }
-        this.lastInterruption = await this.readRecord(LAST_INTERRUPTION_PATH);
-        return null;
+        let orphan: OperationRecord | null = null;
+        await this.enqueue(async () => {
+            const active = await this.readRecord(ACTIVE_PATH);
+            if (active) {
+                this.lastInterruption = active;
+                await this.writeRecord(LAST_INTERRUPTION_PATH, active);
+                await this.deleteRecord(ACTIVE_PATH);
+                console.warn(
+                    `[obsetync] previous renderer stopped during ${active.phase}: ${active.detail}`,
+                );
+                orphan = { ...active };
+            } else {
+                this.lastInterruption = await this.readRecord(LAST_INTERRUPTION_PATH);
+            }
+        });
+        return orphan;
     }
 
     async begin(phase: string, detail = "started"): Promise<string> {
@@ -71,15 +84,23 @@ export class OperationCheckpoint {
         return operationId;
     }
 
-    /** Rate-limited progress update; intentionally fire-and-forget safe. */
+    /** Rate-limited progress update; intentionally fire-and-forget safe.
+     * A stalled adapter retains only the latest pending progress, not a promise
+     * and encoded record for every interval. Lifecycle barriers supersede it. */
     progress(operationId: string, detail: string): void {
-        if (this.current?.operationId !== operationId) return;
+        if (this.current?.operationId !== operationId || this.current.failed) return;
         const timestamp = this.now();
         this.current.detail = clean(detail);
         this.current.updatedAt = timestamp;
+        if (this.pendingProgress) {
+            this.pendingProgress = { ...this.current };
+            this.lastProgressWrite = timestamp;
+            return;
+        }
         if (timestamp - this.lastProgressWrite < PROGRESS_WRITE_INTERVAL_MS) return;
         this.lastProgressWrite = timestamp;
-        void this.safeWrite(ACTIVE_PATH, { ...this.current });
+        this.pendingProgress = { ...this.current };
+        this.startDrain();
     }
 
     /** Leave the marker behind as useful evidence for a caught failure. */
@@ -124,30 +145,81 @@ export class OperationCheckpoint {
     }
 
     private safeWrite(path: string, record: OperationRecord): Promise<void> {
-        const bytes = new TextEncoder().encode(JSON.stringify(record));
-        return this.enqueue(async () => {
-            try {
-                await this.io.writeFile(path, bytes);
-            } catch {
-                // Diagnostics must never make sync fail.
-            }
-        });
+        // current is mutable, whereas a queued begin/fail must preserve the
+        // exact barrier snapshot even if another operation starts meanwhile.
+        const snapshot = { ...record };
+        return this.enqueue(() => this.writeRecord(path, snapshot));
     }
 
     private safeDelete(path: string): Promise<void> {
-        return this.enqueue(async () => {
-            try {
-                await this.io.deleteFile(path);
-            } catch {
-                // Missing/unavailable diagnostics are non-fatal.
-            }
-        });
+        return this.enqueue(() => this.deleteRecord(path));
     }
 
     private enqueue(work: () => Promise<void>): Promise<void> {
-        const result = this.writeChain.then(work, work);
-        this.writeChain = result.catch(() => {});
+        // Progress is best-effort; a begin/fail carries its newer snapshot and
+        // a complete deletes it. Never let an obsolete pending write run after
+        // one of these barriers and resurrect or overwrite an operation.
+        this.pendingProgress = null;
+        const result = new Promise<void>((resolve) => {
+            const barrier: CheckpointBarrier = { work, resolve, next: null };
+            if (this.barrierTail) this.barrierTail.next = barrier;
+            else this.barrierHead = barrier;
+            this.barrierTail = barrier;
+        });
+        this.startDrain();
         return result;
+    }
+
+    private async writeRecord(path: string, record: OperationRecord): Promise<void> {
+        try {
+            const bytes = new TextEncoder().encode(JSON.stringify(record));
+            await this.io.writeFile(path, bytes);
+        } catch {
+            // Diagnostics must never make sync fail.
+        }
+    }
+
+    private async deleteRecord(path: string): Promise<void> {
+        try {
+            await this.io.deleteFile(path);
+        } catch {
+            // Missing/unavailable diagnostics are non-fatal.
+        }
+    }
+
+    private startDrain(): void {
+        if (this.draining) return;
+        this.draining = true;
+        void this.drain();
+    }
+
+    /** Only explicit awaited lifecycle calls occupy FIFO barriers. Progress
+     * has one replaceable slot across the entire queue, and at most one native
+     * mutation runs at a time. No history of superseded updates is retained. */
+    private async drain(): Promise<void> {
+        try {
+            while (this.barrierHead || this.pendingProgress) {
+                const barrier = this.barrierHead;
+                if (barrier) {
+                    this.barrierHead = barrier.next;
+                    if (!this.barrierHead) this.barrierTail = null;
+                    try {
+                        await barrier.work();
+                    } catch {
+                        // Also cover synchronous adapter errors: every waiting
+                        // lifecycle caller must settle and later work must run.
+                    } finally {
+                        barrier.resolve();
+                    }
+                    continue;
+                }
+                const progress = this.pendingProgress!;
+                this.pendingProgress = null;
+                await this.writeRecord(ACTIVE_PATH, progress);
+            }
+        } finally {
+            this.draining = false;
+        }
     }
 }
 

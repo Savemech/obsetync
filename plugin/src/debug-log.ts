@@ -14,6 +14,104 @@ interface LogEntry {
     msg: string;
 }
 
+/**
+ * Support bundles are routinely pasted into issue trackers and chats. Keep
+ * their operational evidence, but never retain a vault pathname in the
+ * in-memory console ring (or in the persistent crash log) by default.
+ *
+ * This deliberately recognises the finite path-bearing messages emitted by
+ * the plugin instead of treating every slash as private: HTTP API routes and
+ * profile names such as `x86-desktop/recovery` remain useful diagnostics.
+ * Absolute host paths and structured path fields are redacted as a final
+ * defence for errors returned by Node/Obsidian.
+ */
+const MAX_DEBUG_CAPTURE_CHARS = 12_000;
+const REDACTED_PATH = "[path redacted]";
+
+function capDebugText(value: string): string {
+    return value.length <= MAX_DEBUG_CAPTURE_CHARS
+        ? value
+        : value.slice(0, MAX_DEBUG_CAPTURE_CHARS) + "…[truncated]";
+}
+
+export function sanitizeDebugLogLine(input: string): string {
+    let value = capDebugText(String(input));
+
+    // Bounded lists and JSON samples currently emitted by push/pull.
+    value = value
+        .replace(/(first 3 paths:\s*)[^\r\n]*/giu, `$1${REDACTED_PATH}`)
+        .replace(/(first 3:\s*)[^\r\n]*/giu, `$1${REDACTED_PATH}`)
+        .replace(/(next pull:\s*)[^\r\n]*/giu, `$1${REDACTED_PATH}`)
+        .replace(
+            /(pull deferred \d+ locally-edited file\(s\):\s*).*?(?=\s+—|$)/giu,
+            `$1${REDACTED_PATH}`,
+        )
+        .replace(
+            /conflict on\s+.*?\s+—\s+our version preserved as\s+[^\r\n]*/giu,
+            `conflict on ${REDACTED_PATH} — our version preserved as ${REDACTED_PATH}`,
+        )
+        .replace(
+            /(preserved unsynced local bytes as\s+).*?(?=\s+before pull\b)/giu,
+            `$1${REDACTED_PATH}`,
+        )
+        .replace(
+            /(deferred remote delete for locally changed\s+)[^\r\n]*/giu,
+            `$1${REDACTED_PATH}`,
+        );
+
+    // Single-path diagnostics. The delimiter is part of the message grammar,
+    // so a drive-letter colon does not terminate the match.
+    value = value.replace(
+        /((?:pull:\s+deferring|local-hash check failed for|failed to preserve conflict copy for|change journal append failed for|pull-echo verification failed for)\s+).*?(?=:\s)/giu,
+        `$1${REDACTED_PATH}`,
+    );
+    value = value
+        .replace(
+            /((?:expected a file, found a directory|invalid file metadata|file disappeared during configuration listing):\s*)[^\r\n]*/giu,
+            `$1${REDACTED_PATH}`,
+        )
+        .replace(
+            /(memory-safe mobile read limit exceeded for\s+).*?(?=\s+\()/giu,
+            `$1${REDACTED_PATH}`,
+        )
+        .replace(
+            /((?:small-file content hash mismatch for|could not allocate a conflict-copy path for)\s+)[^\r\n]*/giu,
+            `$1${REDACTED_PATH}`,
+        )
+        .replace(
+            /(server delta list touches\s+).*?(?=\s+more than once\b)/giu,
+            `$1${REDACTED_PATH}`,
+        );
+
+    // Structured error details. `/api/...` is a protocol route, not a vault
+    // pathname, and remains visible. JSON fields cannot contain an unescaped
+    // quote here; escaped pairs are consumed atomically.
+    value = value.replace(
+        /"(path|old_path|oldPath|copyPath)"\s*:\s*"(?:\\.|[^"\\])*"/gu,
+        (_match, key: string) => `"${key}":"${REDACTED_PATH}"`,
+    );
+    value = value.replace(
+        /\b(path|old_path|copy_path)=([^\s,;]+)/giu,
+        (match, key: string, path: string) => path.startsWith("/api/")
+            ? match
+            : `${key}=${REDACTED_PATH}`,
+    );
+
+    // Native errors and stacks can surface paths which were never formatted
+    // by our own logger. Cover the normal Windows, UNC, iOS, Android, Linux and
+    // file-URL forms without consuming an HTTP URL or arbitrary slash tokens.
+    const absoluteStart = String.raw`(?:[A-Za-z]:[\\/]|\\\\|file:\/\/\/|\/(?:Users|home|mnt|storage|private|data|sdcard|var\/mobile)\/)`;
+    value = value.replace(
+        new RegExp(`(["'])${absoluteStart}(?:\\\\.|(?!\\1)[^\\r\\n])*\\1`, "giu"),
+        (_match, quote: string) => `${quote}${REDACTED_PATH}${quote}`,
+    );
+    value = value.replace(
+        new RegExp(`${absoluteStart}[^\\s,;)]+`, "giu"),
+        REDACTED_PATH,
+    );
+    return capDebugText(value);
+}
+
 class ObsetyncDebugLog {
     private buf: LogEntry[] = [];
     private readonly MAX = 200;
@@ -57,7 +155,7 @@ class ObsetyncDebugLog {
     }
 
     private append(level: LogLevel, msg: string): void {
-        this.buf.push({ ts: Date.now(), level, msg });
+        this.buf.push({ ts: Date.now(), level, msg: sanitizeDebugLogLine(msg) });
         if (this.buf.length > this.MAX) this.buf.shift();
     }
 
@@ -214,6 +312,8 @@ class ObsetyncCrashLogger {
         try {
             if (this.capped) return;
 
+            msg = sanitizeDebugLogLine(msg);
+
             if (msg.length > MAX_MSG_CHARS) {
                 msg = msg.slice(0, MAX_MSG_CHARS) + "…[truncated]";
             }
@@ -243,6 +343,7 @@ class ObsetyncCrashLogger {
                 const frames = String(stack)
                     .split("\n")
                     .slice(0, MAX_STACK_LINES)
+                    .map(sanitizeDebugLogLine)
                     .map(s => s.length > MAX_STACK_LINE_CHARS
                         ? s.slice(0, MAX_STACK_LINE_CHARS) + "…"
                         : s);

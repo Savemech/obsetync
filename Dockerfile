@@ -18,7 +18,23 @@
 # Uses BuildKit cache mounts so repeated builds don't refetch crates or redo
 # unchanged dependency compilation.
 # ------------------------------------------------------------------------------
+ARG OBSETYNC_BUILD_GIT_COMMIT=unknown
+ARG OBSETYNC_BUILD_SOURCE_STATE=local-unknown
+ARG OBSETYNC_BUILD_EXPECTED_COMMIT=
+ARG OBSETYNC_BUILD_REQUIRE_EXPECTED_COMMIT=0
+ARG OBSETYNC_BUILD_REQUIRE_CLEAN=0
+ARG OBSETYNC_BUILD_EXPECTED_VERSION=
+ARG TARGETARCH
+
 FROM rust:1.95-bookworm AS rust-builder
+
+ARG OBSETYNC_BUILD_GIT_COMMIT
+ARG OBSETYNC_BUILD_SOURCE_STATE
+ARG OBSETYNC_BUILD_EXPECTED_COMMIT
+ARG OBSETYNC_BUILD_REQUIRE_EXPECTED_COMMIT
+ARG OBSETYNC_BUILD_REQUIRE_CLEAN
+ARG OBSETYNC_BUILD_EXPECTED_VERSION
+ARG TARGETARCH
 
 ENV CARGO_TERM_COLOR=never \
     CARGO_TERM_PROGRESS_WHEN=never \
@@ -31,24 +47,51 @@ ENV CARGO_TERM_COLOR=never \
 #   cmake     — aws-lc-sys build
 #   perl      — aws-lc-sys build (OpenSSL-style scripts)
 #   git       — cargo fetches some deps via git
-#   binaryen  — validates/optimizes scalar and SIMD WASM artifacts
-# wasm-pack — fetches pre-built binary from rustwasm releases
+# wasm-pack + Binaryen — pinned pre-built release tools for reproducible WASM
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         clang \
         cmake \
         perl \
         git \
-        binaryen \
         ca-certificates \
         curl \
         && rm -rf /var/lib/apt/lists/*
 
-# Pin wasm-pack for reproducibility.
-ENV WASM_PACK_VERSION=0.13.1
-RUN curl -sSfL https://github.com/rustwasm/wasm-pack/releases/download/v${WASM_PACK_VERSION}/wasm-pack-v${WASM_PACK_VERSION}-x86_64-unknown-linux-musl.tar.gz \
-    | tar -xz -C /usr/local/bin --strip-components=1 \
-        wasm-pack-v${WASM_PACK_VERSION}-x86_64-unknown-linux-musl/wasm-pack
+# Pin wasm-pack and its compatible optimizer for reproducibility.
+ENV WASM_PACK_VERSION=0.13.1 \
+    BINARYEN_VERSION=117
+# BuildKit supplies TARGETARCH. If a classic/default builder leaves it empty,
+# select tools for the architecture that is actually executing this stage.
+# A non-empty override still goes through the strict allowlist below.
+RUN tool_arch="${TARGETARCH}"; \
+    if [ -z "${tool_arch}" ]; then \
+        tool_arch="$(dpkg --print-architecture)"; \
+    fi; \
+    case "${tool_arch}" in \
+        amd64) \
+            binaryen_arch=x86_64; \
+            binaryen_sha=3dc677006555b355ea2da5e82602065a161d5e83eaefd3f759afa00b96e83212; \
+            wasm_pack_arch=x86_64; \
+            wasm_pack_sha=c539d91ccab2591a7e975bcf82c82e1911b03335c80aa83d67ad25ed2ad06539 ;; \
+        arm64) \
+            binaryen_arch=aarch64; \
+            binaryen_sha=ad560204426015a815faa45693c83bef7d58677d38a39422c272a30ba4b6da2a; \
+            wasm_pack_arch=aarch64; \
+            wasm_pack_sha=2e65038769f8bbaa5fc237ad4bb523e692df99458cbd3e3d92525b89d8762379 ;; \
+        *) echo "unsupported Docker build TARGETARCH/host architecture: ${tool_arch:-<empty>}" >&2; exit 2 ;; \
+    esac && \
+    curl -sSfL "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-${binaryen_arch}-linux.tar.gz" \
+        -o /tmp/binaryen.tar.gz && \
+    echo "${binaryen_sha}  /tmp/binaryen.tar.gz" | sha256sum -c - && \
+    tar -xz -C /usr/local/bin --strip-components=2 -f /tmp/binaryen.tar.gz \
+        "binaryen-version_${BINARYEN_VERSION}/bin/wasm-opt" && \
+    curl -sSfL "https://github.com/rustwasm/wasm-pack/releases/download/v${WASM_PACK_VERSION}/wasm-pack-v${WASM_PACK_VERSION}-${wasm_pack_arch}-unknown-linux-musl.tar.gz" \
+        -o /tmp/wasm-pack.tar.gz && \
+    echo "${wasm_pack_sha}  /tmp/wasm-pack.tar.gz" | sha256sum -c - && \
+    tar -xz -C /usr/local/bin --strip-components=1 -f /tmp/wasm-pack.tar.gz \
+        "wasm-pack-v${WASM_PACK_VERSION}-${wasm_pack_arch}-unknown-linux-musl/wasm-pack" && \
+    rm -f /tmp/binaryen.tar.gz /tmp/wasm-pack.tar.gz
 
 # Add WASM target (also declared in rust-toolchain.toml so this is idempotent).
 RUN rustup target add wasm32-unknown-unknown
@@ -100,7 +143,14 @@ RUN find crates -name '*.rs' -exec touch {} +
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=server-target,target=/build/target,sharing=locked \
-    CC=clang cargo build --release --locked -p sync-server && \
+    CC=clang \
+    OBSETYNC_BUILD_GIT_COMMIT="${OBSETYNC_BUILD_GIT_COMMIT}" \
+    OBSETYNC_BUILD_SOURCE_STATE="${OBSETYNC_BUILD_SOURCE_STATE}" \
+    OBSETYNC_BUILD_EXPECTED_COMMIT="${OBSETYNC_BUILD_EXPECTED_COMMIT}" \
+    OBSETYNC_BUILD_REQUIRE_EXPECTED_COMMIT="${OBSETYNC_BUILD_REQUIRE_EXPECTED_COMMIT}" \
+    OBSETYNC_BUILD_REQUIRE_CLEAN="${OBSETYNC_BUILD_REQUIRE_CLEAN}" \
+    OBSETYNC_BUILD_EXPECTED_VERSION="${OBSETYNC_BUILD_EXPECTED_VERSION}" \
+    cargo build --release --locked -p sync-server && \
     mkdir -p /out && \
     cp /build/target/release/sync-server /out/sync-server && \
     chmod 0755 /out/sync-server
@@ -120,6 +170,13 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
 # ------------------------------------------------------------------------------
 FROM node:20-bookworm-slim AS plugin-builder
 
+ARG OBSETYNC_BUILD_GIT_COMMIT
+ARG OBSETYNC_BUILD_SOURCE_STATE
+ARG OBSETYNC_BUILD_EXPECTED_COMMIT
+ARG OBSETYNC_BUILD_REQUIRE_EXPECTED_COMMIT
+ARG OBSETYNC_BUILD_REQUIRE_CLEAN
+ARG OBSETYNC_BUILD_EXPECTED_VERSION
+
 # Note: we deliberately don't set NODE_ENV=production here — esbuild + TS are
 # in devDependencies and npm ci with NODE_ENV=production would skip them.
 # The `production` mode of our build is driven by the argv to esbuild.config.mjs.
@@ -136,10 +193,20 @@ RUN --mount=type=cache,id=npm-cache,target=/root/.npm \
 
 # Bring in sources + the WASM produced by the rust-builder stage.
 COPY plugin/tsconfig.json plugin/esbuild.config.mjs plugin/manifest.json plugin/styles.css ./
+COPY plugin/scripts/build-identity-config.mjs ./scripts/build-identity-config.mjs
 COPY plugin/src ./src
 COPY --from=rust-builder /build/plugin/wasm ./wasm
 
-RUN node esbuild.config.mjs production
+# The helper narrows this exception to commit=unknown + source_state=local-unknown.
+# Exact release SHA/version/clean requirements are still passed through unchanged.
+RUN OBSETYNC_BUILD_GIT_COMMIT="${OBSETYNC_BUILD_GIT_COMMIT}" \
+    OBSETYNC_BUILD_SOURCE_STATE="${OBSETYNC_BUILD_SOURCE_STATE}" \
+    OBSETYNC_BUILD_EXPECTED_COMMIT="${OBSETYNC_BUILD_EXPECTED_COMMIT}" \
+    OBSETYNC_BUILD_REQUIRE_EXPECTED_COMMIT="${OBSETYNC_BUILD_REQUIRE_EXPECTED_COMMIT}" \
+    OBSETYNC_BUILD_REQUIRE_CLEAN="${OBSETYNC_BUILD_REQUIRE_CLEAN}" \
+    OBSETYNC_BUILD_EXPECTED_VERSION="${OBSETYNC_BUILD_EXPECTED_VERSION}" \
+    OBSETYNC_BUILD_ALLOW_LOCAL_UNKNOWN=1 \
+    node esbuild.config.mjs production
 
 
 # ------------------------------------------------------------------------------
@@ -149,8 +216,14 @@ RUN node esbuild.config.mjs production
 # ------------------------------------------------------------------------------
 FROM debian:bookworm-slim AS server
 
+ARG OBSETYNC_BUILD_GIT_COMMIT
+ARG OBSETYNC_BUILD_SOURCE_STATE
+
 LABEL org.opencontainers.image.title="obsetync-server" \
-      org.opencontainers.image.description="Self-hosted Obsidian vault sync server"
+      org.opencontainers.image.description="Self-hosted Obsidian vault sync server" \
+      org.opencontainers.image.revision="${OBSETYNC_BUILD_GIT_COMMIT}" \
+      org.opencontainers.image.source-state="${OBSETYNC_BUILD_SOURCE_STATE}" \
+      org.opencontainers.image.obsetync-protocol="api-v1;transport-v2;tree-v1-v2;ws-data-v1-v2;root-outcome-v1"
 
 # Minimal runtime deps.
 RUN apt-get update && \

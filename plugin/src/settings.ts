@@ -111,6 +111,7 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                     .setPlaceholder("https://sync.example.com:27182")
                     .setValue(this.plugin.settings.serverUrl)
                     .onChange(async (value) => {
+                        this.plugin.authorizeSettingsMutation();
                         this.plugin.settings.serverUrl = value;
                         await this.plugin.saveSettings();
                     })
@@ -128,6 +129,7 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                     .setPlaceholder("my-vault")
                     .setValue(this.plugin.settings.vaultId)
                     .onChange(async (value) => {
+                        this.plugin.authorizeSettingsMutation();
                         this.plugin.settings.vaultId = value;
                         await this.plugin.saveSettings();
                     })
@@ -142,6 +144,7 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                     .setPlaceholder("Desktop Home")
                     .setValue(this.plugin.settings.deviceName)
                     .onChange(async (value) => {
+                        this.plugin.authorizeSettingsMutation();
                         this.plugin.settings.deviceName = value;
                         await this.plugin.saveSettings();
                     })
@@ -172,6 +175,7 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                             return;
                         }
                         try {
+                            this.plugin.authorizeSettingsMutation();
                             await this.plugin.enroll(enrollCode);
                             new Notice("Enrolled successfully!");
                             this.display(); // Refresh UI.
@@ -193,6 +197,7 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                         .setButtonText("Reset enrollment")
                         .setWarning()
                         .onClick(async () => {
+                            this.plugin.authorizeSettingsMutation();
                             // Stop timers, listeners, and late retry drains
                             // before invalidating credentials.
                             this.plugin.syncEngineOrNull()?.stop();
@@ -221,6 +226,7 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                     .onChange(async (value) => {
                         const secs = parseInt(value);
                         if (!isNaN(secs) && secs >= 5) {
+                            this.plugin.authorizeSettingsMutation();
                             this.plugin.settings.syncIntervalMs = secs * 1000;
                             await this.plugin.saveSettings();
                         }
@@ -234,6 +240,7 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                 toggle
                     .setValue(this.plugin.settings.autoSync)
                     .onChange(async (value) => {
+                        this.plugin.authorizeSettingsMutation();
                         this.plugin.settings.autoSync = value;
                         await this.plugin.saveSettings();
                     })
@@ -254,6 +261,7 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                 toggle
                     .setValue(this.plugin.settings.syncObsidianConfig)
                     .onChange(async (value) => {
+                        this.plugin.authorizeSettingsMutation();
                         this.plugin.settings.syncObsidianConfig = value;
                         await this.plugin.saveSettings();
                     })
@@ -272,6 +280,7 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                 ta.setPlaceholder("target/\nnode_modules/\n.git/\n*.tmp")
                     .setValue(this.plugin.settings.ignorePatterns.join("\n"))
                     .onChange(async (value) => {
+                        this.plugin.authorizeSettingsMutation();
                         this.plugin.settings.ignorePatterns = value
                             .split("\n")
                             .map((s) => s.trim())
@@ -295,6 +304,7 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                 toggle
                     .setValue(this.plugin.settings.realtimeWs)
                     .onChange(async (value) => {
+                        this.plugin.authorizeSettingsMutation();
                         this.plugin.settings.realtimeWs = value;
                         await this.plugin.saveSettings();
                         new Notice("Obsetync: reload the plugin to apply the realtime setting.");
@@ -313,6 +323,7 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                 toggle
                     .setValue(this.plugin.settings.sharePresence)
                     .onChange(async (value) => {
+                        this.plugin.authorizeSettingsMutation();
                         this.plugin.settings.sharePresence = value;
                         await this.plugin.saveSettings();
                         new Notice("Obsetync: reload the plugin to apply the presence setting.");
@@ -333,6 +344,7 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                     .addOption("random", "Random")
                     .setValue(this.plugin.settings.syncPriority)
                     .onChange(async (value) => {
+                        this.plugin.authorizeSettingsMutation();
                         this.plugin.settings.syncPriority = value as SyncPriority;
                         await this.plugin.saveSettings();
                     })
@@ -348,6 +360,7 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                 btn.setButtonText("Sync Now").onClick(async () => {
                     const startedAt = Date.now();
                     try {
+                        this.plugin.authorizeSettingsMutation();
                         await this.plugin.syncNow();
                         const engine = this.plugin.syncEngineOrNull();
                         const err = engine?.getLastError();
@@ -355,14 +368,24 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                             new Notice(
                                 `Sync had errors: [${err.origin}] ${err.message.slice(0, 80)}${err.message.length > 80 ? "…" : ""}`
                             );
+                        } else if (!engine) {
+                            new Notice("Sync engine is not initialized.");
+                        } else if (engine.isReenrollmentRequired()) {
+                            new Notice("Sync is paused: re-enrollment required.");
+                        } else if (engine.hasPendingRootWork()) {
+                            new Notice("Sync is pending: recovering a root transaction. Its outcome must be settled before new work.");
+                        } else if (engine.isBulkChangeReviewRequired() || engine.isPushBlocked()) {
+                            new Notice("Sync is paused: review changes and run Full Rescan.");
+                        } else if (engine.getLastRepairSummary()?.incomplete) {
+                            new Notice("Sync content repair is still pending; some server objects could not be restored.");
+                        } else if (engine.getPendingChangeCount() > 0 || engine.getDeferredChangeSummary().count > 0) {
+                            new Notice(`Sync still pending: ${engine.getPendingChangeCount()} queued, ${engine.getDeferredChangeSummary().count} deferred.`);
+                        } else if (engine.isBusy()) {
+                            new Notice("Sync has not finished yet.");
                         } else {
-                            // Distinguish "nothing to do" from "applied changes"
-                            // so the user isn't left wondering whether the
-                            // click did anything.
-                            const localRoot  = engine?.getLocalRootHash() ?? null;
-                            const serverRoot = engine?.getLastObservedServerRoot() ?? null;
-                            const inSync = !!localRoot && localRoot === serverRoot;
-                            new Notice(inSync ? "Already up to date." : "Sync complete.");
+                            const treeRoot = engine.getTreeRootHash();
+                            const rootsMatch = !!treeRoot && treeRoot === engine.getLastObservedServerRoot();
+                            new Notice(rootsMatch ? "Sync complete." : "Sync cycle finished; roots have not converged yet.");
                         }
                     } catch (e: any) {
                         new Notice(`Sync failed: ${e.message}`);
@@ -380,6 +403,12 @@ export class ObsetyncSettingTab extends PluginSettingTab {
             )
             .addButton((btn) =>
                 btn.setButtonText("Show debug info").onClick(async () => {
+                    try {
+                        this.plugin.authorizeSettingsMutation();
+                    } catch (e: any) {
+                        new Notice(`Debug info unavailable: ${e.message}`);
+                        return;
+                    }
                     const loading = new Notice("Gathering debug info…", 0);
                     try {
                         const text = await this.plugin.getDebugInfo();
@@ -393,6 +422,11 @@ export class ObsetyncSettingTab extends PluginSettingTab {
             );
 
         new Setting(containerEl)
+            .setName("Test browser worker capabilities")
+            .setDesc("Opt-in diagnostic using only synthetic data. Tests Blob worker startup, transferable buffers and scalar/SIMD WASM; no vault files or network access. Keep Obsidian visible and wait for active sync to finish.")
+            .addButton(btn => btn.setButtonText("Run synthetic test").onClick(() => this.plugin.showBrowserCapabilityProbe()));
+
+        new Setting(containerEl)
             .setName("Full Rescan")
             .setDesc(
                 "Scan all files and sync any untracked changes. May be slow on large vaults."
@@ -401,6 +435,7 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                 btn.setButtonText("Full Rescan").onClick(async () => {
                     const startedAt = Date.now();
                     try {
+                        this.plugin.authorizeSettingsMutation();
                         await this.plugin.fullScan();
                         const err = this.plugin.syncEngineOrNull()?.getLastError();
                         if (err && err.ts >= startedAt) {
@@ -425,6 +460,12 @@ export class ObsetyncSettingTab extends PluginSettingTab {
             )
             .addButton((btn) =>
                 btn.setButtonText("Reconcile with server").onClick(async () => {
+                    try {
+                        this.plugin.authorizeSettingsMutation();
+                    } catch (e: any) {
+                        new Notice(`Reconcile unavailable: ${e.message}`);
+                        return;
+                    }
                     const engine = this.plugin.syncEngineOrNull();
                     if (!engine) {
                         new Notice("Sync engine not ready.");
@@ -478,9 +519,14 @@ export class ObsetyncSettingTab extends PluginSettingTab {
      *  buttons. Rollback is two-click (button flips to "Confirm?") — it
      *  rewinds every device in the fleet, so no accidental single clicks. */
     private async renderHistory(listEl: HTMLElement): Promise<void> {
-        const api = this.plugin.apiOrNull();
+        try {
+            this.plugin.authorizeSettingsMutation();
+        } catch (e: any) {
+            new Notice(`History unavailable: ${e.message}`);
+            return;
+        }
         const vaultId = this.plugin.settings.vaultId;
-        if (!api || !vaultId) {
+        if (!vaultId) {
             new Notice("Not enrolled yet — no history to show.");
             return;
         }
@@ -488,7 +534,7 @@ export class ObsetyncSettingTab extends PluginSettingTab {
         listEl.createSpan({ text: "Loading history…", cls: "obsetync-status-label" });
         let entries;
         try {
-            entries = await api.getHistory(vaultId);
+            entries = await this.plugin.getRootHistory();
         } catch (e: any) {
             listEl.empty();
             new Notice(`History failed: ${e?.message ?? e}`);
@@ -516,6 +562,12 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                 row.addButton((btn) => {
                     let armed = false;
                     btn.setButtonText("Roll back").onClick(async () => {
+                        try {
+                            this.plugin.authorizeSettingsMutation();
+                        } catch (e: any) {
+                            new Notice(`Rollback unavailable: ${e.message}`);
+                            return;
+                        }
                         if (!armed) {
                             armed = true;
                             btn.setButtonText("Confirm?");
@@ -528,13 +580,10 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                             return;
                         }
                         try {
-                            await api.rollbackVault(vaultId, entry.root);
+                            await this.plugin.rollbackRoot(entry.root);
                             new Notice(
                                 `Rolled back to ${entry.root.slice(0, 12)}… — syncing…`
                             );
-                            // Converge this device immediately; others follow
-                            // on their next poll.
-                            await this.plugin.syncEngineOrNull()?.forceSync();
                             await this.renderHistory(listEl);
                         } catch (e: any) {
                             new Notice(`Rollback failed: ${e?.message ?? e}`);
@@ -583,10 +632,18 @@ export class ObsetyncSettingTab extends PluginSettingTab {
         const treeRoot   = engine?.getTreeRootHash() ?? null;
         const baseRoot   = engine?.getTreeBaseRoot() ?? null;
         const serverRoot = engine?.getLastObservedServerRoot() ?? null;
-        const inSync     = !!treeRoot && !!serverRoot && treeRoot === serverRoot;
+        const pendingRoot = engine?.hasPendingRootWork() ?? false;
+        const pending = (engine?.getPendingChangeCount() ?? 0) > 0 ||
+            (engine?.getDeferredChangeSummary().count ?? 0) > 0 || !!engine?.getLastRepairSummary()?.incomplete;
+        const inSync     = !!treeRoot && !!serverRoot && treeRoot === serverRoot &&
+            !pendingRoot && !pending && !engine?.isBusy();
         const blocked    = engine?.isPushBlocked() ?? false;
-        const syncLabel  = blocked
+        const syncLabel  = pendingRoot
+            ? "⏸ root recovery pending"
+            : blocked
             ? "⛔ paused — run Full Rescan"
+            : pending
+                ? "… changes pending"
             : inSync
                 ? "✓ in sync"
                 : engine?.getState() ?? "not-initialized";

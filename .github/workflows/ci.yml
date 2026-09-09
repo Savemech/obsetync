@@ -47,6 +47,12 @@ jobs:
           CC: clang
         run: cargo test --workspace --locked
 
+      - name: cargo test wasm feature
+        env:
+          RUSTFLAGS: ""
+          CC: clang
+        run: cargo test -p sync-core --features wasm --locked
+
       - name: cargo check wasm
         env:
           RUSTFLAGS: ""
@@ -54,7 +60,7 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Plugin: type-check the TypeScript source and run the Node-compatible
-  # regression suite. Production/WASM bundling remains in the release workflow.
+  # regression suite without waiting for generated WASM artifacts.
   # ---------------------------------------------------------------------------
   plugin:
     name: Plugin (tsc + tests)
@@ -86,6 +92,92 @@ jobs:
       - run: npm test
 
   # ---------------------------------------------------------------------------
+  # Plugin/WASM: exercise the real browser worker and production bundle with
+  # freshly built scalar/SIMD artifacts. Keep this separate from the fast source
+  # tests above; neither gate replaces the other. No artifacts are published.
+  # ---------------------------------------------------------------------------
+  plugin-wasm:
+    name: Plugin (WASM parity + browser worker + bundle)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.95.0
+          target: wasm32-unknown-unknown
+
+      # Match the release toolchain and both-variant build path.
+      - name: Install WASM tools
+        run: |
+          curl -sSfL https://github.com/WebAssembly/binaryen/releases/download/version_117/binaryen-version_117-x86_64-linux.tar.gz \
+            -o /tmp/binaryen-version_117-x86_64-linux.tar.gz
+          echo "3dc677006555b355ea2da5e82602065a161d5e83eaefd3f759afa00b96e83212  /tmp/binaryen-version_117-x86_64-linux.tar.gz" \
+            | sha256sum -c -
+          sudo tar -xz -C /usr/local/bin --strip-components=2 \
+            -f /tmp/binaryen-version_117-x86_64-linux.tar.gz \
+            binaryen-version_117/bin/wasm-opt
+          curl -sSfL https://github.com/rustwasm/wasm-pack/releases/download/v0.13.1/wasm-pack-v0.13.1-x86_64-unknown-linux-musl.tar.gz \
+            -o /tmp/wasm-pack-v0.13.1-x86_64-unknown-linux-musl.tar.gz
+          echo "c539d91ccab2591a7e975bcf82c82e1911b03335c80aa83d67ad25ed2ad06539  /tmp/wasm-pack-v0.13.1-x86_64-unknown-linux-musl.tar.gz" \
+            | sha256sum -c -
+          sudo tar -xz -C /usr/local/bin --strip-components=1 \
+            -f /tmp/wasm-pack-v0.13.1-x86_64-unknown-linux-musl.tar.gz \
+            wasm-pack-v0.13.1-x86_64-unknown-linux-musl/wasm-pack
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: plugin/package-lock.json
+
+      - name: Build scalar/SIMD WASM
+        env:
+          RUSTFLAGS: ""
+        run: bash scripts/build-wasm.sh plugin/wasm
+
+      - name: Verify scalar/SIMD parity
+        run: node scripts/verify-wasm-parity.mjs plugin/wasm
+
+      - name: Verify WASM allocation lifetime and 25k rebuilds
+        run: node scripts/verify-wasm-memory.mjs plugin/wasm
+
+      - name: Install plugin dependencies
+        working-directory: plugin
+        run: npm ci --no-audit --no-fund
+
+      - name: Verify native root mutation complexity
+        working-directory: plugin
+        run: npm run test:native-root-complexity
+
+      - name: Test actual browser worker bundle
+        working-directory: plugin
+        run: npm run test:browser-probe
+
+      - name: Test actual browser hash worker bundle
+        working-directory: plugin
+        run: npm run test:browser-hash-worker
+
+      - name: Build production plugin bundle
+        working-directory: plugin
+        run: npm run build
+
+      - name: Stage fresh WASM for native integration gates
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-plugin-wasm
+          retention-days: 1
+          path: |
+            plugin/wasm/sync_core.js
+            plugin/wasm/sync_core_bg.wasm
+            plugin/wasm/sync_core_simd.js
+            plugin/wasm/sync_core_simd_bg.wasm
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
   # Docker: verify the multi-stage Dockerfile still builds end-to-end.
   # Uses gha cache so warm runs are fast.
   # ---------------------------------------------------------------------------
@@ -99,10 +191,80 @@ jobs:
         with:
           context: .
           target: server
+          load: true
           push: false
           tags: obsetync/server:ci
           cache-from: type=gha
           cache-to:   type=gha,mode=max
+
+      - name: Extract exact release server binary
+        run: |
+          mkdir -p ci-server
+          container_id="$(docker create obsetync/server:ci)"
+          trap 'docker rm -f "$container_id" >/dev/null' EXIT
+          docker cp "$container_id:/usr/local/bin/sync-server" ci-server/sync-server
+          chmod 0755 ci-server/sync-server
+
+      - name: Stage release server for native integration gates
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-server-binary
+          retention-days: 1
+          path: ci-server/sync-server
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Native integration: use the exact release-profile server extracted from
+  # the CI image and the freshly packaged WASM. These listener/crash tests stay
+  # opt-in from source-only npm test, but must gate mergeable checkpoints.
+  # ---------------------------------------------------------------------------
+  native-integration:
+    name: Native integration (WS data + crash recovery)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [docker, plugin-wasm]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: plugin/package-lock.json
+
+      - name: Restore exact release server binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-server-binary
+          path: target/release
+
+      - name: Restore fresh packaged WASM
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-plugin-wasm
+          path: plugin/wasm
+
+      - name: Install plugin dependencies
+        working-directory: plugin
+        run: npm ci --no-audit --no-fund
+
+      - name: Verify native WS data lane
+        working-directory: plugin
+        env:
+          NODE_OPTIONS: --experimental-websocket
+        run: |
+          chmod 0755 "$GITHUB_WORKSPACE/target/release/sync-server"
+          npm run test:native-ws-data -- --binary "$GITHUB_WORKSPACE/target/release/sync-server"
+
+      - name: Verify crash recovery before root commit
+        working-directory: plugin
+        run: npm run test:native-root-crash -- --case objects-before-root --binary "$GITHUB_WORKSPACE/target/release/sync-server"
+
+      - name: Verify crash recovery after accepted root
+        working-directory: plugin
+        run: npm run test:native-root-crash -- --case root-accepted-before-response --binary "$GITHUB_WORKSPACE/target/release/sync-server"
 
   # ---------------------------------------------------------------------------
   # E2E: spin up the isolated docker-compose stack and run the e2e suite
