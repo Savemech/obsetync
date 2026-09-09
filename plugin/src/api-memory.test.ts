@@ -55,6 +55,17 @@ async function turns(count = 15): Promise<void> {
     for (let index = 0; index < count; index++) await Promise.resolve();
 }
 
+async function withAvailableWebSocket<T>(run: () => Promise<T>): Promise<T> {
+    const previousWebSocket = (globalThis as any).WebSocket;
+    (globalThis as any).WebSocket = class {};
+    try {
+        return await run();
+    } finally {
+        if (previousWebSocket === undefined) delete (globalThis as any).WebSocket;
+        else (globalThis as any).WebSocket = previousWebSocket;
+    }
+}
+
 interface Reply {
     body: Uint8Array;
     status?: number;
@@ -660,11 +671,13 @@ void (async () => {
         await ownedDownloadRetainsAdmissionThroughApplyAndRejectsOversizeBeforeDecrypt();
         await oversizedWsPayloadHasAnExplicitRouteReason();
         await legacyLargeObjectFitsMobileAndCumulativeRetentionIsBounded();
-        await ownedUploadStillUsesTheAutomaticWsLane();
-        await productionRouterOwnsFallbackAndStopsWsPingPong();
-        await callerCancellationNeverFallsBackToHttp();
-        await semanticLanesOwnHalfOpenProbeSelection();
-        await urgentFilePriorityIsBoundedExplicitAndReplaySafe();
+        await withAvailableWebSocket(async () => {
+            await ownedUploadStillUsesTheAutomaticWsLane();
+            await productionRouterOwnsFallbackAndStopsWsPingPong();
+            await callerCancellationNeverFallsBackToHttp();
+            await semanticLanesOwnHalfOpenProbeSelection();
+            await urgentFilePriorityIsBoundedExplicitAndReplaySafe();
+        });
         await desktopOwnedReceiveFitsARecoverySizedPool();
         console.log("api-memory.test: 17 ownership/transport regression scenarios passed");
     } finally {
