@@ -1,6 +1,6 @@
 # Responsive sync: implementation progress
 
-Updated: 2026-09-09. Original implementation baseline: `1.11.4` (`d5df76fe613d509a64c5ff22d9cc9f27845cc4f5`).
+Updated: 2026-09-09. Published baseline: `1.11.4` (`d5df76fe613d509a64c5ff22d9cc9f27845cc4f5`).
 Related document: [implementation roadmap](responsive-sync-roadmap.md).
 
 ## Current state: stabilization candidate
@@ -12,9 +12,9 @@ publish before a 25,000-file review completes, while deletion review, journal
 ownership, dependency cuts, and the mandatory complete review remain
 fail-closed. P4/Yjs/CRDT remains dormant by explicit scope decision.
 
-This is a stabilization candidate, **not release readiness**. The version
-remains `1.11.4`; real-device numerical gates, remote CI, release artifacts,
-tagging, the Nix release pin, and publication are still open.
+The implementation is staged as `1.12.0`. Local release gates and exact-build
+identity checks are required before deployment; remote CI, release artifacts,
+tagging, publication, and real-device numerical evidence remain separate gates.
 
 ### Current exact-tree local evidence
 

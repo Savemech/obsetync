@@ -89,6 +89,11 @@ jobs:
         working-directory: plugin
         run: node scripts/build-identity-config.test.mjs
 
+      - name: deployment helper tests
+        run: |
+          bash scripts/deploy-plugin.test.sh
+          bash scripts/deploy-server.test.sh
+
   # A tag is a new GitHub event and does not inherit green branch checks.
   # Re-run the release-critical Rust, E2E and hermetic Nix gates against the
   # exact tag commit before any registry or GitHub Release publication.

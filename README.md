@@ -360,33 +360,33 @@ just --choose              # interactive picker (requires fzf)
 | `just shell`         | `docker compose exec server sh`                            |
 | `just dev`           | `docker compose run --rm dev`                              |
 | `just test`          | `docker compose run --rm test`                             |
-| `just ship`          | *(personal: `build-artifacts` + rsync binary + copy plugin)* |
+| `just ship`          | *(personal: strict release build + rollback-safe server deploy + local plugin install)* |
 | `just clean-server`  | `docker compose exec server sh -c '…wipe vaults+index+content…'` + `restart` |
 | `just clean-cache`   | `docker builder prune -af`                                 |
 | `just nuke`          | `docker compose --profile tools down -v` + `docker rmi …` + `docker builder prune -af` |
 
-**Environment overrides.** The justfile loads `.env` if present (`set dotenv-load := true`). Copy `.env.example` to `.env` — used only by `just ship` for rsync target and local vault path.
+**Environment overrides.** The justfile loads `.env` if present (`set dotenv-load := true`). Copy `.env.example` to `.env`; `just ship` uses it for the SSH target, remote Compose directory, and local plugin directory.
 
 ### `just ship` — personal deploy helper
 
-Builds a hermetic Nix Docker image locally, transfers it to a remote server via `docker save | ssh | docker load`, copies the current `docker-compose.yml` to the remote, tags the loaded image as `obsetync/server:local`, and runs `docker compose up -d` + `/health` verification. Also copies fresh plugin files to a local Obsidian vault if configured.
+Requires a clean Git commit and builds both the plugin and hermetic Nix server image with its exact version and commit identity. It validates both destinations before changing either one, deploys and health-checks the server first, and installs the plugin last. The remote deploy keeps the previous Compose file and image in `/backup/obsetync-deploy/` and automatically rolls back if the new container does not become healthy or does not use the expected image.
 
 Set the three vars in `.env` (gitignored):
 
 ```
 OBSETYNC_SERVER=user@host        # ssh target
 OBSETYNC_DEST=/opt/obsetync      # where docker-compose.yml + data/ live on the remote
-OBSETYNC_VAULT=/path/to/vault/.obsidian/plugins/obsetync   # optional local copy
+OBSETYNC_VAULT=/path/to/vault/.obsidian/plugins/obsetync
 ```
 
 Then `just ship` does:
 
-1. `nix build .#dockerImage` — hermetic OCI image
-2. `scp result $OBSETYNC_SERVER:/tmp/obsetync-nix.tar.gz`
-3. `scp docker-compose.yml $OBSETYNC_SERVER:$OBSETYNC_DEST/`
-4. `ssh` — `docker load`, tag as both `obsetync/server:local` and `ghcr.io/savemech/obsetync-nix:<version>`, `docker compose up -d`
-5. `curl /health` to verify the new image is serving
-6. If `OBSETYNC_VAULT` is set: rebuild plugin artifacts and copy `main.js`, `manifest.json`, and both scalar/SIMD WASM variants into that vault
+1. Prove a clean release commit and consistent version declarations.
+2. Build and verify the plugin and Nix OCI image before changing either destination.
+3. Upload the image, staged Compose file, and remote deploy helper.
+4. Save the previous server image and Compose file under `/backup/obsetync-deploy/`.
+5. Start the commit-qualified image, wait for container health, and verify its image ID; roll back on failure.
+6. Atomically replace individual plugin artifacts, with `main.js` installed last as the activation marker.
 
 Public users: ignore `just ship` — `just build` + `just up` is the full flow.
 

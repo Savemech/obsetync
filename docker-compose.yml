@@ -24,6 +24,14 @@
 # init --data-dir /data` will recreate the server layout.
 # ==============================================================================
 
+x-build-identity-args: &build-identity-args
+  OBSETYNC_BUILD_GIT_COMMIT: "${OBSETYNC_BUILD_GIT_COMMIT:-unknown}"
+  OBSETYNC_BUILD_SOURCE_STATE: "${OBSETYNC_BUILD_SOURCE_STATE:-local-unknown}"
+  OBSETYNC_BUILD_EXPECTED_COMMIT: "${OBSETYNC_BUILD_EXPECTED_COMMIT:-}"
+  OBSETYNC_BUILD_REQUIRE_EXPECTED_COMMIT: "${OBSETYNC_BUILD_REQUIRE_EXPECTED_COMMIT:-0}"
+  OBSETYNC_BUILD_REQUIRE_CLEAN: "${OBSETYNC_BUILD_REQUIRE_CLEAN:-0}"
+  OBSETYNC_BUILD_EXPECTED_VERSION: "${OBSETYNC_BUILD_EXPECTED_VERSION:-}"
+
 services:
 
   # ---------------------------------------------------------------------------
@@ -33,7 +41,9 @@ services:
     build:
       context: .
       target: server
-    image: obsetync/server:local
+      args:
+        <<: *build-identity-args
+    image: "${OBSETYNC_SERVER_IMAGE:-obsetync/server:local}"
     container_name: obsetync-server
     restart: unless-stopped
     environment:
@@ -85,6 +95,8 @@ services:
     build:
       context: .
       target: plugin-builder
+      args:
+        <<: *build-identity-args
     image: obsetync/plugin-builder:local
     profiles: ["tools"]
     volumes:
@@ -109,6 +121,8 @@ services:
     build:
       context: .
       target: server
+      args:
+        <<: *build-identity-args
     image: obsetync/server:local
     profiles: ["tools"]
     user: root

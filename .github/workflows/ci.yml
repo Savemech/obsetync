@@ -79,6 +79,12 @@ jobs:
           cmp -s manifest.json plugin/manifest.json \
             || { echo "::error::manifest.json and plugin/manifest.json differ — keep them in sync"; exit 1; }
 
+      - name: deployment helper tests
+        working-directory: ${{ github.workspace }}
+        run: |
+          bash scripts/deploy-plugin.test.sh
+          bash scripts/deploy-server.test.sh
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20

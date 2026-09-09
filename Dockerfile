@@ -218,9 +218,11 @@ FROM debian:bookworm-slim AS server
 
 ARG OBSETYNC_BUILD_GIT_COMMIT
 ARG OBSETYNC_BUILD_SOURCE_STATE
+ARG OBSETYNC_BUILD_EXPECTED_VERSION
 
 LABEL org.opencontainers.image.title="obsetync-server" \
       org.opencontainers.image.description="Self-hosted Obsidian vault sync server" \
+      org.opencontainers.image.version="${OBSETYNC_BUILD_EXPECTED_VERSION}" \
       org.opencontainers.image.revision="${OBSETYNC_BUILD_GIT_COMMIT}" \
       org.opencontainers.image.source-state="${OBSETYNC_BUILD_SOURCE_STATE}" \
       org.opencontainers.image.obsetync-protocol="api-v1;transport-v2;tree-v1-v2;ws-data-v1-v2;root-outcome-v1"

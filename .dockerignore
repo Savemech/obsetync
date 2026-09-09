@@ -20,6 +20,7 @@ CLAUDE.md
 private/
 notes/
 _private/
+temp/
 
 # Build artifacts (these are what got us in trouble — never send them in)
 target/

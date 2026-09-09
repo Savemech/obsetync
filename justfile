@@ -9,6 +9,11 @@ server := env_var_or_default("OBSETYNC_SERVER", "")
 dest   := env_var_or_default("OBSETYNC_DEST",   "/opt/obsetync")
 vault  := env_var_or_default("OBSETYNC_VAULT",  "")
 
+# Release identity is pinned once when just loads this file. Every release
+# build and deploy recipe in the same invocation therefore uses one exact HEAD.
+release_version := `node -p "require('./manifest.json').version"`
+release_commit  := `git rev-parse --verify HEAD`
+
 # Default: list recipes.
 default:
     @just --list
@@ -94,41 +99,139 @@ test:
 
 # --- personal deploy (optional) -------------------------------------------
 
-# Build fresh plugin + Nix Docker image, ship to both the remote server (via
-# docker save/load) and the local Obsidian vault. Replaces the old binary +
-# systemd flow — post-1.1.0 the server runs exclusively via docker compose.
+# Build a release plugin + Nix Docker image from one clean commit, then ship to
+# both the remote server and the local Obsidian vault. All target checks happen
+# before either destination is changed.
 #
 # Requires OBSETYNC_SERVER and OBSETYNC_VAULT in .env (OBSETYNC_DEST defaults
 # to /opt/obsetync).
-ship: ship-plugin ship-server
+# Build and verify both artifacts before changing either destination. Update the
+# server first so an older client never has to serve a newer wire contract.
+ship: ship-preflight build-release-plugin build-release-nix-image ship-server ship-plugin
     @echo "Shipped."
 
-# Build plugin files and copy them into the local Obsidian vault.
-ship-plugin: build-plugin
-    @test -n "{{vault}}" || (echo "OBSETYNC_VAULT not set in .env — skipping plugin copy" && exit 0)
-    @echo "→ copying plugin files to {{vault}}/"
-    mkdir -p "{{vault}}"
-    cp dist/plugin/main.js                 "{{vault}}/"
-    cp dist/plugin/manifest.json           "{{vault}}/"
-    cp dist/plugin/styles.css              "{{vault}}/"
-    cp dist/plugin/sync_core.js            "{{vault}}/"
-    cp dist/plugin/sync_core_bg.wasm       "{{vault}}/"
-    cp dist/plugin/sync_core_simd.js       "{{vault}}/"
-    cp dist/plugin/sync_core_simd_bg.wasm  "{{vault}}/"
+# Fail before building or copying when release identity cannot be proven.
+release-preflight:
+    @commit="{{release_commit}}"; \
+     test "${#commit}" -eq 40 || { \
+        echo "release HEAD is not a full lowercase Git commit" >&2; exit 2; \
+     }; \
+     case "$commit" in \
+        *[!0-9a-f]*) echo "release HEAD is not a full lowercase Git commit" >&2; exit 2 ;; \
+     esac
+    @test "$(git rev-parse --verify HEAD)" = "{{release_commit}}" || \
+        (echo "release HEAD changed after just started" >&2; exit 2)
+    @test -z "$(git status --porcelain --untracked-files=no)" || \
+        (echo "release checkout has tracked modifications" >&2; exit 2)
+    @test -z "$(git ls-files --others --exclude-standard -- \
+        Cargo.toml Cargo.lock Dockerfile docker-compose.yml flake.nix flake.lock \
+        justfile manifest.json versions.json crates plugin scripts)" || \
+        (echo "release checkout has untracked build inputs" >&2; exit 2)
+    @cmp -s manifest.json plugin/manifest.json || \
+        (echo "root and plugin manifests differ" >&2; exit 2)
+    @OBSETYNC_RELEASE_EVENT_NAME=push \
+     OBSETYNC_RELEASE_REF_NAME="{{release_version}}" \
+     node scripts/check-release-version.mjs
+    @echo "Release identity: {{release_version}} @ {{release_commit}} (clean)"
+
+# Validate all destinations without changing them. Shared dependencies are run
+# only once when `just ship` executes the complete graph.
+ship-preflight: ship-plugin-preflight ship-server-preflight
+    @echo "Ship preflight passed."
+
+ship-plugin-preflight: release-preflight
+    @test -n "{{vault}}" || (echo "OBSETYNC_VAULT is not set" >&2; exit 2)
+    @test -d "{{vault}}" || (echo "plugin destination does not exist: {{vault}}" >&2; exit 2)
+    @test -w "{{vault}}" || (echo "plugin destination is not writable: {{vault}}" >&2; exit 2)
+    @docker compose config --quiet
+    @docker info >/dev/null
+
+ship-server-preflight: release-preflight
+    @test -n "{{server}}" || (echo "OBSETYNC_SERVER is not set" >&2; exit 2)
+    @case "{{dest}}" in \
+        /*) ;; \
+        *) echo "OBSETYNC_DEST must be an absolute remote path" >&2; exit 2 ;; \
+     esac
+    @command -v nix >/dev/null
+    @command -v scp >/dev/null
+    @command -v ssh >/dev/null
+    @docker compose config --quiet
+    @docker info >/dev/null
+    @ssh -o BatchMode=yes "{{server}}" "test -d '{{dest}}' && test -w '{{dest}}' && test -f '{{dest}}/docker-compose.yml' && test -d /backup && test -w /backup && test -w /tmp && command -v docker >/dev/null && command -v curl >/dev/null && command -v flock >/dev/null && command -v install >/dev/null && docker info >/dev/null && docker compose version >/dev/null && docker inspect obsetync-server >/dev/null"
+
+# Build plugin files with strict release inputs. Docker builds do not receive
+# .git, so the injected full commit is also required as the expected commit.
+build-release-plugin: release-preflight
+    @OBSETYNC_BUILD_GIT_COMMIT="{{release_commit}}" \
+     OBSETYNC_BUILD_SOURCE_STATE=clean \
+     OBSETYNC_BUILD_EXPECTED_COMMIT="{{release_commit}}" \
+     OBSETYNC_BUILD_REQUIRE_EXPECTED_COMMIT=1 \
+     OBSETYNC_BUILD_REQUIRE_CLEAN=1 \
+     OBSETYNC_BUILD_EXPECTED_VERSION="{{release_version}}" \
+     docker compose run --build --rm plugin
+    @test "$(git rev-parse --verify HEAD)" = "{{release_commit}}" && \
+     test -z "$(git status --porcelain --untracked-files=no)" || \
+        (echo "release checkout changed during plugin build" >&2; exit 2)
+    @RELEASE_VERSION="{{release_version}}" RELEASE_COMMIT="{{release_commit}}" node -e ' \
+        const fs = require("node:fs"); \
+        const manifest = JSON.parse(fs.readFileSync("dist/plugin/manifest.json", "utf8")); \
+        if (manifest.version !== process.env.RELEASE_VERSION) throw new Error("built plugin manifest version mismatch"); \
+        const bundle = fs.readFileSync("dist/plugin/main.js", "utf8"); \
+        if (!bundle.includes(process.env.RELEASE_COMMIT)) throw new Error("built plugin does not contain the release commit");'
+
+# Build and load the Nix image, then verify its immutable OCI identity labels.
+build-release-nix-image: release-preflight
+    nix build .#dockerImage
+    docker load < result
+    @identity_file="$(mktemp)"; \
+     trap 'rm -f "$identity_file"' EXIT; \
+     docker run --rm obsetync-server:nix build-identity > "$identity_file"; \
+     node scripts/release-provenance.mjs verify-server-json "$identity_file" \
+        "{{release_version}}" "{{release_commit}}" clean
+    @export RELEASE_VERSION="{{release_version}}" RELEASE_COMMIT="{{release_commit}}"; \
+     docker image inspect obsetync-server:nix | node -e ' \
+        let input = ""; \
+        process.stdin.setEncoding("utf8"); \
+        process.stdin.on("data", chunk => input += chunk); \
+        process.stdin.on("end", () => { \
+            const labels = JSON.parse(input)[0]?.Config?.Labels ?? {}; \
+            const expected = { \
+                "org.opencontainers.image.version": process.env.RELEASE_VERSION, \
+                "org.opencontainers.image.revision": process.env.RELEASE_COMMIT, \
+                "org.opencontainers.image.source-state": "clean", \
+            }; \
+            for (const [name, value] of Object.entries(expected)) \
+                if (labels[name] !== value) throw new Error(`image label ${name}: expected ${value}, got ${labels[name] ?? "missing"}`); \
+        });'
+    @test "$(git rev-parse --verify HEAD)" = "{{release_commit}}" && \
+     test -z "$(git status --porcelain --untracked-files=no)" || \
+        (echo "release checkout changed during Nix image build" >&2; exit 2)
+
+# Copy the already verified release plugin into the local Obsidian vault.
+ship-plugin: ship-plugin-preflight build-release-plugin
+    bash scripts/deploy-plugin.sh dist/plugin "{{vault}}" "{{release_commit}}"
 
 # Build the Nix docker image, transfer it to the remote host, load + restart.
 # Does NOT re-run `init` — the server's existing data dir + box keypair stay
 # intact across deploys. Only the compose restarts to pick up the new image.
-ship-server: build-nix-image
-    @test -n "{{server}}" || (echo "OBSETYNC_SERVER not set in .env — skipping server ship" && exit 0)
-    @echo "→ shipping Nix image to {{server}}"
-    scp -q result {{server}}:/tmp/obsetync-nix.tar.gz
-    @echo "→ shipping docker-compose.yml to {{server}}:{{dest}}"
-    scp -q docker-compose.yml {{server}}:{{dest}}/docker-compose.yml
-    ssh {{server}} "docker load < /tmp/obsetync-nix.tar.gz && docker tag obsetync-server:nix obsetync/server:local && docker tag obsetync-server:nix ghcr.io/savemech/obsetync-nix:1.11.4 && rm /tmp/obsetync-nix.tar.gz && cd {{dest}} && docker compose up -d"
-    @echo "→ verifying /health"
-    ssh {{server}} "curl -fsS http://127.0.0.1:27182/health"
-    @echo
+ship-server: ship-server-preflight build-release-nix-image
+    @set -eu; \
+     image_tar="/tmp/obsetync-server-{{release_commit}}.tar"; \
+     staged_compose="{{dest}}/.docker-compose-{{release_commit}}.yml"; \
+     remote_script="/tmp/obsetync-deploy-server-{{release_commit}}.sh"; \
+     remote_script_uploaded=0; \
+     cleanup() { \
+        if [ "$remote_script_uploaded" -eq 1 ]; then \
+            ssh "{{server}}" rm -f "$remote_script" >/dev/null 2>&1 || true; \
+        fi; \
+     }; \
+     trap cleanup EXIT; \
+     scp result "{{server}}:$image_tar"; \
+     scp docker-compose.yml "{{server}}:$staged_compose"; \
+     scp scripts/deploy-server.sh "{{server}}:$remote_script"; \
+     remote_script_uploaded=1; \
+     ssh "{{server}}" bash "$remote_script" "{{dest}}" "$image_tar" \
+        "$staged_compose" "{{release_version}}" "{{release_commit}}"
 
 # --- maintenance ----------------------------------------------------------
 
