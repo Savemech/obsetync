@@ -96,6 +96,21 @@ async function reuseUsesFreshFingerprintAndDetachedOwnership(): Promise<void> {
     assert.equal(hint.manifest.chunks[0].size, 4);
 }
 
+async function acceptsOpaqueWindowsFileIdsBeyondSafeInteger(): Promise<void> {
+    const { options } = fixture();
+    const opaqueId = Number.MAX_SAFE_INTEGER + 2048;
+    options.loadHint = async () => null;
+    options.run = async () => {
+        const value = fullResult();
+        value.fingerprint.device = opaqueId;
+        value.fingerprint.inode = opaqueId + 2;
+        return value;
+    };
+    const resolved = await resolvePreparedDesktopManifest(options);
+    assert.equal(resolved.result.fingerprint.device, opaqueId);
+    assert.equal(resolved.result.fingerprint.inode, opaqueId + 2);
+}
+
 async function missingAndSizeMismatchingHintsPrepareFresh(): Promise<void> {
     for (const missing of [true, false]) {
         const { options, calls } = fixture();
@@ -404,6 +419,7 @@ async function detachedCloneAdmissionIsExactAndRAII(): Promise<void> {
 void (async () => {
     await alwaysVerifyEvenWhenOldObjectsExist();
     await reuseUsesFreshFingerprintAndDetachedOwnership();
+    await acceptsOpaqueWindowsFileIdsBeyondSafeInteger();
     await missingAndSizeMismatchingHintsPrepareFresh();
     await freshPreparationWaitsForSaveAndKeepsSeparateOwners();
     await lateInvalidationOrAbortAwaitsEveryNativeBoundary();

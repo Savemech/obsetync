@@ -85,6 +85,12 @@ function nonnegative(value: unknown): value is number {
 function integer(value: unknown): value is number {
     return nonnegative(value) && Number.isSafeInteger(value);
 }
+function nativeIdentity(value: unknown): value is number {
+    // Node exposes dev/ino as numbers by default. On Windows an NTFS file ID
+    // can exceed Number.MAX_SAFE_INTEGER while remaining a stable, finite
+    // integer for equality checks within this process and after JSON cloning.
+    return nonnegative(value) && Number.isInteger(value);
+}
 function hash(value: unknown): value is string {
     return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
 }
@@ -142,7 +148,7 @@ function detachFingerprint(value: unknown, size: number, mtime: number): Desktop
     const actualSize = data(value, "size"), actualMtime = data(value, "mtime"), ctime = data(value, "ctime"),
         device = data(value, "device"), inode = data(value, "inode");
     if (actualSize !== size || !nonnegative(actualMtime) || Math.abs(actualMtime - mtime) > 1 ||
-        !nonnegative(ctime) || !integer(device) || !integer(inode)) invalid();
+        !nonnegative(ctime) || !nativeIdentity(device) || !nativeIdentity(inode)) invalid();
     return { size, mtime: actualMtime, ctime, device, inode };
 }
 

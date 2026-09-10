@@ -86,6 +86,9 @@ function exact(value: unknown, keys: readonly string[], message: string): assert
 const integer = (value: unknown, min = 0): value is number =>
     Number.isSafeInteger(value) && (value as number) >= min && (value as number) < Number.MAX_SAFE_INTEGER;
 const time = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0;
+// Node's numeric fs.Stats may expose Windows file IDs above MAX_SAFE_INTEGER.
+// They are still useful as opaque equality witnesses together with size/time.
+const nativeIdentity = (value: unknown): value is number => time(value) && Number.isInteger(value);
 const hash = (value: unknown): value is string => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
 function identity(scope: unknown, path: unknown): void {
     if (!hash(scope) || typeof path !== "string" || path.length > MAX_PATH_UNITS || !isSafeVaultPath(path)) {
@@ -106,7 +109,9 @@ function sourceCopy(value: unknown, storeKind: StoreKind): PreparedSource {
         const copy = { kind: "desktop-v1" as const, size: fingerprint.size, mtime: fingerprint.mtime,
             ctime: fingerprint.ctime, device: fingerprint.device, inode: fingerprint.inode };
         if (!integer(size) || !time(mtime) || copy.size !== size || copy.mtime !== mtime ||
-            !time(copy.ctime) || !integer(copy.device) || !integer(copy.inode)) failure("CORRUPT", "invalid prepared source fingerprint");
+            !time(copy.ctime) || !nativeIdentity(copy.device) || !nativeIdentity(copy.inode)) {
+            failure("CORRUPT", "invalid prepared source fingerprint");
+        }
         return { size, mtime, fingerprint: copy };
     }
     exact(fingerprint, ["kind", "size", "mtime", "resourceVersion"], "invalid prepared fingerprint fields");

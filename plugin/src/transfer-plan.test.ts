@@ -108,6 +108,21 @@ async function scopeCasOwnershipAndRestart(): Promise<void> {
     check(io.events.length === lookupEvents, "hint lookup read source bytes or performed storage/network IO");
 }
 
+async function opaqueWindowsFileIdsSurviveRestart(): Promise<void> {
+    const { io, plan } = await fixture();
+    const value = input({ path: "opaque-file-id.bin" });
+    if (value.source.fingerprint.kind !== "desktop-v1") throw new Error("desktop fixture changed source kind");
+    const opaqueId = Number.MAX_SAFE_INTEGER + 2048;
+    value.source.fingerprint.device = opaqueId;
+    value.source.fingerprint.inode = opaqueId + 2;
+    check((await plan.retain(value)).retained, "opaque Windows file IDs were rejected before persistence");
+    await plan.compact();
+    const restored = await reopened(io);
+    const source = restored.lookup(SCOPE, "opaque-file-id.bin")?.source;
+    check(source?.fingerprint.kind === "desktop-v1" && source.fingerprint.device === opaqueId &&
+        source.fingerprint.inode === opaqueId + 2, "opaque Windows file IDs changed across prepared-plan recovery");
+}
+
 async function capsRejectBeforeCopyAndKeepOldHints(): Promise<void> {
     const { io, plan } = await fixture({ records: 2, chunks: 3, retainedBytes: 4096, queuedRequests: 2 });
     check((await plan.retain(input())).retained, "bounded first record was not retained");
@@ -443,6 +458,7 @@ async function storeScratchAdmissionPrecedesAllocationAndWrites(): Promise<void>
 
 const watchdog = setTimeout(() => { throw new Error("prepared transfer stage tests did not settle"); }, 30_000);
 void scopeCasOwnershipAndRestart()
+    .then(opaqueWindowsFileIdsSurviveRestart)
     .then(capsRejectBeforeCopyAndKeepOldHints)
     .then(publicationVisibilityAndClose)
     .then(faultedPublicationRetainsOnlyWholeCuts)
