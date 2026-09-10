@@ -4,13 +4,14 @@ import { BulkObjectKind, type BulkUploadRecord } from "./bulk-codec";
 import { HashWorkerFileDriftError, HashWorkerPoolError, waitForHashWorkerCleanup,
     type DesktopHashWorkerPool } from "./desktop-hash-workers";
 import { reconcileDesktopLargeFile } from "./desktop-reconcile-upload";
-import type { DesktopRangeReaderOpener } from "./desktop-ranged-upload";
+import { openQualifiedDesktopRangeSource, type DesktopRangeReaderOpener,
+    type QualifiedDesktopRangeSource } from "./desktop-ranged-upload";
 import { getHashTuning, type HashTuning } from "./hash-runtime";
 import { MAX_FASTCDC_CHUNK_BYTES } from "./hash-worker-protocol";
 import type { PerfOperation, PerfPhase } from "./perf-trace";
 import type { PlatformIO } from "./platform";
 import { allSettledBounded, validateManifest } from "./pull";
-import { chunkFileStreaming, type WasmModule } from "./push";
+import { chunkFileStreaming, runDesktopRendererRangePass, type WasmModule } from "./push";
 import { planPushMemory, pushGroupingByteLimit, PUSH_CHUNKER_WORK_BYTES } from "./push-memory";
 import type { ReconcileContentSource } from "./reconcile-content";
 import { selectReconcileMissingRanges } from "./reconcile-content";
@@ -43,6 +44,8 @@ export interface ReconcileUploadOptions {
     budget?: RepairBudget;
     tuning?: () => HashTuning;
     openReader?: DesktopRangeReaderOpener;
+    qualifyReader?: (absolutePath: string, expected: { size: number; mtime: number }) =>
+        Promise<QualifiedDesktopRangeSource>;
 }
 
 const emptyStats = (): ReconcileRepairStats => ({
@@ -243,12 +246,14 @@ export async function repairLargeContent(api: RepairApi, io: PlatformIO, wasm: W
     for (;;) {
         await permit(options);
         const tuning = tuningNow();
-        const absolutePath = allowWorker ? io.getAbsolutePath(source.path) : null;
-        const ranged = !!absolutePath && !!worker;
-        let plan = planPushMemory([{ size: source.size, chunked: true, ranged, worker: ranged }], tuning);
+        const absolutePath = io.getAbsolutePath(source.path);
+        const ranged = !!absolutePath;
+        const workerBacked = ranged && allowWorker && !!worker;
+        let plan = planPushMemory([{ size: source.size, chunked: true, ranged, worker: workerBacked }], tuning);
         const capacity = budget.snapshot().capacityBytes;
         if (ranged && plan.totalBytes > capacity) {
-            plan = planPushMemory([{ size: source.size, chunked: true, ranged: true, worker: true }], tuning, MAX_FASTCDC_CHUNK_BYTES);
+            plan = planPushMemory([{ size: source.size, chunked: true, ranged: true, worker: workerBacked }],
+                tuning, MAX_FASTCDC_CHUNK_BYTES);
         }
         if (plan.totalBytes > capacity) {
             recordFailure(stats, new ResourceBudgetOversizedError(plan.totalBytes, capacity), "read");
@@ -270,7 +275,28 @@ export async function repairLargeContent(api: RepairApi, io: PlatformIO, wasm: W
                 const endWorker = options.perf?.phase("prepare_batch");
                 let workerPending = true;
                 try {
-                    const result = await reconcileDesktopLargeFile(worker!, {
+                    const manifestRunner: Pick<DesktopHashWorkerPool, "run"> = workerBacked ? worker! : {
+                        run: async (job, signal) => {
+                            const qualified = await (options.qualifyReader ?? openQualifiedDesktopRangeSource)(
+                                job.absolutePath,
+                                { size: job.expectedSize, mtime: job.expectedMtime },
+                            );
+                            try {
+                                return await runDesktopRendererRangePass(
+                                    wasm,
+                                    qualified.source,
+                                    qualified.reader,
+                                    job.mode,
+                                    options.perf,
+                                    signal,
+                                    Math.min(job.feedBytes, tuning.maxFeedBytes),
+                                );
+                            } finally {
+                                await qualified.reader.close();
+                            }
+                        },
+                    };
+                    const result = await reconcileDesktopLargeFile(manifestRunner, {
                         absolutePath: absolutePath!, expectedHash: source.hash.toLowerCase(), expectedSize: source.size,
                         expectedMtime: stat.mtime, feedBytes: Math.min(tuning.feedBytes, tuning.maxFeedBytes),
                     }, hashes => {
@@ -306,14 +332,16 @@ export async function repairLargeContent(api: RepairApi, io: PlatformIO, wasm: W
                     return stats;
                 } catch (error) {
                     rethrowTerminal(error, options.signal);
-                    // Only a worker capability failure permits whole-file
-                    // fallback. Do not reinterpret source drift or upload errors.
-                    if (workerPending && stage === "read" && !(error instanceof HashWorkerFileDriftError) &&
+                    // A confirmed worker capability failure retries through the
+                    // same bounded native range path in the renderer. Do not
+                    // reinterpret source drift or upload errors as capability loss.
+                    if (workerBacked && workerPending && stage === "read" &&
+                        !(error instanceof HashWorkerFileDriftError) &&
                         await waitForHashWorkerCleanup(error)) {
                         throwIfWorkAborted(options.signal);
                         allowWorker = false;
-                        // finally closes the old, drained range scope. The next
-                        // iteration re-admits full source copies before reading.
+                        // finally closes the drained worker scope. The next
+                        // iteration re-admits a renderer range pass from scratch.
                         continue;
                     }
                     throw error;

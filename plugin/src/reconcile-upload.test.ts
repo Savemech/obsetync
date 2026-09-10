@@ -3,7 +3,7 @@ import { ResourceBudget } from "./resource-budget";
 import { hashTuningForRuntime } from "./hash-runtime";
 import { planPushMemory } from "./push-memory";
 import { BulkObjectKind } from "./bulk-codec";
-import { DesktopHashWorkerPool, HashWorkerPoolError } from "./desktop-hash-workers";
+import { DesktopHashWorkerPool } from "./desktop-hash-workers";
 import type { HashWorkerRequest, HashWorkerResponse } from "./hash-worker-protocol";
 
 let assertions = 0;
@@ -185,16 +185,17 @@ async function fallbackWaitsForNativeTerminationAndReadmission(): Promise<void> 
     const worker = new FakeWorker();
     const pool = new DesktopHashWorkerPool(() => worker as any, 1, 1);
     worker.emit("message", { type: "ready", wasm_mode: "simd" } satisfies HashWorkerResponse);
-    let reads = 0;
+    let rendererReads = 0;
+    let wholeReads = 0;
+    let workerTerminated = false;
     let seenScopeSize = 0;
-    const wholePlan = planPushMemory([{ size, chunked: true, ranged: false }], tuning());
+    const rangedPlan = planPushMemory([{ size, chunked: true, ranged: true, worker: false }], tuning());
     const io = {
         getAbsolutePath: () => "/fixture/source",
         stat: async () => ({ size, mtime: 1 }),
         readFile: async () => {
-            reads++;
-            check(budget.snapshot().usedBytes === wholePlan.totalBytes, "whole fallback reused smaller ranged admission");
-            return new Uint8Array(size);
+            wholeReads++;
+            throw new Error("worker fallback read the whole source");
         },
     } as any;
     const api = {
@@ -205,34 +206,82 @@ async function fallbackWaitsForNativeTerminationAndReadmission(): Promise<void> 
                 "fallback uploaded already-present content chunks");
         },
     } as any;
-    const repairing = repairLargeContent(api, io, wasm, { path: "source", hash: hash(1), size }, pool, options(budget));
+    const rangeOptions = {
+        ...options(budget),
+        qualifyReader: async (absolutePath: string, expected: { size: number; mtime: number }) => {
+            check(workerTerminated, "renderer range fallback raced native worker termination");
+            return {
+                source: { absolutePath, fingerprint: { ...expected, ctime: 1, device: 1, inode: 1 } },
+                reader: {
+                    verify: async () => {},
+                    read: async (_offset: number, requested: number) => {
+                        rendererReads++;
+                        check(requested <= tuning().maxFeedBytes, "renderer fallback exceeded admitted feed ceiling");
+                        return new Uint8Array(requested).fill(1);
+                    },
+                    close: async () => {},
+                },
+            };
+        },
+        openReader: async () => ({ verify: async () => {}, read: async () => new Uint8Array(0), close: async () => {} }),
+    };
+    const repairing = repairLargeContent(api, io, wasm,
+        { path: "source", hash: hash(1), size }, pool, rangeOptions);
     await worker.entered.promise;
     check(worker.posted[0].type === "job" && worker.posted[0].feed_bytes <= tuning().maxFeedBytes,
         "worker feed was not pinned before source read");
     worker.emit("error", new Error("worker crashed"));
     await flush();
-    check(reads === 0 && budget.snapshot().usedBytes > 0, "fallback raced native worker termination");
+    check(rendererReads === 0 && wholeReads === 0 && budget.snapshot().usedBytes > 0,
+        "fallback raced native worker termination");
+    workerTerminated = true;
     worker.termination.resolve(0);
     const stats = await repairing;
-    check(reads === 1 && seenScopeSize === wholePlan.totalBytes && stats.uploaded === 1,
-        `confirmed worker termination failed to re-admit safe fallback: ${JSON.stringify({ reads, seenScopeSize, expected: wholePlan.totalBytes, stats })}`);
+    check(rendererReads > 1 && wholeReads === 0 && seenScopeSize === rangedPlan.totalBytes && stats.uploaded === 1,
+        `confirmed worker termination failed to re-admit bounded fallback: ${JSON.stringify({ rendererReads, wholeReads, seenScopeSize, expected: rangedPlan.totalBytes, stats })}`);
     check(budget.snapshot().usedBytes === 0, "fallback leaked worker/source admission");
     pool.close();
 }
 
-async function oversizedWorkerFallbackNeverReadsSource(): Promise<void> {
-    const budget = new ResourceBudget({ capacityBytes: 32 * 1024 * 1024 });
-    const size = 32 * 1024 * 1024;
-    let reads = 0;
+async function absentWorkerUsesBoundedRendererRanges(): Promise<void> {
+    const size = 4 * 1024 * 1024;
+    const rangedPlan = planPushMemory([{ size, chunked: true, ranged: true, worker: false }], tuning());
+    const wholePlan = planPushMemory([{ size, chunked: true, ranged: false }], tuning());
+    check(rangedPlan.totalBytes < wholePlan.totalBytes, "range regression fixture does not exclude whole-source fallback");
+    const budget = new ResourceBudget({ capacityBytes: rangedPlan.totalBytes });
+    let rangeReads = 0;
+    let wholeReads = 0;
+    let manifests = 0;
     const io = {
         getAbsolutePath: () => "/fixture/large",
         stat: async () => ({ size, mtime: 1 }),
-        readFile: async () => { reads++; throw new Error("unbounded whole source read"); },
+        readFile: async () => { wholeReads++; throw new Error("unbounded whole source read"); },
     } as any;
-    const worker = { run: async () => { throw new HashWorkerPoolError("unavailable", "UNAVAILABLE"); } } as any;
-    const stats = await repairLargeContent({} as any, io, wasm, { path: "large", hash: hash(1), size }, worker, options(budget));
-    check(reads === 0 && stats.deferred === 1 && stats.uploaded === 0, "oversized worker fallback attempted native whole read");
-    check(budget.snapshot().usedBytes === 0, "oversized fallback leaked drained worker scope");
+    const stats = await repairLargeContent({
+        checkContentChunks: async () => [],
+        putObjects: async (records: any[]) => {
+            if (records.some(record => record.kind === BulkObjectKind.Manifest)) manifests++;
+        },
+    } as any, io, wasm, { path: "large", hash: hash(1), size }, undefined, {
+        ...options(budget),
+        qualifyReader: async (absolutePath, expected) => ({
+            source: { absolutePath, fingerprint: { ...expected, ctime: 1, device: 1, inode: 1 } },
+            reader: {
+                verify: async () => {},
+                read: async (_offset, requested) => {
+                    rangeReads++;
+                    check(requested <= tuning().maxFeedBytes, "renderer repair exceeded feed ceiling");
+                    return new Uint8Array(requested).fill(1);
+                },
+                close: async () => {},
+            },
+        }),
+        openReader: async () => ({ verify: async () => {}, read: async () => new Uint8Array(0), close: async () => {} }),
+    });
+    check(rangeReads === size / tuning().maxFeedBytes && wholeReads === 0 && manifests === 1 &&
+        stats.deferred === 0 && stats.uploaded === 1,
+    "absent worker did not complete through bounded renderer ranges");
+    check(budget.snapshot().usedBytes === 0, "renderer range fallback leaked drained worker scope");
 }
 
 async function unconfirmedWorkerTerminationNeverStartsFallback(): Promise<void> {
@@ -353,7 +402,7 @@ void smallRepairValidatesAndIsolatesFailures()
     .then(queuedShrinkReplansBeforeAnyRead)
     .then(oversizeAndSourceGrowthDoNotReadUnboundedBytes)
     .then(fallbackWaitsForNativeTerminationAndReadmission)
-    .then(oversizedWorkerFallbackNeverReadsSource)
+    .then(absentWorkerUsesBoundedRendererRanges)
     .then(unconfirmedWorkerTerminationNeverStartsFallback)
     .then(rangedQueueAndNativeCloseStayOwned)
     .then(abortDuringRangeReadWaitsForNativeClose)

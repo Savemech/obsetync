@@ -2872,7 +2872,7 @@ export async function chunkFileStreaming(
  * It preserves the same two-pass manifest/range protocol as the worker path,
  * but performs only one bounded native read and one bounded WASM update at a
  * time, yielding cooperatively between renderer slices. */
-async function runDesktopRendererRangePass(
+export async function runDesktopRendererRangePass(
     wasm: WasmModule,
     source: DesktopRangeSource,
     reader: DesktopRangeReader,

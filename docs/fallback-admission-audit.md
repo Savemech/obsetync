@@ -6,10 +6,11 @@ pass.
 
 ## Result
 
-The audit found 14 fallback-boundary families. Ten preserve the original
-bounded ownership model or fail closed. Four need action: one P0 is fixed in
-the current `1.12.3` worktree, two P1 items remain, and one P2 compatibility
-item remains.
+The audit found 14 fallback-boundary families. Eleven now preserve the
+original bounded ownership model or fail closed. Three follow-ups remain: one
+P1 conflict-preservation item, one P2 mobile retry item, and one P2 tree-ABI
+compatibility item. The Windows manifest validator and desktop reconcile
+fallback defects were fixed during this audit.
 
 The failure pattern under review is:
 
@@ -30,7 +31,7 @@ The failure pattern under review is:
 | FA-04 | `push`: desktop worker fails for a small source | Adapter whole-file read | Worker cleanup is joined and a larger whole-source plan is re-admitted before reading; oversized sources defer | closed | Existing transaction coverage |
 | FA-05 | `hashStableFile`: desktop worker unavailable/fails | Native `createReadStream`, otherwise admitted adapter read | Native stream is feed-bounded. Adapter fallback reserves the complete source first and rejects growth | closed | Existing hash-source and scan coverage; native-device qualification still required |
 | FA-06 | Browser hash worker unavailable/fails | Renderer hashes already admitted bytes, or performs a fresh admitted reread after transferred-buffer loss | Generation and cleanup fences prevent reuse of detached bytes | closed | Existing browser-worker fallback tests |
-| FA-07 | `repairLargeContent`: desktop worker unavailable/fails | Whole-file renderer FastCDC | Ranged native IO is currently enabled only by the worker capability. Moderate files consume the whole-source plan; larger files defer even when native ranges are available | P1 | Open; reuse FA-01 ranged preparation and add no-worker/runtime-failure repair tests |
+| FA-07 | `repairLargeContent`: desktop worker unavailable/fails | Native ranged renderer FastCDC + ranged upload | Range qualification is independent of worker-pool availability. Confirmed runtime worker cleanup is followed by a newly admitted bounded renderer pass; no adapter whole-file read occurs | closed | Fixed in 1.12.4; constructor/unavailable and runtime-failure regressions present |
 | FA-08 | `readAdmittedPushSource`: no qualified no-follow reader | Adapter whole-file read | The original whole-source reservation remains live; unsafe/drifting native observations reject rather than fall back | closed | Existing verified-read and push tests |
 | FA-09 | Mobile large-file range capability unavailable | Defer the path | No whole-file allocation occurs, but unchanged unsupported work is reconsidered after the generic 60-second cooldown | P2 UX | Memory-safe; improve capability-keyed suppression/diagnostics after P1 fixes |
 | FA-10 | WS data lane unavailable/retryable failure | HTTP bulk | Pending WS crypto/send tasks drain before HTTP reuses child quota; operation must be content-addressed replay-safe | closed | Router, WS lifetime, and API tests present |
@@ -49,9 +50,8 @@ their durability behavior is covered by the storage and conflict ADRs.
 
 1. Ship FA-03 so the eight currently journaled GIFs can complete through the
    bounded renderer path on Windows.
-2. Fix FA-07 by making desktop range qualification independent of worker-pool
-   availability in reconcile, then prove both constructor and runtime worker
-   failure without `PlatformIO.readFile`.
+2. Ship FA-07 after the complete plugin suite confirms worker cleanup,
+   renderer range bounds, and existing push behavior together.
 3. Fix FA-12 before claiming legacy V1 conflict safety for large files. The
    losing bytes must come from immutable server objects or a fingerprinted,
    admitted source; a generic catch must not authorize the local current path.

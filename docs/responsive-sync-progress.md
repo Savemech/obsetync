@@ -7,14 +7,14 @@ Fallback-boundary follow-up: [capability fallback and admission audit](fallback-
 ## Current state: stabilization candidate
 
 The enabled P0–P3 file-sync scope is in stabilization. The focused fallback
-audit found one Windows prepared-manifest P0 (fixed in the current worktree),
-two remaining P1 items, and one P2 compatibility item. The current tree also adds bounded initial-review
+audit found one Windows prepared-manifest P0 and one desktop reconcile P1,
+both fixed, with one P1 and two P2 follow-ups remaining. The current tree also adds bounded initial-review
 preemption: a separately captured and reviewed durable recent-edit prefix can
 publish before a 25,000-file review completes, while deletion review, journal
 ownership, dependency cuts, and the mandatory complete review remain
 fail-closed. P4/Yjs/CRDT remains dormant by explicit scope decision.
 
-The implementation is staged as `1.12.3`. Local release gates and exact-build
+The implementation is staged as `1.12.4`. Local release gates and exact-build
 identity checks are required before deployment; remote CI, release artifacts,
 tagging, publication, and real-device numerical evidence remain separate gates.
 
