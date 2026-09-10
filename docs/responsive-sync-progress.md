@@ -1,6 +1,6 @@
 # Responsive sync: implementation progress
 
-Updated: 2026-09-09. Published baseline: `1.11.4` (`d5df76fe613d509a64c5ff22d9cc9f27845cc4f5`).
+Updated: 2026-09-10. Published baseline: `1.11.4` (`d5df76fe613d509a64c5ff22d9cc9f27845cc4f5`).
 Related document: [implementation roadmap](responsive-sync-roadmap.md).
 
 ## Current state: stabilization candidate
@@ -12,7 +12,7 @@ publish before a 25,000-file review completes, while deletion review, journal
 ownership, dependency cuts, and the mandatory complete review remain
 fail-closed. P4/Yjs/CRDT remains dormant by explicit scope decision.
 
-The implementation is staged as `1.12.0`. Local release gates and exact-build
+The implementation is staged as `1.12.1`. Local release gates and exact-build
 identity checks are required before deployment; remote CI, release artifacts,
 tagging, publication, and real-device numerical evidence remain separate gates.
 
@@ -78,9 +78,36 @@ Current-tree automated gates completed so far:
 - current source and documentation outside the untracked user-owned `temp/`
   directory contain no Cyrillic text.
 
-Remote CI, real-device qualification, and release artifacts have not run.
+Remote CI passed for the initial `1.12.0` deployment commit. The tag-triggered
+release stopped before publication because YAML folding passed a leading space
+in the server provenance version argument; the corrected literal command is
+covered by the normal CI workflow. Release artifacts and the broader real-device
+qualification remain open.
+
+### 1.12.1 field stabilization
+
+The first Windows field run completed a 25k full scan in 1.6 minutes with
+foreground lag normally at or below 8 ms, then retained all 24,655 dirty paths
+after a deterministic root-plan admission refusal. No root mutation or journal
+acknowledgement occurred after that refusal. The failure was independent of disk,
+server, transport, and V2 output pressure: the configured 16 MiB metadata model
+left room for only about 60 unescaped ASCII path characters per hashful row at
+that queue size.
+
+The root-plan ceiling is now 32 MiB without reducing any row, path, hash,
+dependency, or workspace charge. The mobile shared arbiter retains an 8 MiB
+interactive reserve; root review, root plan, and prepared-manifest ownership use
+48 MiB of the 72 MiB background capacity and leave 24 MiB for other admitted
+background work. The existing 25k hashful test now uses production-depth paths,
+peaks at 18,058,752 modeled bytes, must fail under an explicit 16 MiB ceiling,
+and drains under the new ceiling. This is still a deterministic model rather
+than a measured heap/RSS or Jetsam guarantee.
 
 ## Previous freeze checkpoint (historical evidence)
+
+The sections below retain the contracts and measurements recorded at each
+historical slice. Where they mention a 16 MiB root-plan ceiling, that value is
+superseded by the 1.12.1 field-stabilization note above.
 
 The current verifiable code-freeze checkpoint before documentation edits is
 `responsive-stage-235`. After separate audits, this cut

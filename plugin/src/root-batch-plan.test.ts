@@ -139,7 +139,7 @@ async function twentyFiveThousandRowsAreVisitedOnce(): Promise<void> {
 
 async function realisticHashfulCorpusSharesActualRecords(): Promise<void> {
     const queued = Array.from({ length: 25_000 }, (_, index) => ({
-        ...hint(`notes/projects/p-${String(index % 500).padStart(3, "0")}/note-${String(index).padStart(5, "0")}.md`, index + 1),
+        ...hint(`notes/projects/archive/p-${String(index % 500).padStart(3, "0")}/workstream/meeting-and-research-note-${String(index).padStart(5, "0")}.md`, index + 1),
         hash: index.toString(16).padStart(64, "0"),
     }));
     const ready = [...queued].reverse().map(row => ({ ...row }));
@@ -147,8 +147,10 @@ async function realisticHashfulCorpusSharesActualRecords(): Promise<void> {
     const built = plan.snapshot();
     same([built.sharedReadyRows, built.overrideReadyRows], [25_000, 0], "fullscan matching hashes/stats were not actually interned");
     same(built.preflightMetadataBytes, built.buildPeakMetadataBytes, "shared matching rows allocated/charged overrides");
-    check(built.buildPeakMetadataBytes <= 16 * 1024 * 1024 && built.retainedMetadataBytes <= built.buildPeakMetadataBytes,
-        "hashful graph or compact retained model exceeded the unchanged 16 MiB cap");
+    check(built.buildPeakMetadataBytes > 16 * 1024 * 1024 &&
+        built.buildPeakMetadataBytes <= ROOT_BATCH_PLAN_ADMISSION.maxMetadataBytes &&
+        built.retainedMetadataBytes <= built.buildPeakMetadataBytes,
+        "realistic long-path graph did not exercise and stay within the expanded admission cap");
     let count = 0;
     for (;;) {
         const batch = plan.next(); if (!batch) break;
@@ -160,14 +162,21 @@ async function realisticHashfulCorpusSharesActualRecords(): Promise<void> {
         for (const row of batch.queued) check(row === queued[row.journalId! - 1], "hashful compaction lost original hint proof");
     }
     same(count, 25_000, "hashful compact plan did not drain the complete reviewed corpus");
-    // Different actual ready metadata requires REAL override records. The
-    // same weights/cap must reject, not pretend those records were shared.
+    await rejects(createRootBatchPlan(ready, queued, [], {
+        cooperate, admission: { maxMetadataBytes: 16 * 1024 * 1024 },
+    }), "ROOT_BATCH_PLAN_ADMISSION");
+    // Different actual ready metadata requires real override records. A cap
+    // equal to the shared-row peak must reject rather than pretend the rows
+    // were shared.
     const different = ready.map(row => ({ ...row, mtime: row.mtime! + 1 }));
-    await rejects(createRootBatchPlan(different, queued, [], { cooperate }), "ROOT_BATCH_PLAN_ADMISSION");
-    same(ROOT_BATCH_PLAN_ADMISSION.maxMetadataBytes, 16 * 1024 * 1024, "compaction raised admission to fit the fixture");
+    await rejects(createRootBatchPlan(different, queued, [], {
+        cooperate, admission: { maxMetadataBytes: built.buildPeakMetadataBytes },
+    }), "ROOT_BATCH_PLAN_ADMISSION");
+    same(ROOT_BATCH_PLAN_ADMISSION.maxMetadataBytes, 32 * 1024 * 1024,
+        "long-path admission ceiling changed unexpectedly");
     same([ROOT_BATCH_PLAN_ADMISSION.queuedRowBytes, ROOT_BATCH_PLAN_ADMISSION.readyRowBytes, ROOT_BATCH_PLAN_ADMISSION.dependencyBytes],
         [352, 128, 256], "compaction reduced experimental weights instead of removing records");
-    console.log(`root batch plan hashful fixture: shared=25000 peak=${built.buildPeakMetadataBytes} retained=${built.retainedMetadataBytes} bytes; differing-stat corpus rejected`);
+    console.log(`root batch plan hashful long-path fixture: shared=25000 peak=${built.buildPeakMetadataBytes} retained=${built.retainedMetadataBytes} bytes; differing-stat corpus rejected at shared peak`);
 }
 
 async function overridesAreChargedAndProjectedExactly(): Promise<void> {

@@ -72,13 +72,17 @@ authorize legacy protocol fallback. Byte charges are an experimental metadata
 model, not a measured worst-case JS heap size or a reservation from the shared
 `ResourceBudget`. Caller-owned inputs lie outside this model and must remain
 immutable; repeated admission does not protect against arbitrary later
-mutation of an already-retained caller-owned object. Under the previous
-16 MiB ceiling, the compact planner now shares matching queued/ready scalar
-witnesses and canonical paths/hashes, and releases the union graph after
-constructing compact components. A 25k matching hashful fixture fits the model
-at 15 058 752 bytes; a hashless fixture uses 10 358 752. If every ready stat
-differs and overrides are required, 25k is still rejected. This is not a
-universal memory-admission proof for every vault. A separate review ledger has
+mutation of an already-retained caller-owned object. The compact planner shares
+matching queued/ready scalar witnesses and canonical paths/hashes, and releases
+the union graph after constructing compact components. The initial 16 MiB
+ceiling admitted the short synthetic 25k corpus but rejected a production-shaped
+corpus whose modeled path charge exhausted the remaining budget. For 24,655
+hashful rows this boundary is roughly a 60-character unescaped ASCII average;
+Unicode and JSON escaping change it. The ceiling is now 32 MiB; a 25k matching
+hashful long-path fixture must exceed the old limit and remain below the new one,
+while distinct ready overrides are charged separately.
+This is not a universal memory-admission proof for every vault. A separate
+review ledger has
 a 65 536-path / 8 MiB experimental charge ceiling; combining the models,
 original immutable AVL captures, and native heaps still requires shared
 resource accounting.

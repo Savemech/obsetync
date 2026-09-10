@@ -19,7 +19,7 @@ import {
 export const ROOT_BATCH_PLAN_ADMISSION = {
     maxPaths: 65_536,
     maxDependencies: 65_536,
-    maxMetadataBytes: 16 * 1024 * 1024,
+    maxMetadataBytes: 32 * 1024 * 1024,
     queuedRowBytes: 352,
     readyRowBytes: 128,
     dependencyBytes: 256,
@@ -220,7 +220,7 @@ class AdmittedRootBatchPlan implements RootBatchPlan {
  * copying, yielding by bounded work units. Ready rows intern exact matching
  * queued witnesses; only actual scalar overrides are copied/charged before
  * retention. All paths and equal hashes use existing captured canonical values.
- * The same weights and 16 MiB cap apply, including bounded projection/compaction
+ * The same weights and 32 MiB cap apply, including bounded projection/compaction
  * workspace. Finished union graph and parallel membership arrays are dropped;
  * the returned plan holds compact component membership, not the build graph.
  * A second charge pass detects model growth observed at each visit. It cannot bound arbitrary later mutations of
