@@ -1216,6 +1216,85 @@ async function workerManifestAvoidsRendererFileBytes(): Promise<void> {
     }
 }
 
+async function rendererRangeFallbackChunksWithoutWorkerPool(): Promise<void> {
+    const previous = getHashTuning();
+    configureHashTuning(hashTuningForRuntime("desktop"));
+    const f = fixture();
+    const mib = 1024 * 1024;
+    const size = 2 * mib;
+    const fileHash = "d".repeat(64);
+    const firstChunkHash = "3".repeat(64);
+    const secondChunkHash = "4".repeat(64);
+    const directory = await mkdtemp(join(tmpdir(), "obsetync-renderer-range-"));
+    const absolutePath = join(directory, "large.gif");
+    try {
+        const handle = await open(absolutePath, "w");
+        try {
+            await handle.truncate(size);
+            await handle.write(new Uint8Array([11, 12, 13]), 0, 3, mib);
+        } finally { await handle.close(); }
+        const info = await stat(absolutePath);
+        const mtime = Number(info.mtimeMs);
+        let wholeReads = 0;
+        let totalChunked = 0;
+        let largestFeed = 0;
+        f.io.stat = async () => ({ size, mtime });
+        f.io.getAbsolutePath = () => absolutePath;
+        f.io.readFile = async () => {
+            wholeReads++;
+            throw new Error("renderer fallback used a whole-file read");
+        };
+        f.wasm.wasm_should_chunk = (bytes: number) => bytes >= mib;
+        f.wasm.WasmChunker = class {
+            update(data: Uint8Array) {
+                totalChunked += data.byteLength;
+                largestFeed = Math.max(largestFeed, data.byteLength);
+            }
+            finish() {
+                return { file_hash: fileHash, total_size: size, chunks: [
+                    { hash: firstChunkHash, offset: 0, size: mib },
+                    { hash: secondChunkHash, offset: mib, size: mib },
+                ] };
+            }
+            free() {}
+        };
+        let chunkUploads = 0;
+        let manifestUploads = 0;
+        let uploadedFirstByte = -1;
+        const api = {
+            ensureTransportReady: async () => {},
+            checkContentChunks: async () => [secondChunkHash],
+            putObjects: async (records: Array<{ kind: BulkObjectKind; data: Uint8Array }>) => {
+                for (const record of records) {
+                    if (record.kind === BulkObjectKind.ContentChunk) {
+                        chunkUploads++;
+                        uploadedFirstByte = record.data[0];
+                    } else if (record.kind === BulkObjectKind.Manifest) manifestUploads++;
+                }
+            },
+            putRoot: async () => ({ root_hash: "accepted-renderer-range", conflicts: [] }),
+        } as any;
+
+        const outcome = await push(api, f.io, f.syncBase, f.wasm, f.tree, "vault", [{
+            action: "created", path: "large.gif", size, mtime,
+        }], "base");
+
+        check(outcome.published === true && outcome.deferred?.length !== 1,
+            "renderer ranged fallback deferred a chunkable desktop file");
+        check(wholeReads === 0 && totalChunked === size,
+            "renderer ranged fallback did not stream the complete source");
+        check(largestFeed > 0 && largestFeed <= getHashTuning().maxFeedBytes,
+            "renderer ranged fallback exceeded its admitted feed ceiling");
+        check(chunkUploads === 1 && uploadedFirstByte === 11 && manifestUploads === 1,
+            "renderer ranged fallback ignored the missing bitmap or source offset");
+        check(f.entries.get("large.gif")?.hash === fileHash && f.commitCalls() === 1,
+            "renderer ranged fallback did not commit the manifest identity");
+    } finally {
+        configureHashTuning(previous);
+        await rm(directory, { recursive: true, force: true });
+    }
+}
+
 async function interruptedRangedUploadResumesFromServerBitmap(): Promise<void> {
     const f = fixture();
     const mib = 1024 * 1024;
@@ -1768,20 +1847,45 @@ async function freshStatDriftStopsBeforeSourceAllocation(): Promise<void> {
     check(reads === 0 && f.abortCalls() === 1 && f.saves() === 0, "fresh stat drift allocated or committed source");
 }
 
-async function workerFailureDoesNotReadOversizedFallback(): Promise<void> {
+async function workerFailureUsesBoundedDesktopRangeFallback(): Promise<void> {
     const f = fixture();
-    f.wasm.wasm_should_chunk = () => true;
-    f.io.getAbsolutePath = () => "/test-only/huge.bin";
-    let workerCalls = 0;
-    const workers = { run: async () => { workerCalls++; throw new Error("test worker unavailable"); } } as any;
-    const result = await push({ ensureTransportReady: async () => {} } as any,
-        f.io, f.syncBase, f.wasm, f.tree, "vault", [
-            { action: "created", path: "huge.bin", size: 128 * 1024 * 1024, mtime: 11 },
+    const size = 2 * 1024 * 1024;
+    const fileHash = "5".repeat(64);
+    const chunkHash = "6".repeat(64);
+    const directory = await mkdtemp(join(tmpdir(), "obsetync-worker-range-fallback-"));
+    const absolutePath = join(directory, "large.bin");
+    try {
+        const handle = await open(absolutePath, "w");
+        try { await handle.truncate(size); }
+        finally { await handle.close(); }
+        const info = await stat(absolutePath);
+        const mtime = Number(info.mtimeMs);
+        let workerCalls = 0, wholeReads = 0, chunkedBytes = 0;
+        f.wasm.wasm_should_chunk = () => true;
+        f.wasm.WasmChunker = class {
+            update(data: Uint8Array) { chunkedBytes += data.byteLength; }
+            finish() { return { file_hash: fileHash, total_size: size,
+                chunks: [{ hash: chunkHash, offset: 0, size }] }; }
+            free() {}
+        };
+        f.io.stat = async () => ({ size, mtime });
+        f.io.getAbsolutePath = () => absolutePath;
+        f.io.readFile = async () => { wholeReads++; throw new Error("unexpected whole-file fallback"); };
+        const workers = { run: async () => { workerCalls++; throw new Error("test worker unavailable"); } } as any;
+        const api = {
+            ensureTransportReady: async () => {},
+            checkContentChunks: async () => [],
+            putObjects: async () => {},
+            putRoot: async () => ({ root_hash: "accepted-worker-fallback", conflicts: [] }),
+        } as any;
+        const result = await push(api, f.io, f.syncBase, f.wasm, f.tree, "vault", [
+            { action: "created", path: "large.bin", size, mtime },
         ], "base", undefined, undefined, workers);
-    check(workerCalls === 1, "bounded native worker source was not admitted");
-    check(result.published === false && result.deferred?.[0]?.reason === "source-too-large",
-        "unavailable worker caused an unadmitted renderer fallback");
-    check(f.saves() === 0, "deferred worker fallback saved sync-base");
+        check(workerCalls === 1 && wholeReads === 0 && chunkedBytes === size,
+            "failed worker did not hand off to the bounded ranged fallback");
+        check(result.published === true && f.entries.get("large.bin")?.hash === fileHash,
+            "bounded worker fallback did not commit the manifest");
+    } finally { await rm(directory, { recursive: true, force: true }); }
 }
 
 async function failedReadKeepsNativeSiblingCharged(): Promise<void> {
@@ -2775,6 +2879,7 @@ void terminalPreflightDoesNotMutate()
     .then(pagedCandidateChunksDriveActualPushSafely)
     .then(rejectedCommittedBootstrapNeverFallsBackOrOpensCandidate)
     .then(workerManifestAvoidsRendererFileBytes)
+    .then(rendererRangeFallbackChunksWithoutWorkerPool)
     .then(interruptedRangedUploadResumesFromServerBitmap)
     .then(rangedDriftAfterTransferAbortsCandidate)
     .then(workerDriftAbortsCandidate)
@@ -2793,7 +2898,7 @@ void terminalPreflightDoesNotMutate()
     .then(oversizedSourceDoesNotBlockIndependentNote)
     .then(onlyOversizedWorkDoesNotPublishRoot)
     .then(freshStatDriftStopsBeforeSourceAllocation)
-    .then(workerFailureDoesNotReadOversizedFallback)
+    .then(workerFailureUsesBoundedDesktopRangeFallback)
     .then(failedReadKeepsNativeSiblingCharged)
     .then(knownSmallReadGroupsFollowLiveLimitsAndPreserveUploadOrder)
     .then(identityVerifiedDesktopReadPreservesAdmissionAndPortableFallback)

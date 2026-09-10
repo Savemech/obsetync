@@ -20,9 +20,11 @@ import {
     type DesktopHashWorkerPool,
 } from "./desktop-hash-workers";
 import {
+    openQualifiedDesktopRangeSource,
     uploadDesktopMissingRanges,
     uploadMissingRangesWithReader,
     type DesktopRangedUploadResult,
+    type DesktopRangeReader,
     type DesktopRangeSource,
 } from "./desktop-ranged-upload";
 import { MobileRangeReadError, type MobileRangeReader } from "./mobile-ranged-source";
@@ -32,7 +34,11 @@ import { planPushMemory, pushGroupingByteLimit, PUSH_CHUNKER_WORK_BYTES, type Pu
 import { reserveTransientScope, transientMemorySnapshot,
     type TransientWorkScope } from "./transient-memory";
 import { ResourceBudgetOversizedError } from "./resource-budget";
-import { MAX_FASTCDC_CHUNK_BYTES } from "./hash-worker-protocol";
+import {
+    MAX_FASTCDC_CHUNK_BYTES,
+    type HashWorkerMode,
+    type HashWorkerResult,
+} from "./hash-worker-protocol";
 import { withHashSource, withStreamingHashSource } from "./hash-source-budget";
 import { reserveCompactIndexHashSpool, uploadIndexChunks,
     type CompactIndexHashSpool } from "./index-upload";
@@ -41,7 +47,6 @@ import type { ConfirmedObject, ConfirmedObjectKind, ObjectConfirmationStore } fr
 import { PreparedDesktopManifestError, resolvePreparedDesktopManifest } from "./prepared-desktop-manifest";
 import { resolvePreparedMobileManifest } from "./prepared-mobile-manifest";
 import type { SyncMemoryArbiter } from "./sync-memory-arbiter";
-import type { HashWorkerMode } from "./hash-worker-protocol";
 import {
     BrowserHashWorkerError,
     type BrowserHashWorkerRuntime,
@@ -1125,20 +1130,20 @@ export async function push(
             }
         }
         const mobileRangedChanges = new Set<FileChange>();
+        const desktopRangedChanges = new Map<FileChange, string>();
         const workerPaths = new Map<FileChange, string>();
         const memoryFiles: PushMemoryFile[] = batchChanges.map(change => {
             const chunked = wasm.wasm_should_chunk(change.size!);
-            // Resolve a native path only when a desktop worker can consume it.
-            // Known-hash small files deliberately skip phase-A source IO, and
-            // renderer-only hosts cannot use the path at all. Calling through
-            // the adapter for every such file adds one native boundary to a
-            // large drain without adding a source-identity check.
-            const absolutePath = hashWorkers &&
+            // A native path also enables the bounded renderer fallback when
+            // worker_threads cannot be constructed. Known-hash small files
+            // still skip phase-A source IO and do not cross the adapter.
+            const absolutePath = (!!hashWorkers || (tuning.runtime === "desktop" && chunked)) &&
                 !(change.hash && !chunked) &&
                 change.data === undefined && change.mtime !== undefined
                 && typeof io.getAbsolutePath === "function" ? io.getAbsolutePath(change.path) : null;
             if (absolutePath) workerPaths.set(change, absolutePath);
-            const desktopRanged = !!(hashWorkers && chunked && absolutePath);
+            const desktopRanged = !!(chunked && absolutePath);
+            if (desktopRanged) desktopRangedChanges.set(change, absolutePath!);
             const mobileRanged = !!(!absolutePath && chunked && change.data === undefined &&
                 change.mtime !== undefined && openMobileRangeReader &&
                 planPushMemory([{ size: change.size!, chunked: true, ranged: false }], tuning).totalBytes > capacityBytes);
@@ -1310,6 +1315,7 @@ export async function push(
                 const skipRead: FileChange[] = [];
                 const needRead: FileChange[] = [];
                 const workerEligible: Array<{ change: FileChange; absolutePath: string }> = [];
+                const desktopRangeEligible: Array<{ change: FileChange; absolutePath: string }> = [];
                 const mobileRangeEligible: FileChange[] = [];
                 for (const c of group) {
                     if (c.hash && c.size !== undefined && !wasm.wasm_should_chunk(c.size)) {
@@ -1318,6 +1324,8 @@ export async function push(
                         const absolutePath = workerPaths.get(c) ?? null;
                         if (hashWorkers && absolutePath) {
                             workerEligible.push({ change: c, absolutePath });
+                        } else if (absolutePath && desktopRangedChanges.has(c)) {
+                            desktopRangeEligible.push({ change: c, absolutePath });
                         } else if (mobileRangedChanges.has(c)) {
                             mobileRangeEligible.push(c);
                         } else {
@@ -1405,6 +1413,10 @@ export async function push(
                                     error,
                                 );
                             }
+                            if (wasm.wasm_should_chunk(candidate.change.size!)) {
+                                desktopRangeEligible.push(candidate);
+                                return null;
+                            }
                             const fallbackPlan = planPushMemory([{
                                 size: candidate.change.size!, chunked: wasm.wasm_should_chunk(candidate.change.size!), ranged: false,
                             }], getHashTuning());
@@ -1467,6 +1479,107 @@ export async function push(
                             ));
                             if (row.preparedMemoryOwner) unattachedPreparedOwners.delete(row.preparedMemoryOwner);
                         }
+                    }
+                }
+
+                for (const candidate of desktopRangeEligible) {
+                    throwIfWorkAborted(signal);
+                    rootContext?.assertApplicable(candidate.change.path);
+                    prepared?.assertApplicable(candidate.change.path);
+                    let qualified: Awaited<ReturnType<typeof openQualifiedDesktopRangeSource>> | undefined;
+                    let preparedOwner: { release(): void } | undefined;
+                    let primaryError: unknown;
+                    try {
+                        qualified = await openQualifiedDesktopRangeSource(candidate.absolutePath, {
+                            size: candidate.change.size!,
+                            mtime: candidate.change.mtime!,
+                        });
+                        const run = (mode: HashWorkerMode): Promise<HashWorkerResult> => {
+                            const workBytes = mode === "manifest"
+                                ? PUSH_CHUNKER_WORK_BYTES
+                                : 2 * admittedFeedBytes + 64 * 1024;
+                            return memory.run(workBytes, () => runDesktopRendererRangePass(
+                                wasm,
+                                qualified!.source,
+                                qualified!.reader,
+                                mode,
+                                perf,
+                                signal,
+                                admittedFeedBytes,
+                            ), { signal });
+                        };
+                        let result: HashWorkerResult;
+                        let reusedPrepared = false;
+                        if (prepared) {
+                            const { path } = candidate.change;
+                            const journalThroughId = prepared.journalThroughId(path);
+                            const resolution = await resolvePreparedDesktopManifest({
+                                expectedSize: candidate.change.size!, expectedMtime: candidate.change.mtime!, signal,
+                                assertApplicable: () => prepared.assertApplicable(path),
+                                loadHint: async () => {
+                                    const hint = await (prepared.memoryArbiter
+                                        ? prepared.plan.lookupUnownedViewForAdmission(prepared.scopeHash, path)
+                                        : prepared.plan.lookup(prepared.scopeHash, path));
+                                    if (hint) preparedMutations.set(path, hint.mutationId);
+                                    return hint;
+                                },
+                                discardHint: async mutationId => {
+                                    await prepared.plan.discard(prepared.scopeHash, path, mutationId);
+                                    preparedMutations.delete(path);
+                                },
+                                retain: async value => {
+                                    const retained = await prepared.plan.retain({ scopeHash: prepared.scopeHash, path,
+                                        journalThroughId, baseRoot: baseRootHash,
+                                        source: { size: value.size, mtime: value.mtime,
+                                            fingerprint: { kind: "desktop-v1", ...value.fingerprint } },
+                                        manifest: value.manifest });
+                                    if (retained.retained) preparedMutations.set(path, retained.mutationId);
+                                },
+                                run,
+                                memoryArbiter: prepared.memoryArbiter,
+                            });
+                            preparedPaths.add(path);
+                            perf?.addPhase("read", resolution.validationReadMs);
+                            perf?.addPhase("hash", resolution.validationHashMs);
+                            preparedOwner = resolution.memoryOwner;
+                            if (preparedOwner) unattachedPreparedOwners.add(preparedOwner);
+                            result = resolution.result;
+                            reusedPrepared = resolution.reusedPrepared;
+                        } else {
+                            result = await run("manifest");
+                        }
+                        if (result.mode !== "manifest") {
+                            throw new Error("desktop renderer ranged preparation returned a hash result");
+                        }
+                        throwIfWorkAborted(signal);
+                        rootContext?.assertApplicable(candidate.change.path);
+                        prepared?.assertApplicable(candidate.change.path);
+                        perf?.addPhase("read", result.read_ms);
+                        perf?.addPhase("fastcdc", result.hash_ms);
+                        candidate.change.hash = result.manifest.file_hash;
+                        batchFiles.push(new ObsetyncBatchFile(
+                            candidate.change,
+                            result.size,
+                            candidate.change.mtime!,
+                            result.manifest,
+                            undefined,
+                            qualified.source,
+                            reusedPrepared,
+                            undefined,
+                            preparedOwner,
+                        ));
+                        if (preparedOwner) unattachedPreparedOwners.delete(preparedOwner);
+                        preparedOwner = undefined;
+                    } catch (error) {
+                        primaryError = error;
+                        throw error;
+                    } finally {
+                        let closeError: unknown;
+                        try { await qualified?.reader.close(); }
+                        catch (error) { closeError = error; }
+                        preparedOwner?.release();
+                        if (preparedOwner) unattachedPreparedOwners.delete(preparedOwner);
+                        if (primaryError === undefined && closeError !== undefined) throw closeError;
                     }
                 }
 
@@ -2752,6 +2865,75 @@ export async function chunkFileStreaming(
         return chunker.finish();
     } finally {
         chunker.free();
+    }
+}
+
+/** Desktop fallback for hosts where worker_threads cannot be constructed.
+ * It preserves the same two-pass manifest/range protocol as the worker path,
+ * but performs only one bounded native read and one bounded WASM update at a
+ * time, yielding cooperatively between renderer slices. */
+async function runDesktopRendererRangePass(
+    wasm: WasmModule,
+    source: DesktopRangeSource,
+    reader: DesktopRangeReader,
+    mode: HashWorkerMode,
+    perf?: PerfOperation,
+    signal?: AbortSignal,
+    admittedFeedCeiling = getHashTuning().maxFeedBytes,
+): Promise<HashWorkerResult> {
+    throwIfWorkAborted(signal);
+    const processor = mode === "hash" ? new wasm.Hasher() : new wasm.WasmChunker();
+    let offset = 0;
+    let readMs = 0;
+    let hashMs = 0;
+    let lastYieldAt = monotonicNow();
+    try {
+        await reader.verify();
+        while (offset < source.fingerprint.size) {
+            throwIfWorkAborted(signal);
+            const feedBytes = Math.min(getHashTuning().feedBytes, admittedFeedCeiling);
+            if (!Number.isSafeInteger(feedBytes) || feedBytes <= 0) {
+                throw new RangeError("invalid desktop renderer feed size");
+            }
+            const size = Math.min(feedBytes, source.fingerprint.size - offset);
+            const readStarted = monotonicNow();
+            const data = await reader.read(offset, size);
+            readMs += Math.max(0, monotonicNow() - readStarted);
+            throwIfWorkAborted(signal);
+            if (data.byteLength !== size) {
+                throw new HashWorkerFileDriftError("desktop ranged preparation returned a truncated read");
+            }
+            const hashStarted = monotonicNow();
+            processor.update(data);
+            hashMs += observeHashStep(data.byteLength, hashStarted);
+            offset += data.byteLength;
+            if (monotonicNow() - lastYieldAt >= getHashTuning().yieldBudgetMs) {
+                await yieldWork({ perf, signal });
+                lastYieldAt = monotonicNow();
+            }
+        }
+        throwIfWorkAborted(signal);
+        const finalizeStarted = monotonicNow();
+        const value = mode === "hash"
+            ? (processor as WasmHasher).finalize()
+            : (processor as WasmChunker).finish();
+        hashMs += Math.max(0, monotonicNow() - finalizeStarted);
+        await reader.verify();
+        throwIfWorkAborted(signal);
+        const common = {
+            type: "result" as const,
+            job_id: `renderer-range-${mode}`,
+            size: source.fingerprint.size,
+            mtime: source.fingerprint.mtime,
+            fingerprint: source.fingerprint,
+            read_ms: readMs,
+            hash_ms: hashMs,
+        };
+        return mode === "hash"
+            ? { ...common, mode, hash: value as string }
+            : { ...common, mode, manifest: value };
+    } finally {
+        processor.free();
     }
 }
 

@@ -12,7 +12,7 @@ publish before a 25,000-file review completes, while deletion review, journal
 ownership, dependency cuts, and the mandatory complete review remain
 fail-closed. P4/Yjs/CRDT remains dormant by explicit scope decision.
 
-The implementation is staged as `1.12.1`. Local release gates and exact-build
+The implementation is staged as `1.12.2`. Local release gates and exact-build
 identity checks are required before deployment; remote CI, release artifacts,
 tagging, publication, and real-device numerical evidence remain separate gates.
 
@@ -123,6 +123,23 @@ completely and requires a 256-object WS CHECK to finish without a global waiter.
 The parent upload plan also includes the WS error-response floor, including for
 singleton and zero-byte content, so the borrowed child check cannot exceed the
 work quota by the fixed response allowance.
+
+The next Windows restart completed that previously blocked presence check and
+committed five of thirteen recovered files. The remaining eight large GIF files
+exposed a separate capability gap: when `worker_threads` construction failed,
+the desktop client stopped resolving a native path and therefore fell back to a
+whole-file renderer allocation before FastCDC. Files above that allocation
+ceiling were deferred and immediately retried without reaching chunking.
+
+Desktop chunked sources now retain the ranged path independently of worker-pool
+availability. A worker-less renderer pass opens a fingerprint-qualified file
+handle, feeds the shared WASM hasher or FastCDC chunker in adaptive bounded
+slices, yields cooperatively, verifies the handle and pathname before and after
+each pass, and then uploads only ranges selected by the server bitmap. A runtime
+worker failure joins its native cleanup before using the same path. Whole-file
+`DataAdapter.read` is not used. Focused regression coverage includes both a
+missing pool and a failed worker, exact source consumption, feed ceilings,
+missing-range selection, manifest upload, root commit, and mobile-path isolation.
 
 ## Previous freeze checkpoint (historical evidence)
 

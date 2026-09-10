@@ -27,6 +27,11 @@ export interface DesktopRangeReader {
     close(): Promise<void>;
 }
 
+export interface QualifiedDesktopRangeSource {
+    source: DesktopRangeSource;
+    reader: DesktopRangeReader;
+}
+
 export type DesktopRangeReaderOpener = (
     source: DesktopRangeSource,
 ) => Promise<DesktopRangeReader>;
@@ -197,6 +202,50 @@ export const openDesktopRangeReader: DesktopRangeReaderOpener = async (source) =
         },
     };
 };
+
+/** Qualify a desktop path for a bounded renderer-side pass when worker_threads
+ * is unavailable. The returned handle and pathname already match the metadata
+ * captured by the journal; subsequent verify() calls fence both identities. */
+export async function openQualifiedDesktopRangeSource(
+    absolutePath: string,
+    expected: { size: number; mtime: number },
+): Promise<QualifiedDesktopRangeSource> {
+    if (
+        typeof absolutePath !== "string" || absolutePath.includes("\0") ||
+        !Number.isSafeInteger(expected.size) || expected.size < 0 ||
+        !Number.isFinite(expected.mtime) || expected.mtime < 0
+    ) {
+        throw new RangeError("invalid desktop range source qualification");
+    }
+    const { fs, path } = nodeModules();
+    if (!path.isAbsolute(absolutePath)) {
+        throw new RangeError("desktop range source must be absolute");
+    }
+    let stats: import("node:fs").Stats;
+    try {
+        stats = await fs.stat(absolutePath);
+    } catch (error) {
+        if (isVanished(error)) throw driftError("file disappeared before ranged preparation");
+        throw error;
+    }
+    const fingerprint = fingerprintFromStats(stats);
+    if (
+        !stats.isFile() ||
+        fingerprint.size !== expected.size ||
+        !timestampMatches(fingerprint.mtime, expected.mtime)
+    ) {
+        throw driftError("file changed before ranged preparation");
+    }
+    const source = { absolutePath, fingerprint };
+    const reader = await openDesktopRangeReader(source);
+    try {
+        await reader.verify();
+        return { source, reader };
+    } catch (error) {
+        try { await reader.close(); } catch { /* preserve qualification failure */ }
+        throw error;
+    }
+}
 
 function validateRanges(
     sourceSize: number,
