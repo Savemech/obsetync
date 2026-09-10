@@ -14,7 +14,7 @@ publish before a 25,000-file review completes, while deletion review, journal
 ownership, dependency cuts, and the mandatory complete review remain
 fail-closed. P4/Yjs/CRDT remains dormant by explicit scope decision.
 
-The implementation is staged as `1.12.5`. Local release gates and exact-build
+The implementation is staged as `1.12.6`. Local release gates and exact-build
 identity checks are required before deployment; remote CI, release artifacts,
 tagging, publication, and real-device numerical evidence remain separate gates.
 
@@ -143,9 +143,10 @@ worker failure joins its native cleanup before using the same path. Whole-file
 missing pool and a failed worker, exact source consumption, feed ceilings,
 missing-range selection, manifest upload, root commit, and mobile-path isolation.
 
-### 1.12.5 fallback-boundary closure
+### 1.12.5-1.12.6 fallback-boundary closure
 
-The remaining fallback-audit findings are closed in the staged 1.12.5 tree.
+The remaining fallback-audit findings are closed in the 1.12.5 implementation;
+1.12.6 carries the corrected fixed-output Nix dependency pin for publication.
 Legacy V1 conflict copies are reconstructed only from immutable, hash-verified
 server blobs or manifest chunks. Large copies use exclusive staging plus native
 append; the current local path is never accepted as the losing generation.
