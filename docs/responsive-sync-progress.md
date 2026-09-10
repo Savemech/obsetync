@@ -103,6 +103,14 @@ peaks at 18,058,752 modeled bytes, must fail under an explicit 16 MiB ceiling,
 and drains under the new ceiling. This is still a deterministic model rather
 than a measured heap/RSS or Jetsam guarantee.
 
+Normal push, pull, scan, reconcile, and journal-recovery progress is rendered
+only in the persistent status bar. Short root transactions no longer create and
+hide an Obsidian Notice for every batch; Notices remain for actionable states
+such as review, re-enrollment, conflicts, and index recovery. Local debug and
+crash exports preserve vault and host paths for diagnosis while retaining the
+existing per-line size cap; credentials remain excluded at their logging
+sources.
+
 ## Previous freeze checkpoint (historical evidence)
 
 The sections below retain the contracts and measurements recorded at each

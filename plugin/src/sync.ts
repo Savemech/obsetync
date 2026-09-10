@@ -1504,15 +1504,6 @@ export class ObsetyncSyncEngine {
                 deferred: 0, drifted: 0, readErrors: 0, uploadErrors: 0 };
         }
 
-        const notice = totalMissing >= 20
-            ? new Notice(
-                `Reconcile: uploading ${missingSmall.length} small + ` +
-                `${missingLargeManifests.length} large + ` +
-                `${missingTreeChunks.length} tree chunks...`,
-                0,
-            )
-            : null;
-
         let smallUploaded = 0;
         let largeUploaded = 0;
         let treeChunksUploaded = 0;
@@ -1530,72 +1521,68 @@ export class ObsetyncSyncEngine {
             uploadErrors += stats.uploadErrors;
         };
 
+        // Copy each immutable index pack only after exact byte admission.
+        // A failed index repair does not prevent independent content repair;
+        // no root is published by this operation.
+        const endTreeUpload = perf?.phase("tree_index_upload");
         try {
-            // Copy each immutable index pack only after exact byte admission.
-            // A failed index repair does not prevent independent content repair;
-            // no root is published by this operation.
-            const endTreeUpload = perf?.phase("tree_index_upload");
-            try {
-                await uploadIndexChunks({
-                    putObjects: async (records, operation, memory) => {
-                        await this.api.putObjects(records, operation, memory);
-                        treeChunksUploaded += records.length;
-                        const transferred = records.reduce((sum, record) => sum + record.data.byteLength, 0);
-                        bytes += transferred;
-                        perf?.increment({ bytesTransferred: transferred });
-                    },
-                }, this.wasm, this.tree, missingTreeChunks, perf,
-                () => this.waitForHeavyWork("reconcile index upload"), signal,
-                assertCommittedTreeCurrent);
-            } catch (error) {
-                throwIfWorkAborted(signal);
-                if ((error as Error)?.name === "AbortError" || error instanceof ResourceBudgetClosedError) throw error;
-                const incomplete = missingTreeChunks.length - treeChunksUploaded;
-                deferred += incomplete;
-                uploadErrors += incomplete;
-            } finally { endTreeUpload?.(); }
+            await uploadIndexChunks({
+                putObjects: async (records, operation, memory) => {
+                    await this.api.putObjects(records, operation, memory);
+                    treeChunksUploaded += records.length;
+                    const transferred = records.reduce((sum, record) => sum + record.data.byteLength, 0);
+                    bytes += transferred;
+                    perf?.increment({ bytesTransferred: transferred });
+                },
+            }, this.wasm, this.tree, missingTreeChunks, perf,
+            () => this.waitForHeavyWork("reconcile index upload"), signal,
+            assertCommittedTreeCurrent);
+        } catch (error) {
+            throwIfWorkAborted(signal);
+            if ((error as Error)?.name === "AbortError" || error instanceof ResourceBudgetClosedError) throw error;
+            const incomplete = missingTreeChunks.length - treeChunksUploaded;
+            deferred += incomplete;
+            uploadErrors += incomplete;
+        } finally { endTreeUpload?.(); }
 
-            const small = await repairSmallContent(this.api, this.io, this.wasm,
-                missingSmall.map(hash => ({ hash, ...smallByHash.get(hash)! })), {
+        const small = await repairSmallContent(this.api, this.io, this.wasm,
+            missingSmall.map(hash => ({ hash, ...smallByHash.get(hash)! })), {
+                signal, perf,
+                beforeHeavyBatch: () => this.waitForHeavyWork("reconcile content"),
+                onProgress: (checked, stats) => {
+                    const msg = `reconcile: ${checked}/${missingSmall.length} files · ${formatBytes(bytes + stats.bytes)} · ${stats.deferred} deferred`;
+                    progress(msg);
+                },
+            });
+        smallUploaded = small.uploaded;
+        bytes += small.bytes;
+        addFailures(small);
+
+        for (let index = 0; index < missingLargeManifests.length; index++) {
+            throwIfWorkAborted(signal);
+            const hash = missingLargeManifests[index];
+            const source = largeByHash.get(hash)!;
+            const msg = `reconcile: large file ${index + 1}/${missingLargeManifests.length}`;
+            progress(msg);
+            const result = await repairLargeContent(this.api, this.io, this.wasm,
+                { hash, ...source }, this.hashWorkers ?? undefined, {
                     signal, perf,
-                    beforeHeavyBatch: () => this.waitForHeavyWork("reconcile content"),
-                    onProgress: (checked, stats) => {
-                        const msg = `reconcile: ${checked}/${missingSmall.length} files · ${formatBytes(bytes + stats.bytes)} · ${stats.deferred} deferred`;
-                        progress(msg);
-                        notice?.setMessage(msg);
-                    },
+                    beforeHeavyBatch: () => this.waitForHeavyWork("large-file reconcile"),
                 });
-            smallUploaded = small.uploaded;
-            bytes += small.bytes;
-            addFailures(small);
+            largeUploaded += result.uploaded;
+            bytes += result.bytes;
+            contentBytesNeeded += result.neededBytes;
+            addFailures(result);
+        }
 
-            for (let index = 0; index < missingLargeManifests.length; index++) {
-                throwIfWorkAborted(signal);
-                const hash = missingLargeManifests[index];
-                const source = largeByHash.get(hash)!;
-                const msg = `reconcile: large file ${index + 1}/${missingLargeManifests.length}`;
-                progress(msg);
-                notice?.setMessage(msg);
-                const result = await repairLargeContent(this.api, this.io, this.wasm,
-                    { hash, ...source }, this.hashWorkers ?? undefined, {
-                        signal, perf,
-                        beforeHeavyBatch: () => this.waitForHeavyWork("large-file reconcile"),
-                    });
-                largeUploaded += result.uploaded;
-                bytes += result.bytes;
-                contentBytesNeeded += result.neededBytes;
-                addFailures(result);
-            }
-
-            const summary =
-                `reconcile ${deferred ? "incomplete" : "done"}: ${smallUploaded} small, ${largeUploaded} large, ` +
-                `${treeChunksUploaded} tree chunks, ${formatBytes(bytes)}; ${deferred} deferred ` +
-                `(${drifted} drifted, ${readErrors} read errors, ${uploadErrors} upload errors)`;
-            console.log(`[obsetync] ${summary}`);
-            progress(summary);
-            perf?.setWorkload({ bytesNeeded: contentBytesNeeded });
-            return { smallUploaded, largeUploaded, treeChunksUploaded, bytes, deferred, drifted, readErrors, uploadErrors };
-        } finally { notice?.hide(); }
+        const summary =
+            `reconcile ${deferred ? "incomplete" : "done"}: ${smallUploaded} small, ${largeUploaded} large, ` +
+            `${treeChunksUploaded} tree chunks, ${formatBytes(bytes)}; ${deferred} deferred ` +
+            `(${drifted} drifted, ${readErrors} read errors, ${uploadErrors} upload errors)`;
+        console.log(`[obsetync] ${summary}`);
+        progress(summary);
+        perf?.setWorkload({ bytesNeeded: contentBytesNeeded });
+        return { smallUploaded, largeUploaded, treeChunksUploaded, bytes, deferred, drifted, readErrors, uploadErrors };
     }
 
     /** Force a full vault scan (Layer 4). Doubles as the recovery action for
@@ -1642,7 +1629,6 @@ export class ObsetyncSyncEngine {
         this.onStatusUpdate("sync ⟳");
         const perf = perfTrace.begin("scan");
         let perfOutcome: PerfOutcome = "success";
-        const notice = new Notice("Scanning vault...", 0);
         console.log("[obsetync] full scan started");
         const endSpan = perfSpan("scan.full");
         let operationId: string | undefined;
@@ -1922,9 +1908,6 @@ export class ObsetyncSyncEngine {
                 // the old placement (inside the flush guard) meant vaults with
                 // <500 changes showed "Scanning vault..." frozen to the end.
                 const done = i;
-                notice.setMessage(
-                    `Obsetync: scanning ${done}/${toHash.length} · ${totalChanges} changed`,
-                );
                 this.onStatusUpdate(`⟳ ${done}/${toHash.length}`);
                 this.progressHeartbeat("fullScan", `${done}/${toHash.length} hashed, ${totalChanges} changed`);
                 if (operationId) {
@@ -2002,7 +1985,6 @@ export class ObsetyncSyncEngine {
                 lifecycleWork?.release();
                 perf.finish(perfOutcome);
                 endSpan();
-                notice.hide();
                 this.syncing = false;
                 this.state = scanFailed ? "error" : "idle";
                 if (!lifecycleQuiesced) this.onStatusUpdate(scanFailed ? "sync ✗" : this.pendingIdleStatus());
@@ -2394,23 +2376,12 @@ export class ObsetyncSyncEngine {
         let workSignal = this.hashWorkerAbort.signal;
         let lifecycleQuiesced = false;
 
-        // Live progress: every tick lands in the status bar; a persistent
-        // Notice appears only once REAL work is detected (first-sync or a
-        // non-trivial delta), so idle 30s polls stay silent. A 31-minute
-        // first-sync once ran with zero feedback because this callback was
-        // simply never passed — pull's per-batch ticks all landed in void.
-        // (ref-object because TS control-flow can't see the closure assign)
-        const noticeRef: { n: Notice | null } = { n: null };
+        // Normal operation progress belongs in the stable status bar. Notices
+        // are reserved for actionable or terminal events, never batch ticks.
         let pullFailed = false;
         const progress = (msg: string) => {
             if (this.stopped) throw new Error("sync engine stopped");
             this.onStatusUpdate(`↓ ${msg}`);
-            const isRealWork = /files applied|changes to apply|first sync/.test(msg);
-            if (noticeRef.n) {
-                noticeRef.n.setMessage(`Obsetync ↓ ${msg}`);
-            } else if (isRealWork) {
-                noticeRef.n = new Notice(`Obsetync ↓ ${msg}`, 0);
-            }
             this.progressHeartbeat("pull", msg);
             if (operationId) this.operationCheckpoint?.progress(operationId, msg);
         };
@@ -2578,7 +2549,6 @@ export class ObsetyncSyncEngine {
                 lifecycleWork?.release();
                 perf.finish(perfOutcome);
                 endSpan();
-                noticeRef.n?.hide();
                 this.syncing = false;
                 if (lifecycleQuiesced && !this.stopped) this.state = "idle";
             }
@@ -3349,7 +3319,6 @@ export class ObsetyncSyncEngine {
         // legacy mode still detaches a coalesced snapshot. Both freshly stat
         // selected sources and verify bytes before publication.
         let operationId: string | undefined;
-        let notice: Notice | null = null;
         let pushFailed = false;
         let lifecycleQuiesced = false;
         // A failed negotiation is not permission for a legacy retry loop.
@@ -3548,8 +3517,6 @@ export class ObsetyncSyncEngine {
             );
             this.onStatusUpdate(`↑ 0/${batch.length}`);
 
-            // Show a persistent notice for batches large enough to care about.
-            notice = batch.length >= 5 ? new Notice(`↑ 0/${batch.length}`, 0) : null;
             const preparedJournalCuts = new Map<string, number>();
             if (this.preparedTransfers || transaction) {
                 for (const change of transactionQueued) if (change.journalId !== undefined) {
@@ -3578,7 +3545,6 @@ export class ObsetyncSyncEngine {
                 (text) => {
                     if (this.stopped) throw new Error("sync engine stopped");
                     this.onStatusUpdate(text);
-                    notice?.setMessage(text);
                     if (operationId) this.operationCheckpoint?.progress(operationId, text);
                 },
                 perf,
@@ -3822,9 +3788,6 @@ export class ObsetyncSyncEngine {
             }
             if (!this.stopped && !lifecycleQuiesce && !retainedReview && !repeatedBootstrapRefusal) {
                 this.recordSyncFailure("push", e);
-                notice?.setMessage(
-                    this.reenrollmentRequired ? "Obsetync: re-enrollment required" : "sync ✗ error",
-                );
             }
             if (bootstrapRefusal) this.pushBootstrapReportedRefusal = e;
             if (retainedReview) {
@@ -3838,7 +3801,6 @@ export class ObsetyncSyncEngine {
                 lifecycleWork?.release();
                 perf.finish(perfOutcome);
                 endSpan();
-                notice?.hide();
                 this.syncing = false;
                 if (lifecycleQuiesced && !this.stopped) this.state = "idle";
             }
@@ -3947,55 +3909,47 @@ export class ObsetyncSyncEngine {
         console.log(
             `[obsetync] recovering ${unsyncedCount} changes from journal`
         );
-        const notice =
-            unsyncedCount >= 20
-                ? new Notice(`Obsetync: recovering ${unsyncedCount} journaled changes…`, 0)
-                : null;
-
         const recovered = new DirtyPathSet();
         let processed = 0;
-        try {
-            for (const entry of unsynced) {
-                throwIfWorkAborted(this.hashWorkerAbort.signal);
-                // No reads or hashes during recovery: one final-state stat happens
-                // immediately before push. The captured index shares immutable
-                // metadata; coalesced hints and unresolved rename dependencies
-                // still use metadata proportional to pending work.
-                if (entry.action === "renamed" && entry.oldPath) {
-                    this.deferredChanges.registerLegacyRename(entry.oldPath, entry.path, entry.id);
-                }
-                recovered.add(
-                    {
-                        action: entry.action === "created" ? "created" :
-                            entry.action === "deleted" ? "deleted" : "modified",
-                        path: entry.path,
-                        ...(entry.hash !== undefined ? { hash: entry.hash } : {}),
-                        ...(entry.mtime !== undefined ? { mtime: entry.mtime } : {}),
-                        ...(entry.size !== undefined ? { size: entry.size } : {}),
-                    },
-                    entry.id,
-                );
-                if (entry.action === "renamed" && entry.oldPath) {
-                    recovered.add({ action: "deleted", path: entry.oldPath }, entry.id);
-                }
-                processed++;
-                if (processed % 256 === 0 || processed === unsyncedCount) {
-                    this.onStatusUpdate(`⟳ journal ${processed}/${unsyncedCount}`);
-                    notice?.setMessage(`Obsetync: journal recovery ${processed}/${unsyncedCount}`);
-                    this.progressHeartbeat("journal", `${processed}/${unsyncedCount}`);
-                    await yieldToUI({ signal: this.hashWorkerAbort.signal, lane: "maintenance" });
-                }
+        for (const entry of unsynced) {
+            throwIfWorkAborted(this.hashWorkerAbort.signal);
+            // No reads or hashes during recovery: one final-state stat happens
+            // immediately before push. The captured index shares immutable
+            // metadata; coalesced hints and unresolved rename dependencies
+            // still use metadata proportional to pending work.
+            if (entry.action === "renamed" && entry.oldPath) {
+                this.deferredChanges.registerLegacyRename(entry.oldPath, entry.path, entry.id);
             }
-            // Merge each unique old path once. Live callbacks may have completed
-            // during the yields; preserve those newer hints and carry only the
-            // older WAL watermark into their eventual successful publication.
-            const hints = recovered.take();
-            for (let offset = 0; offset < hints.length; offset += 256) {
-                throwIfWorkAborted(this.hashWorkerAbort.signal);
-                this.pendingChanges.restoreJournal(hints.slice(offset, offset + 256));
+            recovered.add(
+                {
+                    action: entry.action === "created" ? "created" :
+                        entry.action === "deleted" ? "deleted" : "modified",
+                    path: entry.path,
+                    ...(entry.hash !== undefined ? { hash: entry.hash } : {}),
+                    ...(entry.mtime !== undefined ? { mtime: entry.mtime } : {}),
+                    ...(entry.size !== undefined ? { size: entry.size } : {}),
+                },
+                entry.id,
+            );
+            if (entry.action === "renamed" && entry.oldPath) {
+                recovered.add({ action: "deleted", path: entry.oldPath }, entry.id);
+            }
+            processed++;
+            if (processed % 256 === 0 || processed === unsyncedCount) {
+                this.onStatusUpdate(`⟳ journal ${processed}/${unsyncedCount}`);
+                this.progressHeartbeat("journal", `${processed}/${unsyncedCount}`);
                 await yieldToUI({ signal: this.hashWorkerAbort.signal, lane: "maintenance" });
             }
-        } finally { notice?.hide(); }
+        }
+        // Merge each unique old path once. Live callbacks may have completed
+        // during the yields; preserve those newer hints and carry only the
+        // older WAL watermark into their eventual successful publication.
+        const hints = recovered.take();
+        for (let offset = 0; offset < hints.length; offset += 256) {
+            throwIfWorkAborted(this.hashWorkerAbort.signal);
+            this.pendingChanges.restoreJournal(hints.slice(offset, offset + 256));
+            await yieldToUI({ signal: this.hashWorkerAbort.signal, lane: "maintenance" });
+        }
     }
 
     /** Layer 3: metadata audit — detect any stat drift and offline deletion. */
@@ -4113,106 +4067,92 @@ export class ObsetyncSyncEngine {
                     if (item.stat.size >= LARGE_FILE_THRESHOLD) return 0;
                     return perfSampleWeight(hashOrdinal++, hashableTotal);
                 });
-                const notice = plan.toHash.length >= 20
-                    ? new Notice(
-                        `Obsetync: checking ${plan.toHash.length} recently-touched files…`,
-                        0,
-                    )
-                    : null;
-                try {
-                    for (let i = 0; i < plan.toHash.length;) {
-                        await this.waitForHeavyWork("metadata scan", undefined, workSignal);
-                        const batch = plan.toHash.slice(i, i + getHashTuning().readConcurrency);
-                        perf.setDemand({ read: plan.toHash.length - i, hash: plan.toHash.length - i });
-                        perf.observePeakBatchBytes(batch.reduce((sum, item) => {
-                            const residentBytes = this.io.getAbsolutePath(item.path)
-                                ? Math.min(item.stat.size, getHashTuning().feedBytes)
-                                : item.stat.size;
-                            return sum + residentBytes;
-                        }, 0));
-                        const endBatch = perf.phase("scan_batch");
-                        const results = await joinStartedWork(
-                            batch.map(async ({ path, stat }, batchIndex) => {
-                                const knownHash = this.syncBase.getHash(path);
-                                if (stat.size >= LARGE_FILE_THRESHOLD) {
-                                    return {
-                                        kind: "change" as const,
-                                        path,
-                                        stat,
-                                        hash: undefined as string | undefined,
-                                        knownHash,
-                                    };
-                                }
-                                const itemIndex = i + batchIndex;
-                                const sampleWeight = hashSampleWeights[itemIndex];
-                                const stable = await this.hashStableFile(
-                                    path,
-                                    stat,
-                                    sampleWeight > 0 ? perf : undefined,
-                                    sampleWeight,
-                                    workSignal,
-                                );
-                                if (stable.hash === knownHash) {
-                                    return {
-                                        kind: "metadata" as const,
-                                        path,
-                                        stat: stable.stat,
-                                    };
-                                }
+                for (let i = 0; i < plan.toHash.length;) {
+                    await this.waitForHeavyWork("metadata scan", undefined, workSignal);
+                    const batch = plan.toHash.slice(i, i + getHashTuning().readConcurrency);
+                    perf.setDemand({ read: plan.toHash.length - i, hash: plan.toHash.length - i });
+                    perf.observePeakBatchBytes(batch.reduce((sum, item) => {
+                        const residentBytes = this.io.getAbsolutePath(item.path)
+                            ? Math.min(item.stat.size, getHashTuning().feedBytes)
+                            : item.stat.size;
+                        return sum + residentBytes;
+                    }, 0));
+                    const endBatch = perf.phase("scan_batch");
+                    const results = await joinStartedWork(
+                        batch.map(async ({ path, stat }, batchIndex) => {
+                            const knownHash = this.syncBase.getHash(path);
+                            if (stat.size >= LARGE_FILE_THRESHOLD) {
                                 return {
                                     kind: "change" as const,
                                     path,
-                                    stat: stable.stat,
-                                    hash: stable.hash,
+                                    stat,
+                                    hash: undefined as string | undefined,
                                     knownHash,
                                 };
-                            }),
-                        ).finally(endBatch);
-                        for (const result of results) {
-                            if (result.kind === "metadata") {
-                                if (this.syncBase.refreshLocalMetadata(
-                                    result.path,
-                                    result.stat.mtime,
-                                    result.stat.size,
-                                )) {
-                                    metadataRefreshes++;
-                                    metadataRefreshesSinceCheckpoint++;
-                                }
-                                continue;
                             }
-                            found++;
-                            changedBytes += result.stat.size;
-                            const change: FileChange = {
-                                action: result.knownHash ? "modified" : "created",
-                                path: result.path,
-                                mtime: result.stat.mtime,
-                                size: result.stat.size,
+                            const itemIndex = i + batchIndex;
+                            const sampleWeight = hashSampleWeights[itemIndex];
+                            const stable = await this.hashStableFile(
+                                path,
+                                stat,
+                                sampleWeight > 0 ? perf : undefined,
+                                sampleWeight,
+                                workSignal,
+                            );
+                            if (stable.hash === knownHash) {
+                                return {
+                                    kind: "metadata" as const,
+                                    path,
+                                    stat: stable.stat,
+                                };
+                            }
+                            return {
+                                kind: "change" as const,
+                                path,
+                                stat: stable.stat,
+                                hash: stable.hash,
+                                knownHash,
                             };
-                            if (result.hash !== undefined) change.hash = result.hash;
-                            durablePending.push(change);
-                            if (durablePending.length >= 256) await flushDurablePending();
+                        }),
+                    ).finally(endBatch);
+                    for (const result of results) {
+                        if (result.kind === "metadata") {
+                            if (this.syncBase.refreshLocalMetadata(
+                                result.path,
+                                result.stat.mtime,
+                                result.stat.size,
+                            )) {
+                                metadataRefreshes++;
+                                metadataRefreshesSinceCheckpoint++;
+                            }
+                            continue;
                         }
-                        perf.increment({ filesCompleted: batch.length });
-                        i += batch.length;
-                        perf.setDemand({});
-                        if (metadataRefreshesSinceCheckpoint >= 500) {
-                            await this.syncBase.checkpoint();
-                            metadataRefreshesSinceCheckpoint = 0;
-                        }
-                        await yieldToUI({ signal: workSignal, perf, lane: "maintenance" });
-                        const done = i;
-                        this.onStatusUpdate(`⟳ scan ${done}/${plan.toHash.length}`);
-                        notice?.setMessage(
-                            `Obsetync: metadata scan ${done}/${plan.toHash.length} ` +
-                            `· ${found} changed`,
-                        );
-                        this.progressHeartbeat(
-                            "mtimeScan",
-                            `${done}/${plan.toHash.length}, ${found} changed`,
-                        );
+                        found++;
+                        changedBytes += result.stat.size;
+                        const change: FileChange = {
+                            action: result.knownHash ? "modified" : "created",
+                            path: result.path,
+                            mtime: result.stat.mtime,
+                            size: result.stat.size,
+                        };
+                        if (result.hash !== undefined) change.hash = result.hash;
+                        durablePending.push(change);
+                        if (durablePending.length >= 256) await flushDurablePending();
                     }
-                } finally {
-                    notice?.hide();
+                    perf.increment({ filesCompleted: batch.length });
+                    i += batch.length;
+                    perf.setDemand({});
+                    if (metadataRefreshesSinceCheckpoint >= 500) {
+                        await this.syncBase.checkpoint();
+                        metadataRefreshesSinceCheckpoint = 0;
+                    }
+                    await yieldToUI({ signal: workSignal, perf, lane: "maintenance" });
+                    const done = i;
+                    this.onStatusUpdate(`⟳ scan ${done}/${plan.toHash.length}`);
+                    this.progressHeartbeat(
+                        "mtimeScan",
+                        `${done}/${plan.toHash.length}, ${found} changed`,
+                    );
                 }
             }
             await flushDurablePending();

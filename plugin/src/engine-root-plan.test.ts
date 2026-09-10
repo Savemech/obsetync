@@ -1187,7 +1187,19 @@ process.once("beforeExit", () => { if (!completed && !process.exitCode) { consol
 async function run() {
     assert(process.execArgv.includes("--unhandled-rejections=strict"));
     const globals = globalThis as any, previousNotice = globals.__obsetyncTestNotice, previousDebounce = globals.__obsetyncTestDebounce;
-    const notice = () => ({ setMessage() {}, hide() {} }), debounce = () => () => {};
+    const progressNotices: string[] = [];
+    const isProgressNotice = (message: unknown) =>
+        /^(?:↑|Obsetync ↓|Scanning vault|Obsetync: scanning|Obsetync: recovering|Obsetync: journal recovery|Obsetync: checking|Reconcile:|reconcile:)/.test(String(message));
+    const notice = (message: unknown) => {
+        if (isProgressNotice(message)) progressNotices.push(String(message));
+        return {
+            setMessage(next: unknown) {
+                if (isProgressNotice(next)) progressNotices.push(String(next));
+            },
+            hide() {},
+        };
+    };
+    const debounce = () => () => {};
     globals.__obsetyncTestNotice = notice; globals.__obsetyncTestDebounce = debounce;
     const filter = process.env.OBSETYNC_ENGINE_PLAN_CASE;
     if (filter !== undefined) assert(Object.prototype.hasOwnProperty.call(suites, filter), "unknown engine plan test case");
@@ -1195,6 +1207,7 @@ async function run() {
     const timeout = setTimeout(() => { throw new Error("engine-root-plan suite exceeded its bounded fixture watchdog"); }, 45_000);
     try {
         for (const [name, test] of selected) { await test(); console.log(`engine-root-plan.test: ${name} passed`); }
+        assert(progressNotices.length === 0, `normal progress opened or updated ${progressNotices.length} Notice instances`);
         console.log(`engine-root-plan.test: ${selected.length} actual engine reviewed-queue suites passed (synthetic tree/transport)`);
         completed = true;
     } finally {
