@@ -1,6 +1,8 @@
 import { strict as assert } from "node:assert";
 import { createHash } from "node:crypto";
-import { RootConflictPreserver, rootConflictCopyPath } from "./root-conflicts";
+import { legacyConflictStagingKey, preserveVerifiedConflictCopy,
+    RootConflictPreserver, rootConflictCopyPath } from "./root-conflicts";
+import { conflictCopyPath } from "./conflict-path";
 import { RootIntentStore, type StoredRootIntent } from "./root-intent";
 import { RootSettlementCoordinator } from "./root-settlement";
 import { ObsetyncSyncBase } from "./sync-base";
@@ -215,6 +217,26 @@ async function pathsAndCapabilities() {
         "reader-unavailable", "large portable verifier bypassed whole read ceiling");
     check(!existing.files.calls.length, "large verifier allocated through DataAdapter readFile");
 }
+async function legacyCopyUsesOnlyImmutableObjects() {
+    const f = await fixture(2200000);
+    f.files.data.set("note.md", new Uint8Array([99, 99, 99]));
+    const destination = conflictCopyPath("note.md", "Desktop", new Date(2026, 8, 10, 12, 30));
+    const stagingKey = await legacyConflictStagingKey("note.md", f.digest);
+    check(stagingKey !== await legacyConflictStagingKey("other.md", f.digest),
+        "legacy staging owners merged unrelated paths with the same content");
+    await preserveVerifiedConflictCopy(f.api, f.files.io, { Hasher }, {
+        path: "note.md",
+        copyPath: destination,
+        hash: f.digest,
+        size: f.content.length,
+        stagingKey,
+    });
+    same(f.files.data.get(destination), f.content, "legacy copy did not reconstruct the exact losing generation");
+    check(!f.files.calls.some(call => call.method === "read" && call.path === "note.md"),
+        "legacy copy read the mutable local source");
+    check(f.counters().used === 0 && f.counters().requests === f.counters().releases,
+        "legacy immutable download leaked its admitted owner");
+}
 async function copyReceiptFailureAndFreshStaging() {
     for (const phase of ["before", "after"] as const) {
         const f = await fixture(); let injected = false;
@@ -298,6 +320,7 @@ async function closeStopsUndispatchedWork() {
 }
 async function run() {
     await freshAndRecorded(); await ambiguousCopiesAndRestart(); await copyOwnerRacesAndFailure(); await pathsAndCapabilities();
+    await legacyCopyUsesOnlyImmutableObjects();
     await copyReceiptFailureAndFreshStaging();
     await closeStopsUndispatchedWork();
     console.log(`root-conflicts: ${assertions} assertions passed`);

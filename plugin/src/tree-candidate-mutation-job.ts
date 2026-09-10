@@ -77,6 +77,8 @@ export interface ApplyTreeCandidateMutationOptions {
     onOutputMemoryPlan?(plan: CandidateMutationOutputMemoryPlan): CandidateMutationOutputOwner | undefined;
     /** Monotonic test seam. Production uses performance.now()/Date.now(). */
     now?: () => number;
+    /** Refuse the synchronous candidate mutation compatibility path. */
+    requireIncremental?: boolean;
 }
 
 const RETIREMENT_UNITS = 256;
@@ -617,7 +619,8 @@ export async function applyTreeCandidateMutation(
         (options.onCandidateMutated !== undefined && typeof options.onCandidateMutated !== "function") ||
         (options.cooperateRetirement !== undefined && typeof options.cooperateRetirement !== "function") ||
         (options.onOutputMemoryPlan !== undefined && typeof options.onOutputMemoryPlan !== "function") ||
-        (options.now !== undefined && typeof options.now !== "function")) {
+        (options.now !== undefined && typeof options.now !== "function") ||
+        (options.requireIncremental !== undefined && typeof options.requireIncremental !== "boolean")) {
         throw new TypeError("candidate mutation requires host cooperation and a fallback");
     }
     const { cooperate, signal, assertCurrent: assertOwner, legacy,
@@ -649,6 +652,9 @@ export async function applyTreeCandidateMutation(
     assertCurrent();
 
     if (!jobs) {
+        if (options.requireIncremental) {
+            throw new TypeError("incremental candidate mutation API is required");
+        }
         legacy();
         onCandidateMutated();
         assertCurrent();

@@ -2802,6 +2802,7 @@ async function mobileCapabilityFailureDefersWithoutBlocking(): Promise<void> {
             { action: "created", path: "independent.md", size: 1, mtime: 8, hash: smallHash },
         ], "base");
         check(outcome.deferred?.length === 1 && outcome.deferred[0].path === "unsupported-large.bin" &&
+            outcome.deferred[0].reason === "range-unavailable" &&
             outcome.newRootHash === "accepted", "mobile capability failure blocked independent publication");
         check(f.entries.has("independent.md") && !f.entries.has("unsupported-large.bin") &&
             wholeReads === 0 && opens === 1 && chunkers === 0,

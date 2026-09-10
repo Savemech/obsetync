@@ -140,7 +140,12 @@ async function fixture(count = 1) {
             phase: "plan" | "build" | "ready"; completed: number; processed: number;
             arenaLimit: number; offset: number; bytes?: Uint8Array };
         type BeginJob = { kind: "begin"; token: number; done: boolean };
-        let job: RootJob | BeginJob | null = null, nextToken = 1, committedRevision = 0, rootHashReads = 0;
+        type ChunkJob = { kind: "chunks"; token: number; done: boolean; resumed: boolean };
+        type MutationJob = { kind: "mutation"; token: number; operation: "update" | "delete";
+            payload: string; done: boolean };
+        type RetireJob = { kind: "retire"; token: number };
+        let job: RootJob | BeginJob | ChunkJob | MutationJob | RetireJob | null = null;
+        let nextToken = 1, committedRevision = 0, candidateRevision = 0, rootHashReads = 0;
         const treeState = { commits: 0, aborts: 0, repairs: 0,
             rootExports: 0, rootBuilds: 0, rootReads: 0, rootFinishes: 0, rootCancels: 0,
             get committedRevision() { return committedRevision; },
@@ -171,6 +176,7 @@ async function fixture(count = 1) {
         const tree = {
             tree_version: () => 1,
             committed_revision: () => committedRevision,
+            candidate_revision: () => candidateRevision,
             bump_committed_revision_for_test: () => { committedRevision++; },
             set_committed_revision_for_test: (value: number) => { committedRevision = value; },
             root_hash_hex: () => { rootHashReads++; return treeRoot(committed); },
@@ -184,7 +190,34 @@ async function fixture(count = 1) {
             },
             finish_candidate_job(token: number) {
                 assert(job?.kind === "begin" && job.done); assert.equal(job.token, token);
-                candidate = new Map(committed); job = null; return 0;
+                candidate = new Map(committed); job = null; candidateRevision++; return 0;
+            },
+            begin_candidate_chunks_job() {
+                idle(); assert(candidate);
+                job = { kind: "chunks", token: nextToken++, done: false, resumed: false }; return job.token;
+            },
+            finish_candidate_chunks_job(token: number) {
+                assert(job?.kind === "chunks" && job.done); assert.equal(job.token, token);
+                job = null; return { all: [], fresh: [] };
+            },
+            begin_candidate_update_job(payload: string) {
+                idle(); assert(candidate);
+                job = { kind: "mutation", token: nextToken++, operation: "update", payload, done: false };
+                return job.token;
+            },
+            begin_candidate_delete_job(payload: string) {
+                idle(); assert(candidate);
+                job = { kind: "mutation", token: nextToken++, operation: "delete", payload, done: false };
+                return job.token;
+            },
+            finish_candidate_mutation_job(token: number) {
+                assert(job?.kind === "mutation" && job.done); assert.equal(job.token, token); assert(candidate);
+                if (job.operation === "update") {
+                    for (const [path, entry] of fromRows(job.payload)) candidate.set(path, entry);
+                } else {
+                    for (const path of JSON.parse(job.payload)) candidate.delete(path);
+                }
+                job = null; candidateRevision++;
             },
             begin_candidate_root_export_job(arenaLimit: number) {
                 assert(candidate); return beginRoot(candidate, arenaLimit, "candidate");
@@ -195,8 +228,65 @@ async function fixture(count = 1) {
             step_tree_job(token: number, maxUnits: number) {
                 assert(job); assert.equal(job.token, token);
                 assert(Number.isInteger(maxUnits) && maxUnits >= 1 && maxUnits <= 256);
-                assert.equal(job.kind, "begin"); assert.equal(job.done, false); job.done = true;
+                assert(job.kind === "begin" || job.kind === "mutation");
+                assert.equal(job.done, false); job.done = true;
                 return { done: true, units: 1, completed: 1, remaining: 0, reachable: 0 };
+            },
+            step_reachability_job_deferred(token: number, maxUnits: number) {
+                assert(job?.kind === "begin" || job?.kind === "chunks");
+                assert.equal(job.token, token); assert.equal(maxUnits, 1); assert.equal(job.done, false);
+                job.done = true;
+                return { done: true, units: 0, completed: 0, remaining: 0, reachable: 0 };
+            },
+            finish_candidate_job_deferred(token: number) {
+                const finish = tree.finish_candidate_job;
+                const reachable = finish.call(tree, token);
+                job = { kind: "retire", token };
+                return reachable;
+            },
+            finish_candidate_chunks_job_deferred(token: number) {
+                const finish = tree.finish_candidate_chunks_job;
+                const result = finish.call(tree, token);
+                job = { kind: "retire", token };
+                return result;
+            },
+            cancel_reachability_job_deferred(token: number) {
+                assert(job); assert.equal(job.token, token);
+                job = { kind: "retire", token };
+            },
+            step_reachability_retirement(token: number, completed: number, maxUnits: number) {
+                assert(job?.kind === "retire"); assert.equal(job.token, token);
+                assert.equal(completed, 0); assert.equal(maxUnits, 256);
+                return { done: true, units: 0, completed: 0 };
+            },
+            finish_reachability_retirement(token: number, completed: number) {
+                assert(job?.kind === "retire"); assert.equal(job.token, token); assert.equal(completed, 0);
+                job = null;
+            },
+            candidate_chunks_sort_memory_plan_v1_job(token: number) {
+                assert(job?.kind === "chunks" && job.done); assert.equal(job.token, token);
+                return { schema: 1, scope: "candidate-chunk-plan-sort-workspace", hashCount: 0,
+                    hashSizeBytes: 32, sourceHashesRequestedBytes: 0, scratchHashesRequestedBytes: 0,
+                    peakAdmissionBytes: 0, reachableSetUnmeasured: true, pageOutputUnmeasured: true,
+                    sortStrategy: "stable-lsd-radix-v1", pageMaxHashes: 256 };
+            },
+            resume_candidate_chunks_sort_memory_v1_job(token: number, source: number, scratch: number) {
+                assert(job?.kind === "chunks" && job.done); assert.equal(job.token, token);
+                assert.equal(source, 0); assert.equal(scratch, 0); job.resumed = true;
+            },
+            step_candidate_chunks_sort_v1_job() {
+                throw new Error("empty synthetic tree unexpectedly sorted candidate chunks");
+            },
+            candidate_chunks_plan_info_v1_job(token: number) {
+                assert(job?.kind === "chunks" && job.done && job.resumed); assert.equal(job.token, token);
+                return { schema: 1, scope: "candidate-chunk-plan-pages", allCount: 0, pageMaxHashes: 256 };
+            },
+            read_candidate_chunks_page_v1_job() {
+                throw new Error("empty synthetic tree unexpectedly read a candidate chunk page");
+            },
+            finish_candidate_chunks_plan_v1_job(token: number) {
+                assert(job?.kind === "chunks" && job.done && job.resumed); assert.equal(job.token, token);
+                job = { kind: "retire", token };
             },
             step_root_export_job(token: number, maxUnits: number, maxBytes: number) {
                 const current = rootJob(token);
@@ -272,10 +362,13 @@ async function fixture(count = 1) {
             commit_candidate() {
                 idle(); assert(candidate); events.push(`${name}:candidate-commit`);
                 if (control.commitFailure) { control.commitFailure = false; throw new Error("native candidate commit failed"); }
-                committed = candidate; candidate = null; treeState.commits++; committedRevision++;
+                committed = candidate; candidate = null; treeState.commits++; committedRevision++; candidateRevision++;
                 return { before: 1, after: 1, reachable: 1, removed: 0 };
             },
-            abort_candidate() { idle(); candidate = null; treeState.aborts++; return { before: 1, after: 1, reachable: 1, removed: 0 }; },
+            abort_candidate() {
+                idle(); candidate = null; treeState.aborts++; candidateRevision++;
+                return { before: 1, after: 1, reachable: 1, removed: 0 };
+            },
             rebuild_from_entries_in_version(version: number, json: string) {
                 idle(); assert.equal(version, 1); assert.equal(candidate, null); events.push(`${name}:repair`);
                 committed = fromRows(json); treeState.repairs++; committedRevision++;

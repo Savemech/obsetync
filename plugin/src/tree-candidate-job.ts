@@ -63,6 +63,9 @@ export interface BeginTreeCandidateOptions {
     /** Synchronous ownership handoff. Once this returns, the caller must abort
      * the candidate on every pre-accept failure. */
     onCandidateOpened(reachable: number | null): void;
+    /** Refuse the synchronous whole-tree compatibility path. Production sync
+     * requires the incremental ABI; structural compatibility tests may omit it. */
+    requireIncremental?: boolean;
 }
 
 export interface CandidateOpenMemoryPlan {
@@ -106,6 +109,8 @@ export interface CollectTreeCandidateChunksOptions {
     assertCurrent?(): void;
     /** Compatibility path for structural ports or an older packaged tree. */
     legacy(): unknown;
+    /** Refuse a synchronous whole-tree compatibility result. */
+    requireIncremental?: boolean;
 }
 
 export interface CandidateChunkSortMemoryPlan {
@@ -798,7 +803,8 @@ export async function beginTreeCandidate(
 ): Promise<BeginTreeCandidateResult> {
     if (typeof options?.cooperate !== "function" || typeof options.onCandidateOpened !== "function" ||
         (options.onOpenMemoryPlan !== undefined && typeof options.onOpenMemoryPlan !== "function") ||
-        (options.abortCandidateOpened !== undefined && typeof options.abortCandidateOpened !== "function")) {
+        (options.abortCandidateOpened !== undefined && typeof options.abortCandidateOpened !== "function") ||
+        (options.requireIncremental !== undefined && typeof options.requireIncremental !== "boolean")) {
         throw new TypeError("candidate begin requires host cooperation and an ownership handoff");
     }
     const cooperate = options.cooperate;
@@ -842,6 +848,9 @@ export async function beginTreeCandidate(
         throw new TypeError("deferred reachability requires the candidate job API");
     }
     if (!traversal) {
+        if (options.requireIncremental) {
+            throw new TypeError("incremental candidate begin API is required");
+        }
         let opened = false, handedOff = false;
         let failed = false, primary: unknown;
         try {
@@ -1043,6 +1052,9 @@ export async function collectTreeCandidateChunks(
     if (typeof options?.cooperate !== "function" || typeof options.legacy !== "function") {
         throw new TypeError("candidate chunk collection requires host cooperation and a fallback");
     }
+    if (options.requireIncremental !== undefined && typeof options.requireIncremental !== "boolean") {
+        throw new TypeError("candidate chunk collection requires a valid incremental policy");
+    }
     const cooperate = options.cooperate;
     const cooperateRetirementOption = options.cooperateRetirement;
     const signal = options.signal;
@@ -1074,6 +1086,9 @@ export async function collectTreeCandidateChunks(
         throw new TypeError("deferred reachability requires the candidate chunk job API");
     }
     if (!traversal) {
+        if (options.requireIncremental) {
+            throw new TypeError("incremental candidate chunk API is required");
+        }
         const plan = chunkPlan(legacy());
         assertCurrent();
         return plan;
@@ -1184,6 +1199,9 @@ export async function collectTreeCandidateChunkPages(
     if (hasPendingTreeReachabilityRetirement(tree)) await drainTreeReachabilityRetirement(tree);
     const paged = candidateChunkPagedApi(tree);
     if (!paged) {
+        if (options.requireIncremental) {
+            throw new TypeError("incremental candidate chunk page API is required");
+        }
         const plan = await collectTreeCandidateChunks(tree, options);
         let freshOffset = 0;
         for (let offset = 0; offset < plan.all.length;) {

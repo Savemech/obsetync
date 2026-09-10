@@ -347,7 +347,7 @@ export interface FileChange {
 
 export interface DeferredPushChange {
     path: string;
-    reason: "source-too-large" | "dependent-delete";
+    reason: "source-too-large" | "range-unavailable" | "dependent-delete";
     requiredBytes: number;
     capacityBytes: number;
 }
@@ -853,6 +853,7 @@ export async function push(
     candidateMutationAdmission?: RootTreeResidentAdmission,
     workLane: WorkLane = "bulk",
     browserHash?: BrowserHashWorkerRuntime | null,
+    requireIncrementalTree = false,
 ): Promise<PushOutcome> {
     throwIfWorkAborted(signal);
     perf?.setWorkload({ filesTotal: changes.length });
@@ -985,18 +986,12 @@ export async function push(
         return settlement;
     };
     try {
-    // Packaged trees validate the committed graph one native unit at a time.
-    // Structural test/legacy ports retain the old synchronous fallback and
-    // need the old explicit count because their begin method returns none.
-    const candidateJobMembers = [tree.begin_candidate_job, tree.step_tree_job,
-        tree.finish_candidate_job, tree.cancel_tree_job];
-    const candidateJobClaimed = candidateJobMembers.some(member => member !== undefined);
-    const candidateJobAvailable = candidateJobMembers.every(member => typeof member === "function");
+    // Production publication requires the bounded incremental tree ABI. A
+    // clean bundle always carries it; partial/old embeddings fail before any
+    // synchronous whole-tree compatibility call can run.
     const candidateOpenMemoryAvailable =
         typeof tree.candidate_open_memory_plan_v1_job === "function" &&
         typeof tree.resume_candidate_open_memory_v1_job === "function";
-    const legacyCommittedCount = !candidateJobClaimed
-        ? wasm.wasm_tree_committed_chunk_hashes(tree).length : null;
     const opened = await beginTreeCandidate(tree, {
         signal,
         cooperate: async () => {
@@ -1006,9 +1001,10 @@ export async function push(
         cooperateRetirement: async () => {
             await yieldWork({ perf, lane: "interactive", deadlineMs: 50 });
         },
-        assertCurrent: candidateJobAvailable ? () => {
+        assertCurrent: () => {
             if (rootContext) for (const change of changes) rootContext.assertApplicable(change.path);
-        } : undefined,
+        },
+        requireIncremental: requireIncrementalTree,
         onOpenMemoryPlan: candidateMutationAdmission && candidateOpenMemoryAvailable
             ? plan => admitCandidateOpenRoot(candidateMutationAdmission, tree, plan)
             : undefined,
@@ -1029,7 +1025,7 @@ export async function push(
             recordOwnedCandidateRevision();
         },
     });
-    perf?.setWasmChunks({ before: opened.reachable ?? legacyCommittedCount ?? 0 });
+    perf?.setWasmChunks({ before: opened.reachable ?? 0 });
 
     let deleted     = changes.filter(c => c.action === "deleted");
     const nonDeleted = changes.filter(c => c.action !== "deleted");
@@ -1130,6 +1126,7 @@ export async function push(
             }
         }
         const mobileRangedChanges = new Set<FileChange>();
+        const mobileRangeUnavailableChanges = new Set<FileChange>();
         const desktopRangedChanges = new Map<FileChange, string>();
         const workerPaths = new Map<FileChange, string>();
         const memoryFiles: PushMemoryFile[] = batchChanges.map(change => {
@@ -1144,10 +1141,12 @@ export async function push(
             if (absolutePath) workerPaths.set(change, absolutePath);
             const desktopRanged = !!(chunked && absolutePath);
             if (desktopRanged) desktopRangedChanges.set(change, absolutePath!);
-            const mobileRanged = !!(!absolutePath && chunked && change.data === undefined &&
-                change.mtime !== undefined && openMobileRangeReader &&
-                planPushMemory([{ size: change.size!, chunked: true, ranged: false }], tuning).totalBytes > capacityBytes);
+            const mobileRangeRequired = !absolutePath && tuning.runtime === "mobile" && chunked &&
+                change.data === undefined && change.mtime !== undefined &&
+                planPushMemory([{ size: change.size!, chunked: true, ranged: false }], tuning).totalBytes > capacityBytes;
+            const mobileRanged = !!(mobileRangeRequired && openMobileRangeReader);
             if (mobileRanged) mobileRangedChanges.add(change);
+            else if (mobileRangeRequired) mobileRangeUnavailableChanges.add(change);
             return {
                 size: change.size!,
                 backingBytes: change.data ? Math.max(change.size!, change.data.buffer.byteLength) : undefined,
@@ -1171,7 +1170,8 @@ export async function push(
                 continue;
             }
             for (const change of batchChanges) deferred.push({
-                path: change.path, reason: "source-too-large",
+                path: change.path,
+                reason: mobileRangeUnavailableChanges.has(change) ? "range-unavailable" : "source-too-large",
                 requiredBytes: memoryPlan.totalBytes, capacityBytes,
             });
             continue;
@@ -1600,7 +1600,7 @@ export async function push(
                         rootContext?.assertApplicable(change.path);
                         prepared?.assertApplicable(change.path);
                         if (!mobileReader) {
-                            deferred.push({ path: change.path, reason: "source-too-large",
+                            deferred.push({ path: change.path, reason: "range-unavailable",
                                 requiredBytes: wholeFallback.totalBytes, capacityBytes });
                             continue;
                         }
@@ -1681,7 +1681,7 @@ export async function push(
                         }
                         if (error instanceof MobileRangeReadError &&
                             (error.code === "UNAVAILABLE" || error.code === "PROTOCOL")) {
-                            deferred.push({ path: change.path, reason: "source-too-large",
+                            deferred.push({ path: change.path, reason: "range-unavailable",
                                 requiredBytes: wholeFallback.totalBytes, capacityBytes });
                             continue;
                         }
@@ -2272,6 +2272,7 @@ export async function push(
                 onOutputMemoryPlan: candidateMutationAdmission
                     ? plan => admitCandidateMutationOutput(candidateMutationAdmission, tree, plan)
                     : undefined,
+                requireIncremental: requireIncrementalTree,
             });
         }
         finally { endTree?.(); }
@@ -2310,6 +2311,7 @@ export async function push(
                 onOutputMemoryPlan: candidateMutationAdmission
                     ? plan => admitCandidateMutationOutput(candidateMutationAdmission, tree, plan)
                     : undefined,
+                requireIncremental: requireIncrementalTree,
             });
         } finally {
             endTree?.();
@@ -2374,6 +2376,7 @@ export async function push(
                 const all = wasm.wasm_tree_candidate_chunk_hashes(tree);
                 return { all, fresh: bootstrapped ? all : wasm.wasm_tree_new_candidate_chunk_hashes(tree) };
             },
+            requireIncremental: requireIncrementalTree,
             onSortMemoryPlan: async plan => {
                 if (neededChunks) throw new Error("candidate index hash spool was already admitted");
                 const admitted = await reserveCompactIndexHashSpool(
@@ -2517,6 +2520,7 @@ export async function push(
                     return { hash, version };
                 },
                 legacy: () => tree.candidate_root_bytes(),
+                requireIncremental: requireIncrementalTree,
             });
             try {
                 console.log(

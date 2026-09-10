@@ -35,6 +35,7 @@ const ROOT_PUBLICATION_MAX_BOUNDARY_FILES = 32;
 const ROOT_PUBLICATION_MAX_ELAPSED_MS = 50;
 import { ObsetyncApi, PushConflict } from "./api";
 import { conflictCopyPath } from "./conflict-path";
+import { legacyConflictStagingKey, preserveVerifiedConflictCopy } from "./root-conflicts";
 import { ObsetyncWsChannel, PresenceUpdate, WsState } from "./ws";
 import { PlatformIO, type FileStat } from "./platform";
 import { ObsetyncSyncBase } from "./sync-base";
@@ -3004,10 +3005,15 @@ export class ObsetyncSyncEngine {
         const tuning = getHashTuning();
         const workerMode = this.hashWorkers?.stats().wasmMode ??
             this.browserHash?.pool.stats().wasmMode ?? "unavailable";
+        const mobileRange = this.io.mobileRangeCapability?.();
+        const mobileRangeKey = mobileRange
+            ? `${mobileRange.state}:${mobileRange.reason ?? "none"}:${mobileRange.maxRangeBytes}`
+            : "absent";
         // Admission uses the shared capacity, which may be lower than the
         // profile's requested limit. Occupancy changes do not invalidate a
         // source-size cooldown; an actual capacity/feed/worker change does.
-        return `${tuning.runtime}:${transientMemorySnapshot().capacityBytes}:${tuning.maxFeedBytes}:${workerMode}`;
+        return `${tuning.runtime}:${transientMemorySnapshot().capacityBytes}:${tuning.maxFeedBytes}:` +
+            `${workerMode}:${mobileRangeKey}`;
     }
 
     private hasRunnablePendingChanges(): boolean {
@@ -3610,7 +3616,12 @@ export class ObsetyncSyncEngine {
                 this.rootTreeResidentAdmission,
                 workLane,
                 this.browserHash,
+                true,
             ) : { newRootHash: this.getTreeRootHash(), conflicts: [], published: false, deferred: [] };
+            // A capability probe can become definitively rejected during this
+            // attempt. Attach deferrals to the resulting capability state so
+            // the next automatic readiness check does not immediately retry.
+            const settlementRetryKey = this.deferredRetryKey();
             if (transaction) {
                 const deferred = result.deferred ?? [];
                 const heldPaths = new Set(deferred.map(change => change.path));
@@ -3638,14 +3649,16 @@ export class ObsetyncSyncEngine {
                 if (!result.published) {
                     if (!this.rootSliceUrgentTurn) this.disposeRootReview();
                     this.rootPendingReason = continuationPaths.size > 0 ? null : "root not published";
-                    const held = this.deferredChanges.settle(transactionQueued, transactionReady, deferred, retryKey, Date.now());
+                    const held = this.deferredChanges.settle(transactionQueued, transactionReady, deferred,
+                        settlementRetryKey, Date.now());
                     this.pendingChanges.restore(transactionQueued);
                     // No root means no journal ACK, even for a local omission.
                     if (held.acknowledged.length) this.onStatusUpdate("sync ⏸ root not published");
                     return continuationPaths.size > 0 ? "continue" : undefined;
                 }
                 const covered = transactionQueued.filter(hint => durablyPublishedPaths.has(hint.path) || heldPaths.has(hint.path));
-                const settlement = this.deferredChanges.settle(covered, transactionReady, deferred, retryKey, Date.now());
+                const settlement = this.deferredChanges.settle(covered, transactionReady, deferred,
+                    settlementRetryKey, Date.now());
                 this.pendingChanges.restore(settlement.retained);
                 this.pendingChanges.restore(transactionQueued.filter(hint => !durablyPublishedPaths.has(hint.path) && !heldPaths.has(hint.path)));
                 const dependenciesWereCurrent = this.rootReviewedQueue!.dependenciesCurrent();
@@ -3677,7 +3690,7 @@ export class ObsetyncSyncEngine {
                 queued,
                 batch,
                 [...selection.deferred, ...(result.deferred ?? [])],
-                retryKey,
+                settlementRetryKey,
                 Date.now(),
             );
             this.pendingChanges.restore(settlement.retained);
@@ -3691,7 +3704,7 @@ export class ObsetyncSyncEngine {
             // path with the winner. The copy then syncs out as a normal new
             // file, visible on every device.
             if (result.conflicts.length > 0) {
-                await this.preserveConflictCopies(result.conflicts as PushConflict[]);
+                await this.preserveConflictCopies(result.conflicts as PushConflict[], batch, workSignal, perf);
             }
 
             // Our just-pushed root is now in the server's history, so it is a
@@ -3845,13 +3858,11 @@ export class ObsetyncSyncEngine {
         );
     }
 
-    /** Preserve OUR losing side of unmergeable conflicts as sibling copies
-     *  ("doc (conflict Laptop 2026-07-14 0132).md"). Content comes from the
-     *  server by our own side_b hash — we uploaded that blob moments ago, so
-     *  it is authoritative even if the local file changed since. Falls back
-     *  to the local bytes when the blob fetch fails (e.g. large chunked
-     *  files, which never text-merge and aren't blob-addressable). */
-    private async preserveConflictCopies(conflicts: PushConflict[]): Promise<void> {
+    /** Preserve OUR losing side of a legacy-root conflict from immutable
+     * server objects. The exact pushed row supplies the expected size/hash;
+     * neither a later local generation nor a whole-file fallback is accepted. */
+    private async preserveConflictCopies(conflicts: PushConflict[], batch: readonly FileChange[],
+        signal: AbortSignal, perf?: PerfOperation): Promise<void> {
         let preserved = 0;
         let failed = 0;
         const now = new Date();
@@ -3859,17 +3870,18 @@ export class ObsetyncSyncEngine {
             if (!c.path || !c.side_b_hash) continue;
             const copyPath = conflictCopyPath(c.path, this.deviceName, now);
             try {
-                let bytes: Uint8Array | null = null;
-                try {
-                    bytes = await this.api.getContent(c.side_b_hash);
-                } catch {
-                    // Blob not fetchable (chunked large file) — use the local
-                    // file, which still holds our losing bytes until the next
-                    // pull applies the winner.
-                    bytes = await this.io.readFile(c.path);
+                const matching = batch.filter(change => change.path === c.path && change.action !== "deleted" &&
+                    change.hash?.toLowerCase() === c.side_b_hash.toLowerCase());
+                if (matching.length !== 1 || !Number.isSafeInteger(matching[0].size) || matching[0].size! < 0) {
+                    throw new Error("legacy conflict does not match one exact pushed generation");
                 }
-                if (!bytes) continue;
-                await this.io.writeFile(copyPath, bytes);
+                await preserveVerifiedConflictCopy(this.api, this.io, this.wasm, {
+                    path: c.path,
+                    copyPath,
+                    hash: c.side_b_hash.toLowerCase(),
+                    size: matching[0].size!,
+                    stagingKey: await legacyConflictStagingKey(c.path, c.side_b_hash.toLowerCase()),
+                }, { signal, perf });
                 preserved++;
                 console.log(
                     `[obsetync] conflict on ${c.path} — our version preserved as ${copyPath}`,
@@ -4632,6 +4644,7 @@ export class ObsetyncSyncEngine {
                     return { hash, version };
                 },
                 legacy: () => tree.root_bytes(),
+                requireIncremental: true,
             });
             try {
                 const writeBytes = owned.bytes.byteLength + TREE_ROOT_EXPORT_PAGE_BYTES;

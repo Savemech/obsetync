@@ -138,9 +138,9 @@ async function cleanupFailureDoesNotReplacePrimaryFailure(): Promise<void> {
 }
 
 async function legacyAndPartialCapabilitiesFailSafely(): Promise<void> {
-    let candidate = false, aborts = 0, yields = 0;
+    let candidate = false, aborts = 0, begins = 0, yields = 0;
     const legacy: CandidateJobTree = {
-        begin_candidate: () => { candidate = true; }, has_candidate: () => candidate,
+        begin_candidate: () => { begins++; candidate = true; }, has_candidate: () => candidate,
         abort_candidate: () => { aborts++; candidate = false; },
     };
     const result = await beginTreeCandidate(legacy, {
@@ -158,6 +158,13 @@ async function legacyAndPartialCapabilitiesFailSafely(): Promise<void> {
     await assert.rejects(beginTreeCandidate(partial, {
         cooperate: async () => {}, onCandidateOpened: () => {},
     }), /incomplete candidate job API/);
+    assert.equal(candidate, false);
+
+    const beforeRequired = begins;
+    await assert.rejects(beginTreeCandidate(legacy, {
+        cooperate: async () => {}, onCandidateOpened: () => {}, requireIncremental: true,
+    }), /incremental candidate begin API is required/);
+    assert.equal(begins, beforeRequired);
     assert.equal(candidate, false);
 
     const nonCallable = { ...legacy, begin_candidate_job: 42 } as unknown as CandidateJobTree;
@@ -253,6 +260,13 @@ async function candidateChunkPlansAndCapabilitiesFailClosed(): Promise<void> {
         cooperate: async () => { yields++; }, legacy: () => ({ all: [h(1), h(2)], fresh: [h(1)] }),
     }), { all: [h(1), h(2)], fresh: [h(1)] });
     assert.equal(yields, 1);
+
+    let refusedCalls = 0;
+    await assert.rejects(collectTreeCandidateChunks(legacy, {
+        cooperate: async () => {}, requireIncremental: true,
+        legacy: () => { refusedCalls++; return { all: [], fresh: [] }; },
+    }), /incremental candidate chunk API is required/);
+    assert.equal(refusedCalls, 0);
 
     const stopped = new AbortController();
     await assert.rejects(collectTreeCandidateChunks(legacy, {
@@ -1041,6 +1055,13 @@ async function pagedCandidateChunksCapabilitiesAndLegacyFailClosed(): Promise<vo
     const legacy: CandidateJobTree = {
         begin_candidate: () => {}, has_candidate: () => true, abort_candidate: () => {},
     };
+    let refusedCalls = 0;
+    await assert.rejects(collectTreeCandidateChunkPages(legacy, {
+        cooperate: async () => {}, cooperateRetirement: async () => {}, requireIncremental: true,
+        legacy: () => { refusedCalls++; return { all: [], fresh: [] }; },
+        onSortMemoryPlan: () => ({ release: () => {} }), onPage: async () => {},
+    }), /incremental candidate chunk page API is required/);
+    assert.equal(refusedCalls, 0);
     const all = Array.from({ length: 600 }, (_, index) => h(index + 1));
     const fresh = all.filter((_, index) => index % 7 === 0);
     const pages: string[][] = []; let admissions = 0;

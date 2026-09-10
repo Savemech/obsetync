@@ -567,6 +567,13 @@ async function guardsCaptureMethodsAndCatchReentrantStop() {
 }
 
 async function legacyOnceExplicitModeAndLateAdmission() {
+    const refused = new Fixture(); let refusedCalls = 0;
+    await rejects(exportTreeRoot({}, "candidate", refused.options({
+        requireIncremental: true,
+        legacy: () => { refusedCalls++; return refused.source.slice(); },
+    })), /incremental root export API is required/);
+    assert.equal(refusedCalls, 0); assert.equal(refused.budget.snapshot().usedBytes, 0);
+
     for (const mode of ["candidate", "committed"] as const) {
         const f = new Fixture(), legacyBytes = f.source.slice(), held = gate(), entered = gate(); let calls = 0;
         const sharedOnly = { step_tree_job() { throw new Error("unexpected shared step"); }, cancel_tree_job() { throw new Error("unexpected shared cancel"); } };

@@ -48,6 +48,8 @@ export interface ExportTreeRootOptions {
     /** The selected old getter must return its already detached JS-owned copy.
      * Its allocation necessarily precedes admission; no extra copy is made. */
     legacy(mode: TreeRootExportMode): unknown;
+    /** Refuse synchronous serialization when the incremental export ABI is absent. */
+    requireIncremental?: boolean;
     budget?: TransientReservationBudget;
 }
 
@@ -152,7 +154,8 @@ export async function exportTreeRoot(
         (options.maxArenaBytes !== undefined && !u32(options.maxArenaBytes, 1)) ||
         (options.maxOutputBytes !== undefined && !u32(options.maxOutputBytes, 1)) ||
         (options.workBytes !== undefined && typeof options.workBytes !== "function" &&
-            (!Number.isSafeInteger(options.workBytes) || options.workBytes < 1))) {
+            (!Number.isSafeInteger(options.workBytes) || options.workBytes < 1)) ||
+        (options.requireIncremental !== undefined && typeof options.requireIncremental !== "boolean")) {
         throw new TypeError("root export requires a mode, identity, bound and host callbacks");
     }
     const requestedStepUnits = options.stepUnits;
@@ -198,6 +201,9 @@ export async function exportTreeRoot(
     try {
         await cooperateAndCheck(); check();
         if (!claimed) {
+            if (options.requireIncremental) {
+                throw new TypeError("incremental root export API is required");
+            }
             bytes = exactBytes(legacy(mode)); check();
             const length = byteLengthOf.call(bytes) as number;
             if (!u32(length, 1) || length > maxLength) throw new RangeError("legacy root exceeds its byte bound");

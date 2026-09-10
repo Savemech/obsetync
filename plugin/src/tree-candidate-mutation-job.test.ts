@@ -230,6 +230,13 @@ async function legacyExecutesOnceWithPreAndPostGuards(): Promise<void> {
         assert.equal(calls, Number(phase !== "before" && phase !== "yield"));
         assert.equal(yields, Number(phase !== "before"));
     }
+
+    let calls = 0;
+    const required: CandidateMutationJobTree = { has_candidate: () => true };
+    await assert.rejects(applyTreeCandidateMutation(required, "update", payload, {
+        cooperate: async () => {}, requireIncremental: true, legacy: () => { calls++; },
+    }), /incremental candidate mutation API is required/);
+    assert.equal(calls, 0);
 }
 
 async function cleanupFailureNeverMasksPrimary(): Promise<void> {

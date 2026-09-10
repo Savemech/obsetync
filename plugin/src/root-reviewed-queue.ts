@@ -754,7 +754,11 @@ export class RootReviewedQueue {
     settled(paths: ReadonlySet<string>, deferred: readonly DeferredPushChange[], dependenciesWereCurrent: boolean): void {
         const hadCooling = this.cooling.size > 0;
         for (const path of paths) { this.remove(path); this.cooling.delete(path); }
-        for (const value of deferred) if (value.reason === "source-too-large") this.cooling.add(value.path);
+        for (const value of deferred) {
+            if (value.reason === "source-too-large" || value.reason === "range-unavailable") {
+                this.cooling.add(value.path);
+            }
+        }
         // The static graph excluded deletes held by these sources. Reusing
         // it after the last source succeeds would falsely exhaust the queue.
         // Invalidate the NEXT selection, not the already-successful ACK tail.

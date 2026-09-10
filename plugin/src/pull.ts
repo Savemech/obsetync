@@ -1070,6 +1070,7 @@ async function rebaseTreeWithAdmittedMutation(
                 recordOwnedCandidateRevision();
                 candidateOpen = true;
             },
+            requireIncremental: true,
         });
         if (deletePaths.length > 0) {
             const payload = JSON.stringify(deletePaths);
@@ -1082,6 +1083,7 @@ async function rebaseTreeWithAdmittedMutation(
                 onCandidateMutated: recordOwnedCandidateRevision,
                 onOutputMemoryPlan: plan =>
                     admitCandidateMutationOutput(mutation.residentAdmission, tree, plan),
+                requireIncremental: true,
             });
         }
         if (upserts.length > 0) {
@@ -1095,6 +1097,7 @@ async function rebaseTreeWithAdmittedMutation(
                 onCandidateMutated: recordOwnedCandidateRevision,
                 onOutputMemoryPlan: plan =>
                     admitCandidateMutationOutput(mutation.residentAdmission, tree, plan),
+                requireIncremental: true,
             });
         }
         throwIfWorkAborted(mutation.signal);

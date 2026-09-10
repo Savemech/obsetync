@@ -92,6 +92,7 @@ function validGeneration(generation: number | undefined): void {
 export interface DeferredChangeSummary {
     count: number;
     sourceTooLarge: number;
+    rangeUnavailable: number;
     dependentDeletes: number;
     /** Legacy rename rows can also retain an already-published destination. */
     dependentChanges: number;
@@ -263,10 +264,11 @@ function* partitionSteps(
         for (let index = 0; index < materializedLength; index++) {
             const change = materialized[index], previous = records.get(change.path), hint = hints.get(change.path);
             if (
-                previous?.detail.reason === "source-too-large" && hint &&
+                (previous?.detail.reason === "source-too-large" || previous?.detail.reason === "range-unavailable") && hint &&
                 change.action !== "deleted" && sameHint(hint, previous.hint) &&
                 sameHint(compact(change, hint.journalId), previous.current) &&
-                previous.retryKey === retryKey && now < previous.retryAt
+                previous.retryKey === retryKey &&
+                (previous.detail.reason === "range-unavailable" || now < previous.retryAt)
             ) held.set(change.path, { ...previous.detail });
             yield;
         }
@@ -423,6 +425,8 @@ export class DeferredChangeTracker {
             if (previous.detail.reason === "source-too-large") {
                 if (now >= previous.retryAt) return true;
                 coolingSource = true;
+            } else if (previous.detail.reason === "range-unavailable") {
+                coolingSource = true;
             }
         }
         // Dependency-only states have nothing left to wait for.
@@ -500,7 +504,8 @@ export class DeferredChangeTracker {
         const held = new Map<string, DeferredPushChange>();
         for (const detail of deferred) {
             if (!hints.has(detail.path) ||
-                (detail.reason !== "source-too-large" && detail.reason !== "dependent-delete") ||
+                (detail.reason !== "source-too-large" && detail.reason !== "range-unavailable" &&
+                    detail.reason !== "dependent-delete") ||
                 !Number.isSafeInteger(detail.requiredBytes) || detail.requiredBytes < 0 ||
                 !Number.isSafeInteger(detail.capacityBytes) || detail.capacityBytes < 0) {
                 throw new Error("invalid deferred push outcome");
@@ -535,14 +540,17 @@ export class DeferredChangeTracker {
             // Unrelated successful note uploads must not postpone an existing
             // attachment retry forever by repeatedly refreshing its cooldown.
             const preserveRetry = previous && sameHint(refreshed, previous.hint) &&
-                previous.retryKey === retryKey && previous.retryAt > now;
+                previous.retryKey === retryKey && previous.detail.reason === detail.reason &&
+                previous.retryAt > now;
             const stored = compact(refreshed, hint.journalId);
             const record: DeferredRecord = {
                 hint: stored,
                 current: stored,
                 detail,
                 retryKey,
-                retryAt: preserveRetry ? previous.retryAt : now + this.retryMs,
+                retryAt: detail.reason === "range-unavailable"
+                    ? Number.POSITIVE_INFINITY
+                    : preserveRetry ? previous.retryAt : now + this.retryMs,
             };
             if (!previous || !sameRecord(previous, record)) {
                 beforeRecordMutation();
@@ -604,6 +612,7 @@ export class DeferredChangeTracker {
         const summary: DeferredChangeSummary = {
             count: this.records.size,
             sourceTooLarge: 0,
+            rangeUnavailable: 0,
             dependentDeletes: 0,
             dependentChanges: 0,
             maxRequiredBytes: 0,
@@ -618,6 +627,8 @@ export class DeferredChangeTracker {
                     ? record.detail.capacityBytes
                     : Math.min(summary.minCapacityBytes, record.detail.capacityBytes);
                 summary.nextRetryAt = summary.nextRetryAt === null ? record.retryAt : Math.min(summary.nextRetryAt, record.retryAt);
+            } else if (record.detail.reason === "range-unavailable") {
+                summary.rangeUnavailable++;
             } else if (record.hint.action === "deleted") {
                 summary.dependentDeletes++;
             } else {

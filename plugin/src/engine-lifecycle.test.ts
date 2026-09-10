@@ -4,6 +4,7 @@ import { ObsetyncSyncEngine } from "./sync";
 import { ObsetyncSyncBase, SYNC_BASE_STORE_PATH } from "./sync-base";
 import { ObsetyncJournal, JOURNAL_STORE_PATH } from "./journal";
 import { MemorySegmentedIO, type StoreTestBoundary } from "./segmented-store-test-io";
+import { installIncrementalTreeTestAbi } from "./incremental-tree-test-abi";
 
 (globalThis as any).window ??= globalThis;
 let assertions = 0;
@@ -101,6 +102,7 @@ async function fixture() {
                 return { before: 1, reachable: 1, removed: 0, after: 1 };
             },
         };
+        installIncrementalTreeTestAbi(tree, hash);
         const api = {
             ensureTransportReady: async () => { state.preflights++; },
             checkContent: async () => [],
@@ -124,6 +126,8 @@ async function fixture() {
         };
         const wasm = {
             wasm_should_chunk: () => false,
+            wasm_root_hash_from_bytes: (data: Uint8Array) => hash(data),
+            wasm_root_version_from_bytes: () => 1,
             wasm_hash_batch: (data: Uint8Array, offsets: Uint32Array, sizes: Uint32Array) =>
                 [...offsets].map((offset, index) => hash(data.subarray(offset, offset + sizes[index]))),
             wasm_tree_committed_chunk_hashes: () => [], wasm_tree_candidate_chunk_hashes: () => [],

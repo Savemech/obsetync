@@ -7,14 +7,14 @@ Fallback-boundary follow-up: [capability fallback and admission audit](fallback-
 ## Current state: stabilization candidate
 
 The enabled P0–P3 file-sync scope is in stabilization. The focused fallback
-audit found one Windows prepared-manifest P0 and one desktop reconcile P1,
-both fixed, with one P1 and two P2 follow-ups remaining. The current tree also adds bounded initial-review
+audit found 14 production boundary families; all now preserve their bounded
+ownership model or fail closed. The current tree also adds bounded initial-review
 preemption: a separately captured and reviewed durable recent-edit prefix can
 publish before a 25,000-file review completes, while deletion review, journal
 ownership, dependency cuts, and the mandatory complete review remain
 fail-closed. P4/Yjs/CRDT remains dormant by explicit scope decision.
 
-The implementation is staged as `1.12.4`. Local release gates and exact-build
+The implementation is staged as `1.12.5`. Local release gates and exact-build
 identity checks are required before deployment; remote CI, release artifacts,
 tagging, publication, and real-device numerical evidence remain separate gates.
 
@@ -142,6 +142,25 @@ worker failure joins its native cleanup before using the same path. Whole-file
 `DataAdapter.read` is not used. Focused regression coverage includes both a
 missing pool and a failed worker, exact source consumption, feed ceilings,
 missing-range selection, manifest upload, root commit, and mobile-path isolation.
+
+### 1.12.5 fallback-boundary closure
+
+The remaining fallback-audit findings are closed in the staged 1.12.5 tree.
+Legacy V1 conflict copies are reconstructed only from immutable, hash-verified
+server blobs or manifest chunks. Large copies use exclusive staging plus native
+append; the current local path is never accepted as the losing generation.
+
+Unsupported mobile ranged reads now retain a stable `range-unavailable` reason.
+The same unchanged source and capability key do not re-enter preparation on a
+timer; a source change, capability transition, restart, or explicit manual retry
+makes the item runnable. Diagnostics distinguish this state from a source that
+is intrinsically too large for the active admission ceiling.
+
+Engine-owned candidate opening, mutation, candidate chunk pagination, and root
+export require the incremental Tree/WASM ABI. A missing or partial ABI is
+rejected before any synchronous compatibility getter or mutator runs. Direct
+structural ports retain explicit compatibility defaults for isolated tests, but
+the production engine always selects the strict contract.
 
 ## Previous freeze checkpoint (historical evidence)
 

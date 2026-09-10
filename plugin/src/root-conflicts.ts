@@ -47,11 +47,129 @@ export async function rootConflictCopyPath(identity: RootPublicationIdentity, pa
     return result;
 }
 
+/** Stable local staging owner for the legacy conflict path. It is not a
+ * publication identity or receipt; it only prevents unrelated paths with the
+ * same content hash from sharing the retained-attempt ceiling. */
+export async function legacyConflictStagingKey(path: string, hash: string): Promise<string> {
+    if (!isSafeVaultPath(path) || path.length > 4096 || !/^[0-9a-f]{64}$/.test(hash)) {
+        throw new RootConflictError("IDENTITY", "invalid legacy conflict staging identity");
+    }
+    const source = new TextEncoder().encode(JSON.stringify({
+        domain: "obsetync-legacy-conflict-staging-v1",
+        path,
+        hash,
+    }));
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", source));
+    return [...digest].map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
 export interface RootConflictOptions {
     perf?: PerfOperation;
     /** Optional independently qualified full-content reader. Never implement
      * this using only size/mtime or a remembered partial-download checkpoint. */
     verifyExisting?: (path: string, hash: string, size: number, signal?: AbortSignal) => Promise<ConflictFileVerification>;
+}
+
+export interface VerifiedConflictCopyInput {
+    path: string;
+    copyPath: string;
+    hash: string;
+    size: number;
+    /** Stable lowercase hex owner for a bounded set of retained attempts. */
+    stagingKey: string;
+}
+
+export interface VerifiedConflictCopyOptions extends RootConflictOptions {
+    signal?: AbortSignal;
+}
+
+/** Publish one conflict copy exclusively from immutable server objects. The
+ * current local path is never a source. Large content is reconstructed one
+ * verified chunk at a time through native append; partial staging remains
+ * private and bounded when publication fails. */
+export async function preserveVerifiedConflictCopy(
+    api: Pick<ObsetyncApi, "getObjectsOwned">,
+    io: PlatformIO,
+    wasm: Pick<WasmModule, "Hasher">,
+    input: VerifiedConflictCopyInput,
+    options: VerifiedConflictCopyOptions = {},
+): Promise<"existing" | "created"> {
+    const { path, copyPath, hash, size, stagingKey } = input;
+    const signal = options.signal;
+    if (!isSafeVaultPath(path) || !isSafeVaultPath(copyPath) || !/^[0-9a-f]{64}$/.test(hash) ||
+        !Number.isSafeInteger(size) || size < 0 || !/^[0-9a-f]{64}$/.test(stagingKey)) {
+        throw new RootConflictError("IDENTITY", "invalid verified conflict copy input");
+    }
+    const verify = options.verifyExisting ?? ((target, expectedHash, expectedSize, abort) =>
+        verifyConflictFile(io, wasm, target, expectedHash, expectedSize, abort));
+    const existing = await verify(copyPath, hash, size, signal);
+    throwIfWorkAborted(signal);
+    if (existing === "verified") return "existing";
+    if (existing !== "missing") {
+        throw existing === "reader-unavailable"
+            ? new RootConflictError("READER_UNAVAILABLE", "existing large conflict copy needs a qualified bounded verifier")
+            : new RootConflictError("DESTINATION_CHANGED", "existing conflict destination differs; preserving it unchanged");
+    }
+    if (!io.copyFileExclusive || !io.listDirectory) {
+        throw new RootConflictError("CAPABILITY", "exclusive copy or bounded staging inventory unavailable");
+    }
+    if (size >= CONFLICT_CHUNK_THRESHOLD && (!io.supportsNativeAppend?.() || !io.appendFileOwned)) {
+        throw new RootConflictError("CAPABILITY", "large conflict staging requires native bounded append");
+    }
+    const directory = `${STAGING_ROOT}/${stagingKey}`;
+    if (await io.exists(directory)) {
+        const listing = await io.listDirectory(directory);
+        if (listing.folders.length || listing.files.length >= MAX_STAGE_ATTEMPTS) {
+            throw new RootConflictError("STAGING_LIMIT", "conflict staging requires explicit recovery/cleanup");
+        }
+    } else {
+        await io.mkdir(STAGING_ROOT);
+        await io.mkdir(directory);
+    }
+    const random = new Uint8Array(16);
+    crypto.getRandomValues(random);
+    const token = [...random].map(byte => byte.toString(16).padStart(2, "0")).join("");
+    const stagingPath = `${directory}/${token}.part`;
+    if (await io.exists(stagingPath)) {
+        throw new RootConflictError("STAGING_LIMIT", "new conflict staging name is occupied");
+    }
+    throwIfWorkAborted(signal);
+    await io.writeFile(stagingPath, new Uint8Array());
+    let written = 0;
+    const proof = await verifyConflictContent({
+        api,
+        wasm,
+        expectedHash: hash,
+        expectedSize: size,
+        signal,
+        perf: options.perf,
+        consume: async (data, offset, memory) => {
+            if (offset !== written) throw new Error("conflict staging write order differs");
+            if (size < CONFLICT_CHUNK_THRESHOLD) {
+                if (offset !== 0 || data.byteLength !== size) {
+                    throw new Error("small conflict source was not one complete blob");
+                }
+                await memory.run(2 * data.byteLength + 64 * 1024, () => io.writeFile(stagingPath, data));
+            } else {
+                await io.appendFileOwned!(stagingPath, data, memory);
+            }
+            written += data.byteLength;
+        },
+    });
+    if (proof.hash !== hash || proof.size !== size || written !== size) {
+        throw new Error("conflict staging lacks complete content proof");
+    }
+    const complete = await io.stat(stagingPath);
+    if (!complete || complete.size !== size) throw new Error("conflict staging write size differs");
+    throwIfWorkAborted(signal);
+    try {
+        await io.copyFileExclusive(stagingPath, copyPath);
+    } catch (error) {
+        const after = await verify(copyPath, hash, size);
+        if (after !== "verified") throw error;
+    }
+    try { await io.deleteFile(stagingPath); } catch { /* retained for explicit bounded maintenance */ }
+    return "created";
 }
 
 /** Preserve only a durable accepted intent's actual losing generation. This
@@ -114,68 +232,15 @@ export class RootConflictPreserver {
             if (saved) continue;
             const copyPath = await rootConflictCopyPath(identity, conflict.path, conflict.side_b_hash);
             const receipt = { path: conflict.path, copyPath, hash: row.hash, size: row.size };
-            const verify = this.options.verifyExisting ?? ((path, hash, size, abort) => verifyConflictFile(this.io, this.wasm, path, hash, size, abort));
-            const existing = await verify(copyPath, row.hash, row.size, signal);
-            throwIfWorkAborted(signal);
-            if (existing === "verified") {
-                await this.intents.recordConflictCopy(identity, receipt);
-                continue;
-            }
-            if (existing !== "missing") this.destinationError(existing);
-            if (!this.io.copyFileExclusive || !this.io.listDirectory) throw new RootConflictError("CAPABILITY", "exclusive copy or bounded staging inventory unavailable");
-            if (row.size >= CONFLICT_CHUNK_THRESHOLD && (!this.io.supportsNativeAppend?.() || !this.io.appendFileOwned)) {
-                throw new RootConflictError("CAPABILITY", "large conflict staging requires native bounded append");
-            }
-            // Never reuse a stat-only partial after restart. Retain ambiguous
-            // attempts for recovery, bounded per conflict before new writes.
             const key = copyPath.match(/ \(conflict sync ([a-f0-9]{64})\)(?:\.[a-zA-Z0-9]{1,16})?$/)![1];
-            const directory = `${STAGING_ROOT}/${key}`;
-            if (await this.io.exists(directory)) {
-                const listing = await this.io.listDirectory(directory);
-                if (listing.folders.length || listing.files.length >= MAX_STAGE_ATTEMPTS) throw new RootConflictError("STAGING_LIMIT", "conflict staging requires explicit recovery/cleanup");
-            } else {
-                await this.io.mkdir(STAGING_ROOT);
-                await this.io.mkdir(directory);
-            }
-            const random = new Uint8Array(16); crypto.getRandomValues(random);
-            const token = [...random].map(byte => byte.toString(16).padStart(2, "0")).join("");
-            const stagingPath = `${directory}/${token}.part`;
-            if (await this.io.exists(stagingPath)) throw new RootConflictError("STAGING_LIMIT", "new conflict staging name is occupied");
-            throwIfWorkAborted(signal);
-            await this.io.writeFile(stagingPath, new Uint8Array());
-            let written = 0;
-            const proof = await verifyConflictContent({ api: this.api, wasm: this.wasm, expectedHash: row.hash,
-                expectedSize: row.size, signal, perf: this.options.perf,
-                consume: async (data, offset, memory) => {
-                    if (offset !== written) throw new Error("conflict staging write order differs");
-                    if (row.size < CONFLICT_CHUNK_THRESHOLD) {
-                        if (offset !== 0 || data.byteLength !== row.size) throw new Error("small conflict source was not one complete blob");
-                        await memory.run(2 * data.byteLength + 64 * 1024, () => this.io.writeFile(stagingPath, data));
-                    } else await this.io.appendFileOwned!(stagingPath, data, memory);
-                    written += data.byteLength;
-                } });
-            if (proof.hash !== row.hash || proof.size !== row.size || written !== row.size) throw new Error("conflict staging lacks complete content proof");
-            const complete = await this.io.stat(stagingPath);
-            if (!complete || complete.size !== row.size) throw new Error("conflict staging write size differs");
-            throwIfWorkAborted(signal);
-            // Once native copy starts, settle the actual outcome even if an
-            // abort/close arrives; no replacement owner may race this tail.
-            try { await this.io.copyFileExclusive(stagingPath, copyPath); }
-            catch (error) {
-                // A rejected copy may nevertheless have completed. Only full
-                // content verification can convert that ambiguity to success.
-                const after = await verify(copyPath, row.hash, row.size);
-                if (after !== "verified") throw error;
-            }
+            await preserveVerifiedConflictCopy(this.api, this.io, this.wasm, {
+                path: conflict.path,
+                copyPath,
+                hash: row.hash,
+                size: row.size,
+                stagingKey: key,
+            }, { ...this.options, signal });
             await this.intents.recordConflictCopy(identity, receipt);
-            // Delete only the fresh internal name owned by this completed call,
-            // never a visible destination or an old ambiguous staging attempt.
-            try { await this.io.deleteFile(stagingPath); } catch { /* retained for explicit bounded maintenance */ }
         }
-    }
-    private destinationError(result: ConflictFileVerification): never {
-        throw result === "reader-unavailable"
-            ? new RootConflictError("READER_UNAVAILABLE", "existing large conflict copy needs a qualified bounded verifier")
-            : new RootConflictError("DESTINATION_CHANGED", "existing conflict destination differs; preserving it and the pending intent");
     }
 }

@@ -1225,9 +1225,11 @@ export default class ObsetyncPlugin extends Plugin {
                 const repair = this.syncEngine.getLastRepairSummary();
                 if (repair) push(`Content repair:    ${repair.incomplete ? "incomplete" : "complete"} · ${repair.result?.deferred ?? "unknown"} deferred · checked ${fmt(repair.ts)}`);
                 if (deferred.count > 0) {
-                    push(`Deferred work:     ${deferred.sourceTooLarge} source worksets too large · ${deferred.dependentDeletes} held deletions · ${deferred.dependentChanges} linked changes`);
-                    push(`Admission needed:  up to ${formatDebugBytes(deferred.maxRequiredBytes)} · capacity ${formatDebugBytes(deferred.minCapacityBytes)}`);
-                    push(`Next retry:        ${fmt(deferred.nextRetryAt ?? 0)} · Sync now retries immediately`);
+                    push(`Deferred work:     ${deferred.sourceTooLarge} source worksets too large · ${deferred.rangeUnavailable} range capability unavailable · ${deferred.dependentDeletes} held deletions · ${deferred.dependentChanges} linked changes`);
+                    if (deferred.sourceTooLarge > 0) {
+                        push(`Admission needed:  up to ${formatDebugBytes(deferred.maxRequiredBytes)} · capacity ${formatDebugBytes(deferred.minCapacityBytes)}`);
+                    }
+                    push(`Next retry:        ${deferred.nextRetryAt === null ? "capability/source change" : fmt(deferred.nextRetryAt)} · Sync now retries immediately`);
                 }
                 push(`Push blocked:      ${this.syncEngine.isPushBlocked() ? "YES — run Full Rescan" : "no"}`);
                 push(`Re-enroll needed:  ${this.syncEngine.isReenrollmentRequired() ? "YES — automatic sync paused" : "no"}`);

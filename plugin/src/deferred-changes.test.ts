@@ -64,6 +64,31 @@ function cooldownDoesNotSpinAndCanBeInvalidated(): void {
     assert.equal(new DeferredChangeTracker().hasRunnable(initial.retained, "mobile:320", 3_000), true);
 }
 
+function unavailableRangeWaitsForCapabilityOrSourceChange(): void {
+    const tracker = new DeferredChangeTracker();
+    const unavailable: DeferredPushChange = {
+        path: large.path,
+        reason: "range-unavailable",
+        requiredBytes: 640,
+        capacityBytes: 320,
+    };
+    const initial = tracker.settle([large], [large], [unavailable], "mobile:rejected", 0);
+    assert.equal(tracker.hasRunnable(initial.retained, "mobile:rejected", Number.MAX_SAFE_INTEGER), false,
+        "elapsed time retried a stable missing mobile capability");
+    assert.deepEqual(tracker.partition(initial.retained, initial.retained,
+        "mobile:rejected", Number.MAX_SAFE_INTEGER).deferred, [unavailable]);
+    assert.equal(tracker.hasRunnable(initial.retained, "mobile:qualified", 1), true,
+        "a changed mobile capability did not invalidate suppression");
+    assert.equal(tracker.hasRunnable([{ ...large, mtime: 2 }], "mobile:rejected", 1), true,
+        "a changed source generation inherited capability suppression");
+    assert.equal(tracker.hasRunnable(initial.retained, "mobile:rejected", 1, true), true,
+        "an explicit retry could not override capability suppression");
+    const summary = tracker.summary();
+    assert.equal(summary.rangeUnavailable, 1);
+    assert.equal(summary.sourceTooLarge, 0);
+    assert.equal(summary.nextRetryAt, null);
+}
+
 function lazyReadinessStopsWithoutConsumingTheBacklog(): void {
     const tracker = new DeferredChangeTracker();
     const initial = tracker.settle([large, oldPath], [large, oldPath],
@@ -790,6 +815,7 @@ async function dependencyRevisionWaitsForActualJournalAck(fail: boolean): Promis
 async function run(): Promise<void> {
     settlementRestoresOnlyDeferredAndPreservesNewerEdits();
     cooldownDoesNotSpinAndCanBeInvalidated();
+    unavailableRangeWaitsForCapabilityOrSourceChange();
     lazyReadinessStopsWithoutConsumingTheBacklog();
     unrelatedNotesProgressWhileAllDeletesStayHeld();
     ignoredOrDeletedSourceReleasesDependencies();
