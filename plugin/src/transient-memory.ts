@@ -14,6 +14,7 @@ const MOBILE_TRANSIENT_CEILING = 32 * MIB;
 const DESKTOP_TRANSIENT_CEILING = 128 * MIB;
 const WORKSET_OVERHEAD_BYTES = 64 * 1024;
 const TRANSPORT_HEADER_ALLOWANCE_BYTES = 64 * 1024;
+export const TRANSPORT_ERROR_PAYLOAD_ALLOWANCE_BYTES = 1024;
 
 export interface TransientMemoryTuning {
     runtime: HashRuntime;

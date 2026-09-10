@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import { hashTuningForRuntime } from "./hash-runtime";
 import { estimateManifestBytes, planPushMemory, pushGroupingByteLimit } from "./push-memory";
+import { TRANSPORT_ERROR_PAYLOAD_ALLOWANCE_BYTES } from "./transient-memory";
 
 const mib = 1024 * 1024;
 const mobile = hashTuningForRuntime("mobile");
@@ -8,6 +9,8 @@ const desktop = hashTuningForRuntime("desktop");
 const small = planPushMemory([{ size: 100, chunked: false, ranged: false }], mobile);
 assert.ok(small.ownerBytes > 5 * 100);
 assert.ok(small.totalBytes === small.ownerBytes + small.workBytes);
+assert.ok(small.transportPayloadBytes >= TRANSPORT_ERROR_PAYLOAD_ALLOWANCE_BYTES,
+    "push admission omitted the WS CHECK response floor");
 const large = planPushMemory([{ size: 128 * mib, chunked: true, ranged: false }], mobile);
 assert.ok(large.totalBytes > 32 * mib, "whole-file sources cannot hide behind singleton grouping");
 const ranged = planPushMemory([{ size: 128 * mib, chunked: true, ranged: true }], mobile, 4 * mib);

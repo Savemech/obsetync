@@ -10,6 +10,7 @@ import type { PerfOperation } from "./perf-trace";
 import { yieldWork } from "./work-scheduler";
 import {
     reserveTransientWorkset,
+    TRANSPORT_ERROR_PAYLOAD_ALLOWANCE_BYTES,
     type TransientReservationBudget,
     type TransientWorkContext,
 } from "./transient-memory";
@@ -45,7 +46,6 @@ const SEALED_FRAME_OVERHEAD_BYTES = WS_DATA_FRAME_HEADER_BYTES + 12 + 16;
 const SEALED_FRAGMENT_OVERHEAD_BYTES = WS_DATA_FRAGMENT_HEADER_BYTES + 12 + 16;
 const HANDSHAKE_PAYLOAD_BYTES = 24;
 const HANDSHAKE_V2_PAYLOAD_BYTES = 32;
-const ERROR_PAYLOAD_ALLOWANCE_BYTES = 1024;
 const MAX_CANCELLED_REQUESTS = 64;
 const CANCEL_DRAIN_TIMEOUT_MS = 5_000;
 const V2_REPROBE_BASE_MS = 60_000;
@@ -321,7 +321,8 @@ export class ObsetyncWsDataLane {
             throw new RangeError("invalid WS response byte bound");
         }
         const responseCap = Math.min(limits.maxPayloadBytes,
-            Math.max(ERROR_PAYLOAD_ALLOWANCE_BYTES, maxResponseBytes ?? limits.maxPayloadBytes));
+            Math.max(TRANSPORT_ERROR_PAYLOAD_ALLOWANCE_BYTES,
+                maxResponseBytes ?? limits.maxPayloadBytes));
         // Browser/WebView creates the incoming ArrayBuffer before `onmessage`.
         // Reserve queued plaintext/sealed transmit buffers plus that initial
         // receive frame and its maximum opened plaintext before socket send.

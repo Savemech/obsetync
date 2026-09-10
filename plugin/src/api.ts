@@ -22,6 +22,7 @@ import {
     estimateTransportWorkset,
     estimateRootOutcomeWorkset,
     reserveTransientScope,
+    TRANSPORT_ERROR_PAYLOAD_ALLOWANCE_BYTES,
     transientMemorySnapshot,
     type TransientWorkContext,
     type TransientWorkScope,
@@ -33,6 +34,7 @@ import {
     BULK_MAX_OBJECTS,
     BULK_MOBILE_MAX_BYTES,
     BULK_SERVER_MAX_BYTES,
+    bulkBitmapBytes,
     bulkPackEncodedLength,
     decodeBulkCheckResponse,
     decodeBulkDownloadResponse,
@@ -1339,8 +1341,9 @@ export class ObsetyncApi {
         if (!res.ok) throw new Error(`putChunk ${hash}: ${res.status}`);
     }
 
-    async checkChunks(hashes: string[], perf?: PerfOperation, signal?: AbortSignal): Promise<string[]> {
-        const bulk = await this.checkObjectsBulk(BulkObjectKind.IndexChunk, hashes, perf, signal);
+    async checkChunks(hashes: string[], perf?: PerfOperation, signal?: AbortSignal,
+        memory?: TransientWorkScope): Promise<string[]> {
+        const bulk = await this.checkObjectsBulk(BulkObjectKind.IndexChunk, hashes, perf, signal, memory);
         if (bulk) return bulk;
         throwIfBulkCancelled(signal);
         const body = new TextEncoder().encode(JSON.stringify(hashes));
@@ -1365,8 +1368,9 @@ export class ObsetyncApi {
         if (!res.ok) throw new Error(`putContent ${hash}: ${res.status}`);
     }
 
-    async checkContent(hashes: string[], perf?: PerfOperation, signal?: AbortSignal): Promise<string[]> {
-        const bulk = await this.checkObjectsBulk(BulkObjectKind.Content, hashes, perf, signal);
+    async checkContent(hashes: string[], perf?: PerfOperation, signal?: AbortSignal,
+        memory?: TransientWorkScope): Promise<string[]> {
+        const bulk = await this.checkObjectsBulk(BulkObjectKind.Content, hashes, perf, signal, memory);
         if (bulk) return bulk;
         throwIfBulkCancelled(signal);
         const body = new TextEncoder().encode(JSON.stringify(hashes));
@@ -1406,8 +1410,9 @@ export class ObsetyncApi {
         hashes: string[],
         perf?: PerfOperation,
         signal?: AbortSignal,
+        memory?: TransientWorkScope,
     ): Promise<string[]> {
-        const bulk = await this.checkObjectsBulk(BulkObjectKind.Manifest, hashes, perf, signal);
+        const bulk = await this.checkObjectsBulk(BulkObjectKind.Manifest, hashes, perf, signal, memory);
         if (bulk) return bulk;
         throwIfBulkCancelled(signal);
         const body = new TextEncoder().encode(JSON.stringify(hashes));
@@ -1446,8 +1451,9 @@ export class ObsetyncApi {
         hashes: string[],
         perf?: PerfOperation,
         signal?: AbortSignal,
+        memory?: TransientWorkScope,
     ): Promise<string[]> {
-        const bulk = await this.checkObjectsBulk(BulkObjectKind.ContentChunk, hashes, perf, signal);
+        const bulk = await this.checkObjectsBulk(BulkObjectKind.ContentChunk, hashes, perf, signal, memory);
         if (bulk) return bulk;
         throwIfBulkCancelled(signal);
         const body = new TextEncoder().encode(JSON.stringify(hashes));
@@ -1462,6 +1468,7 @@ export class ObsetyncApi {
         hashes: readonly string[],
         perf?: PerfOperation,
         signal?: AbortSignal,
+        memory?: TransientWorkScope,
     ): Promise<string[] | null> {
         throwIfBulkCancelled(signal);
         if (hashes.length === 0) return [];
@@ -1475,14 +1482,18 @@ export class ObsetyncApi {
         for (let offset = 0; offset < hashes.length; offset += hashesPerRequest) {
             const batch = hashes.slice(offset, offset + hashesPerRequest);
             const body = encodeBulkCheckRequest(kind, batch, limits.maxObjects);
-            const dataResponse = await this.routeDataRpc<Uint8Array | null>(
+            const responseBytes = Math.max(
+                TRANSPORT_ERROR_PAYLOAD_ALLOWANCE_BYTES,
+                8 + bulkBitmapBytes(batch.length),
+            );
+            const request = (work?: TransientWorkContext) => this.routeDataRpc<Uint8Array | null>(
                 WsDataFrameType.CheckObjects,
                 body,
                 WsDataFrameType.CheckResult,
                 (bytes) => bytes,
                 async () => {
                     const response = await this.sealed("POST", "/api/v1/bulk/check", body, perf,
-                        undefined, replaySafeSealedOptions(signal));
+                        responseBytes, replaySafeSealedOptions(signal));
                     if (response.status === 404 || response.status === 405) {
                         this.bulkLimits = null;
                         this.wsDataFrameBytes = null;
@@ -1494,10 +1505,14 @@ export class ObsetyncApi {
                     return new Uint8Array(await response.arrayBuffer());
                 },
                 perf,
-                undefined,
-                undefined,
+                work,
+                responseBytes,
                 signal,
             );
+            const workBytes = estimateTransportWorkset(Math.max(body.byteLength, responseBytes));
+            const dataResponse = memory
+                ? await memory.run(workBytes, request, { signal })
+                : await request();
             if (dataResponse) {
                 needed.push(...decodeBulkCheckResponse(dataResponse, batch));
                 continue;

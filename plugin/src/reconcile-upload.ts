@@ -218,13 +218,15 @@ export async function repairSmallContent(api: RepairApi, io: PlatformIO, wasm: W
     return stats;
 }
 
-async function checkChunkHashes(api: RepairApi, hashes: readonly string[], options: ReconcileUploadOptions): Promise<string[]> {
+async function checkChunkHashes(api: RepairApi, hashes: readonly string[], options: ReconcileUploadOptions,
+    memory: TransientWorkScope): Promise<string[]> {
     const unique = [...new Set(hashes)];
     const missing: string[] = [];
     for (let cursor = 0; cursor < unique.length; cursor += 1000) {
         throwIfWorkAborted(options.signal);
         const batch = unique.slice(cursor, cursor + 1000);
-        const response = await phase(options.perf, "check", () => api.checkContentChunks(batch, options.perf));
+        const response = await phase(options.perf, "check", () =>
+            api.checkContentChunks(batch, options.perf, options.signal, memory));
         missing.push(...validatedReconcileMissing(batch, response));
     }
     return missing;
@@ -271,7 +273,11 @@ export async function repairLargeContent(api: RepairApi, io: PlatformIO, wasm: W
                     const result = await reconcileDesktopLargeFile(worker!, {
                         absolutePath: absolutePath!, expectedHash: source.hash.toLowerCase(), expectedSize: source.size,
                         expectedMtime: stat.mtime, feedBytes: Math.min(tuning.feedBytes, tuning.maxFeedBytes),
-                    }, hashes => { workerPending = false; stage = "upload"; return checkChunkHashes(api, hashes, options); },
+                    }, hashes => {
+                        workerPending = false;
+                        stage = "upload";
+                        return checkChunkHashes(api, hashes, options, memory);
+                    },
                     async batch => {
                         workerPending = false;
                         stage = "upload";
@@ -324,7 +330,7 @@ export async function repairLargeContent(api: RepairApi, io: PlatformIO, wasm: W
             }
             const manifest = validateManifest(info, source.hash, source.size);
             stage = "upload";
-            const missing = await checkChunkHashes(api, manifest.chunks.map(chunk => chunk.hash), options);
+            const missing = await checkChunkHashes(api, manifest.chunks.map(chunk => chunk.hash), options, memory);
             const ranges = selectReconcileMissingRanges(manifest.chunks, missing);
             stats.neededBytes = ranges.reduce((sum, chunk) => sum + chunk.size, 0);
             for (const chunk of ranges) records.push({ kind: BulkObjectKind.ContentChunk, hash: chunk.hash,

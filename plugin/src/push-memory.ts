@@ -1,7 +1,8 @@
 import type { HashTuning } from "./hash-runtime";
 import { BULK_MOBILE_MAX_BYTES, BULK_SERVER_MAX_BYTES } from "./bulk-codec";
 import { MAX_FASTCDC_CHUNK_BYTES } from "./hash-worker-protocol";
-import { estimateUploadBatchWorkset, type TransientWorksetEstimate } from "./transient-memory";
+import { estimateUploadBatchWorkset, TRANSPORT_ERROR_PAYLOAD_ALLOWANCE_BYTES,
+    type TransientWorksetEstimate } from "./transient-memory";
 
 /** StreamingChunker owns one fixed FastCDC maximum-size window. */
 export const PUSH_CHUNKER_WORK_BYTES = MAX_FASTCDC_CHUNK_BYTES;
@@ -65,7 +66,7 @@ export function planPushMemory(
         }
     }
     const bulkCap = tuning.runtime === "desktop" ? BULK_SERVER_MAX_BYTES : BULK_MOBILE_MAX_BYTES;
-    const transportPayloadBytes = Math.max(largestSingle,
+    const transportPayloadBytes = Math.max(TRANSPORT_ERROR_PAYLOAD_ALLOWANCE_BYTES, largestSingle,
         Math.min(bulkCap, contentBytes + manifestBytes + files.length * 42 + 10));
     const estimate = estimateUploadBatchWorkset({
         // JSON string, encoded manifest and serializer allowance have the same

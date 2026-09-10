@@ -111,6 +111,19 @@ crash exports preserve vault and host paths for diagnosis while retaining the
 existing per-line size cap; credentials remain excluded at their logging
 sources.
 
+A subsequent Windows recovery drain exposed a nested transient-memory deadlock:
+an owning push batch retained 91 of 96 MiB while each WS object-presence check
+independently reserved receive space for the full negotiated 4 MiB frame. One
+of the two checks then waited behind its own parent indefinitely. Bulk CHECK now
+bounds the valid bitmap response directly and borrows the owning batch's
+pre-admitted transport workset. Concurrent content/chunk checks serialize inside
+that child quota when required, and the same ownership rule covers ranged
+lookahead and large-content repair. A regression fills the shared parent budget
+completely and requires a 256-object WS CHECK to finish without a global waiter.
+The parent upload plan also includes the WS error-response floor, including for
+singleton and zero-byte content, so the borrowed child check cannot exceed the
+work quota by the fixed response allowance.
+
 ## Previous freeze checkpoint (historical evidence)
 
 The sections below retain the contracts and measurements recorded at each

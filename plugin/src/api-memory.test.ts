@@ -582,6 +582,49 @@ async function semanticLanesOwnHalfOpenProbeSelection(): Promise<void> {
     assert.equal(budget.snapshot().usedBytes, 0, "semantic lane routing leaked admission");
 }
 
+async function scopedCheckUsesParentWorksetAndExactResponseBound(): Promise<void> {
+    const capacityBytes = 2 * MIB;
+    const budget = new ResourceBudget({ capacityBytes });
+    const fake = fakeApi(budget);
+    fake.internal.wsDataFrameBytes = 2 * MIB;
+    const scope = await reserveTransientScope({
+        ownerBytes: MIB,
+        workBytes: MIB,
+    }, { budget });
+    assert.equal(budget.snapshot().usedBytes, capacityBytes,
+        "check deadlock fixture did not occupy the complete shared budget");
+    let childBytes = 0;
+    let responseBound = 0;
+    fake.internal.getDataLane = async () => ({
+        request: async (
+            _type: WsDataFrameType,
+            body: Uint8Array,
+            _expected: WsDataFrameType,
+            _perf: unknown,
+            memory: { bytes: number } | undefined,
+            maxResponseBytes: number | undefined,
+        ) => {
+            childBytes = memory?.bytes ?? 0;
+            responseBound = maxResponseBytes ?? 0;
+            return checkAck(new DataView(body.buffer, body.byteOffset).getUint32(5, true));
+        },
+    });
+    fake.reply(() => { throw new Error("healthy scoped CHECK unexpectedly used HTTP"); });
+    try {
+        const hashes = Array.from({ length: 256 }, (_, index) => hash(index));
+        assert.deepEqual(await fake.api.checkContent(hashes, undefined, undefined, scope), []);
+        assert.ok(childBytes > 0 && childBytes <= scope.snapshot().work.capacityBytes,
+            "scoped CHECK did not borrow its parent's admitted workset");
+        assert.equal(responseBound, 1024,
+            "CHECK reserved the full negotiated frame instead of its bounded bitmap response");
+        assert.equal(budget.snapshot().queuedRequests, 0,
+            "scoped CHECK waited on the globally exhausted parent budget");
+    } finally {
+        scope.close();
+    }
+    assert.equal(budget.snapshot().usedBytes, 0, "scoped CHECK leaked parent admission");
+}
+
 async function urgentFilePriorityIsBoundedExplicitAndReplaySafe(): Promise<void> {
     const budget = new ResourceBudget({ capacityBytes: 4 * MIB });
     const fake = fakeApi(budget);
@@ -676,10 +719,11 @@ void (async () => {
             await productionRouterOwnsFallbackAndStopsWsPingPong();
             await callerCancellationNeverFallsBackToHttp();
             await semanticLanesOwnHalfOpenProbeSelection();
+            await scopedCheckUsesParentWorksetAndExactResponseBound();
             await urgentFilePriorityIsBoundedExplicitAndReplaySafe();
         });
         await desktopOwnedReceiveFitsARecoverySizedPool();
-        console.log("api-memory.test: 17 ownership/transport regression scenarios passed");
+        console.log("api-memory.test: 18 ownership/transport regression scenarios passed");
     } finally {
         delete (globalThis as any).__obsetyncTestRequestUrl;
     }

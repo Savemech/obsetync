@@ -693,7 +693,7 @@ async function prepareRangedPushLookahead(
         assertApplicable?.(change.path);
         const endCheck = perf?.phase("check");
         let response: unknown;
-        try { response = await api.checkContentChunks(hashes, perf); }
+        try { response = await api.checkContentChunks(hashes, perf, signal, memory); }
         finally { endCheck?.(); }
         throwIfWorkAborted(signal);
         assertApplicable?.(change.path);
@@ -1689,10 +1689,10 @@ export async function push(
         try {
             const checks = Promise.all([
                 uncheckedSmall.length > 0
-                    ? api.checkContent(uncheckedSmall, perf)
+                    ? api.checkContent(uncheckedSmall, perf, signal, memory)
                     : Promise.resolve([]),
                 uncheckedChunkHashes.length > 0
-                    ? api.checkContentChunks(uncheckedChunkHashes, perf)
+                    ? api.checkContentChunks(uncheckedChunkHashes, perf, signal, memory)
                     : Promise.resolve([]),
             ]);
             // Network calls above are already dispatched. Prepare only the
