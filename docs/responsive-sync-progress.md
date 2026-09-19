@@ -14,10 +14,12 @@ publish before a 25,000-file review completes, while deletion review, journal
 ownership, dependency cuts, and the mandatory complete review remain
 fail-closed. P4/Yjs/CRDT remains dormant by explicit scope decision.
 
-`1.12.7` is published from the exact commit above. Local and remote release
+`1.12.7` is published from the exact commit above. Its local and remote release
 gates, exact-build identity, tag/release provenance, and flat BRAT artifacts are
-verified. Clean BRAT/manual installation and update on a real device, production
-deployment, and the numerical real-device gates remain separate and open.
+verified. The unpublished `1.12.8` candidate has passed the applicable local
+release gates. Its tag-triggered remote workflow, published artifacts, clean
+BRAT/manual installation and update on a real device, production deployment,
+and the numerical real-device gates remain separate and open.
 
 ### Current exact-tree local evidence
 
@@ -63,21 +65,25 @@ Current-tree automated gates completed so far:
   PASS;
 - Rust format, workspace Clippy, workspace tests, sync-core WASM-feature tests,
   wasm32 check, and release server build: PASS; the server binary is 4,618,384
-  bytes;
+  bytes for the published baseline. The exact local `1.12.8` Nix server binary
+  is 4,641,288 bytes; its immutable hash belongs in the external release
+  artifact manifest because the binary embeds the release commit identity;
 - native WS data, fragmentation/interleaving/cancellation/fallback, and both
   fresh-process crash boundaries: PASS. The tested release server binary
   SHA256 is
   `dba812c0d0269aa1a01dbc68e55c9b278a8eb826c71db328defac1d0d3deb8f3`;
 - fresh packaged scalar/SIMD WASM reproduction, parity, 25,000-entry memory
   lifecycle, browser worker/probe, and desktop-worker regressions: PASS. All
-  eight generated artifacts are byte-identical to the tracked files; scalar
-  is 807,655 bytes and SIMD is 793,402 bytes;
+  generated artifacts are byte-identical to the tracked files; the local
+  `1.12.8` scalar module is 811,389 bytes and SIMD is 796,974 bytes;
 - `nix flake check --no-build`, focused Nix WASM build plus parity/memory,
   complete `nix flake check`, and `nix build .#server`: PASS. The focused Nix
   output is `/tmp/obsetync-sync-core-wasm-post-preemption`;
 - isolated Docker `just e2e`: PASS, including concurrency, conflict, enrollment,
   history export, realtime WS, stale-tree rejection, text merge, transport
   security, and one-device/two-device scenarios; teardown left no containers;
+- exact local `1.12.8` release preflight, flat plugin archive construction,
+  Nix server build, and provenance-labelled OCI image construction: PASS;
 - current source and documentation outside the untracked user-owned `temp/`
   directory contain no Cyrillic text.
 
