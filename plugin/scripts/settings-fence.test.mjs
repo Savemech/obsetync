@@ -103,6 +103,8 @@ function fixture(enrolled = true) {
         syncEngineOrNull: () => exposeEngine ? engine : null,
         async getDebugInfo() { return ""; },
         async showBrowserCapabilityProbe() {},
+        typingLatencySnapshot: () => ({ state: "not-run" }),
+        toggleTypingLatencyCapture() {},
     };
     const tab = new ObsetyncSettingTab({ containerEl: new Element() }, plugin);
     tab.display();

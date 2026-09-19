@@ -44,7 +44,7 @@ const fixtures = new Map([
     ["./debug-log", ["debugLog", "crashLog", "perfSpan"]],
     ["./operation-checkpoint", ["OperationCheckpoint"]],
     ["./ignore", ["migrateLegacyDefaultIgnorePatterns"]],
-    ["./perf-trace", ["normalizePerfArchitecture", "perfTrace"]],
+    ["./perf-trace", ["formatTypingLatency", "normalizePerfArchitecture", "perfTrace", "TypingLatencyProbe"]],
     ["./hash-runtime", ["configureHashTuning", "getHashTuning"]],
     ["./work-scheduler", ["disposeWorkScheduler", "workSchedulerSnapshot", "throwIfWorkAborted", "yieldWork"]],
     ["./transient-memory", ["configureTransientMemory", "transientMemorySnapshot", "closeTransientMemory"]],
@@ -519,7 +519,23 @@ function fixture({ workers = false, mobile = false, legacyState = "none", enroll
         perfSpan: () => noop,
         OperationCheckpoint: class { async initialize() { await step("checkpoint:initialize"); return null; } },
         migrateLegacyDefaultIgnorePatterns: value => value,
+        formatTypingLatency: snapshot => `${snapshot.state} · fixture`,
         normalizePerfArchitecture: () => "x64",
+        TypingLatencyProbe: class {
+            constructor() { this.state = "not-run"; }
+            isRunning() { return this.state === "running"; }
+            start() { this.state = "running"; return this.snapshot(); }
+            stop(reason) {
+                if (this.state === "running") this.state = "complete";
+                record(`typing:stop:${reason}`);
+                return this.snapshot();
+            }
+            snapshot() {
+                return { state: this.state, method: "beforeinput-two-frame-upper-bound",
+                    samples: 0, discarded: 0, elapsedMs: 0, p50Ms: null, p95Ms: null,
+                    p99Ms: null, maxMs: null, stopReason: null, qualificationEligible: false };
+            }
+        },
         perfTrace: { setVisible: noop, subscribeWindows: () => () => record("perf:unsubscribe"),
             activeSnapshots: () => [],
             getProfile: () => perfProfile, setProfile: value => { perfProfile = value; } },
@@ -604,6 +620,7 @@ test("status refresh owns one bounded interval and releases it on unload", async
     equal(f.count("arbiter:new"), 1, "Plugin did not create exactly one lifetime memory arbiter");
     await f.unload(plugin);
     equal(f.intervals.size, 0, "Plugin unload retained its status refresh interval");
+    equal(f.count("typing:stop:unload"), 1, "Plugin unload retained the typing-latency probe");
     equal(f.count("arbiter:close"), 1, "Plugin did not close its lifetime memory arbiter exactly once");
     f.before("plan:close", "arbiter:close");
     for (const owner of ["base", "journal", "confirmations"]) {

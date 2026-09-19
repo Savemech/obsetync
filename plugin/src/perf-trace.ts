@@ -1011,4 +1011,197 @@ function formatMilestones(value: Pick<PerfActiveOperation,
     return parts.length > 0 ? ` · milestones ${parts.join(" · ")}` : "";
 }
 
+export type TypingLatencyStopReason =
+    "manual" | "hidden" | "freeze" | "pagehide" | "unload" | "duration-limit" | "sample-limit";
+
+export interface TypingLatencySnapshot {
+    state: "not-run" | "running" | "complete";
+    method: "beforeinput-two-frame-upper-bound";
+    samples: number;
+    discarded: number;
+    elapsedMs: number;
+    p50Ms: number | null;
+    p95Ms: number | null;
+    p99Ms: number | null;
+    maxMs: number | null;
+    stopReason: TypingLatencyStopReason | null;
+    qualificationEligible: boolean;
+}
+
+export interface TypingLatencyHost {
+    monotonicNow(): number;
+    visible(): boolean;
+    isEditorTarget(target: EventTarget | null): boolean;
+    addBeforeInput(listener: (event: Event) => void): () => void;
+    requestFrame(callback: () => void): number;
+    cancelFrame(handle: number): void;
+    setTimeout(callback: () => void, delayMs: number): ReturnType<typeof globalThis.setTimeout>;
+    clearTimeout(handle: ReturnType<typeof globalThis.setTimeout>): void;
+}
+
+const TYPING_LATENCY_MAX_SAMPLES = 2_048;
+const TYPING_LATENCY_MAX_PENDING = 64;
+const TYPING_LATENCY_MAX_DURATION_MS = 5 * 60_000;
+const TYPING_LATENCY_MIN_QUALIFICATION_SAMPLES = 500;
+const TYPING_LATENCY_MIN_QUALIFICATION_MS = 60_000;
+
+function browserTypingLatencyHost(): TypingLatencyHost {
+    if (typeof document === "undefined" || typeof window === "undefined" ||
+        typeof window.requestAnimationFrame !== "function") {
+        throw new Error("Typing latency capture requires a visible Obsidian window.");
+    }
+    return {
+        monotonicNow: () => performance.now(),
+        visible: () => !document.hidden,
+        isEditorTarget: target => typeof (target as Element | null)?.closest === "function" &&
+            !!(target as Element).closest(".cm-editor"),
+        addBeforeInput: listener => {
+            document.addEventListener("beforeinput", listener, true);
+            return () => document.removeEventListener("beforeinput", listener, true);
+        },
+        requestFrame: callback => window.requestAnimationFrame(() => callback()),
+        cancelFrame: handle => window.cancelAnimationFrame(handle),
+        setTimeout: (callback, delayMs) => globalThis.setTimeout(callback, delayMs),
+        clearTimeout: handle => globalThis.clearTimeout(handle),
+    };
+}
+
+function nearestRank(sorted: readonly number[], quantile: number): number | null {
+    if (sorted.length === 0) return null;
+    return sorted[Math.max(0, Math.ceil(sorted.length * quantile) - 1)];
+}
+
+/** Explicit, bounded editor responsiveness capture. A second animation frame
+ * runs only after the first frame had an opportunity to paint, so passing this
+ * conservative bound also passes the earlier actual paint. No event, target,
+ * editor text, or path is retained. */
+export class TypingLatencyProbe {
+    private state: TypingLatencySnapshot["state"] = "not-run";
+    private host: TypingLatencyHost | null = null;
+    private removeListener: (() => void) | null = null;
+    private timeout: ReturnType<typeof globalThis.setTimeout> | null = null;
+    private samples: number[] = [];
+    private discarded = 0;
+    private startedAt = 0;
+    private finishedAt = 0;
+    private stopReason: TypingLatencyStopReason | null = null;
+    private nextToken = 0;
+    private readonly pending = new Map<number, number>();
+
+    isRunning(): boolean { return this.state === "running"; }
+
+    start(host: TypingLatencyHost = browserTypingLatencyHost()): TypingLatencySnapshot {
+        if (this.isRunning()) return this.snapshot();
+        if (!host.visible()) throw new Error("Keep Obsidian visible while capturing typing latency.");
+        this.samples = [];
+        this.discarded = 0;
+        this.startedAt = host.monotonicNow();
+        this.finishedAt = 0;
+        this.stopReason = null;
+        this.host = host;
+        this.state = "running";
+        try {
+            this.removeListener = host.addBeforeInput(event => this.observe(event));
+            this.timeout = host.setTimeout(() => this.stop("duration-limit"), TYPING_LATENCY_MAX_DURATION_MS);
+        } catch (error) {
+            this.removeListener?.();
+            this.removeListener = null;
+            this.host = null;
+            this.state = "not-run";
+            throw error;
+        }
+        return this.snapshot();
+    }
+
+    stop(reason: TypingLatencyStopReason = "manual"): TypingLatencySnapshot {
+        if (!this.isRunning()) return this.snapshot();
+        const host = this.host!;
+        this.state = "complete";
+        this.stopReason = reason;
+        this.finishedAt = host.monotonicNow();
+        this.removeListener?.();
+        this.removeListener = null;
+        if (this.timeout !== null) host.clearTimeout(this.timeout);
+        this.timeout = null;
+        this.discarded += this.pending.size;
+        for (const frame of this.pending.values()) host.cancelFrame(frame);
+        this.pending.clear();
+        this.host = null;
+        return this.snapshot();
+    }
+
+    snapshot(): TypingLatencySnapshot {
+        const sorted = [...this.samples].sort((a, b) => a - b);
+        const endedAt = this.isRunning() ? this.host!.monotonicNow() : this.finishedAt;
+        const elapsedMs = this.state === "not-run" ? 0 : Math.max(0, endedAt - this.startedAt);
+        const total = sorted.length + this.discarded;
+        return {
+            state: this.state,
+            method: "beforeinput-two-frame-upper-bound",
+            samples: sorted.length,
+            discarded: this.discarded,
+            elapsedMs,
+            p50Ms: nearestRank(sorted, 0.50),
+            p95Ms: nearestRank(sorted, 0.95),
+            p99Ms: nearestRank(sorted, 0.99),
+            maxMs: sorted.at(-1) ?? null,
+            stopReason: this.stopReason,
+            qualificationEligible: this.state === "complete" &&
+                (this.stopReason === "manual" || this.stopReason === "duration-limit" ||
+                    this.stopReason === "sample-limit") &&
+                sorted.length >= TYPING_LATENCY_MIN_QUALIFICATION_SAMPLES &&
+                elapsedMs >= TYPING_LATENCY_MIN_QUALIFICATION_MS &&
+                (total === 0 || this.discarded / total <= 0.01),
+        };
+    }
+
+    private observe(event: Event): void {
+        const host = this.host;
+        if (!host || !this.isRunning() || !event.isTrusted || !host.visible() ||
+            !host.isEditorTarget(event.target)) return;
+        if (this.pending.size >= TYPING_LATENCY_MAX_PENDING) {
+            this.discarded++;
+            return;
+        }
+        const now = host.monotonicNow();
+        const eventTime = Number(event.timeStamp);
+        const startedAt = Number.isFinite(eventTime) && eventTime >= 0 && eventTime <= now &&
+            now - eventTime <= TYPING_LATENCY_MAX_DURATION_MS ? eventTime : now;
+        const token = ++this.nextToken;
+        const first = host.requestFrame(() => {
+            if (!this.pending.has(token)) return;
+            if (!this.isRunning() || !host.visible()) return this.discard(token);
+            const second = host.requestFrame(() => {
+                if (!this.pending.has(token)) return;
+                this.pending.delete(token);
+                if (!this.isRunning() || !host.visible()) {
+                    this.discarded++;
+                    return;
+                }
+                const duration = host.monotonicNow() - startedAt;
+                if (Number.isFinite(duration) && duration >= 0) this.samples.push(duration);
+                else this.discarded++;
+                if (this.samples.length >= TYPING_LATENCY_MAX_SAMPLES) this.stop("sample-limit");
+            });
+            this.pending.set(token, second);
+        });
+        this.pending.set(token, first);
+    }
+
+    private discard(token: number): void {
+        if (!this.pending.delete(token)) return;
+        this.discarded++;
+    }
+}
+
+export function formatTypingLatency(snapshot: TypingLatencySnapshot): string {
+    if (snapshot.state === "not-run") return "not run (opt-in only)";
+    const duration = (value: number | null) => value === null ? "unmeasured" : `${value.toFixed(1)}ms`;
+    return `${snapshot.state} · two-frame upper bound · ${snapshot.samples} samples/${formatDuration(snapshot.elapsedMs)} · ` +
+        `p50 ${duration(snapshot.p50Ms)} · p95 ${duration(snapshot.p95Ms)} · ` +
+        `p99 ${duration(snapshot.p99Ms)} · max ${duration(snapshot.maxMs)} · ` +
+        `discarded ${snapshot.discarded} · evidence ${snapshot.qualificationEligible ? "eligible" : "insufficient"}` +
+        (snapshot.stopReason ? ` · ${snapshot.stopReason}` : "");
+}
+
 export const perfTrace = new PerfTrace();

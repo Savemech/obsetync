@@ -2,11 +2,14 @@ import { strict as assert } from "node:assert";
 import {
     DEFAULT_PERF_PROFILE,
     PerfTrace,
+    TypingLatencyProbe,
     perfSampleWeight,
+    formatTypingLatency,
     normalizePerfArchitecture,
     type PerfOperationWindow,
     type PerfTimerScheduler,
     type PerfPlatformProfile,
+    type TypingLatencyHost,
 } from "./perf-trace";
 
 const profile: PerfPlatformProfile = {
@@ -465,6 +468,84 @@ function testWindows(): void {
     a.finish();
     b.finish();
     offConcurrent();
+
+    let typingNow = 10;
+    let typingVisible = true;
+    let beforeInput: ((event: Event) => void) | null = null;
+    let nextFrame = 0;
+    const frames = new Map<number, () => void>();
+    let timeoutCallback: (() => void) | null = null;
+    const editor = {} as EventTarget;
+    const typingHost: TypingLatencyHost = {
+        monotonicNow: () => typingNow,
+        visible: () => typingVisible,
+        isEditorTarget: target => target === editor,
+        addBeforeInput: listener => {
+            assert.equal(beforeInput, null, "typing listener duplicated");
+            beforeInput = listener;
+            return () => { beforeInput = null; };
+        },
+        requestFrame: callback => { const handle = ++nextFrame; frames.set(handle, callback); return handle; },
+        cancelFrame: handle => { frames.delete(handle); },
+        setTimeout: callback => { timeoutCallback = callback; return 1 as any; },
+        clearTimeout: () => { timeoutCallback = null; },
+    };
+    const flushFrame = (advanceMs: number) => {
+        typingNow += advanceMs;
+        const ready = [...frames.entries()];
+        for (const [handle] of ready) frames.delete(handle);
+        for (const [, callback] of ready) callback();
+    };
+    const input = (target: EventTarget, trusted = true, queuedMs = 0) =>
+        beforeInput?.({ target, isTrusted: trusted, timeStamp: typingNow - queuedMs } as Event);
+    const typing = new TypingLatencyProbe();
+    assert.equal(typing.snapshot().state, "not-run");
+    typing.start(typingHost);
+    input({} as EventTarget);
+    input(editor, false);
+    assert.equal(frames.size, 0, "non-editor or synthetic input was measured");
+    for (const duration of [10, 20, 30, 40, 50]) {
+        input(editor, true, 2);
+        flushFrame((duration - 2) / 2);
+        flushFrame((duration - 2) / 2);
+    }
+    assert.deepEqual(typing.snapshot(), {
+        state: "running", method: "beforeinput-two-frame-upper-bound", samples: 5, discarded: 0,
+        elapsedMs: 140, p50Ms: 30, p95Ms: 50, p99Ms: 50, maxMs: 50, stopReason: null,
+        qualificationEligible: false,
+    });
+    input(editor);
+    flushFrame(1);
+    typingVisible = false;
+    flushFrame(1);
+    typingVisible = true;
+    assert.equal(typing.snapshot().discarded, 1, "hidden-crossing input became foreground evidence");
+    input(editor);
+    const complete = typing.stop("manual");
+    assert.equal(complete.discarded, 2, "stopped in-flight input was not discarded");
+    assert.equal(frames.size, 0);
+    assert.match(formatTypingLatency(complete), /p95 50\.0ms/);
+    assert.doesNotMatch(JSON.stringify(complete), /target|text|path/);
+    assert.equal(typing.stop("unload").stopReason, "manual", "stop was not idempotent");
+    typing.start(typingHost);
+    for (let i = 0; i < 500; i++) {
+        input(editor);
+        flushFrame(60);
+        flushFrame(60);
+    }
+    assert.equal(typing.stop("manual").qualificationEligible, true,
+        "long foreground capture was not qualification-eligible");
+    typing.start(typingHost);
+    const fireTimeout = timeoutCallback as unknown as (() => void);
+    assert.equal(typeof fireTimeout, "function");
+    fireTimeout();
+    assert.equal(typing.snapshot().stopReason, "duration-limit");
+    assert.equal(beforeInput, null);
+    assert.throws(() => typing.start({ ...typingHost, visible: () => false }), /visible/);
+    const installFailure = new Error("injected listener failure");
+    assert.throws(() => typing.start({ ...typingHost,
+        addBeforeInput: () => { throw installFailure; } }), error => error === installFailure);
+    assert.equal(typing.snapshot().state, "not-run", "failed installation left capture running");
 }
 
 run();

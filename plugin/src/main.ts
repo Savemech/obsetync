@@ -43,8 +43,10 @@ import { OperationCheckpoint } from "./operation-checkpoint";
 import type { WasmModule, WasmTree } from "./push";
 import { migrateLegacyDefaultIgnorePatterns } from "./ignore";
 import {
+    formatTypingLatency,
     normalizePerfArchitecture,
     perfTrace,
+    TypingLatencyProbe,
 } from "./perf-trace";
 import { configureHashTuning, getHashTuning, type HashTuning } from "./hash-runtime";
 import { disposeWorkScheduler, workSchedulerSnapshot, yieldWork } from "./work-scheduler";
@@ -290,6 +292,7 @@ export default class ObsetyncPlugin extends Plugin {
     private browserProbeReport: BrowserCapabilityReport | null = null;
     private browserProbePromise: Promise<string> | null = null;
     private browserProbeAbort: AbortController | null = null;
+    private readonly typingLatency = new TypingLatencyProbe();
     private legacyDowngradeHost: LegacyDowngradeHostCoordinator | null = null;
     private legacyDowngradeStoppedHost: LegacyDowngradeStoppedHost | null = null;
     private legacyRootIntentOwner: RootIntentStore | null = null;
@@ -441,13 +444,17 @@ export default class ObsetyncPlugin extends Plugin {
                 perfTrace.setVisible(visible);
                 this.resourceGovernor.setVisible(visible);
                 this.visibilityGate.setVisible(visible, "hidden");
-                if (!visible) this.browserProbeAbort?.abort("hidden");
+                if (!visible) {
+                    this.browserProbeAbort?.abort("hidden");
+                    this.typingLatency.stop("hidden");
+                }
             });
             this.registerDomEvent(document, "freeze" as keyof DocumentEventMap, () => {
                 perfTrace.setVisible(false);
                 this.resourceGovernor.setVisible(false);
                 this.visibilityGate.setVisible(false, "freeze");
                 this.browserProbeAbort?.abort("freeze");
+                this.typingLatency.stop("freeze");
             });
         }
         if (typeof window !== "undefined") {
@@ -456,6 +463,7 @@ export default class ObsetyncPlugin extends Plugin {
                 this.resourceGovernor.setVisible(false);
                 this.visibilityGate.setVisible(false, "pagehide");
                 this.browserProbeAbort?.abort("pagehide");
+                this.typingLatency.stop("pagehide");
             });
             this.registerDomEvent(window, "pageshow", () => {
                 const visible = typeof document === "undefined" || !document.hidden;
@@ -558,6 +566,9 @@ export default class ObsetyncPlugin extends Plugin {
         this.addCommand({ id: "test-browser-worker-capabilities",
             name: "Test browser worker capabilities (synthetic data only)",
             callback: () => { void this.showBrowserCapabilityProbe(); } });
+        this.addCommand({ id: "measure-editor-typing-latency",
+            name: "Measure editor typing latency (start/stop)",
+            callback: () => this.toggleTypingLatencyCapture() });
         if (scheduleAutomaticSync && this.settings.enrolled && this.settings.serverUrl) {
             this.app.workspace.onLayoutReady(() => {
                 try { this.legacyDowngradeHost?.authorize("init").assertCurrent(); }
@@ -913,6 +924,7 @@ export default class ObsetyncPlugin extends Plugin {
         this.rootTreeResidentAdmission.close();
         this.syncInitGeneration++;
         this.browserProbeAbort?.abort();
+        this.typingLatency.stop("unload");
         this.hashWorkerGeneration++;
         // Stop admission synchronously, but leave services needed by accepted
         // root/base/journal settlement alive until all actual owners finish.
@@ -999,6 +1011,28 @@ export default class ObsetyncPlugin extends Plugin {
             "Termination requested is not a native heap-release/RSS measurement.",
             "A passing probe does not enable production browser workers or prove mobile UI/memory gates.",
         ].join("\n");
+    }
+
+    typingLatencySnapshot() { return this.typingLatency.snapshot(); }
+
+    toggleTypingLatencyCapture(): void {
+        try {
+            if (this.typingLatency.isRunning()) {
+                const result = this.typingLatency.stop("manual");
+                new ObsetyncDebugModal(this.app, [
+                    "=== ObsetyNC editor typing latency ===",
+                    formatTypingLatency(result),
+                    "Method: trusted editor beforeinput to the second animation frame.",
+                    "This is a conservative upper bound: at least one paint opportunity completed.",
+                    "Captured data: durations and counts only; no text, target, or path.",
+                ].join("\n")).open();
+                return;
+            }
+            this.typingLatency.start();
+            new Notice("Typing latency capture started. Type normally, then press the button again. Capture stops when hidden or after 5 minutes.");
+        } catch (error) {
+            new Notice((error as Error).message);
+        }
     }
 
     /** Expose the sync engine for the settings tab's status box. Returns null
@@ -1114,6 +1148,7 @@ export default class ObsetyncPlugin extends Plugin {
         push(`Build verification: ${compareBuildIdentity(this.manifest.version, BUNDLE_BUILD_IDENTITY).diagnostic}`);
         push(`Browser probe:     ${this.browserProbeReport?.code ?? "not run (opt-in only)"} · not a production capability grant`);
         if (this.browserProbeReport) push(this.formatBrowserProbe());
+        push(`Typing latency:    ${formatTypingLatency(this.typingLatency.snapshot())}`);
         const prepared = this.preparedTransfers?.snapshot();
         if (prepared) {
             push(`Prepared hints:    ${prepared.ready ? "ready" : prepared.closed ? "closed" : "not ready"} · ${prepared.records}/${prepared.limits.records} files · ${prepared.chunks}/${prepared.limits.chunks} chunks`);

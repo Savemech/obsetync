@@ -104,6 +104,16 @@ directory between stat and binary read and preserves the native `EISDIR`. Both
 checks are newer than the `1.12.7` tag and are not claimed as part of that
 release.
 
+Post-release diagnostics now also include an explicit bounded editor typing
+capture. It measures trusted CodeMirror `beforeinput` events through the second
+animation frame, a conservative upper bound after at least one paint
+opportunity. The probe retains only durations and counts, permits at most 2,048
+samples and 64 in-flight measurements, stops after five minutes or on any
+visibility/lifecycle boundary, and marks evidence eligible only after 500
+samples, 60 seconds, and at most 1% discarded measurements. It is exposed by a
+command, settings action, and the debug report. This instrumentation is newer
+than `1.12.7`; no real-device p95/p99 result is claimed yet.
+
 ### 1.12.1 field stabilization
 
 The first Windows field run completed a 25k full scan in 1.6 minutes with

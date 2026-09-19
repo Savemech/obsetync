@@ -426,6 +426,14 @@ export class ObsetyncSettingTab extends PluginSettingTab {
             .setDesc("Opt-in diagnostic using only synthetic data. Tests Blob worker startup, transferable buffers and scalar/SIMD WASM; no vault files or network access. Keep Obsidian visible and wait for active sync to finish.")
             .addButton(btn => btn.setButtonText("Run synthetic test").onClick(() => this.plugin.showBrowserCapabilityProbe()));
 
+        const typing = this.plugin.typingLatencySnapshot();
+        new Setting(containerEl)
+            .setName("Measure editor typing latency")
+            .setDesc("Opt-in five-minute capture of trusted editor input to a completed paint opportunity. Stores durations only, never note text or paths. Keep Obsidian visible and type normally; press again to finish.")
+            .addButton(btn => btn
+                .setButtonText(typing.state === "running" ? "Stop and show" : typing.state === "complete" ? "Run again" : "Start capture")
+                .onClick(() => { this.plugin.toggleTypingLatencyCapture(); this.display(); }));
+
         new Setting(containerEl)
             .setName("Full Rescan")
             .setDesc(
