@@ -1,6 +1,6 @@
 # Responsive sync: implementation progress
 
-Updated: 2026-09-19. Published baseline: `1.12.7` (`7fdd43065058d10ed61bc5f2c58c094f39f990b5`).
+Updated: 2026-09-19. Published baseline: `1.12.7` (`7fdd43065058d10ed61bc5f2c58c094f39f990b5`). Local candidate: `1.12.8` (unpublished).
 Related document: [implementation roadmap](responsive-sync-roadmap.md).
 Fallback-boundary follow-up: [capability fallback and admission audit](fallback-admission-audit.md).
 
