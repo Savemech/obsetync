@@ -76,7 +76,7 @@ test("real text/binary/append/stat/list/rename/remove methods satisfy adapter sh
 });
 
 test("only actual ENOENT becomes absence; type/native failures stay failures", async () => {
-    await fixture(async ({ adapter, resetCounters, snapshot }) => {
+    await fixture(async ({ adapter, resetCounters, snapshot }, directory) => {
         await adapter.mkdir("folder"); await adapter.write("file", "preserved"); resetCounters();
         for (const operation of [() => adapter.stat("file/child"), () => adapter.exists("file/child"),
             () => adapter.mkdir("file/child"), () => adapter.list("file")]) {
@@ -93,6 +93,9 @@ test("only actual ENOENT becomes absence; type/native failures stay failures", a
         }
         await assert.rejects(adapter.writeBinary("bad", "not bytes"), code("EINVAL"));
         await assert.rejects(adapter.write("bad", new Uint8Array(1)), code("EINVAL"));
+        await adapter.write("type-race", "file"); assert.equal((await adapter.stat("type-race")).type, "file");
+        await fs.unlink(join(directory, "type-race")); await fs.mkdir(join(directory, "type-race"));
+        await assert.rejects(adapter.readBinary("type-race"), code("EISDIR"));
         assert.equal(await adapter.read("file"), "preserved"); assert.equal((await adapter.stat("folder")).type, "folder");
         const result = snapshot(); idle(result);
         assert(result.total.failed >= 16); assert(result.total.native.operations.close.succeeded >= 3,

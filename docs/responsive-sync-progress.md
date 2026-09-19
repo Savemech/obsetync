@@ -1,6 +1,6 @@
 # Responsive sync: implementation progress
 
-Updated: 2026-09-10. Published baseline: `1.11.4` (`d5df76fe613d509a64c5ff22d9cc9f27845cc4f5`).
+Updated: 2026-09-19. Published baseline: `1.12.7` (`7fdd43065058d10ed61bc5f2c58c094f39f990b5`).
 Related document: [implementation roadmap](responsive-sync-roadmap.md).
 Fallback-boundary follow-up: [capability fallback and admission audit](fallback-admission-audit.md).
 
@@ -14,9 +14,10 @@ publish before a 25,000-file review completes, while deletion review, journal
 ownership, dependency cuts, and the mandatory complete review remain
 fail-closed. P4/Yjs/CRDT remains dormant by explicit scope decision.
 
-The implementation is staged as `1.12.7`. Local release gates and exact-build
-identity checks are required before deployment; remote CI, release artifacts,
-tagging, publication, and real-device numerical evidence remain separate gates.
+`1.12.7` is published from the exact commit above. Local and remote release
+gates, exact-build identity, tag/release provenance, and flat BRAT artifacts are
+verified. Clean BRAT/manual installation and update on a real device, production
+deployment, and the numerical real-device gates remain separate and open.
 
 ### Current exact-tree local evidence
 
@@ -80,11 +81,28 @@ Current-tree automated gates completed so far:
 - current source and documentation outside the untracked user-owned `temp/`
   directory contain no Cyrillic text.
 
-Remote CI passed for the initial `1.12.0` deployment commit. The tag-triggered
-release stopped before publication because YAML folding passed a leading space
-in the server provenance version argument; the corrected literal command is
-covered by the normal CI workflow. Release artifacts and the broader real-device
-qualification remain open.
+The tag-triggered `1.12.7` release workflow
+[`35446231178`](https://github.com/Savemech/obsetync/actions/runs/35446231178)
+completed successfully for the exact release commit. It passed plugin preflight,
+workspace Rust/WASM tests, exact-image E2E, the complete Nix flake check, server
+binary provenance, plugin artifact construction, and both Docker publication
+paths. The non-draft, non-prerelease
+[`1.12.7` release](https://github.com/Savemech/obsetync/releases/tag/1.12.7)
+contains `main.js`, `manifest.json`, `styles.css`, scalar/SIMD JS and WASM,
+`versions.json`, `obsetync-1.12.7.zip`, the server binary, container metadata,
+and the artifact manifest. GitHub reports all assets uploaded. This proves
+publication, not that a real BRAT client loaded the build or passed the device
+matrix.
+
+Post-release local coverage now also drives a raw `EISDIR` file-to-directory
+race after successful metadata materialization through the actual engine,
+journal, candidate, and root lifecycle. The failed attempt retains the durable
+journal generation and retry hint, publishes no root or base, survives a cold
+reload, and succeeds after the path becomes a file again. This regression is
+paired with a real temporary-filesystem adapter check that changes a file to a
+directory between stat and binary read and preserves the native `EISDIR`. Both
+checks are newer than the `1.12.7` tag and are not claimed as part of that
+release.
 
 ### 1.12.1 field stabilization
 
@@ -286,17 +304,18 @@ by −13.81% wall duration, +16.02% throughput, and −63.57% wire requests, but
 single runs on different code cuts do not prove causality, the population
 tail, or a release performance gate.
 
-What actually remains before release:
+What actually remains before production rollout:
 
 - iPhone/iPad/Android/macOS/Windows matrix: input-to-paint, UI lag, RSS/Jetsam,
-  plugin reload, suspend/resume, OS kill, and native-filesystem behavior;
+  plugin reload, suspend/resume, OS kill, native-filesystem behavior, and a clean
+  BRAT/manual install plus update from the published artifacts;
 - LAN/WAN/loss/reorder/WS-reset testing of automatic WS ↔ HTTP selection,
   mixed-client upgrade, and prolonged soak/canary;
-- fault/power-loss evidence on real storage, remote CI on the exact commit, and
-  threshold calibration. Increasing concurrency for pull/reconcile is
-  intentionally excluded without comparable admitted stage-demand evidence;
-- only after these gates: version assignment, tag, release assets,
-  provenance/SHA256, Nix pin update, and staged deployment.
+- fault/power-loss evidence on real storage and threshold calibration.
+  Increasing concurrency for pull/reconcile is intentionally excluded without
+  comparable admitted stage-demand evidence;
+- only after these gates: production deployment. Version `1.12.7`, its tag,
+  release assets, provenance, and Nix pin are already published and verified.
 
 P4/Yjs/CRDT remains a frozen dormant track: simultaneous editing of one file
 is not being optimized now, while the existing conflict-copy, revision/root,
@@ -1448,7 +1467,10 @@ warnings. Remote CI and real-device memory/UI/reload checks were not run.
   entire restart/pipeline workflow or native memory qualification.
 - Complete CRDT/editor binding, durable document operations, and a materializer are not enabled. These WS metrics do not declare the server live-editing scaffold fixed.
 - Worker-startup reasons and the opt-in browser probe are available; native mobile capability results, the production mobile worker/reader, and build-provenance/manifest mismatch still require work. Version `1.11.4` here is the source baseline, not a newly published release.
-- Native adapter integration tests and scenarios where a file changes to a directory between stat and read are still needed. Such a read error remains an error for retry rather than becoming an inferred deletion.
+- The local Node native adapter and engine lifecycle now cover a file changing
+  to a directory between stat and read: native `EISDIR` remains retryable and
+  cannot publish a root, advance the base, or acknowledge the journal. Native
+  Obsidian IPC/Windows 9p/mobile-host qualification remains a device gate.
 - Working vaults, clients, Syncthing, and production services were unchanged. This phase did not perform a new tag/release/deploy.
 - The new journal/sync-base limit the size of individual IO/parse operations, not the entire backlog/index or native-host memory. Legacy migration has explicit limits/recovery stops; a safe user rollout/rollback is not ready. The advance fence is neither a latest-generation witness nor an fsync/power-loss guarantee.
 

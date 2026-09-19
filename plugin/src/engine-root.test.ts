@@ -553,6 +553,44 @@ async function materializationFailureCannotBecomeLocalOmissionAck() {
     }
 }
 
+async function sourceReadDirectoryRaceRemainsRetryable() {
+    const f = await fixture(), a = await f.create("source-type-race");
+    const path = pathAt(0);
+    try {
+        await f.queue(a.engine, [path], 2);
+        f.control.contentMissing = true;
+        const directory = Object.assign(new Error("source became a directory during read"), { code: "EISDIR" });
+        f.control.beforeRead = async candidate => {
+            assert.equal(candidate, path);
+            f.source.delete(path);
+            throw directory;
+        };
+
+        const originalRoot = f.base.treeBaseRoot;
+        await a.engine.pushPending();
+        assert.equal(a.engine.lastError?.message, directory.message);
+        assert.equal(f.server.requests.length, 0, "directory race published a root");
+        assert.equal(f.journal.unsyncedCount(), 1, "directory race acknowledged its journal generation");
+        assert.equal(a.engine.pendingChanges.size, 1, "directory race discarded its retry hint");
+        assert.equal(f.base.treeBaseRoot, originalRoot);
+        assert.equal(f.base.getHash(path), hashFor(1), "directory race changed the durable base");
+        const failedDisk = await f.cold();
+        assert.equal(failedDisk.journal.unsyncedCount(), 1, "directory race was not restart-durable");
+        assert.equal(failedDisk.base.getHash(path), hashFor(1));
+
+        f.control.beforeRead = undefined;
+        f.source.set(path, 2);
+        await a.engine.pushPending();
+        assert.equal(f.server.requests.length, 1, "restored file did not retry its publication");
+        assert.equal(f.journal.unsyncedCount(), 0);
+        assert.equal(a.engine.pendingChanges.size, 0);
+        assert.equal(f.base.getHash(path), hashFor(2));
+    } finally {
+        f.control.beforeRead = undefined;
+        await f.close();
+    }
+}
+
 async function localOmissionCutsAreBoundedAndWaitForFullBulkReview() {
     const f = await fixture(), a = await f.create("omission-bounds", { ignorePatterns: ["ignored/"] });
     try {
@@ -2437,6 +2475,7 @@ async function run() {
         await ambiguousLocalAckReloadsItsActualCut();
         await omittedRenamePeerHoldsItsGroupWhileIndependentWorkPublishes();
         await materializationFailureCannotBecomeLocalOmissionAck();
+        await sourceReadDirectoryRaceRemainsRetryable();
         await localOmissionCutsAreBoundedAndWaitForFullBulkReview();
         await metadataMutexProtectsNativeAuditAndStillDrainsLiveEdits();
         await metadataErrorAndAbortReleaseOnlyAfterActualRead();
@@ -2460,7 +2499,7 @@ async function run() {
         await deferredFreshPullKeepsItsVerifiedDiffFallback();
         await deferredFreshPullWithoutAHeadKeepsItsDurableFence();
         await ignoredFreshPullCannotAdoptOrPublishMissingLeaves();
-        console.log("engine-root.test: 37 actual engine/root/journal/base integration suites passed (synthetic tree/transport)");
+        console.log("engine-root.test: 38 actual engine/root/journal/base integration suites passed (synthetic tree/transport)");
     } finally {
         if (globals.__obsetyncTestNotice === notice) {
             if (oldNotice === undefined) delete globals.__obsetyncTestNotice; else globals.__obsetyncTestNotice = oldNotice;
