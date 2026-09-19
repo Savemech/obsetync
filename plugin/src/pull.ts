@@ -1512,35 +1512,39 @@ async function applyDeltas(
                     return;
                 }
                 const countedHashes = new Set<string>();
-                const applied = await allSettledBounded(
-                    pending,
-                    activeTuning.applyConcurrency,
-                    ({ delta, preparation }) => {
-                        const canonicalHash = delta.hash!.toLowerCase();
-                        const countTransferredBytes = !countedHashes.has(canonicalHash);
-                        countedHashes.add(canonicalHash);
-                        return finishContentDownload(
-                            api,
-                            io,
-                            syncBase,
-                            wasm,
-                            delta,
-                            stats,
-                            preparation,
-                            () => shouldSkip(delta),
-                            perf,
-                            downloaded!.objects.get(canonicalHash),
-                            countTransferredBytes,
-                            beforeHeavyBatch,
-                            downloaded,
-                            largeTransferScope,
-                        );
-                    },
-                );
-                applied.forEach((result, index) => {
-                    if (result.status === "rejected") failed.push(pending[index].delta);
-                    else if (!result.value) deferLocal(pending[index].delta);
-                });
+                for (let offset = 0; offset < pending.length; offset += activeTuning.applyConcurrency) {
+                    const window = pending.slice(offset, offset + activeTuning.applyConcurrency);
+                    const applied = await allSettledBounded(
+                        window,
+                        activeTuning.applyConcurrency,
+                        ({ delta, preparation }) => {
+                            const canonicalHash = delta.hash!.toLowerCase();
+                            const countTransferredBytes = !countedHashes.has(canonicalHash);
+                            countedHashes.add(canonicalHash);
+                            return finishContentDownload(
+                                api,
+                                io,
+                                syncBase,
+                                wasm,
+                                delta,
+                                stats,
+                                preparation,
+                                () => shouldSkip(delta),
+                                perf,
+                                downloaded!.objects.get(canonicalHash),
+                                countTransferredBytes,
+                                beforeHeavyBatch,
+                                downloaded,
+                                largeTransferScope,
+                            );
+                        },
+                    );
+                    applied.forEach((result, index) => {
+                        if (result.status === "rejected") failed.push(window[index].delta);
+                        else if (!result.value) deferLocal(window[index].delta);
+                    });
+                    await beforeHeavyBatch?.();
+                }
             }
             await checkpointAndReport(batch.length);
         } finally {

@@ -102,6 +102,14 @@ function pendingStatusUsesConstantTimeJournalCount(): void {
     check(engine.pendingIdleStatus() === "sync ✓", "empty durable journal did not clear pending status");
 }
 
+function firstSyncFenceCannotLookReady(): void {
+    const { engine } = fixture();
+    engine.treeBaseRoot = null;
+    engine.syncBase.verifiedBaseRequired = true;
+    check(engine.pendingIdleStatus() === "sync ↓ first sync",
+        "missing verified base root looked ready");
+}
+
 function rootRecoveryCannotLookComplete(): void {
     const { engine } = fixture();
     let pending = true;
@@ -130,6 +138,7 @@ void incompleteRepairNeverClaimsCompletion()
     .then(checkpointBeginFailureReleasesEngine)
     .then(repairMutexPreventsIdleCapabilityProbe)
     .then(pendingStatusUsesConstantTimeJournalCount)
+    .then(firstSyncFenceCannotLookReady)
     .then(rootRecoveryCannotLookComplete)
     .then(() => console.log(`reconcile-status.test: ${assertions} assertions passed`))
     .catch(error => { console.error(error); process.exitCode = 1; });

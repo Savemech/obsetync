@@ -14,7 +14,8 @@ import {
 } from "./bulk-codec";
 import { ResourceBudget } from "./resource-budget";
 import { TransportRouter } from "./transport-router";
-import { WsDataFrameType } from "./ws-data-codec";
+import { WsDataErrorCode, WsDataFrameType } from "./ws-data-codec";
+import { WsDataRpcError } from "./ws-data";
 import { estimateTransportWorkset, reserveTransientScope } from "./transient-memory";
 
 const MIB = 1024 * 1024;
@@ -482,6 +483,43 @@ async function productionRouterOwnsFallbackAndStopsWsPingPong(): Promise<void> {
     assert.equal(budget.snapshot().usedBytes, 0);
 }
 
+async function oversizedWsGetFallsBackWithoutMaskingInvalidWrites(): Promise<void> {
+    const remoteError = () => new WsDataRpcError({
+        code: WsDataErrorCode.InvalidRequest,
+        retryAfterMs: 0,
+        message: "invalid data RPC",
+    });
+    const download = fakeApi(new ResourceBudget({ capacityBytes: 4 * MIB }));
+    download.internal.wsDataFrameBytes = 2 * MIB;
+    download.internal.getDataLane = async () => ({ request: async () => { throw remoteError(); } });
+    let getFallbacks = 0;
+    const received = await download.internal.routeDataRpc(
+        WsDataFrameType.GetPack,
+        new Uint8Array([1]),
+        WsDataFrameType.GetResult,
+        (bytes: Uint8Array) => bytes,
+        async () => { getFallbacks++; return new Uint8Array([9]); },
+        undefined,
+        undefined,
+        16,
+    );
+    assert.deepEqual([...received], [9]);
+    assert.equal(getFallbacks, 1, "replay-safe GetPack did not fall back to HTTP");
+
+    const upload = fakeApi(new ResourceBudget({ capacityBytes: 4 * MIB }));
+    upload.internal.wsDataFrameBytes = 2 * MIB;
+    upload.internal.getDataLane = async () => ({ request: async () => { throw remoteError(); } });
+    let putFallbacks = 0;
+    await assert.rejects(upload.internal.routeDataRpc(
+        WsDataFrameType.PutPack,
+        new Uint8Array([1]),
+        WsDataFrameType.PutAck,
+        (bytes: Uint8Array) => bytes,
+        async () => { putFallbacks++; return new Uint8Array([9]); },
+    ), /invalid data RPC/);
+    assert.equal(putFallbacks, 0, "invalid PutPack was masked by HTTP fallback");
+}
+
 async function callerCancellationNeverFallsBackToHttp(): Promise<void> {
     const budget = new ResourceBudget({ capacityBytes: 4 * MIB });
     const fake = fakeApi(budget);
@@ -717,13 +755,14 @@ void (async () => {
         await withAvailableWebSocket(async () => {
             await ownedUploadStillUsesTheAutomaticWsLane();
             await productionRouterOwnsFallbackAndStopsWsPingPong();
+            await oversizedWsGetFallsBackWithoutMaskingInvalidWrites();
             await callerCancellationNeverFallsBackToHttp();
             await semanticLanesOwnHalfOpenProbeSelection();
             await scopedCheckUsesParentWorksetAndExactResponseBound();
             await urgentFilePriorityIsBoundedExplicitAndReplaySafe();
         });
         await desktopOwnedReceiveFitsARecoverySizedPool();
-        console.log("api-memory.test: 18 ownership/transport regression scenarios passed");
+        console.log("api-memory.test: 19 ownership/transport regression scenarios passed");
     } finally {
         delete (globalThis as any).__obsetyncTestRequestUrl;
     }

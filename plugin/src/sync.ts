@@ -391,6 +391,9 @@ export class ObsetyncSyncEngine {
      *  Kept briefly after pull completion because Obsidian can emit the
      *  corresponding vault events asynchronously. */
     private pullEchoes = new PullEchoTracker();
+    /** Pull-generated vault callbacks currently proving their written bytes.
+     *  Apply windows drain these before admitting more writes. */
+    private pullEchoWork?: Set<Promise<void>>;
     /** Legacy debounce compatibility/test seam; production scheduling is owned
      *  by autoPushCoalescer so continuous changes have a hard latency bound. */
     private debouncedPush: (() => void) | null = null;
@@ -845,7 +848,12 @@ export class ObsetyncSyncEngine {
         // frames trigger pulls within seconds and the timer degrades to a
         // slow safety net (4× the interval); the moment the socket drops,
         // full-cadence polling resumes automatically.
-        console.log("[obsetync] ready");
+        if (!this.treeBaseRoot && this.syncBase.verifiedBaseRequired) {
+            this.onStatusUpdate("sync ↓ first sync");
+            console.log("[obsetync] runtime active: sync ↓ first sync");
+        } else {
+            console.log("[obsetync] ready");
+        }
         this.syncTimer = window.setInterval(() => {
             const wsLive = this.wsChannel?.isConnected() ?? false;
             if (wsLive && Date.now() - this.lastPullDoneMs < this.syncInterval * 4 - 500) {
@@ -1163,10 +1171,27 @@ export class ObsetyncSyncEngine {
         if (this.stopped || tracker.snapshot().closed) return Promise.resolve(inactive);
         return this.runTracked(tracker, operation);
     }
-    private trackLocalEvent(operation: () => Promise<void>): Promise<void> {
+    private trackLocalEvent(operation: () => Promise<void>, pullEcho = false): Promise<void> {
         const tracker = this.callbackWork();
         if (tracker.snapshot().closed) return Promise.resolve();
-        return this.runTracked(tracker, operation);
+        const work = this.runTracked(tracker, operation);
+        if (pullEcho) {
+            const pending = this.pullEchoWork ??= new Set();
+            pending.add(work);
+            void work.then(() => pending.delete(work), () => pending.delete(work));
+        }
+        return work;
+    }
+    private async drainPullEchoWork(signal: AbortSignal): Promise<void> {
+        for (;;) {
+            // Vault callbacks can arrive on the task after adapter.writeFile()
+            // resolves. An empty turn is therefore part of the drain fence.
+            await yieldToUI({ signal, lane: "maintenance" });
+            const work = [...(this.pullEchoWork ?? [])];
+            if (work.length === 0) return;
+            await Promise.allSettled(work);
+            throwIfWorkAborted(signal);
+        }
     }
     private detachVaultListeners(): void {
         this.autoPushCoalescer?.close();
@@ -2438,7 +2463,10 @@ export class ObsetyncSyncEngine {
                 // Slice 2: never fetch ignored paths; untrack them if purged.
                 (p) => this.isExcluded(p),
                 perf,
-                () => this.waitForHeavyWork("pull", operationId, workSignal),
+                async () => {
+                    await this.drainPullEchoWork(workSignal);
+                    await this.waitForHeavyWork("pull", operationId, workSignal);
+                },
                 !treeWasEmpty && this.rootTreeResidentAdmission ? {
                     signal: workSignal,
                     residentAdmission: this.rootTreeResidentAdmission,
@@ -3030,6 +3058,7 @@ export class ObsetyncSyncEngine {
         if (this.bulkChangeReviewRequired) return "sync ⚠ review";
         if (this.hasPendingRootWork()) return "sync ⏸ root recovery";
         if (this.rootPendingReason && this.pendingChanges.size > 0) return `sync ⏸ ${this.rootPendingReason}`;
+        if (!this.treeBaseRoot && this.syncBase.verifiedBaseRequired) return "sync ↓ first sync";
         if (this.lastRepairSummary?.incomplete) {
             const count = this.lastRepairSummary.result?.deferred;
             return count ? `sync ⚠ repair ${count}` : "sync ⚠ repair pending";
@@ -4453,11 +4482,16 @@ export class ObsetyncSyncEngine {
         });
         const debouncedPush = () => this.autoPushCoalescer?.trigger();
 
+        const trackUpsert = (file: TAbstractFile, action: "created" | "modified") =>
+            this.trackLocalEvent(
+                () => this.queueLocalUpsert(file, action),
+                file instanceof TFile && !this.stopped && this.pullEchoes.expectsUpsert(file.path),
+            );
         this.eventRefs.push(
-            this.app.vault.on("modify", (file: TAbstractFile) => this.trackLocalEvent(() => this.queueLocalUpsert(file, "modified"))),
+            this.app.vault.on("modify", (file: TAbstractFile) => trackUpsert(file, "modified")),
         );
         this.eventRefs.push(
-            this.app.vault.on("create", (file: TAbstractFile) => this.trackLocalEvent(() => this.queueLocalUpsert(file, "created"))),
+            this.app.vault.on("create", (file: TAbstractFile) => trackUpsert(file, "created")),
         );
 
         this.eventRefs.push(
@@ -4575,7 +4609,8 @@ export class ObsetyncSyncEngine {
                     oldGuard.release();
                     newGuard.release();
                 }
-            }))
+            }, file instanceof TFile && !this.stopped &&
+                this.pullEchoes.expectsRename(oldPath, file.path)))
         );
     }
 

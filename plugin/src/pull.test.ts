@@ -1280,7 +1280,8 @@ async function admittedPullNeverAbortsAReplacementCandidate(): Promise<void> {
 }
 
 async function smallMissesUseOneVerifiedBulkDownload(): Promise<void> {
-    const hashes = ["01".repeat(32), "02".repeat(32), "03".repeat(32)];
+    const hashes = Array.from({ length: 17 }, (_, index) =>
+        (index + 1).toString(16).padStart(2, "0").repeat(32));
     const deltas: FileDelta[] = hashes.map((hash, index) => ({
         action: "added",
         path: `bulk-${index}.md`,
@@ -1347,11 +1348,12 @@ async function smallMissesUseOneVerifiedBulkDownload(): Promise<void> {
         undefined,
         async () => { heavyBatchPermits++; },
     );
-    check(bulkCalls === 1, "three small misses were not coalesced into one bulk GET");
+    check(bulkCalls === 1, "small misses were not coalesced into one bulk GET");
     check(singleCalls === 0, "bulk pull fell through to a single GET");
-    check(files.size === 3, "bulk pull did not apply every verified record");
-    check(result.downloaded === 3, "bulk pull lost physical-file progress");
-    check(heavyBatchPermits === 1, "pull bypassed its bounded download permit");
+    check(files.size === hashes.length, "bulk pull did not apply every verified record");
+    check(result.downloaded === hashes.length, "bulk pull lost physical-file progress");
+    check(heavyBatchPermits >= 3,
+        "one bulk download was not split into bounded apply/echo windows");
 }
 
 async function ownedSmallBatchRetainsAllNativeSiblingsAndCheckpoint(): Promise<void> {

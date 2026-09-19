@@ -14,7 +14,7 @@ publish before a 25,000-file review completes, while deletion review, journal
 ownership, dependency cuts, and the mandatory complete review remain
 fail-closed. P4/Yjs/CRDT remains dormant by explicit scope decision.
 
-The implementation is staged as `1.12.6`. Local release gates and exact-build
+The implementation is staged as `1.12.7`. Local release gates and exact-build
 identity checks are required before deployment; remote CI, release artifacts,
 tagging, publication, and real-device numerical evidence remain separate gates.
 

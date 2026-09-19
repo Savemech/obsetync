@@ -1817,7 +1817,8 @@ export class ObsetyncApi {
                     return { retryable: false };
                 }
                 if (error instanceof WsDataRpcError &&
-                    error.remote.code === WsDataErrorCode.InvalidRequest) {
+                    error.remote.code === WsDataErrorCode.InvalidRequest &&
+                    type !== WsDataFrameType.GetPack) {
                     return { retryable: false };
                 }
                 return {

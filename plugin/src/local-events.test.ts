@@ -53,7 +53,8 @@ function fixture() {
         eventRefs: [], autoSync: false, pendingChanges: new DirtyPathSet(),
         deferredChanges: new DeferredChangeTracker(), localEventsInFlight: new LocalEventGuards(),
         hashWorkerAbort: new AbortController(),
-        pullEchoes: { expectsUpsert: () => false, consumeUpsert: () => false, consumeDelete: () => false },
+        pullEchoes: { expectsUpsert: () => false, expectsRename: () => false,
+            consumeUpsert: () => false, consumeDelete: () => false },
         isExcluded: () => false,
     });
     const globals = globalThis as any;
@@ -230,6 +231,28 @@ async function hashVerifierNeverFollowsRenamedFile(): Promise<void> {
     check(folderWrites === 0, "callback migration started journaling/reading folders");
 }
 
+async function pullApplyFenceWaitsForEchoClassification(): Promise<void> {
+    const f = fixture();
+    const release = deferred<string>();
+    let entered = 0;
+    f.engine.pullEchoes.expectsUpsert = () => true;
+    f.engine.pullEchoes.consumeUpsert = () => true;
+    f.engine.pullEchoHash = async () => { entered++; return release.promise; };
+    const callbacks = Array.from({ length: 4 }, (_, index) =>
+        f.callbacks.get("create")!(fileAt(`remote-${index}.md`)));
+    while (entered < callbacks.length) await Promise.resolve();
+    let drained = false;
+    const drain = f.engine.drainPullEchoWork(new AbortController().signal)
+        .then(() => { drained = true; });
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+    check(!drained && f.engine.pullEchoWork.size === callbacks.length,
+        "pull apply fence did not retain active echo classification");
+    release.resolve("echo");
+    await Promise.all([...callbacks, drain]);
+    check(drained && f.engine.pullEchoWork.size === 0,
+        "pull apply fence did not drain completed echo classification");
+}
+
 guardRefcountsAndOverflowAreBounded();
 const watchdog = setTimeout(() => { throw new Error("local event callback test did not settle"); }, 10_000);
 void overlapKeepsGuardUntilBothCallbacksSettle()
@@ -237,6 +260,7 @@ void overlapKeepsGuardUntilBothCallbacksSettle()
     .then(oldHashCompletionPreservesNewerHint)
     .then(ackUsesOnlyItsOwnCapturedWatermark)
     .then(hashVerifierNeverFollowsRenamedFile)
+    .then(pullApplyFenceWaitsForEchoClassification)
     .then(durablePullGuardKeepsOldCutAndNewLiveChanges)
     .then(failedJournalCaptureProtectsEveryPath)
     .then(() => console.log(`local-events.test: ${assertions} assertions passed`))

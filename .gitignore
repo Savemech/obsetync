@@ -42,6 +42,7 @@ tasks/
 *.pem
 *.key
 obsetync-test-plan.md
+docs/fragmented-live-document-20ms-adr.md
 
 # local, never committed — real names for the pre-commit guard
 .secrets-denylist
