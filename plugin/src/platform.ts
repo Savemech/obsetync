@@ -3,6 +3,7 @@ import { exactArrayBuffer } from "./binary";
 import { runtimeForHost } from "./host-runtime";
 import { appendBinaryBounded } from "./bounded-append";
 import type { TransientWorkScope } from "./transient-memory";
+import type { PerfOperation } from "./perf-trace";
 import {
     browserMobileRangeHost,
     MOBILE_RESOURCE_RANGE_MAX_BYTES,
@@ -34,7 +35,7 @@ export interface PlatformIO {
      * must be used. The caller owns expected.size bytes before invocation. */
     readFileIdentityVerified?(path: string, expected: FileStat,
         signal?: AbortSignal): Promise<Uint8Array | null>;
-    writeFile(path: string, data: Uint8Array): Promise<void>;
+    writeFile(path: string, data: Uint8Array, perf?: PerfOperation): Promise<void>;
     /** Append one binary segment without reading the existing file. */
     appendFile(path: string, data: Uint8Array): Promise<void>;
     /** Reuse an owned download's work quota for append/copy lifetimes. */
@@ -116,10 +117,16 @@ export class ObsetyncDesktopIO implements PlatformIO {
         return data;
     }
 
-    async writeFile(path: string, data: Uint8Array): Promise<void> {
+    async writeFile(path: string, data: Uint8Array, perf?: PerfOperation): Promise<void> {
         const dir = path.substring(0, path.lastIndexOf("/"));
-        if (dir) await this.mkdir(dir);
-        await this.app.vault.adapter.writeBinary(path, exactArrayBuffer(data));
+        if (dir) {
+            const end = perf?.phase("mkdir");
+            try { await this.mkdir(dir); }
+            finally { end?.(); }
+        }
+        const end = perf?.phase("write");
+        try { await this.app.vault.adapter.writeBinary(path, exactArrayBuffer(data)); }
+        finally { end?.(); }
     }
 
     async appendFile(path: string, data: Uint8Array): Promise<void> {
@@ -215,6 +222,10 @@ export class ObsetyncDesktopIO implements PlatformIO {
     }
 
     async mkdir(path: string): Promise<void> {
+        // Mobile mkdir also queues native creation and host reconciliation
+        // for existing folders. A fresh stat avoids those mutations without
+        // retaining a directory cache that can outlive an external deletion.
+        if ((await this.app.vault.adapter.stat(path))?.type === "folder") return;
         try {
             await this.app.vault.adapter.mkdir(path);
         } catch (error) {

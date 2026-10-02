@@ -392,8 +392,9 @@ export class ObsetyncSyncEngine {
      *  corresponding vault events asynchronously. */
     private pullEchoes = new PullEchoTracker();
     /** Pull-generated vault callbacks currently proving their written bytes.
-     *  Apply windows drain these before admitting more writes. */
+     *  Bounded download batches drain these before their checkpoint. */
     private pullEchoWork?: Set<Promise<void>>;
+    private mobilePullEchoRead?: Promise<void>;
     /** Legacy debounce compatibility/test seam; production scheduling is owned
      *  by autoPushCoalescer so continuous changes have a hard latency bound. */
     private debouncedPush: (() => void) | null = null;
@@ -4303,7 +4304,22 @@ export class ObsetyncSyncEngine {
      *  mobile. Desktop streams from fs. Mobile large-file writes use the
      *  just-recorded sync-base hash only when event stat exactly matches the
      *  post-write stat; otherwise the event stays dirty conservatively. */
-    private async pullEchoHash(file: TFile, path = file.path): Promise<string | null> {
+    private pullEchoHash(file: TFile, path = file.path): Promise<string | null> {
+        const verify = () => this.verifyPullEchoHash(file, path);
+        if (getHashTuning().runtime !== "mobile") return verify();
+        // ponytail: one mobile echo source at a time. The adapter already
+        // serializes IO; parallel verifiers only retain more source buffers
+        // while awaiting hashing/post-stat. Increase only with device evidence.
+        const result = (this.mobilePullEchoRead ?? Promise.resolve()).then(verify);
+        const settled = result.then(() => {}, () => {});
+        this.mobilePullEchoRead = settled;
+        void settled.then(() => {
+            if (this.mobilePullEchoRead === settled) this.mobilePullEchoRead = undefined;
+        });
+        return result;
+    }
+
+    private async verifyPullEchoHash(file: TFile, path: string): Promise<string | null> {
         try {
             if (this.stopped || file.path !== path) return null;
             const expected = { size: file.stat.size, mtime: file.stat.mtime };

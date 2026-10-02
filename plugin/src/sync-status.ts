@@ -42,6 +42,7 @@ const PHASE_PRESENTATION: Record<PerfPhase, PhasePresentation> = {
     download: { label: "downloading batch", priority: 80 },
     apply: { label: "applying remote files", priority: 60 },
     write: { label: "saving files", priority: 70 },
+    mkdir: { label: "preparing folders", priority: 70 },
     pull_echo: { label: "verifying saved files", priority: 70 },
     tree_update: { label: "updating tree", priority: 45 },
     tree_index_upload: { label: "uploading tree index", priority: 80 },

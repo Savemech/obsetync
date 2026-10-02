@@ -1922,9 +1922,7 @@ async function finishContentDownload(
                 );
             }
             beforeWrite?.();
-            const endWrite = perf?.phase("write");
-            try { await io.writeFile(delta.path, data); }
-            finally { endWrite?.(); }
+            await io.writeFile(delta.path, data, perf);
             return true;
         });
         if (!applied) return false;

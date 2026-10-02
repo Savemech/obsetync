@@ -31,6 +31,7 @@ export type PerfPhase =
     | "upload"
     | "download"
     | "apply"
+    | "mkdir"
     | "write"
     | "pull_echo"
     | "tree_update"

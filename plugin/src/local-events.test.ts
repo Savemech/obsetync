@@ -10,6 +10,7 @@ import { pull } from "./pull";
 import { configureHashTuning, getHashTuning } from "./hash-runtime";
 import { configureTransientMemory, reserveTransientScope, transientMemorySnapshot } from "./transient-memory";
 import { yieldWork } from "./work-scheduler";
+import { estimateHashSourceWorkset } from "./hash-source-budget";
 
 let assertions = 0;
 const check = (condition: unknown, message: string): void => {
@@ -271,7 +272,20 @@ async function pullBatchesDurableEchoesWithoutLosingEdits(): Promise<void> {
         const run = async (batchEchoes: boolean) => {
             const f = fixture();
             const storage = new MemorySegmentedIO();
-            const journal = new ObsetyncJournal({ vault: { adapter: storage } } as any);
+            // CapacitorAdapter serializes every operation, including journal
+            // IO and echo reads, through the same native queue as file writes.
+            let adapterTail: Promise<unknown> = Promise.resolve();
+            const enqueue = <T>(work: () => Promise<T>): Promise<T> => {
+                const result = adapterTail.then(work, work);
+                adapterTail = result.catch(() => {});
+                return result;
+            };
+            const adapter = new Proxy(storage, { get(target, key) {
+                const value = (target as any)[key];
+                return typeof value === "function"
+                    ? (...args: unknown[]) => enqueue(() => value.apply(target, args)) : value;
+            } });
+            const journal = new ObsetyncJournal({ vault: { adapter } } as any);
             await journal.load();
             // Reproduce the inherited backlog from the iPad report. These are
             // real protected entries; batching must not acknowledge any of them.
@@ -293,23 +307,26 @@ async function pullBatchesDurableEchoesWithoutLosingEdits(): Promise<void> {
             };
             const io = {
                 getAbsolutePath: () => null,
-                stat: async (path: string) => {
+                stat: (path: string) => enqueue(async () => {
                     await nativeTurn();
                     return files.has(path) ? { size: files.get(path)!.byteLength, mtime: 1 } : null;
-                },
-                readFile: async (path: string) => { sample(); await nativeTurn(); return files.get(path)!.slice(); },
+                }),
+                readFile: (path: string) => enqueue(async () => { sample(); await nativeTurn(); return files.get(path)!.slice(); }),
                 writeFile: async (path: string, data: Uint8Array) => {
                     activeWrites++; peakWrites = Math.max(peakWrites, activeWrites);
                     // Existing-folder mkdir/stat, then the native file write.
-                    await nativeTurn(); await nativeTurn(); await nativeTurn();
-                    files.set(path, data.slice());
-                    const event = Object.assign(fileAt(path), { stat: { size: data.byteLength, mtime: 1 } });
-                    void f.callbacks.get("create")!(event);
-                    if (path === "remote-0.md") {
-                        files.get(path)![0] = 200;
-                        void f.callbacks.get("modify")!(event);
-                    }
-                    sample(); activeWrites--;
+                    await enqueue(async () => { await nativeTurn(); await nativeTurn(); });
+                    await enqueue(async () => {
+                        await nativeTurn();
+                        files.set(path, data.slice());
+                        const event = Object.assign(fileAt(path), { stat: { size: data.byteLength, mtime: 1 } });
+                        void f.callbacks.get("create")!(event);
+                        if (path === "remote-0.md") {
+                            files.get(path)![0] = 200;
+                            void f.callbacks.get("modify")!(event);
+                        }
+                        sample(); activeWrites--;
+                    });
                 },
             };
             const wasm = { wasm_hash: (data: Uint8Array) => hash(data[0]),
@@ -352,8 +369,11 @@ async function pullBatchesDurableEchoesWithoutLosingEdits(): Promise<void> {
             check(result.downloaded === 64 && peakWrites === 1, "echo batching changed serial apply or lost files");
             check(peakEchoes <= 33 && peakBytes <= tuning.transientBudgetBytes,
                 "echo batching exceeded the 32-file batch (plus one local edit) or admitted memory cap");
+            check(peakBytes <= 5 * 1024 * 1024 + estimateHashSourceWorkset(32 * 1024, tuning.maxFeedBytes),
+                "mobile echo verification retained multiple source buffers behind the native adapter queue");
             check(!f.engine.pullEchoWork?.size && transientMemorySnapshot().usedBytes === 0,
                 "completed pull retained callback or byte ownership");
+            check(!f.engine.mobilePullEchoRead, "completed pull retained its mobile echo read queue");
             storage.onBoundary = undefined;
             const restored = new ObsetyncJournal({ vault: { adapter: storage } } as any);
             await restored.load();

@@ -169,7 +169,7 @@ function fixture({ workers = false, mobile = false, legacyState = "none", enroll
     const counts = new Map();
     const state = { wasmMode: workers ? "simd" : "scalar", failedConstruction: null,
         freeFailure: null, legacyState, freezeFailure: null, activationFailure: null,
-        activationFailureState: "interrupted", rootPending: null, rootSequence: 7 };
+        activationFailureState: "interrupted", rootPending: null, rootSequence: 7, interruption: null, lastInterruption: null };
     function record(name) {
         events.push(name);
         counts.set(name, (counts.get(name) ?? 0) + 1);
@@ -460,6 +460,7 @@ function fixture({ workers = false, mobile = false, legacyState = "none", enroll
         current() { return { family: "fixture", name: "fixture", tuning }; }
         snapshot() { return { inputMode: "active-windows" }; }
         recordSimdAvailability() {}
+        recordInterruption() { record("governor:interruption"); }
     }
     class Visibility { dispose() { record("visibility:dispose"); } }
     const noop = () => {};
@@ -518,7 +519,10 @@ function fixture({ workers = false, mobile = false, legacyState = "none", enroll
         debugLog: { install: () => record("debug:install"), uninstall: () => record("debug:uninstall") },
         crashLog: { install: () => record("crash:install"), uninstall: () => record("crash:uninstall") },
         perfSpan: () => noop,
-        OperationCheckpoint: class { async initialize() { await step("checkpoint:initialize"); return null; } },
+        OperationCheckpoint: class {
+            async initialize() { await step("checkpoint:initialize"); return state.interruption; }
+            getLastInterruption() { return state.lastInterruption; }
+        },
         migrateLegacyDefaultIgnorePatterns: value => value,
         formatTypingLatency: snapshot => `${snapshot.state} · fixture`,
         normalizePerfArchitecture: () => "x64",
@@ -599,7 +603,7 @@ function fixture({ workers = false, mobile = false, legacyState = "none", enroll
     async function started() { const plugin = await loaded(); await plugin.initSync(); return plugin; }
     async function unload(plugin) { plugin.onunload(); await plugin.retirement; }
     return { app, events, engines, pools, browserPools, conflictModals, trees, saves, intervals,
-        timeouts, commands, layoutCallbacks, state, block, waitFor, record, count,
+        timeouts, commands, layoutCallbacks, state, settings, block, waitFor, record, count,
         absent, before, newPlugin, loaded, started, unload };
 }
 
@@ -631,6 +635,35 @@ test("startup waits 30 seconds; manual sync, pause and unload cancel its only ti
             equal(f.engines.length, 1, "Manual sync could not resume paused startup");
         }
         if (action !== "unload") await f.unload(plugin);
+    }
+});
+
+test("mobile interruption holds automatic startup across reloads until explicit Sync now", async () => {
+    const f = fixture({ enrolled: true, mobile: true });
+    f.state.interruption = { phase: "pull", operationId: "interrupted-pull" };
+    let plugin = await f.loaded();
+    equal(plugin.startupInterruptionId, "interrupted-pull", "Crash hold was not set");
+    equal(f.layoutCallbacks.length, 0, "Interrupted mobile startup scheduled an automatic retry");
+    f.absent("wasm:load:1"); equal(f.engines.length, 0, "Crash hold allocated an engine");
+    await f.unload(plugin);
+    f.state.lastInterruption = f.state.interruption;
+    f.state.interruption = null;
+    plugin = await f.loaded();
+    equal(f.layoutCallbacks.length, 0, "Reload forgot the unacknowledged crash hold");
+    await plugin.syncNow();
+    equal(f.saves.at(-1).resumedInterruptionId, "interrupted-pull", "Manual retry did not durably acknowledge the hold");
+    equal(f.engines.length, 1, "Explicit Sync now did not resume");
+    Object.assign(f.settings, f.saves.at(-1));
+    await f.unload(plugin);
+    plugin = await f.loaded();
+    equal(f.layoutCallbacks.length, 1, "Acknowledged historical interruption paused startup again");
+    await f.unload(plugin);
+    for (const mobile of [true, false]) {
+        const other = fixture({ enrolled: true, mobile });
+        other.state.interruption = { phase: "pull", operationId: "other-pull", failed: mobile };
+        const running = await other.loaded();
+        equal(other.layoutCallbacks.length, 1, "Desktop interruption or caught error created a mobile crash hold");
+        await other.unload(running);
     }
 });
 

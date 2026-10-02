@@ -9,6 +9,7 @@ import {
 } from "./mobile-ranged-source";
 import { ObsetyncDesktopIO, ObsetyncMobileIO, type PlatformIO } from "./platform";
 import { transientMemorySnapshot } from "./transient-memory";
+import type { PerfOperation, PerfPhase } from "./perf-trace";
 
 let assertions = 0;
 const check = (condition: unknown, message: string) => {
@@ -240,6 +241,43 @@ async function boundsAbortAndDesktopIsolation(): Promise<void> {
     check(resolutions === 2, "unsafe relative source reached the desktop adapter");
 }
 
+async function writesAvoidExistingFolderMutations(): Promise<void> {
+    for (const Implementation of [ObsetyncDesktopIO, ObsetyncMobileIO]) {
+        let folder = true, creates = 0, writes = 0, failed = false;
+        const phases: string[] = [];
+        const perf = { phase(name: PerfPhase) {
+            phases.push(`begin:${name}`); return () => { phases.push(`end:${name}`); };
+        } } as PerfOperation;
+        const adapter = {
+            stat: async () => folder ? { type: "folder" } : null,
+            mkdir: async () => { creates++; folder = true; },
+            writeBinary: async (_path: string, bytes: ArrayBuffer) => {
+                check(folder, "native write entered before parent creation completed");
+                check(new Uint8Array(bytes).join(",") === "1,2", "native write received extra backing bytes");
+                if (failed) throw new Error("disk failure");
+                writes++;
+            },
+        };
+        const io = new Implementation({ vault: { adapter } } as unknown as App);
+        const bytes = new Uint8Array([9, 1, 2, 8]).subarray(1, 3);
+        await io.writeFile("notes/one.md", bytes, perf);
+        await io.writeFile("notes/two.md", bytes, perf);
+        check(creates === 0 && writes === 2, "existing folder was mutated on every file save");
+        assert.deepEqual(phases, Array(2).fill(["begin:mkdir", "end:mkdir", "begin:write", "end:write"]).flat());
+        // A later deletion cannot be hidden by a remembered successful mkdir.
+        folder = false;
+        await io.writeFile("notes/three.md", bytes, perf);
+        check(creates === 1 && writes === 3, "deleted parent was not recreated on the next write");
+        failed = true;
+        await assert.rejects(io.writeFile("notes/four.md", bytes, perf), /disk failure/);
+        check(phases.at(-1) === "end:write", "failed native write left its phase open");
+        phases.length = 0;
+        adapter.stat = async () => { throw new Error("stat failure"); };
+        await assert.rejects(io.writeFile("notes/five.md", bytes, perf), /stat failure/);
+        assert.deepEqual(phases, ["begin:mkdir", "end:mkdir"]);
+    }
+}
+
 async function run(): Promise<void> {
     const backing = new Uint8Array([9, 1, 2, 3, 8]);
     const exact = new Uint8Array(exactArrayBuffer(backing.subarray(1, 4)));
@@ -249,6 +287,7 @@ async function run(): Promise<void> {
     await invalidHostResponsesFailClosed();
     await capabilityAndSourceDriftStayDistinct();
     await boundsAbortAndDesktopIsolation();
+    await writesAvoidExistingFolderMutations();
     console.log(`platform.test: ${assertions} assertions passed`);
 }
 

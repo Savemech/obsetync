@@ -291,6 +291,7 @@ export default class ObsetyncPlugin extends Plugin {
     private statusRefreshTimer: ReturnType<typeof globalThis.setInterval> | null = null;
     private startupSyncTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
     private startupSyncAt = 0;
+    private startupInterruptionId: string | null = null;
     private browserProbeReport: BrowserCapabilityReport | null = null;
     private browserProbePromise: Promise<string> | null = null;
     private browserProbeAbort: AbortController | null = null;
@@ -395,6 +396,13 @@ export default class ObsetyncPlugin extends Plugin {
         );
         const newInterruption = await this.operationCheckpoint.initialize();
         if (this.unloaded) return;
+        const interruption = newInterruption ?? this.operationCheckpoint.getLastInterruption();
+        if (runtime === "mobile" && interruption && !interruption.failed &&
+            interruption.operationId !== this.settings.resumedInterruptionId) {
+            // Include evidence promoted by the previous plugin version so an
+            // update/reload cannot accidentally lift an unacknowledged hold.
+            this.startupInterruptionId = interruption.operationId;
+        }
 
         const environment = detectResourceEnvironment(runtime, detectedArchitecture);
         const initiallyVisible = typeof document === "undefined" || !document.hidden;
@@ -577,6 +585,11 @@ export default class ObsetyncPlugin extends Plugin {
         this.addCommand({ id: "measure-editor-typing-latency",
             name: "Measure editor typing latency (start/stop)",
             callback: () => this.toggleTypingLatencyCapture() });
+        if (this.startupInterruptionId !== null) {
+            this.updateStatusBar("sync paused after interruption — use Sync now");
+            new Notice("ObsetyNC paused after an interrupted sync. Use Sync now when ready to resume.", 0);
+            return;
+        }
         if (scheduleAutomaticSync && this.settings.enrolled && this.settings.serverUrl) {
             this.app.workspace.onLayoutReady(() => {
                 if (this.unloaded || this.syncInitGeneration !== 0 || this.startupSyncTimer !== null) return;
@@ -1117,6 +1130,7 @@ export default class ObsetyncPlugin extends Plugin {
         push(`Server eph valid:  ${this.settings.esPubValidUntil ? new Date(this.settings.esPubValidUntil * 1000).toISOString() : "missing"}`);
         push(`Sync interval:     ${this.settings.syncIntervalMs}ms`);
         push(`Startup delay:     ${this.settings.startupDelayMs}ms`);
+        push(`Startup crash hold: ${this.startupInterruptionId !== null ? "paused — use Sync now" : "off"}`);
         push(`Sync priority:     ${this.settings.syncPriority}`);
         push(`Sync .obsidian/:   ${this.settings.syncObsidianConfig}`);
         push(`Ignore patterns:   ${this.settings.ignorePatterns.length} (${this.settings.ignorePatterns.slice(0, 4).join(", ")}${this.settings.ignorePatterns.length > 4 ? ", …" : ""})`);
@@ -1124,6 +1138,7 @@ export default class ObsetyncPlugin extends Plugin {
         push("");
 
         push("--- Platform ---");
+        push(`Obsidian API:      ${apiVersion}`);
         push(`Transport:         AEAD envelope over HTTP (X25519 + HKDF-SHA256 + AES-256-GCM)`);
         push(`WASM:              ${this.wasm ? `loaded (${perfTrace.getProfile().wasmMode})` : "not loaded"}`);
         for (const line of formatWasmMemoryDebug(this.wasm)) push(line);
@@ -1623,6 +1638,13 @@ export default class ObsetyncPlugin extends Plugin {
         // closes its span and shows how long it ran before dying.
         const endSpan = perfSpan("init");
         try {
+            if (this.startupInterruptionId !== null) {
+                this.settings.resumedInterruptionId = this.startupInterruptionId;
+                await this.saveSettings();
+                hostToken?.assertCurrent();
+                if (this.unloaded || generation !== this.syncInitGeneration) return;
+                this.startupInterruptionId = null;
+            }
             await this.initSyncInner(generation, hostToken);
         } catch (error) {
             // An older failed initialization must not close its replacement's pool.

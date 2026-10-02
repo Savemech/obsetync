@@ -68,10 +68,10 @@ async function delegatesOnlyAfterDirectoryReady(Implementation: typeof ObsetyncD
     let settled = false;
     const pending = f.io.copyFileExclusive(source, target).then(() => { settled = true; });
     await turns();
-    assert.equal(settled, false); assert.deepEqual(f.calls, [["mkdir", directory]]);
+    assert.equal(settled, false); assert.deepEqual(f.calls, [["stat", directory], ["mkdir", directory]]);
     assert.equal(f.files.has(target), false);
     ready.resolve(); await pending;
-    assert.deepEqual(f.calls, [["mkdir", directory], ["copy", source, target]]);
+    assert.deepEqual(f.calls, [["stat", directory], ["mkdir", directory], ["copy", source, target]]);
     assert.deepEqual(f.files.get(target), new Uint8Array([1, 2, 3]));
     assert.deepEqual(f.files.get(source), new Uint8Array([1, 2, 3]), "publication removed staging source");
     const root = fixture(Implementation);
@@ -90,10 +90,10 @@ async function realCopyPromiseIsJoined(Implementation: typeof ObsetyncDesktopIO)
         );
         await entered.promise; await turns();
         assert.equal(settled, false, "copy completed while actual adapter promise was still pending");
-        assert.deepEqual(f.calls, [["mkdir", directory], ["copy", source, target]]);
+        assert.deepEqual(f.calls, [["stat", directory], ["mkdir", directory], ["copy", source, target]]);
         if (fails) native.reject(error); else native.resolve();
         assert.equal(await result, fails ? error : undefined);
-        assert.deepEqual(f.calls, [["mkdir", directory], ["copy", source, target]], "copy settlement added fallback IO");
+        assert.deepEqual(f.calls, [["stat", directory], ["mkdir", directory], ["copy", source, target]], "copy settlement added fallback IO");
     }
 }
 
@@ -104,14 +104,14 @@ async function copyErrorsNeverReplaceOrCleanUp(Implementation: typeof ObsetyncDe
     exists.setCopy(async () => { throw collision; });
     assert.equal(await rejection(exists.io.copyFileExclusive(source, target)), collision);
     assert.equal(exists.files.get(target), previous, "EEXIST changed the existing destination");
-    assert.deepEqual(exists.calls, [["mkdir", directory], ["copy", source, target]]);
+    assert.deepEqual(exists.calls, [["stat", directory], ["mkdir", directory], ["copy", source, target]]);
     assert(exists.files.has(source));
 
     const partial = fixture(Implementation), error = errno("EIO"), partialBytes = new Uint8Array([1]);
     partial.setCopy(async (_from, to) => { partial.files.set(to, partialBytes); throw error; });
     assert.equal(await rejection(partial.io.copyFileExclusive(source, target)), error);
     assert.equal(partial.files.get(target), partialBytes, "EIO removed/replaced a possibly partial native copy");
-    assert.deepEqual(partial.calls, [["mkdir", directory], ["copy", source, target]]);
+    assert.deepEqual(partial.calls, [["stat", directory], ["mkdir", directory], ["copy", source, target]]);
     assert(partial.files.has(source), "failed copy removed the verified stage");
 }
 
@@ -129,13 +129,20 @@ async function missingCopyAndDirectoryErrors(Implementation: typeof ObsetyncDesk
     exists.setMkdir(async () => { throw collision; });
     exists.setStat(async () => ({ type: "folder" }));
     await exists.io.copyFileExclusive(source, target);
-    assert.deepEqual(exists.calls, [["mkdir", directory], ["stat", directory], ["copy", source, target]],
+    assert.deepEqual(exists.calls, [["stat", directory], ["copy", source, target]],
         "existing directory check inspected destination or added replacement fallback");
+    const raced = fixture(Implementation);
+    let stats = 0;
+    raced.setStat(async () => ++stats === 1 ? null : { type: "folder" });
+    raced.setMkdir(async () => { throw collision; });
+    await raced.io.copyFileExclusive(source, target);
+    assert.deepEqual(raced.calls, [["stat", directory], ["mkdir", directory], ["stat", directory], ["copy", source, target]],
+        "concurrent folder creation was not verified before exclusive copy");
     for (const current of [null, { type: "file" }]) {
         const f = fixture(Implementation), failure = errno("EIO");
         f.setMkdir(async () => { throw failure; }); f.setStat(async () => current);
         assert.equal(await rejection(f.io.copyFileExclusive(source, target)), failure);
-        assert.deepEqual(f.calls, [["mkdir", directory], ["stat", directory]], "copy ignored failed parent creation");
+        assert.deepEqual(f.calls, [["stat", directory], ["mkdir", directory], ["stat", directory]], "copy ignored failed parent creation");
     }
 }
 

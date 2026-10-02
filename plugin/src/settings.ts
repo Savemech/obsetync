@@ -46,6 +46,8 @@ export interface SyncSettings {
     lastOutgoingSeq: number;
     /** Local-only conservative startup penalty after a renderer interruption. */
     resourceRecoveryHint: ResourceRecoveryHint | null;
+    /** Local acknowledgement of the last interruption, set by manual resume. */
+    resumedInterruptionId?: string;
 }
 
 export const DEFAULT_SETTINGS: SyncSettings = {
