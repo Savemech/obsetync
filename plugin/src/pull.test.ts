@@ -1,6 +1,8 @@
 import { allSettledBounded, pull, PullTreeRebaseError } from "./pull";
 import type { FileDelta } from "./api";
 import { PerfTrace } from "./perf-trace";
+import { PullEchoTracker } from "./pull-echo";
+import { configureHashTuning, getHashTuning } from "./hash-runtime";
 import { ResourceBudget } from "./resource-budget";
 import { reserveTransientScope, type TransientWorkScope } from "./transient-memory";
 import { RootTreeResidentAdmission } from "./root-tree-resident-admission";
@@ -1459,6 +1461,80 @@ async function ownedSmallBatchRetainsAllNativeSiblingsAndCheckpoint(): Promise<v
     check(budget.snapshot().usedBytes === 0, "owned pull leaked admission");
 }
 
+async function longFreshPullReportsLiveProgressAndRegistersOnlyActualWrites(): Promise<void> {
+    const originalTuning = getHashTuning();
+    try {
+        for (const paged of [false, true]) {
+            configureHashTuning({ ...originalTuning, readConcurrency: 1, applyConcurrency: 1, maxBatchFiles: 32 });
+            let now = 0, writesSincePermit = 0, activeWrites = 0, peakWrites = 0;
+            const windows: number[] = [];
+            const echoes = new PullEchoTracker(60_000, () => now);
+            const deltas: FileDelta[] = Array.from({ length: 8 }, (_, index) => ({
+                action: "added", path: `${index}.md`, size: 1, mtime_ms: 1,
+                hash: (index + 1).toString(16).repeat(64),
+            }));
+            const files = new Map<string, Uint8Array>([["6.md", new Uint8Array([7])]]);
+            const budget = new ResourceBudget({ capacityBytes: 512 * 1024 });
+            const trace = new PerfTrace({ monitorEventLoop: false, monitorWindows: false });
+            const perf = trace.begin("pull");
+            const api = {
+                supportsPagedDiff: async () => paged,
+                getDiff: async () => deltas,
+                getDiffPage: async () => ({ toRoot: "e".repeat(64), deltas, nextCursor: null }),
+                getRoot: async () => new Uint8Array([1]),
+                getRootAt: async () => new Uint8Array([1]),
+                getObjectsOwned: async (_kind: number, hashes: string[]) => {
+                    check(echoes.size === 0, "unwritten paths acquired expiring echo expectations before download");
+                    now += 90_000;
+                    const memory = await reserveTransientScope({ ownerBytes: hashes.length, workBytes: 256 * 1024 }, { budget });
+                    const objects = new Map(hashes.map(hash => [hash, new Uint8Array([parseInt(hash[0], 16)])]));
+                    return { objects, memory, release() { objects.clear(); memory.close(); } };
+                },
+            } as any;
+            const base = {
+                diffPageCheckpoint: null,
+                clearDiffPageCheckpoint: () => false,
+                setVerifiedBaseRequired: () => true,
+                getEntry: (path: string) => path === "6.md" ? { hash: deltas[6].hash, size: 1, mtime: 1 } : null,
+                getTreeMtime: () => 1, setEntry: () => {},
+                checkpoint: async () => {}, save: async () => {}, setLastSyncTimestamp: () => {},
+            } as any;
+            const io = {
+                getAbsolutePath: () => null,
+                stat: async (path: string) => files.has(path) ? { size: 1, mtime: 1 } : null,
+                writeFile: async (path: string, bytes: Uint8Array) => {
+                    check(echoes.consumeUpsert(path, bytes[0].toString(16).repeat(64)),
+                        "long pull expired the expectation before its actual write");
+                    activeWrites++; peakWrites = Math.max(peakWrites, activeWrites);
+                    check(budget.snapshot().usedBytes > 0, "apply escaped its download reservation");
+                    await Promise.resolve();
+                    files.set(path, bytes.slice()); activeWrites--; writesSincePermit++;
+                },
+            } as any;
+            const wasm = { wasm_hash: (bytes: Uint8Array) => bytes[0].toString(16).repeat(64),
+                wasm_root_hash_from_bytes: () => "e".repeat(64) } as any;
+            const result = await pull(api, io, base, "vault", null, wasm, null, undefined,
+                writes => echoes.register(writes), { has: path => path === "7.md" }, undefined, perf,
+                async () => {
+                    if (!writesSincePermit) return;
+                    windows.push(writesSincePermit); writesSincePermit = 0;
+                    const snapshot = trace.activeSnapshots()[0];
+                    check(snapshot.filesCompleted === files.size, "progress remained zero until the diff/page completed");
+                    check(snapshot.bytesTransferred === files.size - 1, "download bytes were not reported live");
+                    now += 61_000;
+                    configureHashTuning({ ...getHashTuning(), applyConcurrency: windows.length === 1 ? 2 : 1 });
+                });
+            perf.finish();
+            check(windows.join() === "1,2,1,1,1" && peakWrites === 2, "apply windows ignored a mid-batch governor increase/decrease");
+            check(result.applied === 7 && result.downloaded === 6 && result.localDeferredCount === 1,
+                "fresh pull lost cached/downloaded/deferred accounting");
+            check(trace.recent()[0].filesCompleted === 7 && trace.recent()[0].bytesTransferred === 6,
+                "final diff/page accounting counted live progress twice");
+            check(echoes.size === 0 && budget.snapshot().usedBytes === 0, "pull retained expectations or download memory");
+        }
+    } finally { configureHashTuning(originalTuning); }
+}
+
 void boundedApplyNeverExceedsTheSelectedLaneCount()
     .then(locallyEditedDeltaKeepsHonestBase)
     .then(renameAfterCrashIsIdempotent)
@@ -1479,6 +1555,7 @@ void boundedApplyNeverExceedsTheSelectedLaneCount()
     .then(admittedPullNeverAbortsAReplacementCandidate)
     .then(smallMissesUseOneVerifiedBulkDownload)
     .then(ownedSmallBatchRetainsAllNativeSiblingsAndCheckpoint)
+    .then(longFreshPullReportsLiveProgressAndRegistersOnlyActualWrites)
     .then(() => console.log("pull.test: regression scenarios passed"))
     .catch((error) => {
         console.error(error);

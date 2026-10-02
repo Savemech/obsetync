@@ -248,6 +248,26 @@ function productionCoverageProbesOnlyAdmittedDemandAndRollsBack(): void {
 }
 
 unfinishedScanRespondsAndSubsequentWindowsContainOnlyDeltas();
+function mobilePullApplyCanRecoverWithoutGrowingOtherStages(): void {
+    const h = harness("production", { runtime: "mobile", architecture: "arm64", os: "ios",
+        hardwareConcurrency: 4, simdAvailable: true });
+    h.governor.recordInterruption("pull");
+    const pull = h.trace.begin("pull");
+    const initial = h.governor.snapshot().controls;
+    pull.setDemand({ apply: 100, read: 100, hash: 100, network: 100 });
+    for (let index = 0; index < 12; index++) {
+        pull.increment({ filesCompleted: 10, bytesTransferred: 1024 });
+        pull.observeEventLoopLag(4);
+        h.sample();
+    }
+    const grown = h.governor.snapshot().controls;
+    assert(grown.apply > initial.apply, "healthy admitted pull stayed stuck in recovery");
+    assert.deepEqual({ ...grown, apply: initial.apply }, initial, "pull grew a stage without buffer coverage");
+    pull.observeEventLoopLag(150); h.sample();
+    assert(h.governor.snapshot().controls.apply < grown.apply, "slow UI did not reduce apply concurrency");
+    pull.finish(); h.dispose();
+}
+mobilePullApplyCanRecoverWithoutGrowingOtherStages();
 hiddenCrossingAndMinuteDelayDoNotBecomeCpuPressure();
 concurrentIntervalsDoNotMultiplyPressureOrGrowth();
 actualWindowStreamDoesNotTurnPartialAccountingIntoGrowth();

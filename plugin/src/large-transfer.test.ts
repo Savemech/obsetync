@@ -8,6 +8,7 @@ import { BulkObjectKind } from "./bulk-codec";
 import { appendBinaryBounded } from "./bounded-append";
 import { ResourceBudget, ResourceBudgetOversizedError } from "./resource-budget";
 import { estimateTransportWorkset, reserveTransientScope, type TransientWorkScope } from "./transient-memory";
+import { PerfTrace } from "./perf-trace";
 
 let assertions = 0;
 const check = (condition: unknown, message: string) => {
@@ -41,6 +42,10 @@ async function resumeInterruptedDownload(): Promise<void> {
     let transferDirectoryExists = false;
     let failSecond = true;
     let requested: string[] = [];
+    let registered = false;
+    const trace = new PerfTrace({ monitorEventLoop: false, monitorWindows: false });
+    const perf = trace.begin("pull");
+    const beforeWrite = () => { registered = true; };
     const chunks = new Map([
         [firstHash, new Uint8Array([1, 2])],
         [secondHash, new Uint8Array([3, 4, 5])],
@@ -48,6 +53,7 @@ async function resumeInterruptedDownload(): Promise<void> {
     const api = {
         getManifest: async () => manifest,
         getContentChunk: async (hash: string) => {
+            check(!registered, "large-file echo TTL started before chunks finished downloading");
             requested.push(hash);
             if (hash === secondHash && failSecond) throw new Error("interrupted");
             return chunks.get(hash)!;
@@ -68,6 +74,7 @@ async function resumeInterruptedDownload(): Promise<void> {
             files.set(path, combined);
         },
         replaceFile: async (staging: string, target: string) => {
+            check(registered, "large-file promotion lacked its echo expectation");
             files.set(target, files.get(staging)!.slice());
             files.delete(staging);
         },
@@ -99,11 +106,14 @@ async function resumeInterruptedDownload(): Promise<void> {
 
     let interrupted = false;
     try {
-        await applyLargeFile(api, io, "media/video.bin", fileHash, 5, wasm);
+        await applyLargeFile(api, io, "media/video.bin", fileHash, 5, wasm,
+            undefined, false, perf, undefined, undefined, beforeWrite);
     } catch {
         interrupted = true;
     }
     check(interrupted, "interrupted transfer unexpectedly completed");
+    check(trace.activeSnapshots()[0].bytesTransferred === 2 && !registered,
+        "interrupted large download did not report its durable chunk progress");
     check(
         [...files.entries()].some(([path, bytes]) => path.endsWith(".part") && bytes.length === 2),
         "verified first chunk was not checkpointed",
@@ -111,7 +121,10 @@ async function resumeInterruptedDownload(): Promise<void> {
 
     failSecond = false;
     requested = [];
-    await applyLargeFile(api, io, "media/video.bin", fileHash, 5, wasm);
+    await applyLargeFile(api, io, "media/video.bin", fileHash, 5, wasm,
+        undefined, false, perf, undefined, undefined, beforeWrite);
+    perf.finish();
+    check(trace.recent()[0].bytesTransferred === 5, "resumed chunk progress counted the retained prefix twice");
     check(requested.length === 1 && requested[0] === secondHash, "resume downloaded a verified chunk again");
     check(files.get("media/video.bin")?.join(",") === "1,2,3,4,5", "resumed file is corrupt");
     check(

@@ -2451,8 +2451,8 @@ export class ObsetyncSyncEngine {
                 this.wasm,
                 treeWasEmpty ? null : pullingTree,
                 progress,
-                // Vault events for paths the pull itself writes are echoes,
-                // not user edits — register them before apply starts.
+                // Authenticate adapter echoes; pull registers each expectation
+                // immediately before its write so long downloads cannot expire it.
                 (writes) => this.pullEchoes.register(writes),
                 // Editor safety: paths with UNSYNCED local edits keep their
                 // disk bytes — the queued push + server merge reconcile them.

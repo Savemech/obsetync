@@ -289,6 +289,8 @@ export default class ObsetyncPlugin extends Plugin {
     private statusBarText = "sync off";
     private readonly syncStatusPresenter = new SyncStatusPresenter();
     private statusRefreshTimer: ReturnType<typeof globalThis.setInterval> | null = null;
+    private startupSyncTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
+    private startupSyncAt = 0;
     private browserProbeReport: BrowserCapabilityReport | null = null;
     private browserProbePromise: Promise<string> | null = null;
     private browserProbeAbort: AbortController | null = null;
@@ -561,6 +563,12 @@ export default class ObsetyncPlugin extends Plugin {
         this.currentUiInstalled = true;
         this.addSettingTab(new ObsetyncSettingTab(this.app, this));
         this.addCommand({ id: "sync-now", name: "Sync now", callback: () => this.syncNow() });
+        this.addCommand({ id: "pause-startup-sync", name: "Pause startup sync", callback: () => {
+            if (this.syncEngine || this.syncInitGeneration !== 0) return;
+            this.cancelStartupSync();
+            this.syncInitGeneration++;
+            this.updateStatusBar("sync paused — use Sync now");
+        } });
         this.addCommand({ id: "full-rescan", name: "Full vault rescan", callback: () => this.fullScan() });
         this.addCommand({ id: "show-conflicts", name: "Show sync conflicts", callback: () => this.showConflicts() });
         this.addCommand({ id: "test-browser-worker-capabilities",
@@ -571,14 +579,28 @@ export default class ObsetyncPlugin extends Plugin {
             callback: () => this.toggleTypingLatencyCapture() });
         if (scheduleAutomaticSync && this.settings.enrolled && this.settings.serverUrl) {
             this.app.workspace.onLayoutReady(() => {
+                if (this.unloaded || this.syncInitGeneration !== 0 || this.startupSyncTimer !== null) return;
                 try { this.legacyDowngradeHost?.authorize("init").assertCurrent(); }
                 catch { return; }
-                this.initSync().catch((error) => {
-                    console.error("[obsetync] init failed:", error);
-                    this.updateStatusBar("sync ✗");
-                });
+                const generation = this.syncInitGeneration;
+                this.startupSyncAt = Date.now() + this.settings.startupDelayMs;
+                this.startupSyncTimer = globalThis.setTimeout(() => {
+                    if (this.unloaded || this.syncInitGeneration !== generation) return;
+                    this.cancelStartupSync();
+                    this.initSync().catch((error) => {
+                        console.error("[obsetync] init failed:", error);
+                        if (!this.unloaded) this.updateStatusBar("sync ✗");
+                    });
+                }, this.settings.startupDelayMs);
+                this.renderStatusBar();
             });
         }
+    }
+
+    private cancelStartupSync(): void {
+        if (this.startupSyncTimer !== null) globalThis.clearTimeout(this.startupSyncTimer);
+        this.startupSyncTimer = null;
+        this.startupSyncAt = 0;
     }
 
     private requireLegacyDowngradeHost(): LegacyDowngradeHostCoordinator {
@@ -915,6 +937,7 @@ export default class ObsetyncPlugin extends Plugin {
     onunload(): void {
         if (this.unloaded) return;
         this.unloaded = true;
+        this.cancelStartupSync();
         this.legacyDowngradeModal?.close();
         this.legacyDowngradeModal = null;
         const legacyRetirement = this.legacyDowngradeHost?.unload() ?? Promise.resolve();
@@ -1093,6 +1116,7 @@ export default class ObsetyncPlugin extends Plugin {
         push(`HTTP wire:         ${this.settings.wireVersion || "not enrolled for v2"}`);
         push(`Server eph valid:  ${this.settings.esPubValidUntil ? new Date(this.settings.esPubValidUntil * 1000).toISOString() : "missing"}`);
         push(`Sync interval:     ${this.settings.syncIntervalMs}ms`);
+        push(`Startup delay:     ${this.settings.startupDelayMs}ms`);
         push(`Sync priority:     ${this.settings.syncPriority}`);
         push(`Sync .obsidian/:   ${this.settings.syncObsidianConfig}`);
         push(`Ignore patterns:   ${this.settings.ignorePatterns.length} (${this.settings.ignorePatterns.slice(0, 4).join(", ")}${this.settings.ignorePatterns.length > 4 ? ", …" : ""})`);
@@ -1452,6 +1476,11 @@ export default class ObsetyncPlugin extends Plugin {
         );
         this.lastSavedSettings = cloneSyncSettings(this.settings);
         let settingsChanged = false;
+        if (!Number.isInteger(this.settings.startupDelayMs) ||
+            this.settings.startupDelayMs < 0 || this.settings.startupDelayMs > 300_000) {
+            this.settings.startupDelayMs = DEFAULT_SETTINGS.startupDelayMs;
+            settingsChanged = true;
+        }
 
         const migratedIgnores = migrateLegacyDefaultIgnorePatterns(this.settings.ignorePatterns);
         if (migratedIgnores !== this.settings.ignorePatterns) {
@@ -1532,9 +1561,9 @@ export default class ObsetyncPlugin extends Plugin {
     async syncNow(): Promise<void> {
         const hostToken = this.legacyDowngradeHost?.authorize("sync");
         if ((!this.syncEngine || this.syncEngine.isStopped()) &&
-            this.legacyDowngradeHost?.snapshot().state === "current-active" &&
             this.settings.enrolled && this.settings.serverUrl) {
             await this.initSync();
+            return;
         }
         if (!this.syncEngine) {
             new Notice("Sync not initialized. Check settings.");
@@ -1587,6 +1616,7 @@ export default class ObsetyncPlugin extends Plugin {
     private async initSync(): Promise<void> {
         if (this.unloaded) return;
         const hostToken = this.legacyDowngradeHost?.authorize("init");
+        this.cancelStartupSync();
         const generation = ++this.syncInitGeneration;
         // Spans the whole startup cost: WASM load + engine start (pull,
         // journal recovery, metadata scan) — finally, so a failed init still
@@ -1997,6 +2027,11 @@ export default class ObsetyncPlugin extends Plugin {
         const legacy = this.legacyDowngradeHost?.snapshot();
         if (legacy && legacy.state !== "none" && legacy.state !== "current-active") {
             this.statusBarEl?.setText(legacyDowngradeStatus(legacy).text);
+            return;
+        }
+        if (this.startupSyncTimer !== null) {
+            const seconds = Math.max(0, Math.ceil((this.startupSyncAt - Date.now()) / 1000));
+            this.statusBarEl?.setText(`sync starts in ${seconds}s · Sync now to start`);
             return;
         }
         // Presence suffix: how many OTHER devices are active right now (Ph3).

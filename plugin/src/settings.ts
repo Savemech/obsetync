@@ -18,6 +18,7 @@ export interface SyncSettings {
     vaultId: string;
     deviceName: string;
     syncIntervalMs: number;
+    startupDelayMs: number;
     autoSync: boolean;
     syncPriority: SyncPriority;
     syncObsidianConfig: boolean;
@@ -52,6 +53,7 @@ export const DEFAULT_SETTINGS: SyncSettings = {
     vaultId: "",
     deviceName: "",
     syncIntervalMs: 30000,
+    startupDelayMs: 30000,
     autoSync: true,
     syncPriority: "sequential",
     syncObsidianConfig: false,
@@ -217,6 +219,20 @@ export class ObsetyncSettingTab extends PluginSettingTab {
         }
 
         // Sync settings.
+        new Setting(containerEl)
+            .setName("Startup delay")
+            .setDesc("Wait before syncing after launch (0–300 seconds). Use Sync now to skip the wait, or the Pause startup sync command to stay paused.")
+            .addText((text) => text
+                .setValue(String(this.plugin.settings.startupDelayMs / 1000))
+                .onChange(async (value) => {
+                    const seconds = Number(value);
+                    if (value.trim() && Number.isInteger(seconds) && seconds >= 0 && seconds <= 300) {
+                        this.plugin.authorizeSettingsMutation();
+                        this.plugin.settings.startupDelayMs = seconds * 1000;
+                        await this.plugin.saveSettings();
+                    }
+                }));
+
         new Setting(containerEl)
             .setName("Sync Interval")
             .setDesc("How often to check for remote changes (seconds).")

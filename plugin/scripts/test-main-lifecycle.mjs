@@ -165,6 +165,7 @@ function fixture({ workers = false, mobile = false, legacyState = "none", enroll
     const events = [], gates = new Map(), waiters = [], engines = [], pools = [], browserPools = [], trees = [], saves = [];
     const conflictModals = [];
     const intervals = new Set(); let intervalSequence = 0;
+    const timeouts = new Map(), commands = new Map(), layoutCallbacks = [];
     const counts = new Map();
     const state = { wasmMode: workers ? "simd" : "scalar", failedConstruction: null,
         freeFailure: null, legacyState, freezeFailure: null, activationFailure: null,
@@ -213,7 +214,7 @@ function fixture({ workers = false, mobile = false, legacyState = "none", enroll
         deviceName: "fixture", deviceId: "fixture-device", serverBoxPub: "fixture-key",
         bearerToken: "fixture-token", wireVersion: "0x02", esPub: "fixture-ephemeral",
         esPubValidUntil: 0, lastOutgoingSeq: 0, ignorePatterns: [], resourceRecoveryHint: 0,
-        syncIntervalMs: 30000, syncPriority: "oldest", syncObsidianConfig: false,
+        syncIntervalMs: 30000, startupDelayMs: 30000, syncPriority: "oldest", syncObsidianConfig: false,
         autoSync: false, realtimeWs: false, sharePresence: false,
     };
     let pluginSequence = 0, cachedReads = 0;
@@ -226,7 +227,7 @@ function fixture({ workers = false, mobile = false, legacyState = "none", enroll
         async mkdir() {},
         async readBinary() { await step(`cached:${++cachedReads}`); return new ArrayBuffer(0); },
     } };
-    const app = { vault, workspace: { onLayoutReady() { throw new Error("Unexpected automatic fixture initialization"); } } };
+    const app = { vault, workspace: { onLayoutReady(callback) { layoutCallbacks.push(callback); } } };
     class Plugin {
         constructor(appArgument) {
             this.app = appArgument;
@@ -245,7 +246,7 @@ function fixture({ workers = false, mobile = false, legacyState = "none", enroll
             await step(`save:${id}`);
         }
         addSettingTab() {}
-        addCommand() {}
+        addCommand(command) { commands.set(command.id, command.callback); }
         addStatusBarItem() { return { setText() {} }; }
         registerDomEvent() {}
     }
@@ -582,6 +583,10 @@ function fixture({ workers = false, mobile = false, legacyState = "none", enroll
         TextEncoder, TextDecoder, AbortController, Uint8Array, ArrayBuffer,
         setInterval: () => { const handle = ++intervalSequence; intervals.add(handle); return handle; },
         clearInterval: handle => intervals.delete(handle),
+        setTimeout: (callback, milliseconds) => {
+            const handle = ++intervalSequence; timeouts.set(handle, { callback, milliseconds }); return handle;
+        },
+        clearTimeout: handle => timeouts.delete(handle),
     });
     function newPlugin() {
         // Re-evaluate the actual bundle: module-local registries would be lost.
@@ -593,12 +598,41 @@ function fixture({ workers = false, mobile = false, legacyState = "none", enroll
     async function loaded() { const plugin = newPlugin(); await plugin.onload(); return plugin; }
     async function started() { const plugin = await loaded(); await plugin.initSync(); return plugin; }
     async function unload(plugin) { plugin.onunload(); await plugin.retirement; }
-    return { app, events, engines, pools, browserPools, conflictModals, trees, saves, intervals, state, block, waitFor, record, count,
+    return { app, events, engines, pools, browserPools, conflictModals, trees, saves, intervals,
+        timeouts, commands, layoutCallbacks, state, block, waitFor, record, count,
         absent, before, newPlugin, loaded, started, unload };
 }
 
 const tests = [];
 function test(name, run) { tests.push({ name, run }); }
+
+test("startup waits 30 seconds; manual sync, pause and unload cancel its only timer", async () => {
+    for (const action of ["timer", "manual", "pause", "unload"]) {
+        const f = fixture({ enrolled: true, mobile: true });
+        const plugin = await f.loaded();
+        equal(f.layoutCallbacks.length, 1, "Automatic startup did not wait for layout");
+        f.layoutCallbacks[0]();
+        f.layoutCallbacks[0]();
+        equal(f.timeouts.size, 1, "Startup scheduled more than one timer");
+        const timer = [...f.timeouts.values()][0];
+        equal(timer.milliseconds, 30000, "Startup skipped the default recovery window");
+        f.absent("wasm:load:1"); equal(f.engines.length, 0, "Engine started inside recovery window");
+        if (action === "unload") await f.unload(plugin);
+        else if (action === "pause") f.commands.get("pause-startup-sync")();
+        else if (action === "manual") await plugin.syncNow();
+        else { timer.callback(); await f.waitFor("engine1:start:done"); }
+        equal(f.timeouts.size, 0, "Startup timer survived completion or cancellation");
+        timer.callback(); f.layoutCallbacks[0]();
+        await nextTurn();
+        equal(f.engines.length, action === "manual" || action === "timer" ? 1 : 0,
+            "Cancelled/stale startup revived an engine or duplicated manual sync");
+        if (action === "pause") {
+            await plugin.syncNow();
+            equal(f.engines.length, 1, "Manual sync could not resume paused startup");
+        }
+        if (action !== "unload") await f.unload(plugin);
+    }
+});
 
 test("scheduler fixture preserves abort identity and real host-task retirement yields", async () => {
     const stopped = new AbortController(), reason = new Error("fixture caller stopped"); stopped.abort(reason);

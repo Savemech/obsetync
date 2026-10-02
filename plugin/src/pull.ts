@@ -180,7 +180,7 @@ export async function pull(
     wasm: WasmModule | null,
     tree: WasmTree | null,
     onProgress?: (msg: string) => void,
-    /** Called with the exact writes this pull will perform, after ignored and
+    /** Called immediately before each disk mutation, after ignored and
      *  locally-edited paths have been removed. Upserts carry their expected
      *  content hash so delayed vault-event echoes can be authenticated. */
     onWritesKnown?: (writes: PullWriteExpectation[]) => void,
@@ -325,10 +325,6 @@ export async function pull(
             filesNeeded: downloaded,
             bytesNeeded: bytesDownloaded,
         });
-        perf?.increment({
-            filesCompleted: kept.length - deferred.length,
-            bytesTransferred: bytesDownloaded,
-        });
 
         // Rebase: sync-base was just seeded with the full server state, so a
         // fresh bootstrap from it materializes the server's tree locally.
@@ -466,10 +462,6 @@ export async function pull(
     perf?.setWorkload({
         filesNeeded: downloaded,
         bytesNeeded: bytesDownloaded,
-    });
-    perf?.increment({
-        filesCompleted: kept.length - deferred.length,
-        bytesTransferred: bytesDownloaded,
     });
 
     // Rebase the Merkle tree with the exact deltas just applied to disk +
@@ -681,10 +673,6 @@ async function pullPagedIfSupported(
         bytesDownloaded += applyResult.bytesDownloaded;
         const pageApplied = kept.length - pageDeferred;
         filesApplied += pageApplied;
-        perf?.increment({
-            filesCompleted: pageApplied,
-            bytesTransferred: applyResult.bytesDownloaded,
-        });
 
         const appliedDeltas = excludeDeltas(kept, applyResult.deferred).concat(ignoredDeletes);
         const endTree = perf?.phase("tree_update");
@@ -1219,19 +1207,11 @@ async function applyDeltas(
         );
     }
 
-    const writes: PullWriteExpectation[] = [];
-    for (const delta of renames) {
-        if (delta.old_path) writes.push({ path: delta.old_path, action: "delete" });
-        if (delta.hash) writes.push({ path: delta.path, action: "upsert", hash: delta.hash });
-    }
-    // Deletions are registered immediately before the adapter mutation, only
-    // after proving the disk still holds the known base. Unlike an upsert,
-    // a delete echo has no content hash with which to authenticate an early
-    // expectation.
-    for (const delta of [...modifications, ...additions]) {
-        if (delta.hash) writes.push({ path: delta.path, action: "upsert", hash: delta.hash });
-    }
-    if (writes.length > 0) onWritesKnown?.(writes);
+    // Start the echo TTL at the actual disk mutation. A fresh-vault pull can
+    // take minutes; registering the entire diff here expired unwritten files.
+    const registerUpsert = (delta: FileDelta): void => {
+        if (delta.hash) onWritesKnown?.([{ path: delta.path, action: "upsert", hash: delta.hash }]);
+    };
 
     for (const delta of renames) {
         // Re-check immediately before touching disk: this guard is live and
@@ -1300,6 +1280,10 @@ async function applyDeltas(
                     deferLocal(delta);
                     continue;
                 }
+                onWritesKnown?.([
+                    { path: delta.old_path, action: "delete" },
+                    { path: delta.path, action: "upsert", hash: delta.hash },
+                ]);
                 await io.renameFile(delta.old_path, delta.path);
             } else {
                 // Crash recovery: adapter.rename() may have committed before
@@ -1364,6 +1348,7 @@ async function applyDeltas(
                 endCheckpoint?.();
             }
             if (markerPath) await safeDelete(io, markerPath);
+            perf?.increment({ filesCompleted: 1 });
         } else {
             deferLocal(delta);
         }
@@ -1394,6 +1379,7 @@ async function applyDeltas(
         await io.deleteFile(delta.path);
         syncBase.removeEntry(delta.path);
         appliedDeletions++;
+        perf?.increment({ filesCompleted: 1 });
     }
     if (appliedDeletions > 0) {
         const endCheckpoint = perf?.phase("checkpoint");
@@ -1454,6 +1440,7 @@ async function applyDeltas(
                 perf,
                 beforeHeavyBatch,
                 largeTransferScope,
+                () => registerUpsert(delta),
             ))
         );
         results.forEach((r, j) => {
@@ -1512,11 +1499,16 @@ async function applyDeltas(
                     return;
                 }
                 const countedHashes = new Set<string>();
-                for (let offset = 0; offset < pending.length; offset += activeTuning.applyConcurrency) {
-                    const window = pending.slice(offset, offset + activeTuning.applyConcurrency);
+                for (let offset = 0; offset < pending.length;) {
+                    // Re-read between windows so lag reductions and healthy
+                    // probes take effect during this batch. Only admitted
+                    // small-file buffers grant apply demand to the governor.
+                    const concurrency = getHashTuning().applyConcurrency;
+                    const window = pending.slice(offset, offset + concurrency);
+                    perf?.setDemand({ apply: downloaded.memory ? pending.length - offset : 0 });
                     const applied = await allSettledBounded(
                         window,
-                        activeTuning.applyConcurrency,
+                        concurrency,
                         ({ delta, preparation }) => {
                             const canonicalHash = delta.hash!.toLowerCase();
                             const countTransferredBytes = !countedHashes.has(canonicalHash);
@@ -1536,6 +1528,7 @@ async function applyDeltas(
                                 beforeHeavyBatch,
                                 downloaded,
                                 largeTransferScope,
+                                () => registerUpsert(delta),
                             );
                         },
                     );
@@ -1544,10 +1537,12 @@ async function applyDeltas(
                         else if (!result.value) deferLocal(window[index].delta);
                     });
                     await beforeHeavyBatch?.();
+                    offset += window.length;
                 }
             }
             await checkpointAndReport(batch.length);
         } finally {
+            perf?.setDemand({ apply: 0 });
             // allSettledBounded drains every native sibling before this owner
             // is closed, including when one apply fails or a local edit wins.
             downloaded?.release();
@@ -1604,6 +1599,7 @@ async function applyDeltas(
                     perf,
                     beforeHeavyBatch,
                     largeTransferScope,
+                    () => registerUpsert(delta),
                 );
                 if (!applied) {
                     deferLocal(delta);
@@ -1725,7 +1721,10 @@ async function prepareContentDelta(
     shouldDefer?: () => boolean,
     perf?: PerfOperation,
 ): Promise<ContentPreparation> {
-    if (!delta.hash) return { kind: "applied" };
+    if (!delta.hash) {
+        perf?.increment({ filesCompleted: 1 });
+        return { kind: "applied" };
+    }
     if (shouldDefer?.()) return { kind: "deferred" };
 
     const size = delta.size ?? 0;
@@ -1764,6 +1763,7 @@ async function prepareContentDelta(
             }
             stats.cacheHit++;
             stats.bytesSkipped += size || stat.size;
+            perf?.increment({ filesCompleted: 1 });
             return { kind: "applied" };
         }
 
@@ -1792,6 +1792,7 @@ async function prepareContentDelta(
                     );
                     stats.localHit++;
                     stats.bytesSkipped += size || stat.size;
+                    perf?.increment({ filesCompleted: 1 });
                     return { kind: "applied" };
                 }
                 // The target differs, but overwriting is safe when disk still
@@ -1831,6 +1832,7 @@ async function finishContentDownload(
     beforeHeavyBatch?: () => Promise<void>,
     prefetchedObjects?: PullObjects,
     largeTransferScope?: PullLargeTransferScope,
+    beforeWrite?: () => void,
 ): Promise<boolean> {
     if (!delta.hash) return true;
     const { size, preserveExisting } = preparation;
@@ -1849,6 +1851,7 @@ async function finishContentDownload(
                 api, io, syncBase, wasm, delta, stats, preparation, shouldDefer,
                 perf, owned.objects.get(delta.hash.toLowerCase()), countTransferredBytes,
                 beforeHeavyBatch, owned, largeTransferScope,
+                beforeWrite,
             );
             if (applied) {
                 const endCheckpoint = perf?.phase("checkpoint");
@@ -1876,6 +1879,7 @@ async function finishContentDownload(
                     fileGeneration: largeTransferFileGeneration(wasm!, delta),
                     targetState: preparation.targetState,
                 },
+                beforeWrite,
             );
         } catch (error) {
             if (error instanceof LocalEditDuringPull) return false;
@@ -1903,6 +1907,7 @@ async function finishContentDownload(
                     `[obsetync] preserved unsynced local bytes as ${conflictPath} before pull`,
                 );
             }
+            beforeWrite?.();
             await io.writeFile(delta.path, data);
             return true;
         });
@@ -1919,6 +1924,8 @@ async function finishContentDownload(
         postStat?.size ?? size,
         delta.mtime_ms,
     );
+    perf?.increment({ filesCompleted: 1,
+        bytesTransferred: size < CHUNK_THRESHOLD && countTransferredBytes ? size : 0 });
     return true;
 }
 
@@ -1933,6 +1940,7 @@ async function applyContentDelta(
     perf?: PerfOperation,
     beforeHeavyBatch?: () => Promise<void>,
     largeTransferScope?: PullLargeTransferScope,
+    beforeWrite?: () => void,
 ): Promise<boolean> {
     const preparation = await prepareContentDelta(
         io,
@@ -1960,6 +1968,7 @@ async function applyContentDelta(
         beforeHeavyBatch,
         undefined,
         largeTransferScope,
+        beforeWrite,
     );
 }
 
@@ -2252,6 +2261,7 @@ export async function applyLargeFile(
     perf?: PerfOperation,
     beforeHeavyBatch?: () => Promise<void>,
     resumeScope?: LargeTransferResumeScope,
+    beforeWrite?: () => void,
 ): Promise<void> {
     if (shouldAbort?.()) throw new LocalEditDuringPull();
     if (!wasm) throw new Error("WASM hash verifier unavailable for large file");
@@ -2448,6 +2458,7 @@ export async function applyLargeFile(
                     } finally {
                         endCheckpoint?.();
                     }
+                    perf?.increment({ bytesTransferred: data.byteLength });
                     // Apply/checkpoint records independently even though transport
                     // grouped them; a kill repeats less than one completed pack.
                     await yieldWork({ perf });
@@ -2489,6 +2500,7 @@ export async function applyLargeFile(
             `[obsetync] preserved unsynced local bytes as ${conflictPath} before pull`,
         );
     }
+        beforeWrite?.();
         await io.replaceFile(stagingPath, path);
         await safeDelete(io, checkpointPath);
     } finally {

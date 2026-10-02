@@ -260,7 +260,8 @@ function admittedCoverageIsOperationAndDemandScoped(): void {
     assert.deepEqual(coveredResourceAxesForWindow({
         operationKind: "pull",
         demand: { read: 1, hash: 1, network: 1, apply: 1 },
-    }), []);
+    }), ["apply"]);
+    assert.deepEqual(coveredResourceAxesForWindow({ operationKind: "pull", demand: { apply: 0 } }), []);
     assert.deepEqual(coveredResourceAxesForWindow({
         operationKind: "reconcile",
         demand: { read: Number.NaN, hash: -1, network: 1, apply: 1 },

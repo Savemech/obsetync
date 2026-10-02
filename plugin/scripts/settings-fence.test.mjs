@@ -123,13 +123,28 @@ test("blocked handoff fences every settings mutation before memory or engine sid
     const before = structuredClone(plugin.settings);
     for (const [key, value] of [
         ["Server URL:text", "http://changed"], ["Vault ID:text", "changed"], ["Device Name:text", "changed"],
-        ["Sync Interval:text", "9"], ["Auto-Sync:toggle", false], ["Sync Obsidian config (.obsidian/):toggle", true],
+        ["Sync Interval:text", "9"], ["Startup delay:text", "45"], ["Auto-Sync:toggle", false], ["Sync Obsidian config (.obsidian/):toggle", true],
         ["Ignore patterns:textarea", "changed/**"], ["Realtime sync:toggle", false], ["Share presence:toggle", false],
         ["Sync Priority:dropdown", "newest"], ["Reset enrollment:button", undefined],
     ]) await invoke(key, value);
     assert.deepEqual(plugin.settings, before);
     assert.equal(effects.saves, 0); assert.equal(effects.stops, 0);
-    assert.equal(effects.authorized, 11);
+    assert.equal(effects.authorized, 12);
+});
+
+test("startup delay defaults to 30 seconds and accepts only bounded whole seconds", async () => {
+    const f = fixture(true);
+    f.setBlocked(false);
+    assert.equal(f.plugin.settings.startupDelayMs, 30000);
+    for (const value of ["", " ", "-1", "301", "1.5", "NaN", "Infinity"]) {
+        await invoke("Startup delay:text", value);
+    }
+    assert.equal(f.plugin.settings.startupDelayMs, 30000);
+    assert.equal(f.effects.saves, 0);
+    await invoke("Startup delay:text", "0");
+    assert.equal(f.plugin.settings.startupDelayMs, 0);
+    await invoke("Startup delay:text", "300");
+    assert.equal(f.plugin.settings.startupDelayMs, 300000);
 });
 
 test("blocked handoff fences enrollment and direct sync/server mutation actions", async () => {

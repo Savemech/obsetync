@@ -89,9 +89,9 @@ const ADMITTED_WINDOW_AXES: Record<
 > = {
     scan: ["read", "hash"],
     push: ["read", "hash", "network"],
-    // Pull/reconcile do not yet publish stage demand. Keep them ineligible
-    // until their exact admitted spans provide comparable window evidence.
-    pull: [],
+    // Pull grants demand only while applying an admitted small-file batch.
+    // Large-file transfers and local/echo reads retain their existing caps.
+    pull: ["apply"],
     reconcile: [],
 };
 
