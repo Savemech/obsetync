@@ -1464,7 +1464,7 @@ async function ownedSmallBatchRetainsAllNativeSiblingsAndCheckpoint(): Promise<v
 async function longFreshPullReportsLiveProgressAndRegistersOnlyActualWrites(): Promise<void> {
     const originalTuning = getHashTuning();
     try {
-        for (const paged of [false, true]) {
+        for (const [paged, cancel] of [[false, false], [true, false], [true, true]]) {
             configureHashTuning({ ...originalTuning, readConcurrency: 1, applyConcurrency: 1, maxBatchFiles: 32 });
             let now = 0, writesSincePermit = 0, activeWrites = 0, peakWrites = 0;
             const windows: number[] = [];
@@ -1513,20 +1513,32 @@ async function longFreshPullReportsLiveProgressAndRegistersOnlyActualWrites(): P
             } as any;
             const wasm = { wasm_hash: (bytes: Uint8Array) => bytes[0].toString(16).repeat(64),
                 wasm_root_hash_from_bytes: () => "e".repeat(64) } as any;
+            const cancelled = new Error("cancelled between small-file apply windows");
             const result = await pull(api, io, base, "vault", null, wasm, null, undefined,
                 writes => echoes.register(writes), { has: path => path === "7.md" }, undefined, perf,
+                async () => check(writesSincePermit === 0, "batch drain replaced per-window cooperation"),
+                undefined,
                 async () => {
                     if (!writesSincePermit) return;
                     windows.push(writesSincePermit); writesSincePermit = 0;
                     const snapshot = trace.activeSnapshots()[0];
                     check(snapshot.filesCompleted === files.size, "progress remained zero until the diff/page completed");
                     check(snapshot.bytesTransferred === files.size - 1, "download bytes were not reported live");
+                    if (cancel) throw cancelled;
                     now += 61_000;
                     configureHashTuning({ ...getHashTuning(), applyConcurrency: windows.length === 1 ? 2 : 1 });
-                });
-            perf.finish();
+                }).catch(error => { if (error !== cancelled) throw error; return null; });
+            perf.finish(cancel ? "cancelled" : "success");
+            if (cancel) {
+                check(result === null && windows.length === 1 && files.size === 2,
+                    "cancellation admitted more writes before the batch drain");
+                check(echoes.size === 0 && budget.snapshot().usedBytes === 0,
+                    "cancelled batch retained echo or download ownership");
+                continue;
+            }
+            check(result !== null, "healthy pull was cancelled");
             check(windows.join() === "1,2,1,1,1" && peakWrites === 2, "apply windows ignored a mid-batch governor increase/decrease");
-            check(result.applied === 7 && result.downloaded === 6 && result.localDeferredCount === 1,
+            check(result!.applied === 7 && result!.downloaded === 6 && result!.localDeferredCount === 1,
                 "fresh pull lost cached/downloaded/deferred accounting");
             check(trace.recent()[0].filesCompleted === 7 && trace.recent()[0].bytesTransferred === 6,
                 "final diff/page accounting counted live progress twice");

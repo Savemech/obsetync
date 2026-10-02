@@ -200,6 +200,9 @@ export async function pull(
     perf?: PerfOperation,
     beforeHeavyBatch?: () => Promise<void>,
     treeMutation?: PullTreeMutationContext,
+    /** Yield/check cancellation between writes without draining the whole
+     * echo journal. The bounded batch still drains before its checkpoint. */
+    afterApplyWindow?: () => Promise<void>,
 ): Promise<PullResult> {
     if (treeMutation) {
         if (!tree) throw new TypeError("pull tree mutation context requires a tree owner");
@@ -229,6 +232,7 @@ export async function pull(
         perf,
         beforeHeavyBatch,
         treeMutation,
+        afterApplyWindow,
     );
     assertPullTreeMutationCurrent(treeMutation);
     if (paged !== undefined) return paged;
@@ -316,6 +320,7 @@ export async function pull(
                 perf,
                 beforeHeavyBatch,
                 { vaultId, rootScope: ZERO_ROOT },
+                afterApplyWindow,
             );
         } finally {
             endApply?.();
@@ -454,6 +459,7 @@ export async function pull(
             perf,
             beforeHeavyBatch,
             { vaultId, rootScope: localRootHash.toLowerCase() },
+            afterApplyWindow,
         );
     } finally {
         endApply?.();
@@ -543,6 +549,7 @@ async function pullPagedIfSupported(
     perf?: PerfOperation,
     beforeHeavyBatch?: () => Promise<void>,
     treeMutation?: PullTreeMutationContext,
+    afterApplyWindow?: () => Promise<void>,
 ): Promise<PullResult | undefined> {
     const candidate = api as unknown as Partial<PagedDiffApi>;
     if (
@@ -662,6 +669,7 @@ async function pullPagedIfSupported(
                 perf,
                 beforeHeavyBatch,
                 { vaultId, rootScope: toRoot!.toLowerCase() },
+                afterApplyWindow,
             );
         } finally {
             endApply?.();
@@ -1163,6 +1171,7 @@ async function applyDeltas(
     perf?: PerfOperation,
     beforeHeavyBatch?: () => Promise<void>,
     largeTransferScope?: PullLargeTransferScope,
+    afterApplyWindow?: () => Promise<void>,
 ): Promise<{
     deferred: FileDelta[];
     downloaded: number;
@@ -1536,9 +1545,14 @@ async function applyDeltas(
                         if (result.status === "rejected") failed.push(window[index].delta);
                         else if (!result.value) deferLocal(window[index].delta);
                     });
-                    await beforeHeavyBatch?.();
+                    await (afterApplyWindow ?? beforeHeavyBatch)?.();
                     offset += window.length;
                 }
+                // Keep the existing byte/file-bounded download owner through
+                // echo settlement. Waiting per write serialized each durable
+                // journal append + ACK and prevented their existing batching.
+                perf?.setDemand({ apply: 0 });
+                if (afterApplyWindow) await beforeHeavyBatch?.();
             }
             await checkpointAndReport(batch.length);
         } finally {
@@ -1908,7 +1922,9 @@ async function finishContentDownload(
                 );
             }
             beforeWrite?.();
-            await io.writeFile(delta.path, data);
+            const endWrite = perf?.phase("write");
+            try { await io.writeFile(delta.path, data); }
+            finally { endWrite?.(); }
             return true;
         });
         if (!applied) return false;

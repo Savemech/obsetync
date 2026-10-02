@@ -31,6 +31,8 @@ export type PerfPhase =
     | "upload"
     | "download"
     | "apply"
+    | "write"
+    | "pull_echo"
     | "tree_update"
     | "tree_index_upload"
     | "root_commit"
@@ -949,6 +951,11 @@ export class PerfTrace {
                 `${phase.name} ${formatDuration(phase.durationMs)}` +
                 (phase.count > 1 ? ` (${phase.count} spans)` : ""));
             lines.push(`    Active phases: ${phases.join(" · ") || "between instrumented phases"}`);
+            const completed = Object.entries(active.phases)
+                .filter(([, duration]) => duration > 0)
+                .sort((a, b) => b[1] - a[1]).slice(0, 6)
+                .map(([name, duration]) => `${name} ${formatDuration(duration)}`);
+            if (completed.length) lines.push(`    Completed phase work (overlapping): ${completed.join(" · ")}`);
         }
         const recent = safeLimit > 0 ? this.records.slice(-safeLimit) : [];
         if (recent.length === 0) {

@@ -3,6 +3,13 @@ import { ObsetyncSyncEngine } from "./sync";
 import { DirtyPathSet } from "./dirty-set";
 import { DeferredChangeTracker } from "./deferred-changes";
 import { LocalEventGuards } from "./local-event-guards";
+import { ObsetyncJournal, JOURNAL_STORE_PATH } from "./journal";
+import { MemorySegmentedIO } from "./segmented-store-test-io";
+import { PullEchoTracker } from "./pull-echo";
+import { pull } from "./pull";
+import { configureHashTuning, getHashTuning } from "./hash-runtime";
+import { configureTransientMemory, reserveTransientScope, transientMemorySnapshot } from "./transient-memory";
+import { yieldWork } from "./work-scheduler";
 
 let assertions = 0;
 const check = (condition: unknown, message: string): void => {
@@ -253,6 +260,120 @@ async function pullApplyFenceWaitsForEchoClassification(): Promise<void> {
         "pull apply fence did not drain completed echo classification");
 }
 
+async function pullBatchesDurableEchoesWithoutLosingEdits(): Promise<void> {
+    const original = getHashTuning();
+    const tuning = { ...original, runtime: "mobile" as const, readConcurrency: 1, applyConcurrency: 1,
+        feedBytes: 128 * 1024, maxFeedBytes: 128 * 1024, maxBatchFiles: 32,
+        maxBatchBytes: 1024 * 1024, transientBudgetBytes: 32 * 1024 * 1024 };
+    configureHashTuning(tuning);
+    configureTransientMemory(tuning);
+    try {
+        const run = async (batchEchoes: boolean) => {
+            const f = fixture();
+            const storage = new MemorySegmentedIO();
+            const journal = new ObsetyncJournal({ vault: { adapter: storage } } as any);
+            await journal.load();
+            // Reproduce the inherited backlog from the iPad report. These are
+            // real protected entries; batching must not acknowledge any of them.
+            for (let start = 0; start < 9008; start += 256) {
+                await journal.appendBatch(Array.from({ length: Math.min(256, 9008 - start) }, (_, i) => ({
+                    action: "modified" as const, path: `offline-${start + i}.md`, ts: 1, synced: false,
+                })));
+            }
+            const files = new Map<string, Uint8Array>();
+            const hash = (value: number) => value.toString(16).padStart(2, "0").repeat(32);
+            const deltas = Array.from({ length: 64 }, (_, i) => ({
+                action: "added" as const, path: `remote-${i}.md`, hash: hash(i + 1), size: 32 * 1024, mtime_ms: 1,
+            }));
+            let peakEchoes = 0, peakBytes = 0, activeWrites = 0, peakWrites = 0;
+            const nativeTurn = () => new Promise<void>(resolve => setImmediate(resolve));
+            const sample = () => {
+                peakEchoes = Math.max(peakEchoes, f.engine.pullEchoWork?.size ?? 0);
+                peakBytes = Math.max(peakBytes, transientMemorySnapshot().usedBytes);
+            };
+            const io = {
+                getAbsolutePath: () => null,
+                stat: async (path: string) => {
+                    await nativeTurn();
+                    return files.has(path) ? { size: files.get(path)!.byteLength, mtime: 1 } : null;
+                },
+                readFile: async (path: string) => { sample(); await nativeTurn(); return files.get(path)!.slice(); },
+                writeFile: async (path: string, data: Uint8Array) => {
+                    activeWrites++; peakWrites = Math.max(peakWrites, activeWrites);
+                    // Existing-folder mkdir/stat, then the native file write.
+                    await nativeTurn(); await nativeTurn(); await nativeTurn();
+                    files.set(path, data.slice());
+                    const event = Object.assign(fileAt(path), { stat: { size: data.byteLength, mtime: 1 } });
+                    void f.callbacks.get("create")!(event);
+                    if (path === "remote-0.md") {
+                        files.get(path)![0] = 200;
+                        void f.callbacks.get("modify")!(event);
+                    }
+                    sample(); activeWrites--;
+                },
+            };
+            const wasm = { wasm_hash: (data: Uint8Array) => hash(data[0]),
+                wasm_root_hash_from_bytes: () => "e".repeat(64),
+                Hasher: class { value = 0; update(data: Uint8Array) { this.value = data[0]; }
+                    finalize() { return hash(this.value); } free() {} } };
+            Object.assign(f.engine, { journal, io, wasm, pullEchoes: new PullEchoTracker() });
+            const base = {
+                setVerifiedBaseRequired: () => true, clearDiffPageCheckpoint: () => false,
+                getEntry: () => null, getTreeMtime: () => 1, setEntry: () => {},
+                checkpoint: async () => {
+                    check(!f.engine.pullEchoWork?.size, "batch checkpoint escaped unfinished echo work");
+                },
+                save: async () => {}, setLastSyncTimestamp: () => {},
+            };
+            const api = {
+                getRoot: async () => new Uint8Array([1]), getDiff: async () => deltas,
+                getObjectsOwned: async (_kind: number, hashes: string[]) => {
+                    const memory = await reserveTransientScope({ ownerBytes: 1024 * 1024, workBytes: 4 * 1024 * 1024 });
+                    const objects = new Map(hashes.map(value => [value,
+                        new Uint8Array(32 * 1024).fill(parseInt(value.slice(0, 2), 16))]));
+                    return { objects, memory, release() { objects.clear(); memory.close(); } };
+                },
+            };
+            const start = storage.events.length;
+            // Native storage crosses host turns. This lets the real journal
+            // coalesce writes behind IO without inventing a debounce timer.
+            storage.onBoundary = async event => {
+                sample();
+                if (event.phase === "before") await nativeTurn();
+            };
+            const began = performance.now();
+            const result = await pull(api as any, io as any, base as any, "vault", null, wasm as any, null,
+                undefined, writes => f.engine.pullEchoes.register(writes), f.engine.unsyncedLocalPaths(),
+                undefined, undefined, () => f.engine.drainPullEchoWork(f.engine.hashWorkerAbort.signal),
+                undefined, batchEchoes ? () => yieldWork() : undefined);
+            const elapsed = performance.now() - began;
+            const heads = storage.events.slice(start).filter(event => event.method === "write" &&
+                event.phase === "after" && event.path === `${JOURNAL_STORE_PATH}/head.json.next`).length;
+            check(result.downloaded === 64 && peakWrites === 1, "echo batching changed serial apply or lost files");
+            check(peakEchoes <= 33 && peakBytes <= tuning.transientBudgetBytes,
+                "echo batching exceeded the 32-file batch (plus one local edit) or admitted memory cap");
+            check(!f.engine.pullEchoWork?.size && transientMemorySnapshot().usedBytes === 0,
+                "completed pull retained callback or byte ownership");
+            storage.onBoundary = undefined;
+            const restored = new ObsetyncJournal({ vault: { adapter: storage } } as any);
+            await restored.load();
+            check(restored.unsyncedCount() === 9009 && restored.capturePendingPaths().has("remote-0.md"),
+                "echo acknowledgement lost an old/new local edit or retained clean downloads");
+            check(files.get("remote-0.md")![0] === 200 && f.engine.pendingChanges.has("remote-0.md"),
+                "an interleaved local edit was overwritten or classified as a download echo");
+            await journal.closeAndDrain(); await restored.closeAndDrain();
+            f.engine.autoPushCoalescer.close();
+            return { heads, elapsed: Math.round(elapsed), peakEchoes, peakBytes };
+        };
+        const serial = await run(false), batched = await run(true);
+        console.log(`pull echo bookkeeping (64 files, 9008 pending): serial ${JSON.stringify(serial)}; batched ${JSON.stringify(batched)}`);
+        check(batched.heads < serial.heads / 4, "small-file pull still serializes durable append/ACK transactions per file");
+    } finally {
+        configureHashTuning(original);
+        configureTransientMemory(original);
+    }
+}
+
 guardRefcountsAndOverflowAreBounded();
 const watchdog = setTimeout(() => { throw new Error("local event callback test did not settle"); }, 10_000);
 void overlapKeepsGuardUntilBothCallbacksSettle()
@@ -261,6 +382,7 @@ void overlapKeepsGuardUntilBothCallbacksSettle()
     .then(ackUsesOnlyItsOwnCapturedWatermark)
     .then(hashVerifierNeverFollowsRenamedFile)
     .then(pullApplyFenceWaitsForEchoClassification)
+    .then(pullBatchesDurableEchoesWithoutLosingEdits)
     .then(durablePullGuardKeepsOldCutAndNewLiveChanges)
     .then(failedJournalCaptureProtectsEveryPath)
     .then(() => console.log(`local-events.test: ${assertions} assertions passed`))

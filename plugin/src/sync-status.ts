@@ -41,6 +41,8 @@ const PHASE_PRESENTATION: Record<PerfPhase, PhasePresentation> = {
     upload: { label: "uploading batch", priority: 80 },
     download: { label: "downloading batch", priority: 80 },
     apply: { label: "applying remote files", priority: 60 },
+    write: { label: "saving files", priority: 70 },
+    pull_echo: { label: "verifying saved files", priority: 70 },
     tree_update: { label: "updating tree", priority: 45 },
     tree_index_upload: { label: "uploading tree index", priority: 80 },
     root_commit: { label: "committing root", priority: 100 },
@@ -52,7 +54,7 @@ const ACTION_STATUS = /(?:re-enroll|review)/i;
 const PATH_LIKE_TEXT = /(?:[A-Za-z_.-][\\/]|[\\/][A-Za-z_.-]|\S+\.md\b)/i;
 const RATE_PHASES = new Set<SelectedOperation["phaseKey"]>([
     "scan_batch", "prepare_batch", "enumerate", "stat", "read", "hash", "fastcdc",
-    "check", "encrypt", "decrypt", "upload", "download", "apply", "tree_index_upload",
+    "check", "encrypt", "decrypt", "upload", "download", "apply", "write", "tree_index_upload",
 ]);
 
 export interface SyncStatusTruth {

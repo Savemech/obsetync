@@ -2464,7 +2464,9 @@ export class ObsetyncSyncEngine {
                 (p) => this.isExcluded(p),
                 perf,
                 async () => {
-                    await this.drainPullEchoWork(workSignal);
+                    const endEcho = perf.phase("pull_echo");
+                    try { await this.drainPullEchoWork(workSignal); }
+                    finally { endEcho(); }
                     await this.waitForHeavyWork("pull", operationId, workSignal);
                 },
                 !treeWasEmpty && this.rootTreeResidentAdmission ? {
@@ -2482,6 +2484,10 @@ export class ObsetyncSyncEngine {
                         this.rootRuntime?.assertCurrentScope();
                     },
                 } : undefined,
+                async () => {
+                    await this.waitForHeavyWork("pull", operationId, workSignal);
+                    await yieldToUI({ signal: workSignal, perf });
+                },
             );
             let observedVersion: 1 | 2 | null = null;
             if (result.newRootBytes) {

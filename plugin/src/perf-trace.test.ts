@@ -231,6 +231,8 @@ function run(): void {
     endAck();
     assert.deepEqual(liveTrace.activeSnapshots()[0].activePhases, []);
     assert.equal(liveTrace.activeSnapshots()[0].phases.read, 100);
+    assert.ok(liveTrace.formatDebug().some(line =>
+        line.includes("Completed phase work (overlapping): read 100ms") && line.includes("ws_ack_wait 50ms")));
     assert.deepEqual(liveTrace.activeSnapshots(0), []);
     assert.deepEqual(liveTrace.activeSnapshots(-1), []);
     assert.deepEqual(liveTrace.activeSnapshots(Number.NaN), []);
