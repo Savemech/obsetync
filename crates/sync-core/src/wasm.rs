@@ -653,6 +653,39 @@ struct V2OutputSettlementReportV1 {
 }
 
 impl V2OutputSettlementReportV1 {
+    fn v1(outcome: &'static str, stats: ChunkGcStats, tree: &TransactionalTree) -> Self {
+        let chunks = tree.chunk_memory();
+        let metadata = tree.metadata_memory();
+        let root = metadata.committed;
+        let root_bytes = root
+            .strings
+            .capacity_bytes
+            .checked_add(root.v1_children_backing_capacity_bytes)
+            .and_then(|bytes| bytes.checked_add(metadata.tree_ids.capacity_bytes));
+        let total = root_bytes
+            .and_then(|bytes| chunks.payload_bytes.checked_add(bytes))
+            .filter(|bytes| *bytes <= (1u64 << 53) - 1);
+        let valid = chunks.counters_valid && metadata.counters_valid && total.is_some();
+        Self {
+            schema: 1,
+            scope: "v1-stable-tree-output",
+            outcome,
+            tree_version: TREE_V1,
+            before: stats.before,
+            reachable: stats.reachable,
+            removed: stats.removed,
+            after: stats.after,
+            bytes_removed: stats.bytes_removed,
+            committed_revision: 0,
+            candidate_revision: 0,
+            counters_valid: valid,
+            node_payload_bytes: valid.then_some(chunks.payload_bytes),
+            // V1 replacement also admits the tree's own identity strings.
+            range_endpoint_resident_requested_bytes: root_bytes.filter(|_| valid),
+            resident_admission_bytes: total.filter(|_| valid),
+        }
+    }
+
     fn new(
         outcome: &'static str,
         stats: ChunkGcStats,
@@ -1802,38 +1835,42 @@ impl WasmTree {
         &mut self,
     ) -> Result<V2OutputSettlementReportV1, ChunkError> {
         self.ensure_tree_job_idle_native()?;
-        let (stats, memory) = self.mutate_committed_native(|inner| match inner {
-            WasmTreeInner::V1(_) => Err(tree_job_error(
-                "V2 output settlement is unavailable for Tree v1",
-            )),
-            WasmTreeInner::V2(tree) => run_local(tree.commit_candidate_output_settlement_v1()),
+        let mut report = self.mutate_committed_native(|inner| match inner {
+            WasmTreeInner::V1(tree) => {
+                let stats = tree.commit_candidate()?;
+                Ok(V2OutputSettlementReportV1::v1("commit", stats, tree))
+            }
+            WasmTreeInner::V2(tree) => {
+                let (stats, memory) = run_local(tree.commit_candidate_output_settlement_v1())?;
+                Ok(V2OutputSettlementReportV1::new(
+                    "commit", stats, memory, 0, 0,
+                ))
+            }
         })?;
-        Ok(V2OutputSettlementReportV1::new(
-            "commit",
-            stats,
-            memory,
-            self.committed_revision,
-            self.candidate_revision,
-        ))
+        report.committed_revision = self.committed_revision;
+        report.candidate_revision = self.candidate_revision;
+        Ok(report)
     }
 
     fn abort_candidate_output_settlement_v1_native(
         &mut self,
     ) -> Result<V2OutputSettlementReportV1, ChunkError> {
         self.ensure_tree_job_idle_native()?;
-        let (stats, memory) = self.mutate_candidate_native(true, |inner, _| match inner {
-            WasmTreeInner::V1(_) => Err(tree_job_error(
-                "V2 output settlement is unavailable for Tree v1",
-            )),
-            WasmTreeInner::V2(tree) => run_local(tree.abort_candidate_output_settlement_v1()),
+        let mut report = self.mutate_candidate_native(true, |inner, _| match inner {
+            WasmTreeInner::V1(tree) => {
+                let stats = tree.abort_candidate()?;
+                Ok(V2OutputSettlementReportV1::v1("abort", stats, tree))
+            }
+            WasmTreeInner::V2(tree) => {
+                let (stats, memory) = run_local(tree.abort_candidate_output_settlement_v1())?;
+                Ok(V2OutputSettlementReportV1::new(
+                    "abort", stats, memory, 0, 0,
+                ))
+            }
         })?;
-        Ok(V2OutputSettlementReportV1::new(
-            "abort",
-            stats,
-            memory,
-            self.committed_revision,
-            self.candidate_revision,
-        ))
+        report.committed_revision = self.committed_revision;
+        report.candidate_revision = self.candidate_revision;
+        Ok(report)
     }
 
     fn ready_candidate_job_native(
@@ -5290,7 +5327,7 @@ impl WasmTree {
         .unwrap_or(0.0)
     }
 
-    /// Atomically promote a V2 candidate, sweep unreachable node buffers and
+    /// Atomically promote a candidate, sweep unreachable node buffers and
     /// return the exact stable requested-output total under the post-commit
     /// wrapper revisions. A null/malformed serialized value is not permission
     /// for the host to release accounting, but the commit remains successful.
@@ -5300,9 +5337,9 @@ impl WasmTree {
             .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
-    /// Atomically abort a V2 candidate, sweep its unreachable node buffers and
+    /// Atomically abort a candidate, sweep its unreachable node buffers and
     /// return the exact stable requested-output total under the post-abort
-    /// candidate revision. Legacy Tree v1 keeps the old abort ABI only.
+    /// candidate revision. V1 includes the surviving root and tree identities.
     pub fn abort_candidate_output_settlement_v1(&mut self) -> Result<JsValue, JsValue> {
         self.abort_candidate_output_settlement_v1_native()
             .map(|report| to_js(&report))
@@ -9034,16 +9071,6 @@ mod root_export_tests {
         assert_eq!(committed.root_hash_hex().unwrap(), candidate);
         assert!(!committed.has_candidate());
 
-        let mut v1 = fixture(TREE_V1, true);
-        let v1_before = state(&v1);
-        assert!(v1.commit_candidate_output_settlement_v1_native().is_err());
-        assert!(v1.abort_candidate_output_settlement_v1_native().is_err());
-        assert_eq!(state(&v1), v1_before);
-        assert_eq!(
-            (v1.committed_revision(), v1.candidate_revision()),
-            (0.0, 0.0)
-        );
-
         for outcome in ["commit", "abort"] {
             let mut active_job = fixture(TREE_V2, true);
             let token = active_job.begin_candidate_chunks_job().unwrap();
@@ -9080,6 +9107,73 @@ mod root_export_tests {
             assert!(result.is_err());
             assert_eq!(state(&exhausted), exhausted_before);
             assert!(exhausted.has_candidate());
+        }
+    }
+
+    #[test]
+    fn v1_output_settlement_reports_all_live_nodes_and_root_after_sweep() {
+        for outcome in ["commit", "abort"] {
+            let mut tree = fixture(TREE_V1, true);
+            let expected_root = if outcome == "commit" {
+                tree.candidate_root_hash_hex()
+            } else {
+                tree.root_hash_hex()
+            };
+            let report = if outcome == "commit" {
+                tree.commit_candidate_output_settlement_v1_native().unwrap()
+            } else {
+                tree.abort_candidate_output_settlement_v1_native().unwrap()
+            };
+            let payload = store(&tree)
+                .all_chunks()
+                .iter()
+                .map(|(_, bytes)| bytes.len() as u64)
+                .sum::<u64>();
+            let WasmTreeInner::V1(inner) = &tree.inner else {
+                unreachable!()
+            };
+            let root = inner.committed_root().unwrap();
+            let root_bytes = (root.vault_id.capacity()
+                + root.device_id.capacity()
+                + root.children.capacity() * std::mem::size_of::<(String, FileHash)>()
+                + root
+                    .children
+                    .iter()
+                    .map(|(path, _)| path.capacity())
+                    .sum::<usize>()
+                + "root-export".len()
+                + "device".len()) as u64;
+            assert_eq!(
+                (report.scope, report.tree_version, report.outcome),
+                ("v1-stable-tree-output", TREE_V1, outcome)
+            );
+            assert!(report.counters_valid);
+            assert!(report.removed > 0);
+            assert_eq!(report.node_payload_bytes, Some(payload));
+            assert_eq!(
+                report.range_endpoint_resident_requested_bytes,
+                Some(root_bytes)
+            );
+            assert_eq!(report.resident_admission_bytes, Some(payload + root_bytes));
+            assert_eq!(report.after, report.reachable);
+            assert_eq!(report.removed, report.before - report.after);
+            assert_eq!(report.committed_revision, u64::from(outcome == "commit"));
+            assert_eq!(report.candidate_revision, 1);
+            assert_eq!(tree.root_hash_hex(), expected_root);
+            assert!(!tree.has_candidate());
+            let settled = state(&tree);
+            assert!(tree.commit_candidate_output_settlement_v1_native().is_err());
+            assert!(tree.abort_candidate_output_settlement_v1_native().is_err());
+            assert_eq!(state(&tree), settled);
+            assert_eq!(tree.candidate_revision, 1);
+
+            let mut busy = fixture(TREE_V1, true);
+            let token = busy.begin_candidate_chunks_job().unwrap();
+            let before = state(&busy);
+            assert!(busy.commit_candidate_output_settlement_v1_native().is_err());
+            assert!(busy.abort_candidate_output_settlement_v1_native().is_err());
+            assert_eq!(state(&busy), before);
+            busy.cancel_tree_job_inner(token).unwrap();
         }
     }
 

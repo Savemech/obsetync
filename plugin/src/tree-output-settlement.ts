@@ -1,4 +1,4 @@
-/** Atomic V2 candidate commit/abort settlement adapter.
+/** Atomic candidate commit/abort settlement adapter.
  *
  * A proof is created only from the direct successful return of the additive
  * native ABI and is kept in a module-local WeakMap. Malformed post-success
@@ -37,12 +37,14 @@ export interface V2TreeOutputSettlementProof { readonly [proofBrand]: true }
 
 export interface V2TreeOutputSettlementProofState {
     readonly tree: object;
+    readonly treeVersion: 1 | 2;
     readonly outcome: V2TreeOutputSettlementOutcome;
     readonly beforeCommittedRevision: number;
     readonly beforeCandidateRevision: number;
     readonly committedRevision: number;
     readonly candidateRevision: number;
     readonly residentAdmissionBytes: number;
+    readonly rootRequestedBytes: number;
 }
 
 interface CandidateSettlementTree {
@@ -126,9 +128,7 @@ export function captureV2CandidateSettlementWitness(
     }
 }
 
-/** Best-effort revision fence for the format-neutral candidate-root owner.
- * Tree v1 has no exact stable-graph settlement report, but its cloned root is
- * still known to be destroyed or promoted by a successful terminal call. */
+/** Best-effort revision fence, also used by legacy wrappers without receipts. */
 function captureCandidateRootSettlementWitness(
     tree: CandidateSettlementTree,
 ): CandidateRootSettlementWitness | null {
@@ -173,7 +173,7 @@ export function settleTreeCandidateOutput(
         throw new TypeError("WASM tree exposes an incomplete V2 output settlement API");
     }
     const version = tree.tree_version();
-    if (version !== 2 || !claimed) {
+    if ((version !== 1 && version !== 2) || !claimed) {
         const result = { atomicV2: false, gcStats: null, proof: null } as {
             atomicV2: boolean; gcStats: CandidateSettlementGcStats | null;
             proof: V2TreeOutputSettlementProof | null;
@@ -205,14 +205,16 @@ export function settleTreeCandidateOutput(
     const token = Object.freeze({ [proofBrand]: true as const }) as V2TreeOutputSettlementProof;
     const state = {
         tree,
+        treeVersion: version,
         outcome,
         beforeCommittedRevision: beforeCommitted ?? -1,
         beforeCandidateRevision: beforeCandidate ?? -1,
         committedRevision: -1,
         candidateRevision: -1,
         residentAdmissionBytes: -1,
+        rootRequestedBytes: -1,
     } as V2TreeOutputSettlementProofState;
-    const result = { atomicV2: true, gcStats: null, proof: null } as {
+    const result = { atomicV2: version === 2, gcStats: null, proof: null } as {
         atomicV2: boolean; gcStats: CandidateSettlementGcStats | null;
         proof: V2TreeOutputSettlementProof | null;
     };
@@ -243,18 +245,19 @@ export function settleTreeCandidateOutput(
         const resident = count(row.residentAdmissionBytes);
         const expectedCommitted = outcome === "commit" ? (beforeCommitted ?? -2) + 1 : beforeCommitted;
         const expectedCandidate = (beforeCandidate ?? -2) + 1;
-        if (row.schema !== 1 || row.scope !== "v2-stable-tree-output" || row.outcome !== outcome ||
-            row.treeVersion !== 2 || row.countersValid !== true || after !== reachable ||
+        if (row.schema !== 1 || row.scope !== `v${version}-stable-tree-output` || row.outcome !== outcome ||
+            row.treeVersion !== version || row.countersValid !== true || after !== reachable ||
             removed !== before - after || resident !== nodePayload + endpoint ||
             committedRevision !== expectedCommitted || candidateRevision !== expectedCandidate ||
-            tree.tree_version() !== 2 || tree.has_candidate() !== false ||
+            tree.tree_version() !== version || tree.has_candidate() !== false ||
             readRevision(tree.committed_revision, tree) !== committedRevision ||
             readRevision(tree.candidate_revision, tree) !== candidateRevision) {
             throw new TypeError("inconsistent V2 output settlement report");
         }
         gc.before = before; gc.reachable = reachable; gc.removed = removed;
         gc.after = after; gc.bytes_removed = bytesRemoved;
-        Object.assign(state, { committedRevision, candidateRevision, residentAdmissionBytes: resident });
+        Object.assign(state, { committedRevision, candidateRevision, residentAdmissionBytes: resident,
+            rootRequestedBytes: endpoint });
         result.gcStats = gc;
         result.proof = token;
         return result;

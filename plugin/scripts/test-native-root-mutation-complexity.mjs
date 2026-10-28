@@ -32,6 +32,10 @@ const result = await build({ absWorkingDir: pluginDirectory, bundle: true, platf
                 TREE_CANDIDATE_MUTATION_MAX_RELIABLE_STEPS_PER_TURN }
                 from "./src/tree-candidate-mutation-job";
             export { beginTreeCandidate } from "./src/tree-candidate-job";
+            export { RootTreeResidentAdmission } from "./src/root-tree-resident-admission";
+            export { admitCandidateOpenRoot } from "./src/candidate-open-root-admission";
+            export { admitCandidateMutationOutput } from "./src/candidate-mutation-output-admission";
+            export { settleTreeCandidateOutputWithAdmission } from "./src/tree-output-settlement";
             export { yieldWork, disposeWorkScheduler, workSchedulerSnapshot } from "./src/work-scheduler";
         `,
     } });
@@ -70,6 +74,7 @@ let maxRequestedUnits = 0, previousCompleted = 0;
 let hostYieldsRequested = 0, hostYieldsCompleted = 0;
 let retirementYieldsRequested = 0, retirementYieldsCompleted = 0;
 const returnedUnits = [];
+const admission = new driver.RootTreeResidentAdmission({ capacityBytes: 96 * 1024 * 1024 });
 try {
     tree.rebuild_from_entries_in_version(1, JSON.stringify(baseline));
     const baselineRoot = tree.root_hash_hex();
@@ -154,14 +159,59 @@ try {
     assert.equal(tree.has_candidate(), true);
     assert.notEqual(tree.candidate_root_hash_hex(), baselineRoot);
 
+    // Reproduce the reported 85 MiB historical charge on a small live V1 tree,
+    // then exercise repeated 64-file roots through the actual admission path.
+    tree.step_candidate_mutation_output_memory_v1_job = nativeStep;
+    tree.commit_candidate();
+    const historical = admission.reserve(tree, { peakBytes: 85 * 1024 * 1024,
+        residentBytes: 85 * 1024 * 1024 });
+    assert(historical);
+    admission.ready(historical);
+    admission.releaseRetired(admission.publish(historical));
+    for (let round = 0; round < 33; round++) {
+        await driver.beginTreeCandidate(tree, {
+            cooperate, cooperateRetirement,
+            onCandidateOpened: () => {},
+            onOpenMemoryPlan: plan => driver.admitCandidateOpenRoot(admission, tree, plan),
+        });
+        const previousRoot = tree.root_hash_hex();
+        if (round > 0) {
+            const hash = bindings.wasm_hash(encoder.encode(`admitted-round-${round}`));
+            await driver.applyTreeCandidateMutation(tree, "update", JSON.stringify(
+                Array.from({ length: 64 }, (_, index) => row(index, hash, round + 2))), {
+                cooperate, cooperateRetirement,
+                legacy: () => { throw new Error("admitted mutation used legacy path"); },
+                onCandidateMutated: () => {},
+                onOutputMemoryPlan: plan => driver.admitCandidateMutationOutput(admission, tree, plan),
+            });
+        }
+        const outcome = round % 3 === 0 ? "abort" : "commit";
+        const expectedRoot = outcome === "commit" ? tree.candidate_root_hash_hex() : previousRoot;
+        driver.settleTreeCandidateOutputWithAdmission(tree, outcome, admission);
+        assert.equal(tree.has_candidate(), false);
+        assert.equal(tree.root_hash_hex(), expectedRoot);
+        assert.equal(tree.total_files(), options.count);
+        const nodes = tree.chunk_memory_snapshot().resident;
+        const metadata = tree.metadata_memory_snapshot().resident;
+        const root = metadata.committed;
+        const liveOutput = nodes.payload_bytes + root.strings.capacity_bytes + root.v1_children_backing_capacity_bytes
+            + metadata.tree_ids.capacity_bytes;
+        const accounted = admission.snapshot();
+        assert.equal(accounted.residentBytes, liveOutput,
+            `round ${round}: V1 output ledger retained swept buffers or released live output`);
+        assert.equal(accounted.privateAttempts, 0);
+        assert.equal(accounted.retiringOwners, 0);
+    }
+
     const scheduler = driver.workSchedulerSnapshot();
     assert.equal(scheduler.pendingJobs, 0);
     process.stdout.write(JSON.stringify({ test: "native-root-mutation-complexity", passed: true,
         profile: options.profile, files: options.count, prefixCount: 1,
         mutationSteps, mutationUnits, planBarriers, hostYields: hostYieldsCompleted,
         retirementYields: retirementYieldsCompleted, quantum: driver.TREE_CANDIDATE_MUTATION_STEP_UNITS,
+        admittedRootCycles: 33, settledResidentBytes: admission.snapshot().residentBytes,
         wasmBytes: wasmBytes.length, wasmSha256: createHash("sha256").update(wasmBytes).digest("hex") }) + "\n");
 } finally {
     try { if (tree.has_candidate()) tree.abort_candidate(); }
-    finally { tree.free(); driver.disposeWorkScheduler(); }
+    finally { tree.free(); admission.releaseResidentAfterFree(tree); driver.disposeWorkScheduler(); }
 }

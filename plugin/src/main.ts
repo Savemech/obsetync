@@ -1226,11 +1226,11 @@ export default class ObsetyncPlugin extends Plugin {
             push(`Managed aggregate:  ${formatDebugBytes(managed.usedBytes)}/${formatDebugBytes(managed.capacityBytes)} reserved · ` +
                 `peak ${formatDebugBytes(managed.peakUsedBytes)} · ${managed.queuedRequests} waiting`);
             const output = this.rootTreeResidentAdmission.snapshot();
-            push(`V2 output ledger:   ${formatDebugBytes(output.ledger.usedBytes)}/` +
+            push(`Tree output ledger: ${formatDebugBytes(output.ledger.usedBytes)}/` +
                 `${formatDebugBytes(output.ledger.capacityBytes)} scoped requested buffers · ` +
                 `private/resident/retiring ${formatDebugBytes(output.privateBytes)}/` +
                 `${formatDebugBytes(output.residentBytes)}/${formatDebugBytes(output.retiringBytes)}`);
-            push("Memory coverage:    admitted source/transfer/apply and V2 replacement/mutation output; excludes full tree metadata, fixed WASM/worker heaps and host/RSS");
+            push("Memory coverage:    admitted source/transfer/apply and tree replacement/mutation output; excludes full tree metadata, fixed WASM/worker heaps and host/RSS");
             push(`Control input:      ${governor.inputMode} · probe ${governor.probeAxis ?? "none"} · growth limited to demanded admitted stages`);
             push(`Latest throughput:  ${formatDebugRate(governor.throughput, governor.throughputUnit)}`);
             push(

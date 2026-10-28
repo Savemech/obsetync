@@ -577,14 +577,20 @@ export class RootTreeResidentAdmission {
         const identityBytes = survivingRoot?.identityBytes ?? 0;
         const droppedRoot = state.outcome === "commit" ? record.committedRoot : record.candidateRoot;
         const conservativeTarget = record.residentBytes - (droppedRoot?.residentBytes ?? 0);
-        const target = proofState ? proofState.residentAdmissionBytes + identityBytes : undefined;
-        const valid = state.exactGraphEligible && proofState !== null && proofState.tree === state.tree &&
+        const v1 = proofState?.treeVersion === 1;
+        // V1's receipt includes all nodes, root buffers and tree IDs. It is
+        // an upper bound even when the initial graph was not admitted here.
+        const target = proofState ? v1
+            ? Math.min(conservativeTarget, proofState.residentAdmissionBytes)
+            : proofState.residentAdmissionBytes + identityBytes : undefined;
+        const graphEligible = v1 ? proofState.rootRequestedBytes >= (survivingRoot?.residentBytes ?? 0)
+            : state.exactGraphEligible && record.completeV2 === true &&
+                record.completeCommittedRevision === state.committedRevision &&
+                record.completeCandidateRevision === state.candidateRevision;
+        const valid = graphEligible && proofState !== null && proofState.tree === state.tree &&
             proofState.outcome === state.outcome &&
             proofState.beforeCommittedRevision === state.committedRevision &&
             proofState.beforeCandidateRevision === state.candidateRevision &&
-            record.completeV2 === true &&
-            record.completeCommittedRevision === state.committedRevision &&
-            record.completeCandidateRevision === state.candidateRevision &&
             state.admissionEpoch !== null && this.mutationEpochValue === state.admissionEpoch &&
             record.resident === state.resident && record.residentBytes === state.residentBytes &&
             record.candidateRoot === state.candidateRoot && record.committedRoot === state.committedRoot &&
@@ -599,10 +605,13 @@ export class RootTreeResidentAdmission {
         try {
             this.terminalRoot(record, state.outcome);
             this.shrinkResident(record, target!);
-            if (record.committedRoot) record.committedRoot.residentBytes = identityBytes;
-            record.completeCommittedRevision = proofState.committedRevision;
-            record.completeCandidateRevision = proofState.candidateRevision;
-            record.completeV2 = true;
+            if (v1) this.clearV2Provenance(record);
+            else {
+                if (record.committedRoot) record.committedRoot.residentBytes = identityBytes;
+                record.completeCommittedRevision = proofState.committedRevision;
+                record.completeCandidateRevision = proofState.candidateRevision;
+                record.completeV2 = true;
+            }
             return true;
         } catch {
             this.clearV2Provenance(record);

@@ -1128,6 +1128,59 @@ function v1MutationAtomicallyReplacesCandidateRootCharge(): void {
     owner.releaseResidentAfterFree(tree); empty(owner);
 }
 
+function v1SettlementReclaimsSweptOutputWithoutReleasingLiveBuffers(): void {
+    class AtomicV1Tree extends SettlementTree {
+        tree_version(): number { return 1; }
+        commit_candidate_output_settlement_v1(): unknown {
+            const report = super.commit_candidate_output_settlement_v1();
+            return report && { ...report as object, scope: "v1-stable-tree-output", treeVersion: 1 };
+        }
+        abort_candidate_output_settlement_v1(): unknown {
+            const report = super.abort_candidate_output_settlement_v1();
+            return report && { ...report as object, scope: "v1-stable-tree-output", treeVersion: 1 };
+        }
+    }
+    const owner = new RootTreeResidentAdmission({ capacityBytes: 96 * 1024 * 1024 });
+    const tree = new AtomicV1Tree();
+    tree.target = 6_457_852 + 10;
+    resident(owner, tree, 85 * 1024 * 1024);
+    rootClone(owner, tree, 10, 3);
+    settleTreeCandidateOutputWithAdmission(tree, "abort", owner);
+    assert.equal(owner.snapshot().residentBytes, tree.target,
+        "V1 retained swept historical output instead of the complete live-buffer upper bound");
+
+    for (let round = 0; round < 32; round++) {
+        tree.open = true;
+        rootClone(owner, tree, 10, 3);
+        const attempt = mutation(owner, tree, 13_333_405, tree.target);
+        owner.readyCandidateMutation(attempt, tree.target);
+        owner.attachV1CandidateMutation(attempt, 10);
+        settleTreeCandidateOutputWithAdmission(tree, round % 3 === 0 ? "abort" : "commit", owner);
+        assert.equal(owner.snapshot().residentBytes, tree.target,
+            "repeated V1 commits/aborts accumulated obsolete output charges");
+    }
+
+    tree.open = true;
+    rootClone(owner, tree, 10, 3);
+    const before = owner.snapshot().residentBytes;
+    tree.malformed = true;
+    settleTreeCandidateOutputWithAdmission(tree, "abort", owner);
+    assert.equal(owner.snapshot().residentBytes, before - 10,
+        "malformed V1 report released more than the proven root clone");
+    owner.releaseResidentAfterFree(tree); empty(owner);
+
+    const partial = new AtomicV1Tree();
+    partial.target = 90;
+    resident(owner, partial, 20);
+    rootClone(owner, partial, 10, 3);
+    settleTreeCandidateOutputWithAdmission(partial, "commit", owner);
+    assert.equal(owner.snapshot().residentBytes, 30,
+        "an uncharged initial V1 graph must not grant extra admission or grow a lease");
+    owner.releaseResidentAfterFree(partial); empty(owner);
+}
+
+v1SettlementReclaimsSweptOutputWithoutReleasingLiveBuffers();
+
 exactPlansAreDetachedBeforeOwnership();
 failFastOldPlusNewAdmissionAndShrink();
 zeroOutputStillRequiresRetirementProof();
@@ -1157,4 +1210,4 @@ rootReplacementAndZeroSlotsKeepRetirementOwnership();
 rootTerminalAdapterAndOverflowRemainFailClosed();
 v1RootTerminalAdapterRetiresOnlyProvenCloneSlots();
 v1MutationAtomicallyReplacesCandidateRootCharge();
-console.log("root-tree-resident-admission.test: 29 requested-output lifecycle/ownership groups passed");
+console.log("root-tree-resident-admission.test: 30 requested-output lifecycle/ownership groups passed");

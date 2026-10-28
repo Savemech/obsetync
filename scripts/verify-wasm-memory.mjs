@@ -2675,21 +2675,37 @@ function settleV2OutputMemory(module, tree, outcome, label,
     return report;
 }
 
-function rejectV1OutputSettlementMemory(module, tree, label) {
+function verifyV1OutputSettlementMemory(module, tree, label) {
     const row = { path: "v1-settlement.md", hash: "cd".repeat(32), size: 2, mtime_ms: 2 };
-    tree.rebuild_from_entries_in_version(1, JSON.stringify([row]));
-    tree.begin_candidate();
-    tree.candidate_update_batch(JSON.stringify([{ ...row, hash: "ef".repeat(32) }]));
-    const before = visible(module, tree);
-    const beforeStore = chunkSnapshot(tree, `${label}/before`).resident;
-    for (const method of ["commit_candidate_output_settlement_v1",
-        "abort_candidate_output_settlement_v1"]) {
-        assert.throws(() => tree[method](), `${label}: ${method} accepted V1`);
-        assert.deepEqual(visible(module, tree), before, `${label}: ${method} changed V1 ownership`);
-        sameStores(chunkSnapshot(tree, `${label}/${method}`).resident, beforeStore,
-            `${label}: ${method} changed the V1 physical store`);
+    for (const outcome of ["commit", "abort"]) {
+        tree.rebuild_from_entries_in_version(1, JSON.stringify([row]));
+        tree.begin_candidate();
+        tree.candidate_update_batch(JSON.stringify([{ ...row, hash: "ef".repeat(32) }]));
+        const commit = outcome === "commit";
+        const rootHash = commit ? tree.candidate_root_hash_hex() : tree.root_hash_hex();
+        const hashes = commit ? module.wasm_tree_candidate_chunk_hashes(tree)
+            : module.wasm_tree_committed_chunk_hashes(tree);
+        const payload = hashes.reduce((total, hash) => total + module.wasm_tree_get_chunk(tree, hash).length, 0);
+        const metadata = metadataSnapshot(tree, label).resident;
+        const root = metadata[commit ? "candidate" : "committed"];
+        const rootBytes = root.strings.capacity_bytes + root.v1_children_backing_capacity_bytes
+            + metadata.tree_ids.capacity_bytes;
+        const before = chunkSnapshot(tree, `${label}/before`).resident;
+        const committed = tree.committed_revision(), candidate = tree.candidate_revision();
+        const report = tree[commit ? "commit_candidate_output_settlement_v1"
+            : "abort_candidate_output_settlement_v1"]();
+        assert.deepEqual(report, {
+            schema: 1, scope: "v1-stable-tree-output", outcome, treeVersion: 1,
+            before: before.chunks, reachable: hashes.length, after: hashes.length,
+            removed: before.chunks - hashes.length, bytesRemoved: before.payload_bytes - payload,
+            committedRevision: committed + Number(commit), candidateRevision: candidate + 1,
+            countersValid: true, nodePayloadBytes: payload,
+            rangeEndpointResidentRequestedBytes: rootBytes, residentAdmissionBytes: payload + rootBytes,
+        }, `${label}: V1 settlement differs from live-node/root oracle`);
+        assert.equal(tree.has_candidate(), false);
+        assert.equal(tree.root_hash_hex(), rootHash);
+        assert.equal(chunkSnapshot(tree, `${label}/after`).resident.payload_bytes, payload);
     }
-    tree.abort_candidate();
 }
 
 function mutationMemoryStep(value, previous, budget, label) {
@@ -2731,7 +2747,7 @@ function warmMutationOutput(module, tree) {
         if (state.done) break;
     }
     settleV2OutputMemory(module, tree, "commit", "warmup-settlement");
-    rejectV1OutputSettlementMemory(module, tree, "warmup-v1-settlement");
+    verifyV1OutputSettlementMemory(module, tree, "warmup-v1-settlement");
 }
 
 async function qualifyV1CandidateMutationOutput(context, oracleContext) {

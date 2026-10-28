@@ -7,6 +7,7 @@ import {
 } from "./tree-output-settlement";
 
 class SettlementTree {
+    version: 1 | 2 = 2;
     committed = 4;
     candidate = 7;
     open = true;
@@ -15,7 +16,7 @@ class SettlementTree {
     throwNative = false;
     reportMutation: ((report: Record<string, unknown>) => unknown) | undefined;
 
-    tree_version(): number { return 2; }
+    tree_version(): number { return this.version; }
     committed_revision(): number { return this.committed; }
     candidate_revision(): number { return this.candidate; }
     has_candidate(): boolean { return this.open; }
@@ -31,9 +32,9 @@ class SettlementTree {
         if (this.malformed) return null;
         const report: Record<string, unknown> = {
             schema: 1,
-            scope: "v2-stable-tree-output",
+            scope: `v${this.version}-stable-tree-output`,
             outcome,
-            treeVersion: 2,
+            treeVersion: this.version,
             before: 8,
             reachable: 5,
             removed: 3,
@@ -54,12 +55,13 @@ class SettlementTree {
 }
 
 function exactCommitAndAbortProofsAreOneUseAndOwnerLocal(): void {
-    for (const outcome of ["commit", "abort"] as const) {
+    for (const version of [1, 2] as const) for (const outcome of ["commit", "abort"] as const) {
         const tree = new SettlementTree();
+        tree.version = version;
         const witness = captureV2CandidateSettlementWitness(tree);
-        assert(witness);
+        assert.equal(witness !== null, version === 2);
         const result = settleTreeCandidateOutput(tree, outcome, witness);
-        assert.equal(result.atomicV2, true);
+        assert.equal(result.atomicV2, version === 2);
         assert.deepEqual(result.gcStats, {
             before: 8, reachable: 5, removed: 3, after: 5, bytes_removed: 30,
         });
@@ -70,12 +72,14 @@ function exactCommitAndAbortProofsAreOneUseAndOwnerLocal(): void {
         assert.equal(takeV2TreeOutputSettlementProof(copied!), null);
         assert.deepEqual(takeV2TreeOutputSettlementProof(result.proof), {
             tree,
+            treeVersion: version,
             outcome,
             beforeCommittedRevision: 4,
             beforeCandidateRevision: 7,
             committedRevision: outcome === "commit" ? 5 : 4,
             candidateRevision: 8,
             residentAdmissionBytes: 50,
+            rootRequestedBytes: 10,
         });
         assert.equal(takeV2TreeOutputSettlementProof(result.proof), null, "proof replay succeeded");
     }
@@ -125,7 +129,7 @@ function malformedAuthorityReportsNeverCreateProofs(): void {
         { name: "nan-revision", mutate: report => ({ ...report, candidateRevision: Number.NaN }) },
         { name: "wrong-schema", mutate: report => ({ ...report, schema: 2 }) },
         { name: "wrong-scope", mutate: report => ({ ...report, scope: "other" }) },
-        { name: "wrong-version", mutate: report => ({ ...report, treeVersion: 1 }) },
+        { name: "wrong-version", mutate: report => ({ ...report, treeVersion: report.treeVersion === 1 ? 2 : 1 }) },
         { name: "wrong-outcome", mutate: report => ({ ...report,
             outcome: report.outcome === "commit" ? "abort" : "commit" }) },
         { name: "wrong-committed-revision", mutate: report => ({ ...report,
@@ -139,12 +143,13 @@ function malformedAuthorityReportsNeverCreateProofs(): void {
         { name: "resident-sum", mutate: report => ({ ...report,
             residentAdmissionBytes: (report.residentAdmissionBytes as number) + 1 }) },
     ];
-    for (const outcome of ["commit", "abort"] as const) for (const test of cases) {
+    for (const version of [1, 2] as const) for (const outcome of ["commit", "abort"] as const) for (const test of cases) {
         const tree = new SettlementTree();
+        tree.version = version;
         tree.reportMutation = test.mutate;
         const result = settleTreeCandidateOutput(tree, outcome,
             captureV2CandidateSettlementWitness(tree));
-        assert.equal(result.atomicV2, true, `${outcome}/${test.name}: lost atomic outcome`);
+        assert.equal(result.atomicV2, version === 2, `${outcome}/${test.name}: lost atomic outcome`);
         assert.equal(result.gcStats, null, `${outcome}/${test.name}: malformed GC stats escaped`);
         assert.equal(result.proof, null, `${outcome}/${test.name}: malformed report created authority`);
         assert.equal(tree.atomicCalls, 1, `${outcome}/${test.name}: native transition repeated`);
