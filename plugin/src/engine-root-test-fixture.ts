@@ -131,7 +131,7 @@ async function fixture(count = 1) {
         free() { assert.equal(++this.owner.freed, 1); this.inner.destroy(); }
     }
     const create = async (name: string, options: { active?: boolean; staleCache?: boolean; ignorePatterns?: string[]; syncConfig?: boolean;
-        autoSync?: boolean; captureDebounce?: (callback: () => void) => void;
+        autoSync?: boolean;
         visibilityGate?: ResourceVisibilityGate } = {}) => {
         let committed = options.staleCache ? decodeTree(cached!) : currentEntries(base);
         let candidate: Map<string, Entry> | null = null;
@@ -456,16 +456,7 @@ async function fixture(count = 1) {
             checkpoint as any, options.autoSync ?? false, null, options.visibilityGate, undefined, identity) as any;
         engines.push(engine);
         if (options.active !== false) {
-            const globals = globalThis as any, previousDebounce = globals.__obsetyncTestDebounce;
-            const capture = options.captureDebounce ? (callback: () => void, wait: number, immediate: boolean) => {
-                assert.equal(wait, 3000); assert.equal(immediate, true);
-                options.captureDebounce!(callback); return () => {};
-            } : undefined;
-            if (capture) globals.__obsetyncTestDebounce = capture;
-            try { await engine.prepareLocal(); }
-            finally {
-                if (capture && globals.__obsetyncTestDebounce === capture) globals.__obsetyncTestDebounce = previousDebounce;
-            }
+            await engine.prepareLocal();
             Object.assign(engine, { startupReplayInProgress: false, startupCompleted: true, state: "idle" });
         }
         return { engine, tree, treeState, treeHashAt: (path: string) => committed.get(path)?.hash };

@@ -37,15 +37,7 @@ async function fixture() {
         pullEchoes: { expectsRename: () => false, expectsUpsert: () => false },
         isExcluded: () => false,
     });
-    const testGlobal = globalThis as any;
-    const previous = testGlobal.__obsetyncTestDebounce;
-    try {
-        testGlobal.__obsetyncTestDebounce = () => () => {};
-        engine.attachVaultListeners();
-    } finally {
-        if (previous === undefined) delete testGlobal.__obsetyncTestDebounce;
-        else testGlobal.__obsetyncTestDebounce = previous;
-    }
+    engine.attachVaultListeners();
     return { app, adapter, callbacks, journal, engine };
 }
 

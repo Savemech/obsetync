@@ -317,9 +317,9 @@ async function recoveredAcceptedOutcomeUsesCommittedExporter() {
 
 async function run() {
     const globals = globalThis as any;
-    const oldNotice = globals.__obsetyncTestNotice, oldDebounce = globals.__obsetyncTestDebounce;
-    const notice = () => ({ setMessage() {}, hide() {} }), debounce = () => () => {};
-    globals.__obsetyncTestNotice = notice; globals.__obsetyncTestDebounce = debounce;
+    const oldNotice = globals.__obsetyncTestNotice;
+    const notice = () => ({ setMessage() {}, hide() {} });
+    globals.__obsetyncTestNotice = notice;
     try {
         await exactPagedExportFinishesBeforeCacheWrite();
         await actualHostTaskRunsBetweenBuildSteps();
@@ -333,9 +333,6 @@ async function run() {
     } finally {
         if (globals.__obsetyncTestNotice === notice) {
             if (oldNotice === undefined) delete globals.__obsetyncTestNotice; else globals.__obsetyncTestNotice = oldNotice;
-        }
-        if (globals.__obsetyncTestDebounce === debounce) {
-            if (oldDebounce === undefined) delete globals.__obsetyncTestDebounce; else globals.__obsetyncTestDebounce = oldDebounce;
         }
     }
 }

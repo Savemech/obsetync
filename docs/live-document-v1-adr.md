@@ -1,6 +1,12 @@
 # Single-writer live document v1 durability ADR
 
-Status: foundation implemented; wire/editor activation disabled.
+Status: deferred design; no production implementation or wire/editor activation.
+
+The disconnected `doc_store.rs` prototype was removed during the 1.13 cleanup.
+Its only callers were its own unit tests: no server route, root guard or editor
+could create or consume its state. The last implementation is preserved in the
+1.12.12 Git tag. This document records the requirements for any future explicit
+reactivation; it does not describe a capability of the running server.
 
 ## Decision
 
@@ -69,13 +75,14 @@ root push guard consumes this fence, live sessions stay off.
 
 All lengths and counters are checked before allocation or mutation. Hot client
 sessions will be separately limited by the renderer resource governor; this
-server foundation does not imply one materialized document per vault file.
+design does not imply one materialized document per vault file.
 
 ## Compatibility and rollout
 
 The existing path-based opaque CRDT endpoints and `ops` WebSocket frame are not
-this protocol and grant no writer lease or file revision. They remain dormant;
-no wire capability is advertised by this change. Rollout requires, in order:
+this protocol and grant no writer lease or file revision. Their compatibility
+handlers remain available, but the plugin does not activate live editing.
+Rollout requires, in order:
 
 1. a versioned deterministic micro-batch codec and real Obsidian input tests;
 2. sealed HTTP lease/append/bootstrap/ACK mapped to this store;

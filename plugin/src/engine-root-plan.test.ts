@@ -1186,7 +1186,7 @@ let completed = false;
 process.once("beforeExit", () => { if (!completed && !process.exitCode) { console.error("engine-root-plan suite did not finish"); process.exitCode = 1; } });
 async function run() {
     assert(process.execArgv.includes("--unhandled-rejections=strict"));
-    const globals = globalThis as any, previousNotice = globals.__obsetyncTestNotice, previousDebounce = globals.__obsetyncTestDebounce;
+    const globals = globalThis as any, previousNotice = globals.__obsetyncTestNotice;
     const progressNotices: string[] = [];
     const isProgressNotice = (message: unknown) =>
         /^(?:↑|Obsetync ↓|Scanning vault|Obsetync: scanning|Obsetync: recovering|Obsetync: journal recovery|Obsetync: checking|Reconcile:|reconcile:)/.test(String(message));
@@ -1199,8 +1199,7 @@ async function run() {
             hide() {},
         };
     };
-    const debounce = () => () => {};
-    globals.__obsetyncTestNotice = notice; globals.__obsetyncTestDebounce = debounce;
+    globals.__obsetyncTestNotice = notice;
     const filter = process.env.OBSETYNC_ENGINE_PLAN_CASE;
     if (filter !== undefined) assert(Object.prototype.hasOwnProperty.call(suites, filter), "unknown engine plan test case");
     const selected = Object.entries(suites).filter(([name]) => !filter || name === filter);
@@ -1214,9 +1213,6 @@ async function run() {
         clearTimeout(timeout); disposeWorkScheduler();
         if (globals.__obsetyncTestNotice === notice) {
             if (previousNotice === undefined) delete globals.__obsetyncTestNotice; else globals.__obsetyncTestNotice = previousNotice;
-        }
-        if (globals.__obsetyncTestDebounce === debounce) {
-            if (previousDebounce === undefined) delete globals.__obsetyncTestDebounce; else globals.__obsetyncTestDebounce = previousDebounce;
         }
     }
 }

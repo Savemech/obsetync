@@ -7,9 +7,7 @@ import { fixture, hashFor, pathAt } from "./engine-root-test-fixture";
 async function run(): Promise<void> {
     const globals = globalThis as any;
     const oldNotice = globals.__obsetyncTestNotice;
-    const oldDebounce = globals.__obsetyncTestDebounce;
     globals.__obsetyncTestNotice = () => ({ setMessage() {}, hide() {} });
-    globals.__obsetyncTestDebounce = () => () => {};
     const f = await fixture(), active = await f.create("urgent-object-route");
     const path = pathAt(0);
     try {
@@ -27,8 +25,6 @@ async function run(): Promise<void> {
         await f.close();
         if (oldNotice === undefined) delete globals.__obsetyncTestNotice;
         else globals.__obsetyncTestNotice = oldNotice;
-        if (oldDebounce === undefined) delete globals.__obsetyncTestDebounce;
-        else globals.__obsetyncTestDebounce = oldDebounce;
     }
 }
 

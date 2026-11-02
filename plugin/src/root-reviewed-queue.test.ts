@@ -5,7 +5,6 @@ import { materializeFileChanges, PathIsDirectoryError, type FileStat } from "./f
 import { RootReviewedQueue, RootReviewInvalidated, RootReviewPaused, RootReviewPreempted, ROOT_REVIEW_LIMITS,
     type RootReviewedQueuePorts } from "./root-reviewed-queue";
 import type { RootLocalOmission } from "./root-local-omissions";
-import type { FileChange } from "./push";
 import { PrioritySortError, sortByPriorityCooperatively } from "./priority-sort";
 import { SyncMemoryArbiter } from "./sync-memory-arbiter";
 import { ROOT_BATCH_PLAN_ADMISSION } from "./root-batch-plan";

@@ -54,7 +54,6 @@ async function childMain() {
     });
     assert(process.execArgv.includes("--unhandled-rejections=strict"));
     globalThis.__obsetyncTestNotice = () => ({ setMessage() {}, hide() {} });
-    globalThis.__obsetyncTestDebounce = () => () => {};
     // Expected engine logs contain synthetic paths but would swamp counters.
     // Assertion/child failures still reach stderr through the explicit catch.
     console.log = console.warn = () => {};
@@ -271,7 +270,6 @@ try {
             builder.onLoad({ filter: /.*/, namespace: "shell" }, () => ({ loader: "js", contents: `
                 export class TAbstractFile {} export class TFile extends TAbstractFile {}
                 export class Notice { constructor(...args) { return globalThis.__obsetyncTestNotice(...args); } }
-                export function debounce(...args) { return globalThis.__obsetyncTestDebounce(...args); }
                 export function requestUrl() { throw new Error("diagnostic attempted native network"); }
                 export const Platform = new Proxy({}, {get() {throw new Error("diagnostic attempted native platform detection");}});
             ` }));

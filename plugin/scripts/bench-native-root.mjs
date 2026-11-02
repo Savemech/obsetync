@@ -145,10 +145,6 @@ try {
             builder.onLoad({ filter: /.*/, namespace: "native-root" }, () => ({ loader: "js", contents: `
                 export class TAbstractFile {} export class TFile extends TAbstractFile {}
                 export class Notice { setMessage() {} hide() {} }
-                // Production callbacks/coalescer timers remain real. The
-                // auto-edits case enables autoSync; other cases keep it off.
-                // This legacy debounce shim adds no separate host timer.
-                export function debounce(callback) { return callback; }
                 export function requestUrl(...args) {
                     if (!globalThis.__nativeRootRequestUrl) throw new Error("native HTTP bridge absent");
                     return globalThis.__nativeRootRequestUrl(...args);

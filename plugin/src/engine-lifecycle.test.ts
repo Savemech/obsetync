@@ -171,28 +171,17 @@ function stopAndDrain(engine: any): Promise<void> {
     return engine.stopAndDrain();
 }
 function attachModify(f: Fixture, engine: any) {
-    const globals = globalThis as any;
-    const previous = globals.__obsetyncTestDebounce;
     const before = new Set(f.refs);
-    try {
-        globals.__obsetyncTestDebounce = () => () => {};
-        engine.attachVaultListeners();
-    } finally {
-        if (previous === undefined) delete globals.__obsetyncTestDebounce;
-        else globals.__obsetyncTestDebounce = previous;
-    }
+    engine.attachVaultListeners();
     return [...f.refs].find(ref => !before.has(ref) && ref.event === "modify")!.callback;
 }
 function withUi<T>(work: () => T): T {
     const globals = globalThis as any;
-    const debounce = globals.__obsetyncTestDebounce, notice = globals.__obsetyncTestNotice;
+    const notice = globals.__obsetyncTestNotice;
     try {
-        globals.__obsetyncTestDebounce = () => () => {};
         globals.__obsetyncTestNotice = () => ({ setMessage: () => {}, hide: () => {} });
         return work();
     } finally {
-        if (debounce === undefined) delete globals.__obsetyncTestDebounce;
-        else globals.__obsetyncTestDebounce = debounce;
         if (notice === undefined) delete globals.__obsetyncTestNotice;
         else globals.__obsetyncTestNotice = notice;
     }

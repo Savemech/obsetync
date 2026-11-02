@@ -1,4 +1,4 @@
-import { App, TAbstractFile, TFile, debounce, Notice } from "obsidian";
+import { App, TAbstractFile, TFile, Notice } from "obsidian";
 
 import { yieldWork as yieldToUI, throwIfWorkAborted, type WorkLane } from "./work-scheduler";
 import { EngineWorkTracker } from "./engine-work";
@@ -66,7 +66,6 @@ import { reserveTransientScope, transientMemorySnapshot } from "./transient-memo
 import { ResourceBudgetClosedError } from "./resource-budget";
 import {
     HashWorkerFileDriftError,
-    HashWorkerPoolError,
     waitForHashWorkerCleanup,
     type DesktopHashWorkerPool,
 } from "./desktop-hash-workers";
@@ -395,9 +394,6 @@ export class ObsetyncSyncEngine {
      *  Bounded download batches drain these before their checkpoint. */
     private pullEchoWork?: Set<Promise<void>>;
     private mobilePullEchoRead?: Promise<void>;
-    /** Legacy debounce compatibility/test seam; production scheduling is owned
-     *  by autoPushCoalescer so continuous changes have a hard latency bound. */
-    private debouncedPush: (() => void) | null = null;
     /** Short quiet batching with a hard upper latency under continuous edits. */
     private autoPushCoalescer: MaxLatencyCoalescer | null = null;
     /** Paths whose vault callbacks have started but whose durable journal
@@ -746,7 +742,6 @@ export class ObsetyncSyncEngine {
                 } catch (error) {
                     this.autoPushCoalescer?.close();
                     this.autoPushCoalescer = null;
-                    this.debouncedPush = null;
                     for (const ref of this.eventRefs) this.app.vault.offref(ref);
                     this.eventRefs = [];
                     throw error;
@@ -1197,7 +1192,6 @@ export class ObsetyncSyncEngine {
     private detachVaultListeners(): void {
         this.autoPushCoalescer?.close();
         this.autoPushCoalescer = null;
-        this.debouncedPush = null;
         const remaining = [];
         for (const ref of this.eventRefs) {
             try { this.app.vault.offref(ref); }
@@ -4492,17 +4486,13 @@ export class ObsetyncSyncEngine {
                 }
             }
         };
-        // Keep the legacy wrapper as an existing deterministic host-test seam.
-        // Production events never call it; batching is owned by the bounded
-        // coalescer below, so this compatibility delay adds no user latency.
-        this.debouncedPush = debounce(() => { void runAutomaticPush(); }, 3_000, true);
         this.autoPushCoalescer?.close();
         this.autoPushCoalescer = new MaxLatencyCoalescer({
             quietMs: 150,
             maxLatencyMs: 750,
             run: runAutomaticPush,
         });
-        const debouncedPush = () => this.autoPushCoalescer?.trigger();
+        const schedulePush = () => this.autoPushCoalescer?.trigger();
 
         const trackUpsert = (file: TAbstractFile, action: "created" | "modified") =>
             this.trackLocalEvent(
@@ -4532,7 +4522,7 @@ export class ObsetyncSyncEngine {
                     const change: DirtyFileChange = { action: "deleted", path, journalId };
                     if (guard.isCurrent()) this.pendingChanges.add(change, journalId);
                     else this.pendingChanges.restore([change]);
-                    debouncedPush();
+                    schedulePush();
                 } finally {
                     guard.release();
                 }
@@ -4565,7 +4555,7 @@ export class ObsetyncSyncEngine {
                         const change: DirtyFileChange = { action: "deleted", path: oldPath, journalId };
                         if (oldGuard.isCurrent()) this.pendingChanges.add(change, journalId);
                         else this.pendingChanges.restore([change]);
-                        debouncedPush();
+                        schedulePush();
                         return;
                     }
 
@@ -4626,7 +4616,7 @@ export class ObsetyncSyncEngine {
                     if (newGuard.isCurrent() && file.path === newPath && actualHash !== null) change.hash = actualHash;
                     if (newGuard.isCurrent()) this.pendingChanges.add(change, newJournalId);
                     else this.pendingChanges.restore([change]);
-                    debouncedPush();
+                    schedulePush();
                 } finally {
                     oldGuard.release();
                     newGuard.release();

@@ -8,7 +8,6 @@ mod bulk;
 mod config;
 mod crdt;
 mod devices;
-mod doc_store;
 mod enrollment;
 mod eph_rotation;
 mod error;

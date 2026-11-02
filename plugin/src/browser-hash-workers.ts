@@ -158,7 +158,6 @@ export class BrowserHashWorkerPool {
     private cancelledJobs = 0;
     private lastFailure: BrowserHashWorkerFailure | null = null;
     private terminationRequested = false;
-    private qualificationBuffer: ArrayBuffer | null = null;
     private moduleByteLengths: readonly [number, number] = [0, 0];
     private qualificationInFlightBytes = 0;
     private quarantinedPayloadBytes = 0;
@@ -286,7 +285,6 @@ export class BrowserHashWorkerPool {
             this.worker.onmessageerror = () => this.fault("MESSAGE_ERROR");
             const fixture = browserHashQualificationFixture();
             fixtureBuffer = fixture.buffer as ArrayBuffer;
-            this.qualificationBuffer = fixtureBuffer;
             this.qualificationTimer = setTimeout(() => this.failQualification("QUALIFICATION_TIMEOUT"),
                 this.qualificationTimeoutMs);
             this.worker.postMessage({ schema: BROWSER_HASH_WORKER_SCHEMA, type: "init",
@@ -340,7 +338,6 @@ export class BrowserHashWorkerPool {
             if (!check.every((value, index) => value === (index & 255))) {
                 return this.failQualification("QUALIFICATION_FAILED");
             }
-            this.qualificationBuffer = null;
             this.clearQualificationTimer();
             this.mode = message.wasmMode;
             this.wasmHeapBytes = message.wasmHeapBytes;
@@ -426,7 +423,7 @@ export class BrowserHashWorkerPool {
         if (this.state !== "starting") return;
         this.failureCount++;
         this.lastFailure = reason;
-        this.state = reason === "UNAVAILABLE" || reason === "SOURCE_INVALID" ? "unavailable" : "unavailable";
+        this.state = "unavailable";
         this.clearQualificationTimer();
         this.terminate();
         const residual = this.unconfirmedReleaseBytes();
@@ -484,7 +481,6 @@ export class BrowserHashWorkerPool {
             try { this.host.revokeUrl(this.url); } catch { /* best effort */ }
             this.url = null;
         }
-        this.qualificationBuffer = null;
     }
 
     private unconfirmedReleaseBytes(): number {

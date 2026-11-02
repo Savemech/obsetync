@@ -1430,8 +1430,9 @@ mandatory.
 not block stabilization/release of file-sync P1–P3/P5. The project owner
 estimates the practical probability of concurrent editing of one file at below
 1%; current protection remains conflict copies, revision/root history, and
-fail-closed fences. The existing server live-document scaffold is not activated
-or declared ready. PR15–20 were not implemented; no compatible
+fail-closed fences. The disconnected server live-document scaffold was removed
+in the 1.13 cleanup; its design is retained in `live-document-v1-adr.md`.
+PR15–20 were not implemented; no compatible
 Yjs/CodeMirror 6/Yrs combination has been selected or verified. Returning to P4
 requires a separate explicit decision and the full PR 15–20/gates set; the
 accumulated specification below is retained so safety shortcuts cannot be

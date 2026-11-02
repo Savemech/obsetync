@@ -10,7 +10,7 @@ import { ObsetyncJournal } from "./journal";
 import { createRootCommitIntent } from "./root-outcome";
 import { BulkObjectKind } from "./bulk-codec";
 import { MemorySegmentedIO, storeTestIOError } from "./segmented-store-test-io";
-import { reserveTransientScope, type TransientWorkScope } from "./transient-memory";
+import { reserveTransientScope } from "./transient-memory";
 import { ResourceBudget } from "./resource-budget";
 import type { PlatformIO } from "./platform";
 import { verifyConflictFile } from "./conflict-file-verification";

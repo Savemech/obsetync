@@ -65,13 +65,7 @@ function fixture() {
             consumeUpsert: () => false, consumeDelete: () => false },
         isExcluded: () => false,
     });
-    const globals = globalThis as any;
-    const previous = globals.__obsetyncTestDebounce;
-    try { globals.__obsetyncTestDebounce = (callback: () => void) => callback; engine.attachVaultListeners(); }
-    finally {
-        if (previous === undefined) delete globals.__obsetyncTestDebounce;
-        else globals.__obsetyncTestDebounce = previous;
-    }
+    engine.attachVaultListeners();
     return { engine, callbacks, rows, acknowledgements };
 }
 

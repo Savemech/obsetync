@@ -92,11 +92,6 @@ try {
                             if (typeof fake !== "function") throw new Error("Obsidian Notice test stub is not installed");
                             return fake(...args);
                         }
-                    }
-                    export function debounce(...args) {
-                        const fake = globalThis.__obsetyncTestDebounce;
-                        if (typeof fake !== "function") throw new Error("Obsidian debounce test stub is not installed");
-                        return fake(...args);
                     }`,
                     loader: "js",
                 }));

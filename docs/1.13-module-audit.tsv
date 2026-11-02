@@ -1,0 +1,428 @@
+status	path	role	evidence
+pending	.cargo/config.toml	configuration/schema	Not reviewed
+pending	.github/workflows/ci.yml	configuration/schema	Not reviewed
+pending	.github/workflows/release.yml	configuration/schema	Not reviewed
+pending	Cargo.lock	generated/lock	Not reviewed
+read	Cargo.toml	configuration/schema	Entry-point/build inventory; behavior/callers still under review
+read	Dockerfile	configuration/schema	Read production pinned WASM toolchain and artifact stages; remaining container/runtime validation pending
+read	Dockerfile.dev	configuration/schema	Read full file; x86-only unchecked wasm-pack and distro optimizer conflict with production toolchain; fix/runtime verification pending
+pending	benchmarks/after-1.11.1/Tree-v1-prefix-slice2.json	historical evidence	Not reviewed
+pending	benchmarks/after-1.11.1/W1-bulk-http-slice5.json	historical evidence	Not reviewed
+pending	benchmarks/after-1.11.1/W1-group-commit-slice6.json	historical evidence	Not reviewed
+pending	benchmarks/after-1.11.1/W1-pack-storage-slice7.json	historical evidence	Not reviewed
+pending	benchmarks/after-1.11.1/W1-ws-data-slice8.json	historical evidence	Not reviewed
+pending	benchmarks/after-1.11.1/W4-ranged-upload-slice13.json	historical evidence	Not reviewed
+pending	benchmarks/after-1.11.1/W5-paged-diff-slice10.json	historical evidence	Not reviewed
+pending	benchmarks/after-1.11.1/W5-tree-v2-slice11.json	historical evidence	Not reviewed
+pending	benchmarks/after-1.11.1/W6-slice1.json	historical evidence	Not reviewed
+pending	benchmarks/after-1.11.1/W6-smoke.json	historical evidence	Not reviewed
+pending	benchmarks/after-1.11.1/WASM-SIMD-feed-slice3.json	historical evidence	Not reviewed
+pending	benchmarks/after-1.11.1/desktop-workers-slice13.json	historical evidence	Not reviewed
+pending	benchmarks/after-1.11.1/desktop-workers-slice4.json	historical evidence	Not reviewed
+pending	benchmarks/after-1.11.1/x86-resource-governor-slice14.json	historical evidence	Not reviewed
+pending	benchmarks/baseline-1.10.2/W1-smoke.json	historical evidence	Not reviewed
+pending	benchmarks/baseline-1.10.2/W2-smoke.json	historical evidence	Not reviewed
+pending	benchmarks/baseline-1.10.2/W3-smoke.json	historical evidence	Not reviewed
+pending	benchmarks/baseline-1.10.2/W4-smoke.json	historical evidence	Not reviewed
+pending	benchmarks/baseline-1.10.2/W5-smoke.json	historical evidence	Not reviewed
+pending	benchmarks/baseline-1.10.2/W6-smoke.json	historical evidence	Not reviewed
+pending	benchmarks/baseline-1.10.2/W7-smoke.json	historical evidence	Not reviewed
+pending	benchmarks/baseline-1.10.2/W8-smoke.json	historical evidence	Not reviewed
+pending	benchmarks/baseline-1.10.2/client-instrumentation-overhead.json	historical evidence	Not reviewed
+read	crates/e2e-tests/Cargo.toml	configuration/schema	Entry-point/build inventory; behavior/callers still under review
+pending	crates/e2e-tests/src/lib.rs	production	Not reviewed
+pending	crates/e2e-tests/tests/concurrency.rs	tests	Not reviewed
+pending	crates/e2e-tests/tests/conflicts.rs	tests	Not reviewed
+pending	crates/e2e-tests/tests/enrollment.rs	tests	Not reviewed
+pending	crates/e2e-tests/tests/history_export.rs	tests	Not reviewed
+pending	crates/e2e-tests/tests/realtime_ws.rs	tests	Not reviewed
+pending	crates/e2e-tests/tests/single_device.rs	tests	Not reviewed
+pending	crates/e2e-tests/tests/smoke.rs	tests	Not reviewed
+pending	crates/e2e-tests/tests/stale_tree_revert.rs	tests	Not reviewed
+pending	crates/e2e-tests/tests/text_merge.rs	tests	Not reviewed
+pending	crates/e2e-tests/tests/transport_security.rs	tests	Not reviewed
+pending	crates/e2e-tests/tests/two_device_sync.rs	tests	Not reviewed
+pending	crates/e2e-tests/tests/ws_data.rs	tests	Not reviewed
+read	crates/perf-harness/Cargo.toml	tooling	Entry-point/build inventory; behavior/callers still under review
+pending	crates/perf-harness/src/lib.rs	tooling	Not reviewed
+pending	crates/perf-harness/src/main.rs	tooling	Not reviewed
+read	crates/sync-core/Cargo.toml	configuration/schema	Entry-point/build inventory; behavior/callers still under review
+pending	crates/sync-core/src/candidate_mutation_v1.rs	production	Not reviewed
+pending	crates/sync-core/src/candidate_mutation_v2.rs	production	Not reviewed
+pending	crates/sync-core/src/chunk.rs	production	Not reviewed
+pending	crates/sync-core/src/conflict.rs	production	Not reviewed
+pending	crates/sync-core/src/content_store.rs	production	Not reviewed
+pending	crates/sync-core/src/diff.rs	production	Not reviewed
+pending	crates/sync-core/src/diff_page.rs	production	Not reviewed
+pending	crates/sync-core/src/fastcdc_chunker.rs	production	Not reviewed
+pending	crates/sync-core/src/hash.rs	production	Not reviewed
+read	crates/sync-core/src/lib.rs	production	Entry-point/build inventory; behavior/callers still under review
+pending	crates/sync-core/src/merge.rs	production	Not reviewed
+pending	crates/sync-core/src/replacement_rebuild.rs	production	Not reviewed
+pending	crates/sync-core/src/replacement_rebuild_v1.rs	production	Not reviewed
+pending	crates/sync-core/src/replacement_rebuild_v2.rs	production	Not reviewed
+pending	crates/sync-core/src/root_export_v1.rs	production	Not reviewed
+pending	crates/sync-core/src/store.rs	production	Not reviewed
+pending	crates/sync-core/src/sync_rules.rs	production	Not reviewed
+pending	crates/sync-core/src/transactional_tree.rs	production	Not reviewed
+pending	crates/sync-core/src/transactional_tree_v2.rs	production	Not reviewed
+pending	crates/sync-core/src/tree.rs	production	Not reviewed
+pending	crates/sync-core/src/tree_metadata.rs	production	Not reviewed
+pending	crates/sync-core/src/tree_v2.rs	production	Not reviewed
+pending	crates/sync-core/src/tree_work_memory.rs	production	Not reviewed
+pending	crates/sync-core/src/versioned_root.rs	production	Not reviewed
+pending	crates/sync-core/src/wasm.rs	production	Not reviewed
+pending	crates/sync-core/src/wasm_memory.rs	production	Not reviewed
+read	crates/sync-schema/Cargo.toml	configuration/schema	Entry-point/build inventory; behavior/callers still under review
+read	crates/sync-schema/schema/chunk.fbs	configuration/schema	Entry-point/build inventory; behavior/callers still under review
+pending	crates/sync-schema/src/chunk_generated.rs	generated/lock	Not reviewed
+read	crates/sync-schema/src/lib.rs	production	Entry-point/build inventory; behavior/callers still under review
+read	crates/sync-server/Cargo.toml	configuration/schema	Entry-point/build inventory; behavior/callers still under review
+pending	crates/sync-server/build.rs	production	Not reviewed
+pending	crates/sync-server/src/admin.rs	production	Not reviewed
+pending	crates/sync-server/src/api.rs	production	Not reviewed
+pending	crates/sync-server/src/api_root_outcome_tests.rs	production	Not reviewed
+pending	crates/sync-server/src/blocking_io.rs	production	Not reviewed
+pending	crates/sync-server/src/box_key.rs	production	Not reviewed
+pending	crates/sync-server/src/bridge.rs	production	Not reviewed
+pending	crates/sync-server/src/build_identity.rs	production	Not reviewed
+pending	crates/sync-server/src/bulk.rs	production	Not reviewed
+pending	crates/sync-server/src/config.rs	production	Not reviewed
+pending	crates/sync-server/src/crdt.rs	production	Not reviewed
+pending	crates/sync-server/src/devices.rs	production	Not reviewed
+removed	crates/sync-server/src/doc_store.rs	production	Only main.rs declaration and own tests referenced the prototype; active CRDT routes use crdt.rs; ADR/roadmap updated; workspace tests pass
+pending	crates/sync-server/src/enrollment.rs	production	Not reviewed
+pending	crates/sync-server/src/eph_rotation.rs	production	Not reviewed
+pending	crates/sync-server/src/error.rs	production	Not reviewed
+pending	crates/sync-server/src/guard.rs	production	Not reviewed
+pending	crates/sync-server/src/ignore_match.rs	production	Not reviewed
+read	crates/sync-server/src/main.rs	production	Read entry points and module graph; removed disconnected doc_store declaration; native workspace tests pass; runtime/error paths pending
+pending	crates/sync-server/src/pack_store.rs	production	Not reviewed
+pending	crates/sync-server/src/perf.rs	production	Not reviewed
+pending	crates/sync-server/src/root_head.rs	production	Not reviewed
+pending	crates/sync-server/src/root_outcome.rs	production	Not reviewed
+pending	crates/sync-server/src/secure.rs	production	Not reviewed
+pending	crates/sync-server/src/seq_tracker.rs	production	Not reviewed
+pending	crates/sync-server/src/state.rs	production	Not reviewed
+read	crates/sync-server/src/storage.rs	production	Layout and root authority readers inspected; loose/packed/recovery paths traced for docs; full durability review pending
+pending	crates/sync-server/src/storage_writer.rs	production	Not reviewed
+pending	crates/sync-server/src/transport_memory.rs	production	Not reviewed
+pending	crates/sync-server/src/ws.rs	production	Not reviewed
+pending	crates/sync-server/src/ws_data.rs	production	Not reviewed
+pending	crates/sync-server/src/ws_ticket.rs	production	Not reviewed
+pending	docker-compose.e2e.yml	configuration/schema	Not reviewed
+read	docker-compose.yml	configuration/schema	Read full services, bind mounts, extraction and healthcheck; outdated directory/cache comments found; runtime review pending
+pending	docs/native-root-read-concurrency-2026-09-05.json	historical evidence	Not reviewed
+pending	docs/root-drain-reviewed-counts-2026-09-05.json	historical evidence	Not reviewed
+read	flake.nix	configuration/schema	Read package graph; fixed missing CSS; actual plugin build has seven files; server/image and check outputs still pending
+read	justfile	configuration/schema	Read build/release/ship graph and maintenance commands; clean-server omits packed state; isolated destructive-command test pending
+pending	manifest.json	configuration/schema	Not reviewed
+read	plugin/esbuild.config.mjs	production	Entry-point/build inventory; behavior/callers still under review
+pending	plugin/manifest.json	configuration/schema	Not reviewed
+pending	plugin/package-lock.json	generated/lock	Not reviewed
+read	plugin/package.json	configuration/schema	Entry-point/build inventory; behavior/callers still under review
+pending	plugin/scripts/bench-journal.mjs	tooling	Not reviewed
+read	plugin/scripts/bench-native-root.mjs	tooling	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
+pending	plugin/scripts/bench-prepared-manifest.mjs	tooling	Not reviewed
+pending	plugin/scripts/bench-sync-base.mjs	tooling	Not reviewed
+pending	plugin/scripts/browser-hash-worker.test.mjs	tests	Not reviewed
+pending	plugin/scripts/browser-probe.test.mjs	tests	Not reviewed
+pending	plugin/scripts/build-identity-config.mjs	tooling	Not reviewed
+pending	plugin/scripts/build-identity-config.test.mjs	tests	Not reviewed
+pending	plugin/scripts/build-wasm-contract.test.mjs	tests	Not reviewed
+pending	plugin/scripts/conflict-ui-lifecycle.test.mjs	tests	Not reviewed
+read	plugin/scripts/diagnose-root-drain.mjs	tooling	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
+pending	plugin/scripts/lib/native-root-audit-diagnostic.mjs	tooling	Not reviewed
+pending	plugin/scripts/lib/native-root-auto-diagnostic.mjs	tooling	Not reviewed
+pending	plugin/scripts/lib/native-root-child.mjs	tooling	Not reviewed
+pending	plugin/scripts/lib/native-root-crash-fixture.mjs	tooling	Not reviewed
+pending	plugin/scripts/lib/native-root-fixture.mjs	tooling	Not reviewed
+pending	plugin/scripts/lib/native-root-instrumentation.mjs	tooling	Not reviewed
+pending	plugin/scripts/lib/native-root-io.mjs	tooling	Not reviewed
+pending	plugin/scripts/lib/native-root-metrics.mjs	tooling	Not reviewed
+pending	plugin/scripts/lib/native-root-publication.ts	tooling	Not reviewed
+pending	plugin/scripts/lib/native-root-qualification.mjs	tooling	Not reviewed
+pending	plugin/scripts/lib/native-root-server.mjs	tooling	Not reviewed
+pending	plugin/scripts/native-root-audit-diagnostic.test.mjs	tests	Not reviewed
+pending	plugin/scripts/native-root-auto-diagnostic.test.mjs	tests	Not reviewed
+pending	plugin/scripts/native-root-child.test.mjs	tests	Not reviewed
+pending	plugin/scripts/native-root-instrumentation.test.mjs	tests	Not reviewed
+pending	plugin/scripts/native-root-io.test.mjs	tests	Not reviewed
+pending	plugin/scripts/native-root-metrics.test.mjs	tests	Not reviewed
+pending	plugin/scripts/native-root-qualification.test.mjs	tests	Not reviewed
+pending	plugin/scripts/run-resource-governor-bench.mjs	tooling	Not reviewed
+read	plugin/scripts/run-tests.mjs	tooling	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
+pending	plugin/scripts/run-tests.test.mjs	tests	Not reviewed
+pending	plugin/scripts/settings-fence.test.mjs	tests	Not reviewed
+pending	plugin/scripts/test-main-lifecycle.mjs	tooling	Not reviewed
+read	plugin/scripts/test-native-root-crash-recovery.mjs	tooling	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
+pending	plugin/scripts/test-native-root-mutation-complexity.mjs	tooling	Not reviewed
+pending	plugin/scripts/test-native-root-server.mjs	tooling	Not reviewed
+pending	plugin/scripts/test-native-ws-data.mjs	tooling	Not reviewed
+pending	plugin/scripts/test-wasm-memory.mjs	tooling	Not reviewed
+pending	plugin/src/adaptive-batches.test.ts	tests	Not reviewed
+pending	plugin/src/adaptive-batches.ts	production	Not reviewed
+pending	plugin/src/adaptive-transport-chaos.test.ts	tests	Not reviewed
+pending	plugin/src/api-memory.test.ts	tests	Not reviewed
+pending	plugin/src/api-root-outcome.test.ts	tests	Not reviewed
+pending	plugin/src/api.ts	production	Not reviewed
+pending	plugin/src/binary.ts	production	Not reviewed
+pending	plugin/src/bounded-append.test.ts	tests	Not reviewed
+pending	plugin/src/bounded-append.ts	production	Not reviewed
+pending	plugin/src/browser-capability-probe.test.ts	tests	Not reviewed
+pending	plugin/src/browser-capability-probe.ts	production	Not reviewed
+pending	plugin/src/browser-hash-worker-entry.ts	production	Not reviewed
+pending	plugin/src/browser-hash-worker-protocol.ts	production	Not reviewed
+pending	plugin/src/browser-hash-workers.test.ts	tests	Not reviewed
+reviewed	plugin/src/browser-hash-workers.ts	production	Read worker qualification, transfers, cancellation, fallback and disposal; removed write-only detached-buffer field; npm test worker ownership cases pass; real browser gate remains
+pending	plugin/src/browser-probe-entry.ts	production	Not reviewed
+pending	plugin/src/browser-probe-protocol.ts	production	Not reviewed
+pending	plugin/src/build-identity-contract.ts	production	Not reviewed
+pending	plugin/src/build-identity.test.ts	tests	Not reviewed
+pending	plugin/src/build-identity.ts	production	Not reviewed
+pending	plugin/src/bulk-codec.test.ts	tests	Not reviewed
+pending	plugin/src/bulk-codec.ts	production	Not reviewed
+pending	plugin/src/bulk-planner.bench.ts	tooling	Not reviewed
+read	plugin/src/cached-root-export.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
+pending	plugin/src/candidate-mutation-output-admission.test.ts	tests	Not reviewed
+pending	plugin/src/candidate-mutation-output-admission.ts	production	Not reviewed
+pending	plugin/src/candidate-open-root-admission.test.ts	tests	Not reviewed
+pending	plugin/src/candidate-open-root-admission.ts	production	Not reviewed
+pending	plugin/src/conflict-file-verification.test.ts	tests	Not reviewed
+pending	plugin/src/conflict-file-verification.ts	production	Not reviewed
+pending	plugin/src/conflict-path.ts	production	Not reviewed
+pending	plugin/src/conflict-ui.ts	production	Not reviewed
+pending	plugin/src/current-host-work.test.ts	tests	Not reviewed
+pending	plugin/src/current-host-work.ts	production	Not reviewed
+pending	plugin/src/debug-log.test.ts	tests	Not reviewed
+pending	plugin/src/debug-log.ts	production	Not reviewed
+pending	plugin/src/debug-modal.ts	production	Not reviewed
+pending	plugin/src/deferred-changes.test.ts	tests	Not reviewed
+pending	plugin/src/deferred-changes.ts	production	Not reviewed
+pending	plugin/src/delta-validation.test.ts	tests	Not reviewed
+pending	plugin/src/delta-validation.ts	production	Not reviewed
+pending	plugin/src/desktop-hash-workers.test.ts	tests	Not reviewed
+pending	plugin/src/desktop-hash-workers.ts	production	Not reviewed
+pending	plugin/src/desktop-ranged-upload.bench.ts	tooling	Not reviewed
+pending	plugin/src/desktop-ranged-upload.test.ts	tests	Not reviewed
+pending	plugin/src/desktop-ranged-upload.ts	production	Not reviewed
+pending	plugin/src/desktop-reconcile-upload.test.ts	tests	Not reviewed
+pending	plugin/src/desktop-reconcile-upload.ts	production	Not reviewed
+pending	plugin/src/desktop-verified-read.test.ts	tests	Not reviewed
+pending	plugin/src/desktop-verified-read.ts	production	Not reviewed
+pending	plugin/src/diff-page-codec.test.ts	tests	Not reviewed
+pending	plugin/src/diff-page-codec.ts	production	Not reviewed
+pending	plugin/src/dirty-set.test.ts	tests	Not reviewed
+pending	plugin/src/dirty-set.ts	production	Not reviewed
+pending	plugin/src/editor-pull-guard.test.ts	tests	Not reviewed
+pending	plugin/src/editor-pull-guard.ts	production	Not reviewed
+read	plugin/src/engine-legacy-downgrade.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
+read	plugin/src/engine-lifecycle.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
+read	plugin/src/engine-mobile-lifecycle.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
+read	plugin/src/engine-root-plan.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
+read	plugin/src/engine-root-test-fixture.ts	production	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
+read	plugin/src/engine-root.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
+read	plugin/src/engine-urgent-upload.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
+pending	plugin/src/engine-work.test.ts	tests	Not reviewed
+pending	plugin/src/engine-work.ts	production	Not reviewed
+pending	plugin/src/file-safety.test.ts	tests	Not reviewed
+pending	plugin/src/file-safety.ts	production	Not reviewed
+pending	plugin/src/hash-runtime.test.ts	tests	Not reviewed
+pending	plugin/src/hash-runtime.ts	production	Not reviewed
+pending	plugin/src/hash-source-budget.test.ts	tests	Not reviewed
+pending	plugin/src/hash-source-budget.ts	production	Not reviewed
+pending	plugin/src/hash-worker-entry.ts	production	Not reviewed
+pending	plugin/src/hash-worker-protocol.ts	production	Not reviewed
+pending	plugin/src/hash-worker-source.d.ts	production	Not reviewed
+pending	plugin/src/host-runtime.test.ts	tests	Not reviewed
+pending	plugin/src/host-runtime.ts	production	Not reviewed
+pending	plugin/src/ignore.test.ts	tests	Not reviewed
+pending	plugin/src/ignore.ts	production	Not reviewed
+pending	plugin/src/incremental-tree-test-abi.ts	production	Not reviewed
+pending	plugin/src/index-upload.test.ts	tests	Not reviewed
+pending	plugin/src/index-upload.ts	production	Not reviewed
+pending	plugin/src/journal-concurrency.test.ts	tests	Not reviewed
+pending	plugin/src/journal-format.ts	production	Not reviewed
+pending	plugin/src/journal-index.test.ts	tests	Not reviewed
+pending	plugin/src/journal-index.ts	production	Not reviewed
+pending	plugin/src/journal-legacy.ts	production	Not reviewed
+pending	plugin/src/journal-owned.test.ts	tests	Not reviewed
+read	plugin/src/journal-rename.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
+read	plugin/src/journal-semantics.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
+pending	plugin/src/journal.test.ts	tests	Not reviewed
+pending	plugin/src/journal.ts	production	Not reviewed
+pending	plugin/src/large-transfer.test.ts	tests	Not reviewed
+pending	plugin/src/legacy-downgrade-host.test.ts	tests	Not reviewed
+pending	plugin/src/legacy-downgrade-host.ts	production	Not reviewed
+pending	plugin/src/legacy-downgrade-modal.test.ts	tests	Not reviewed
+pending	plugin/src/legacy-downgrade-modal.ts	production	Not reviewed
+pending	plugin/src/legacy-downgrade.test.ts	tests	Not reviewed
+pending	plugin/src/legacy-downgrade.ts	production	Not reviewed
+pending	plugin/src/legacy-source.test.ts	tests	Not reviewed
+pending	plugin/src/legacy-source.ts	production	Not reviewed
+pending	plugin/src/local-event-guards.ts	production	Not reviewed
+read	plugin/src/local-events.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
+pending	plugin/src/main.ts	production	Not reviewed
+reviewed	plugin/src/max-latency-coalescer.test.ts	tests	Read quiet/max-latency, failure and closure coverage; npm test passes
+reviewed	plugin/src/max-latency-coalescer.ts	production	Read timer, rerun, flush and close paths with production sync.ts callers and dedicated tests; npm test passes
+pending	plugin/src/mobile-ranged-source.ts	production	Not reviewed
+pending	plugin/src/object-confirmation-store.test.ts	tests	Not reviewed
+pending	plugin/src/object-confirmation-store.ts	production	Not reviewed
+pending	plugin/src/operation-checkpoint.test.ts	tests	Not reviewed
+pending	plugin/src/operation-checkpoint.ts	production	Not reviewed
+pending	plugin/src/paged-pull.test.ts	tests	Not reviewed
+pending	plugin/src/perf-governor.test.ts	tests	Not reviewed
+pending	plugin/src/perf-overhead.bench.ts	tooling	Not reviewed
+pending	plugin/src/perf-trace.test.ts	tests	Not reviewed
+pending	plugin/src/perf-trace.ts	production	Not reviewed
+pending	plugin/src/persistent-path-index.test.ts	tests	Not reviewed
+pending	plugin/src/persistent-path-index.ts	production	Not reviewed
+pending	plugin/src/platform-conflict-copy.test.ts	tests	Not reviewed
+pending	plugin/src/platform.test.ts	tests	Not reviewed
+pending	plugin/src/platform.ts	production	Not reviewed
+pending	plugin/src/plugin.test.ts	tests	Not reviewed
+pending	plugin/src/prepared-desktop-manifest.test.ts	tests	Not reviewed
+pending	plugin/src/prepared-desktop-manifest.ts	production	Not reviewed
+pending	plugin/src/prepared-mobile-manifest.test.ts	tests	Not reviewed
+pending	plugin/src/prepared-mobile-manifest.ts	production	Not reviewed
+pending	plugin/src/prepared-retirement.test.ts	tests	Not reviewed
+pending	plugin/src/prepared-retirement.ts	production	Not reviewed
+pending	plugin/src/priority-sort.test.ts	tests	Not reviewed
+pending	plugin/src/priority-sort.ts	production	Not reviewed
+pending	plugin/src/pull-echo.test.ts	tests	Not reviewed
+pending	plugin/src/pull-echo.ts	production	Not reviewed
+pending	plugin/src/pull.test.ts	tests	Not reviewed
+pending	plugin/src/pull.ts	production	Not reviewed
+pending	plugin/src/push-memory.test.ts	tests	Not reviewed
+pending	plugin/src/push-memory.ts	production	Not reviewed
+pending	plugin/src/push-prepared.test.ts	tests	Not reviewed
+pending	plugin/src/push-root-transaction.test.ts	tests	Not reviewed
+pending	plugin/src/push-transaction.test.ts	tests	Not reviewed
+pending	plugin/src/push.ts	production	Not reviewed
+pending	plugin/src/reconcile-content.test.ts	tests	Not reviewed
+pending	plugin/src/reconcile-content.ts	production	Not reviewed
+pending	plugin/src/reconcile-status.test.ts	tests	Not reviewed
+pending	plugin/src/reconcile-upload.test.ts	tests	Not reviewed
+pending	plugin/src/reconcile-upload.ts	production	Not reviewed
+pending	plugin/src/resident-memory.test.ts	tests	Not reviewed
+pending	plugin/src/resident-memory.ts	production	Not reviewed
+pending	plugin/src/resource-budget.test.ts	tests	Not reviewed
+pending	plugin/src/resource-budget.ts	production	Not reviewed
+pending	plugin/src/resource-governor.bench.ts	tooling	Not reviewed
+pending	plugin/src/resource-governor.test.ts	tests	Not reviewed
+pending	plugin/src/resource-governor.ts	production	Not reviewed
+pending	plugin/src/root-batch-drain.test.ts	tests	Not reviewed
+pending	plugin/src/root-batch-drain.ts	production	Not reviewed
+pending	plugin/src/root-batch-plan.test.ts	tests	Not reviewed
+pending	plugin/src/root-batch-plan.ts	production	Not reviewed
+pending	plugin/src/root-batch.test.ts	tests	Not reviewed
+pending	plugin/src/root-batch.ts	production	Not reviewed
+read	plugin/src/root-conflicts.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
+pending	plugin/src/root-conflicts.ts	production	Not reviewed
+pending	plugin/src/root-intent.test.ts	tests	Not reviewed
+pending	plugin/src/root-intent.ts	production	Not reviewed
+pending	plugin/src/root-local-omissions.test.ts	tests	Not reviewed
+pending	plugin/src/root-local-omissions.ts	production	Not reviewed
+pending	plugin/src/root-outcome.test.ts	tests	Not reviewed
+pending	plugin/src/root-outcome.ts	production	Not reviewed
+pending	plugin/src/root-publication-memory.test.ts	tests	Not reviewed
+pending	plugin/src/root-publication-memory.ts	production	Not reviewed
+pending	plugin/src/root-recovery.test.ts	tests	Not reviewed
+pending	plugin/src/root-recovery.ts	production	Not reviewed
+read	plugin/src/root-reviewed-queue.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
+pending	plugin/src/root-reviewed-queue.ts	production	Not reviewed
+pending	plugin/src/root-settlement.test.ts	tests	Not reviewed
+pending	plugin/src/root-settlement.ts	production	Not reviewed
+pending	plugin/src/root-stream-scope.test.ts	tests	Not reviewed
+pending	plugin/src/root-stream-scope.ts	production	Not reviewed
+pending	plugin/src/root-sync-runtime.test.ts	tests	Not reviewed
+pending	plugin/src/root-sync-runtime.ts	production	Not reviewed
+pending	plugin/src/root-tree-repair-job.test.ts	tests	Not reviewed
+pending	plugin/src/root-tree-repair.test.ts	tests	Not reviewed
+pending	plugin/src/root-tree-repair.ts	production	Not reviewed
+pending	plugin/src/root-tree-resident-admission.test.ts	tests	Not reviewed
+pending	plugin/src/root-tree-resident-admission.ts	production	Not reviewed
+pending	plugin/src/runtime-retirement.test.ts	tests	Not reviewed
+pending	plugin/src/runtime-retirement.ts	production	Not reviewed
+pending	plugin/src/scan-planner.test.ts	tests	Not reviewed
+pending	plugin/src/scan-planner.ts	production	Not reviewed
+pending	plugin/src/secure.test.ts	tests	Not reviewed
+pending	plugin/src/secure.ts	production	Not reviewed
+pending	plugin/src/segmented-store-gc.test.ts	tests	Not reviewed
+pending	plugin/src/segmented-store-migration.test.ts	tests	Not reviewed
+pending	plugin/src/segmented-store-test-io.ts	production	Not reviewed
+pending	plugin/src/segmented-store.test.ts	tests	Not reviewed
+pending	plugin/src/segmented-store.ts	production	Not reviewed
+pending	plugin/src/settings-persistence.test.ts	tests	Not reviewed
+pending	plugin/src/settings-persistence.ts	production	Not reviewed
+read	plugin/src/settings.ts	production	Connection/default settings read; HTTPS placeholder contradicts HTTP server; remaining settings handlers pending
+pending	plugin/src/startup-activation.test.ts	tests	Not reviewed
+pending	plugin/src/startup-activation.ts	production	Not reviewed
+read	plugin/src/startup-replay.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
+pending	plugin/src/sync-base-migration.test.ts	tests	Not reviewed
+pending	plugin/src/sync-base-publication.test.ts	tests	Not reviewed
+pending	plugin/src/sync-base.test.ts	tests	Not reviewed
+pending	plugin/src/sync-base.ts	production	Not reviewed
+pending	plugin/src/sync-memory-arbiter.test.ts	tests	Not reviewed
+pending	plugin/src/sync-memory-arbiter.ts	production	Not reviewed
+pending	plugin/src/sync-status.test.ts	tests	Not reviewed
+pending	plugin/src/sync-status.ts	production	Not reviewed
+read	plugin/src/sync.ts	production	Automatic push and lifecycle paths traced; removed unused debounce seam; actual coalescer regression and engine suites pass; remaining engine paths pending
+pending	plugin/src/transfer-plan-scope.test.ts	tests	Not reviewed
+pending	plugin/src/transfer-plan-scope.ts	production	Not reviewed
+pending	plugin/src/transfer-plan.test.ts	tests	Not reviewed
+pending	plugin/src/transfer-plan.ts	production	Not reviewed
+pending	plugin/src/transient-memory.test.ts	tests	Not reviewed
+pending	plugin/src/transient-memory.ts	production	Not reviewed
+pending	plugin/src/transport-errors.ts	production	Not reviewed
+pending	plugin/src/transport-router.test.ts	tests	Not reviewed
+pending	plugin/src/transport-router.ts	production	Not reviewed
+pending	plugin/src/transport-sequence.test.ts	tests	Not reviewed
+pending	plugin/src/transport-sequence.ts	production	Not reviewed
+pending	plugin/src/tree-candidate-job.test.ts	tests	Not reviewed
+pending	plugin/src/tree-candidate-job.ts	production	Not reviewed
+pending	plugin/src/tree-candidate-mutation-job.test.ts	tests	Not reviewed
+pending	plugin/src/tree-candidate-mutation-job.ts	production	Not reviewed
+pending	plugin/src/tree-chunk-export-job.test.ts	tests	Not reviewed
+pending	plugin/src/tree-chunk-export-job.ts	production	Not reviewed
+pending	plugin/src/tree-format.test.ts	tests	Not reviewed
+pending	plugin/src/tree-format.ts	production	Not reviewed
+pending	plugin/src/tree-negotiation.test.ts	tests	Not reviewed
+pending	plugin/src/tree-negotiation.ts	production	Not reviewed
+pending	plugin/src/tree-output-settlement.test.ts	tests	Not reviewed
+pending	plugin/src/tree-output-settlement.ts	production	Not reviewed
+pending	plugin/src/tree-root-export-job.test.ts	tests	Not reviewed
+pending	plugin/src/tree-root-export-job.ts	production	Not reviewed
+pending	plugin/src/verified-conflict-content.test.ts	tests	Not reviewed
+pending	plugin/src/verified-conflict-content.ts	production	Not reviewed
+pending	plugin/src/wasm-memory.ts	production	Not reviewed
+pending	plugin/src/wasm-runtime.test.ts	tests	Not reviewed
+pending	plugin/src/wasm-runtime.ts	production	Not reviewed
+pending	plugin/src/work-scheduler.test.ts	tests	Not reviewed
+pending	plugin/src/work-scheduler.ts	production	Not reviewed
+pending	plugin/src/ws-data-codec.test.ts	tests	Not reviewed
+pending	plugin/src/ws-data-codec.ts	production	Not reviewed
+pending	plugin/src/ws-data.bench.ts	tooling	Not reviewed
+pending	plugin/src/ws-data.test.ts	tests	Not reviewed
+pending	plugin/src/ws-data.ts	production	Not reviewed
+pending	plugin/src/ws-resume.test.ts	tests	Not reviewed
+pending	plugin/src/ws.ts	production	Not reviewed
+pending	plugin/styles.css	production	Not reviewed
+reviewed	plugin/tsconfig.json	configuration/schema	Enabled noUnusedLocals/noUnusedParameters; tsc and actual Nix plugin compilation pass
+pending	rust-toolchain.toml	configuration/schema	Not reviewed
+pending	scripts/benchmark-hash-workers.mjs	tooling	Not reviewed
+pending	scripts/benchmark-wasm-hash.mjs	tooling	Not reviewed
+pending	scripts/build-wasm.sh	tooling	Not reviewed
+pending	scripts/check-release-version.mjs	tooling	Not reviewed
+pending	scripts/check-release-version.test.mjs	tests	Not reviewed
+pending	scripts/deploy-plugin.sh	tooling	Not reviewed
+pending	scripts/deploy-plugin.test.sh	tests	Not reviewed
+pending	scripts/deploy-server.sh	tooling	Not reviewed
+pending	scripts/deploy-server.test.sh	tests	Not reviewed
+pending	scripts/release-artifact-manifest.mjs	tooling	Not reviewed
+pending	scripts/release-artifact-manifest.test.mjs	tests	Not reviewed
+pending	scripts/release-provenance.mjs	tooling	Not reviewed
+pending	scripts/release-provenance.test.mjs	tests	Not reviewed
+pending	scripts/verify-wasm-memory.mjs	tooling	Not reviewed
+pending	scripts/verify-wasm-parity.mjs	tooling	Not reviewed
+pending	versions.json	configuration/schema	Not reviewed

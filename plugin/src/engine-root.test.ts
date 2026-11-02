@@ -710,23 +710,22 @@ async function metadataErrorAndAbortReleaseOnlyAfterActualRead() {
     }
 }
 
-async function automaticDebounceOwnsEarlyScopeRejection() {
+async function automaticPushOwnsEarlyScopeRejection() {
     // The normal runner launches this actual bundle in a strict child. Do not
     // install unhandledRejection/uncaughtException listeners to hide a leak.
     assert(process.execArgv.includes("--unhandled-rejections=strict"));
     const f = await fixture();
-    let callback: (() => void) | undefined;
     try {
-        const a = await f.create("automatic-scope", { autoSync: true, captureDebounce(value) { callback = value; } });
-        assert(callback, "actual attachVaultListeners did not register its debounce callback");
+        const a = await f.create("automatic-scope", { autoSync: true });
         const [latest] = await f.queue(a.engine, [pathAt(0)], 2);
         const cut = f.storage.events.length;
         const stale = new Error("automatic callback lost its captured API owner");
         f.control.assertApiScope = () => { throw stale; };
-        assert.equal(callback(), undefined, "fixture must invoke the actual fire-and-forget callback");
+        a.engine.autoPushCoalescer.trigger();
+        assert(a.engine.autoPushCoalescer.snapshot().pending, "automatic push was not scheduled");
         // Give Node a host turn to surface an unhandled rejection, rather than
         // ending the suite immediately after the callback's synchronous return.
-        await new Promise<void>(resolve => setTimeout(resolve, 0));
+        await new Promise<void>(resolve => setTimeout(resolve, 250));
         assert.equal(a.engine.lastError?.origin, "push"); assert.equal(a.engine.lastError?.message, stale.message);
         assert.equal(f.server.preflights, 0); assert.equal(f.server.requests.length, 0); assert.equal(f.server.diffs, 0);
         assert.equal(f.server.queries, 0); assert.equal(f.server.legacy, 0);
@@ -2454,12 +2453,11 @@ async function ignoredFreshPullCannotAdoptOrPublishMissingLeaves() {
 }
 
 async function run() {
-    // Stub only Obsidian UI shell. Debounce intentionally never schedules a
-    // background push: publication calls and root ownership remain actual.
+    // Stub only Obsidian UI; automatic scheduling and root ownership stay real.
     const globals = globalThis as any;
-    const oldNotice = globals.__obsetyncTestNotice, oldDebounce = globals.__obsetyncTestDebounce;
-    const notice = () => ({ setMessage() {}, hide() {} }), debounce = () => () => {};
-    globals.__obsetyncTestNotice = notice; globals.__obsetyncTestDebounce = debounce;
+    const oldNotice = globals.__obsetyncTestNotice;
+    const notice = () => ({ setMessage() {}, hide() {} });
+    globals.__obsetyncTestNotice = notice;
     try {
         await boundedPublicationsPreserveUnselectedAndNewEvents();
         await everyOrdinaryEntryWaitsForOutcomeRecovery();
@@ -2479,7 +2477,7 @@ async function run() {
         await localOmissionCutsAreBoundedAndWaitForFullBulkReview();
         await metadataMutexProtectsNativeAuditAndStillDrainsLiveEdits();
         await metadataErrorAndAbortReleaseOnlyAfterActualRead();
-        await automaticDebounceOwnsEarlyScopeRejection();
+        await automaticPushOwnsEarlyScopeRejection();
         await continuationReadinessDoesNotDetachTheBacklog();
         await outputAdmissionRefusalRetriesOnlyWhenFactsChange();
         await initialPushAdmitsTheEmptyCommittedGraphBeforeFileWork();
@@ -2503,9 +2501,6 @@ async function run() {
     } finally {
         if (globals.__obsetyncTestNotice === notice) {
             if (oldNotice === undefined) delete globals.__obsetyncTestNotice; else globals.__obsetyncTestNotice = oldNotice;
-        }
-        if (globals.__obsetyncTestDebounce === debounce) {
-            if (oldDebounce === undefined) delete globals.__obsetyncTestDebounce; else globals.__obsetyncTestDebounce = oldDebounce;
         }
     }
 }

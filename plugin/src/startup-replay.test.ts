@@ -72,15 +72,11 @@ function fixture(rows: any[]) {
 
 function withUiStubs<T>(operation: () => T): T {
     const globals = globalThis as any;
-    const previousDebounce = globals.__obsetyncTestDebounce;
     const previousNotice = globals.__obsetyncTestNotice;
     try {
-        globals.__obsetyncTestDebounce = (callback: () => void) => callback;
         globals.__obsetyncTestNotice = () => ({ setMessage: () => {}, hide: () => {} });
         return operation();
     } finally {
-        if (previousDebounce === undefined) delete globals.__obsetyncTestDebounce;
-        else globals.__obsetyncTestDebounce = previousDebounce;
         if (previousNotice === undefined) delete globals.__obsetyncTestNotice;
         else globals.__obsetyncTestNotice = previousNotice;
     }

@@ -36,7 +36,7 @@ const check = (condition: unknown, message: string) => {
 };
 
 /** In-memory adapter and captured actual callback; no native Obsidian vault or
- * renderer lifecycle is emulated. Only the application debounce is replaced. */
+ * renderer lifecycle is emulated. Automatic sync is disabled. */
 async function fixture() {
     const adapter = new RenameJournalIO();
     const callbacks = new Map<string, (...args: any[]) => Promise<void>>();
@@ -54,15 +54,7 @@ async function fixture() {
         pullEchoes: { expectsRename: () => false, expectsUpsert: () => false },
         isExcluded: (path: string) => path.startsWith("ignored/"),
     });
-    const testGlobal = globalThis as any;
-    const previous = testGlobal.__obsetyncTestDebounce;
-    try {
-        testGlobal.__obsetyncTestDebounce = () => () => {};
-        engine.attachVaultListeners();
-    } finally {
-        if (previous === undefined) delete testGlobal.__obsetyncTestDebounce;
-        else testGlobal.__obsetyncTestDebounce = previous;
-    }
+    engine.attachVaultListeners();
     return { app, engine, journal, files: adapter.files, callbacks, appends: () => adapter.walWrites.length,
         walWrites: adapter.walWrites, failAppend: () => { adapter.partialAppend = true; } };
 }
