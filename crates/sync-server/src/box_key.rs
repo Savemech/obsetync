@@ -16,6 +16,7 @@
 use crate::storage::StorageLayout;
 use base64::prelude::*;
 use std::fs;
+use std::io::Write;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
@@ -23,9 +24,8 @@ const PRIV_FILE: &str = "box.key";
 const PUB_FILE: &str = "box.pub";
 const KEY_LEN: usize = 32;
 
-/// Generate the server's X25519 keypair on disk. Idempotent: if a keypair
-/// already exists, returns it untouched (never overwrites — rotation is a
-/// separate operation).
+/// Initialize the identity without replacing an existing private key.
+/// The derived public copy is also repaired after an interrupted init.
 pub fn init_box_keypair(
     layout: &StorageLayout,
 ) -> Result<(StaticSecret, PublicKey), Box<dyn std::error::Error>> {
@@ -35,27 +35,43 @@ pub fn init_box_keypair(
     let priv_path = server_dir.join(PRIV_FILE);
     let pub_path = server_dir.join(PUB_FILE);
 
-    if priv_path.exists() {
-        return load_box_keypair(layout);
+    if !priv_path.try_exists()? {
+        // x25519-dalek uses rand_core 0.6; source entropy directly from the OS.
+        use rand::TryRngCore;
+        let mut seed = Zeroizing::new([0u8; KEY_LEN]);
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut *seed)
+            .map_err(|e| format!("OS RNG failed: {}", e))?;
+        // tempfile creates Unix files as 0600 before any private bytes are written.
+        let mut staged = tempfile::NamedTempFile::new_in(&server_dir)?;
+        staged.write_all(&*seed)?;
+        staged.as_file().sync_all()?;
+        match staged.persist_noclobber(&priv_path) {
+            Ok(_) => {}
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
     }
 
-    // x25519-dalek 2.0 uses rand_core 0.6, but our workspace already pulls rand 0.9.
-    // Avoid the version mismatch by sourcing entropy directly from the OS.
-    use rand::TryRngCore;
-    let mut seed = Zeroizing::new([0u8; KEY_LEN]);
-    rand::rngs::OsRng
-        .try_fill_bytes(&mut *seed)
-        .map_err(|e| format!("OS RNG failed: {}", e))?;
-    let priv_key = StaticSecret::from(*seed);
-    let pub_key = PublicKey::from(&priv_key);
-
-    fs::write(&priv_path, priv_key.as_bytes())?;
-    restrict_private_perms(&priv_path)?;
-
+    // A concurrent initializer may have won; always derive from the published key.
+    let (priv_key, pub_key) = load_box_keypair(layout)?;
+    fs::File::open(&priv_path)?.sync_all()?;
     let b64 = BASE64_STANDARD.encode(pub_key.as_bytes());
-    fs::write(&pub_path, format!("{}\n", b64))?;
+    let mut public = tempfile::NamedTempFile::new_in(&server_dir)?;
+    writeln!(public, "{b64}")?;
+    public.as_file().sync_all()?;
+    public.persist(&pub_path)?;
+    #[cfg(unix)]
+    for ancestor in server_dir.ancestors() {
+        let path = if ancestor.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            ancestor
+        };
+        fs::File::open(path)?.sync_all()?;
+    }
 
-    tracing::info!("X25519 keypair generated (pub = {})", &b64);
+    tracing::info!("X25519 identity initialized (pub = {})", &b64);
     Ok((priv_key, pub_key))
 }
 
@@ -80,25 +96,9 @@ pub fn load_box_keypair(
 
 /// Just the public key, base64 encoded. Used by the admin UI + enrollment
 /// response so the client can pin it in plugin settings.
-#[allow(dead_code)]
 pub fn load_box_pub_base64(layout: &StorageLayout) -> Result<String, Box<dyn std::error::Error>> {
     let (_, pub_key) = load_box_keypair(layout)?;
     Ok(BASE64_STANDARD.encode(pub_key.as_bytes()))
-}
-
-#[cfg(unix)]
-fn restrict_private_perms(path: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = fs::metadata(path)?.permissions();
-    perms.set_mode(0o600);
-    fs::set_permissions(path, perms)
-}
-
-#[cfg(not(unix))]
-fn restrict_private_perms(_path: &std::path::Path) -> std::io::Result<()> {
-    // On non-Unix platforms (mostly dev), relying on dir perms. The container
-    // runtime is always Linux so this branch is essentially untravelled in prod.
-    Ok(())
 }
 
 #[cfg(test)]
@@ -134,6 +134,11 @@ mod tests {
             Ok(_) => panic!("expected malformed box.key to be rejected"),
             Err(e) => assert!(e.to_string().contains("bytes")),
         }
+        assert!(init_box_keypair(&layout).is_err());
+        assert_eq!(
+            fs::read(layout.base.join("server/box.key")).unwrap(),
+            b"too short"
+        );
     }
 
     #[test]
@@ -146,5 +151,69 @@ mod tests {
 
         let decoded = BASE64_STANDARD.decode(&b64).unwrap();
         assert_eq!(decoded.as_slice(), pub_key.as_bytes());
+        assert_eq!(
+            fs::read_to_string(layout.base.join("server/box.pub")).unwrap(),
+            format!("{b64}\n")
+        );
+    }
+
+    #[test]
+    fn initialization_repairs_the_public_copy_without_rotating_identity() {
+        let dir = tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        let (original, public) = init_box_keypair(&layout).unwrap();
+        let public_path = layout.base.join("server/box.pub");
+        fs::remove_file(&public_path).unwrap();
+        let (reloaded, _) = init_box_keypair(&layout).unwrap();
+        assert_eq!(original.as_bytes(), reloaded.as_bytes());
+        assert_eq!(
+            fs::read_to_string(&public_path).unwrap(),
+            format!("{}\n", BASE64_STANDARD.encode(public.as_bytes()))
+        );
+    }
+
+    #[test]
+    fn concurrent_initializers_publish_one_complete_identity() {
+        for _ in 0..8 {
+            let dir = tempdir().unwrap();
+            let layout = StorageLayout::new(dir.path());
+            let barrier = std::sync::Barrier::new(16);
+            let identities = std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..16)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            init_box_keypair(&layout)
+                                .map(|(_, public)| *public.as_bytes())
+                                .map_err(|error| error.to_string())
+                        })
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().unwrap().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let (_, public) = load_box_keypair(&layout).unwrap();
+            assert!(identities
+                .iter()
+                .all(|identity| identity == public.as_bytes()));
+            assert_eq!(
+                fs::read_to_string(layout.base.join("server/box.pub")).unwrap(),
+                format!("{}\n", BASE64_STANDARD.encode(public.as_bytes()))
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(layout.base.join("server/box.key"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+        }
     }
 }

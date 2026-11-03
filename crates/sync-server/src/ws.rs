@@ -213,6 +213,7 @@ async fn session_v2(
     };
     zeroize::Zeroize::zeroize(&mut ticket.c2s_key_hex);
     zeroize::Zeroize::zeroize(&mut ticket.s2c_key_hex);
+    let presence_session = state.new_presence_session_id();
 
     // Sealed handshake ack — also proves to the client that both sides
     // derived the same keys before it sends anything sensitive.
@@ -254,14 +255,14 @@ async fn session_v2(
 
     // Fan-in: per-vault forwarders → one outbound queue.
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(32);
-    let mut forwarders = Vec::new();
+    let mut forwarders = tokio::task::JoinSet::new();
     for vault in &vaults {
         let mut rx = state.subscribe_roots(vault);
         let tx = out_tx.clone();
         // presence_frame stamps the SHORT (12-char) device id, so compare
         // against that, not the full ticket id.
         let my_device = device_short.clone();
-        forwarders.push(tokio::spawn(async move {
+        forwarders.spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(frame) => {
@@ -279,7 +280,7 @@ async fn session_v2(
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
-        }));
+        });
     }
     drop(out_tx);
 
@@ -343,6 +344,7 @@ async fn session_v2(
                                     state.set_presence(
                                         vault,
                                         &ticket.device_id,
+                                        presence_session,
                                         &device_name,
                                         file,
                                         if p_state == "idle" { "idle" } else { "active" },
@@ -394,12 +396,10 @@ async fn session_v2(
         }
     }
 
-    for f in forwarders {
-        f.abort();
-    }
+    drop(forwarders);
     // Session over → this device is gone from every vault it was visible in.
     for vault in &vaults {
-        state.clear_presence(vault, &ticket.device_id);
+        state.clear_presence(vault, &ticket.device_id, presence_session);
     }
     tracing::info!(device = %device_short, "ws: v2 session closed");
 }
@@ -450,11 +450,11 @@ async fn session(
     tracing::info!(device = %device_short, vaults = ?vaults, "ws: v1 subscribed");
 
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(32);
-    let mut forwarders = Vec::new();
+    let mut forwarders = tokio::task::JoinSet::new();
     for vault in &vaults {
         let mut rx = state.subscribe_roots(vault);
         let tx = out_tx.clone();
-        forwarders.push(tokio::spawn(async move {
+        forwarders.spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(frame) => {
@@ -472,7 +472,7 @@ async fn session(
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
-        }));
+        });
     }
     drop(out_tx);
 
@@ -514,9 +514,7 @@ async fn session(
         }
     }
 
-    for f in forwarders {
-        f.abort();
-    }
+    drop(forwarders);
     tracing::info!(device = %device_short, "ws: v1 session closed");
 }
 

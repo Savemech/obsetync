@@ -29,13 +29,13 @@ pending	benchmarks/baseline-1.10.2/W6-smoke.json	historical evidence	Not reviewe
 pending	benchmarks/baseline-1.10.2/W7-smoke.json	historical evidence	Not reviewed
 pending	benchmarks/baseline-1.10.2/W8-smoke.json	historical evidence	Not reviewed
 pending	benchmarks/baseline-1.10.2/client-instrumentation-overhead.json	historical evidence	Not reviewed
-read	crates/e2e-tests/Cargo.toml	configuration/schema	Entry-point/build inventory; behavior/callers still under review
-pending	crates/e2e-tests/src/lib.rs	production	Not reviewed
+reviewed	crates/e2e-tests/Cargo.toml	configuration/schema	All network test files explicitly require e2e; verified the declared targets exhaust tests/*.rs; corrected workspace-default comment
+read	crates/e2e-tests/src/lib.rs	production	Read environment/enrollment/wire and snapshot helpers while tracing realtime tests; native harness used isolated loopback endpoints; complete harness audit remains
 pending	crates/e2e-tests/tests/concurrency.rs	tests	Not reviewed
 pending	crates/e2e-tests/tests/conflicts.rs	tests	Not reviewed
 pending	crates/e2e-tests/tests/enrollment.rs	tests	Not reviewed
 pending	crates/e2e-tests/tests/history_export.rs	tests	Not reviewed
-pending	crates/e2e-tests/tests/realtime_ws.rs	tests	Not reviewed
+reviewed	crates/e2e-tests/tests/realtime_ws.rs	tests	All six scenarios read and passed against isolated fixed binary; reconnect regression failed against previous binary; CRDT assertions correctly labeled live readback, not crash durability
 pending	crates/e2e-tests/tests/single_device.rs	tests	Not reviewed
 pending	crates/e2e-tests/tests/smoke.rs	tests	Not reviewed
 pending	crates/e2e-tests/tests/stale_tree_revert.rs	tests	Not reviewed
@@ -78,22 +78,22 @@ read	crates/sync-schema/schema/chunk.fbs	configuration/schema	Entry-point/build 
 pending	crates/sync-schema/src/chunk_generated.rs	generated/lock	Not reviewed
 read	crates/sync-schema/src/lib.rs	production	Entry-point/build inventory; behavior/callers still under review
 read	crates/sync-server/Cargo.toml	configuration/schema	Dependency and entry-point inventory read; corrected missing roadmap reference; per-dependency reachability audit pending
-pending	crates/sync-server/build.rs	production	Not reviewed
+reviewed	crates/sync-server/build.rs	production	Read complete input validation; 15 real compiled-script cases cover local/clean/dirty identity, exact release inputs, missing/malformed/mismatched hashes/version and invalid flags
 pending	crates/sync-server/src/admin.rs	production	Not reviewed
-pending	crates/sync-server/src/api.rs	production	Not reviewed
+read	crates/sync-server/src/api.rs	production	Removed disabled HTTP v1 middleware after caller tracing; inspected active admission/auth and legacy CRDT handlers; full route/root/diff audit remains
 pending	crates/sync-server/src/api_root_outcome_tests.rs	production	Not reviewed
-pending	crates/sync-server/src/blocking_io.rs	production	Not reviewed
-read	crates/sync-server/src/box_key.rs	production	Read generation/loading/permissions and tests; audit key creation durability/concurrent initialization before final disposition
+reviewed	crates/sync-server/src/blocking_io.rs	production	Read complete permit ownership and callers; control/storage pools are separate and permit moves into blocking closure; parallelism/panic/isolation tests passed
+reviewed	crates/sync-server/src/box_key.rs	production	All runtime/init/admin callers traced; race and interrupted-public-copy regressions reproduced then fixed with existing tempfile no-replace publication; existing invalid keys preserved; Unix permissions and 16-thread initialization tested
 pending	crates/sync-server/src/bridge.rs	production	Not reviewed
-pending	crates/sync-server/src/build_identity.rs	production	Not reviewed
+reviewed	crates/sync-server/src/build_identity.rs	production	Read all constants/serialization and CLI consumer; protocol fields derive from live endpoints; canonical identity tests passed and build-script inputs exercised separately
 pending	crates/sync-server/src/bulk.rs	production	Not reviewed
 reviewed	crates/sync-server/src/config.rs	production	All callers traced; retired unused port/password fields; explicit data-dir owns storage after restore; old JSON and moved-directory unit/native Nix startup tests pass
-pending	crates/sync-server/src/crdt.rs	production	Not reviewed
+read	crates/sync-server/src/crdt.rs	production	Read complete legacy log implementation and HTTP/WS/E2E callers; test-only frame splitter gated; append durability, relay-on-error, snapshot races and unbounded readback remain open
 pending	crates/sync-server/src/devices.rs	production	Not reviewed
 removed	crates/sync-server/src/doc_store.rs	production	Only main.rs declaration and own tests referenced the prototype; active CRDT routes use crdt.rs; ADR/roadmap updated; workspace tests pass
-pending	crates/sync-server/src/enrollment.rs	production	Not reviewed
-pending	crates/sync-server/src/eph_rotation.rs	production	Not reviewed
-pending	crates/sync-server/src/error.rs	production	Not reviewed
+read	crates/sync-server/src/enrollment.rs	production	Read complete creation/claim and tests; runtime registry/control-pool callers traced; exclusive concurrent claim and failure/crash consumption need fixing
+reviewed	crates/sync-server/src/eph_rotation.rs	production	Read generation/rotation/task and tests; startup/admin/bootstrap/decrypt consumers traced; current and previous slots zeroize on replacement, OS entropy and retry handling preserved
+reviewed	crates/sync-server/src/error.rs	production	Traced every variant and conversion; removed only test-constructed Unauthorized variant and dead-code blanket; active route status mappings and tests preserved
 pending	crates/sync-server/src/guard.rs	production	Not reviewed
 pending	crates/sync-server/src/ignore_match.rs	production	Not reviewed
 reviewed	crates/sync-server/src/main.rs	production	Read CLI/startup/listener/background/health paths; offline cleanup validates initialized identity; CLI tests and native Nix reset/restore/loopback health smoke pass
@@ -101,15 +101,15 @@ pending	crates/sync-server/src/pack_store.rs	production	Not reviewed
 pending	crates/sync-server/src/perf.rs	production	Not reviewed
 pending	crates/sync-server/src/root_head.rs	production	Not reviewed
 pending	crates/sync-server/src/root_outcome.rs	production	Not reviewed
-pending	crates/sync-server/src/secure.rs	production	Not reviewed
+reviewed	crates/sync-server/src/secure.rs	production	Read active HTTP/WS KDF/AAD/frame/zeroization and tests; traced middleware/ticket/WS consumers; removed cfg-disabled v1 cases and corrected stale privacy/nonce comments; server and native realtime tests pass
 reviewed	crates/sync-server/src/seq_tracker.rs	production	Read full reservation/window/persistence and tests; API authenticates before lookup and admits durable work on control pool; reorder/restart/corruption/fast-path tests pass
-read	crates/sync-server/src/state.rs	production	Read full state and constructor; removed unread config copy; traced auth/storage owners and presence callers; WS connection ownership review remains
+read	crates/sync-server/src/state.rs	production	Complete state implementation and callers read; monotonic session ownership rejects delayed old presence and close; regressions and ordered broadcasts tested; notification registry/cardinality limits remain part of WS audit
 read	crates/sync-server/src/storage.rs	production	Layout/reset paths reviewed with writer recovery; native/unit cleanup tests preserve keys/devices/replay state and reject symlinks; full root publication/IO review pending
-pending	crates/sync-server/src/storage_writer.rs	production	Not reviewed
-pending	crates/sync-server/src/transport_memory.rs	production	Not reviewed
-pending	crates/sync-server/src/ws.rs	production	Not reviewed
+read	crates/sync-server/src/storage_writer.rs	production	Read start/owner/admission wrappers and recovery callers; convenience authenticated batch wrapper is test-only; full pack/writer lifecycle audit remains
+reviewed	crates/sync-server/src/transport_memory.rs	production	Read complete non-waiting semaphore ledger, HTTP response ownership and WS data reservation sites; checked overflow/capacity/error/drop cases; ledger deliberately does not prove RSS or notification-channel coverage
+read	crates/sync-server/src/ws.rs	production	Read all handshake/seal/subscription/presence/relay/tests and plugin consumer; JoinSet aborts forwarders on early return; stale-session updates and cleanup fixed; CRDT error/durability and notification memory bounds remain
 pending	crates/sync-server/src/ws_data.rs	production	Not reviewed
-pending	crates/sync-server/src/ws_ticket.rs	production	Not reviewed
+read	crates/sync-server/src/ws_ticket.rs	production	Read complete mint/claim/sweep and tests plus both WS callers; publication/sweep race and interrupted claimed-file cleanup need review
 pending	docker-compose.e2e.yml	configuration/schema	Not reviewed
 reviewed	docker-compose.yml	configuration/schema	Read services/mounts/build args/artifact extraction/healthcheck; reconciled comments with packed storage and bind mounts; dev service actual build passes; release runtime gates remain
 pending	docs/native-root-read-concurrency-2026-09-05.json	historical evidence	Not reviewed
@@ -142,7 +142,7 @@ pending	plugin/scripts/lib/native-root-io.mjs	tooling	Not reviewed
 pending	plugin/scripts/lib/native-root-metrics.mjs	tooling	Not reviewed
 pending	plugin/scripts/lib/native-root-publication.ts	tooling	Not reviewed
 pending	plugin/scripts/lib/native-root-qualification.mjs	tooling	Not reviewed
-read	plugin/scripts/lib/native-root-server.mjs	tooling	Read startup/config.json identity check and owned-loopback gate; config compatibility retained; full process/teardown ownership review pending
+reviewed	plugin/scripts/lib/native-root-server.mjs	tooling	Read complete fixture ownership, explicit binary, random loopback ports, origin allowlist, request caps and teardown; reused for old/fixed realtime regression without production data
 pending	plugin/scripts/native-root-audit-diagnostic.test.mjs	tests	Not reviewed
 pending	plugin/scripts/native-root-auto-diagnostic.test.mjs	tests	Not reviewed
 pending	plugin/scripts/native-root-child.test.mjs	tests	Not reviewed
@@ -406,7 +406,7 @@ pending	plugin/src/ws-data.bench.ts	tooling	Not reviewed
 pending	plugin/src/ws-data.test.ts	tests	Not reviewed
 pending	plugin/src/ws-data.ts	production	Not reviewed
 pending	plugin/src/ws-resume.test.ts	tests	Not reviewed
-pending	plugin/src/ws.ts	production	Not reviewed
+read	plugin/src/ws.ts	production	Read complete connection-generation, foreground, encryption-chain and event lifecycle; server protocol traced; caller/test and queue-bound audit remains
 pending	plugin/styles.css	production	Not reviewed
 reviewed	plugin/tsconfig.json	configuration/schema	Enabled noUnusedLocals/noUnusedParameters; tsc and actual Nix plugin compilation pass
 pending	rust-toolchain.toml	configuration/schema	Not reviewed

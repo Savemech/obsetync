@@ -44,8 +44,8 @@
 //! authenticated, not confidential.
 //!
 //! Bearer token lives in the *encrypted* plaintext as a 64-char ASCII prefix.
-//! No `Authorization` header anywhere. Packet captures cannot fingerprint
-//! which device is talking, only that an obsetync session is active.
+//! No `Authorization` header is sent. Outer HTTP metadata and the client's
+//! per-channel public key remain visible; the bearer itself is encrypted.
 
 use aes_gcm::aead::{Aead, AeadInPlace, Payload};
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
@@ -115,7 +115,7 @@ pub enum TransportMode {
 
 /// A request the server has decrypted successfully. The caller validates
 /// `bearer_token`, then passes `inner_body` to the actual route handler.
-/// `shared_secret` is reused by [`encrypt_response`] so the response
+/// `key_material` is reused by [`encrypt_response`] so the response
 /// reuses the same ECDH result — no second key exchange needed.
 pub struct DecryptedRequest {
     pub bearer_token: String,
@@ -297,7 +297,7 @@ pub fn decrypt_request(
     })
 }
 
-/// Encrypt a response body for the client that shares `shared_secret` with us.
+/// Encrypt a response body using the request's DH key material.
 /// The AAD binds method + path + the request's nonce, so the client can't be
 /// tricked into accepting a response minted for a different endpoint — or for
 /// a different request to the same endpoint within the session.
@@ -310,11 +310,8 @@ pub fn encrypt_response(
     path: &str,
     nonce_req: &[u8; NONCE_LEN],
 ) -> Result<Vec<u8>, SecureError> {
-    // Fresh random 12-byte nonce. AES-GCM allows ~2^32 random nonces with a
-    // single key before collision probability matters; we derive a *new* key
-    // per response via HKDF with the nonce as salt, so collision would require
-    // identical nonce AND identical shared_secret AND identical info, which is
-    // infeasible.
+    // The fresh 96-bit nonce also salts the response key; repeating a nonce
+    // with the same DH material would repeat both the key and nonce.
     let mut nonce_bytes = [0u8; NONCE_LEN];
     use rand::TryRngCore;
     rand::rngs::OsRng
@@ -467,250 +464,6 @@ pub fn decrypt_response_for_tests(
         .unwrap();
     let status = u16::from_be_bytes(plaintext[..2].try_into().unwrap());
     (status, plaintext[2..].to_vec())
-}
-
-// Historical v1 unit cases are retained as source context only; the v2 cases
-// below exercise the active signatures and wire format.
-#[cfg(any())]
-mod tests {
-    use super::*;
-    use rand::TryRngCore;
-
-    fn make_server_keypair() -> (StaticSecret, PublicKey) {
-        let mut seed = [0u8; KEY_LEN];
-        rand::rngs::OsRng.try_fill_bytes(&mut seed).unwrap();
-        let priv_key = StaticSecret::from(seed);
-        let pub_key = PublicKey::from(&priv_key);
-        (priv_key, pub_key)
-    }
-
-    fn make_client_keypair() -> (StaticSecret, PublicKey) {
-        make_server_keypair()
-    }
-
-    fn bearer_64() -> String {
-        "a".repeat(BEARER_LEN)
-    }
-
-    #[test]
-    fn round_trip_request_and_response() {
-        let (server_priv, server_pub) = make_server_keypair();
-        let (client_priv, _) = make_client_keypair();
-
-        let body = b"hello vault";
-        let wire = encrypt_request_for_tests(
-            &client_priv,
-            &server_pub,
-            &bearer_64(),
-            "PUT",
-            "/api/v1/root/example-vault",
-            body,
-        );
-
-        let decrypted =
-            decrypt_request(&wire, &server_priv, "PUT", "/api/v1/root/example-vault").unwrap();
-        assert_eq!(decrypted.bearer_token, bearer_64());
-        assert_eq!(decrypted.inner_body, body);
-
-        let response_body = b"server says ok";
-        let wire_resp = encrypt_response(
-            response_body,
-            &decrypted.shared_secret,
-            "PUT",
-            "/api/v1/root/example-vault",
-            &decrypted.nonce_req,
-        )
-        .unwrap();
-
-        // Symmetric round-trip of response: derive same shared_secret on client
-        // (in real plugin, client has it cached), extract nonce, derive s2c key,
-        // decrypt and check. Response AAD binds the request nonce.
-        let client_shared = client_priv.diffie_hellman(&server_pub);
-        assert_eq!(client_shared.as_bytes(), &decrypted.shared_secret);
-
-        let ver = wire_resp[0];
-        assert_eq!(ver, WIRE_VERSION);
-        let nonce: [u8; NONCE_LEN] = wire_resp[1..1 + NONCE_LEN].try_into().unwrap();
-        let ct = &wire_resp[RESPONSE_HEADER_LEN..];
-        let key = hkdf_key(client_shared.as_bytes(), &nonce, INFO_S2C);
-        let plain = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key))
-            .decrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: ct,
-                    aad: &build_response_aad(
-                        "PUT",
-                        "/api/v1/root/example-vault",
-                        &decrypted.nonce_req,
-                    ),
-                },
-            )
-            .unwrap();
-        assert_eq!(&plain, response_body);
-    }
-
-    /// Regression for in-session response replay: a response sealed for
-    /// request A must NOT decrypt when verified against request B's nonce,
-    /// even though both requests share method + path + session.
-    #[test]
-    fn response_is_bound_to_request_nonce() {
-        let (server_priv, server_pub) = make_server_keypair();
-        let (client_priv, _) = make_client_keypair();
-
-        let make_wire = || {
-            encrypt_request_for_tests(
-                &client_priv,
-                &server_pub,
-                &bearer_64(),
-                "GET",
-                "/api/v1/root/example-vault",
-                b"",
-            )
-        };
-        let wire_a = make_wire();
-        let wire_b = make_wire();
-
-        let dec_a =
-            decrypt_request(&wire_a, &server_priv, "GET", "/api/v1/root/example-vault").unwrap();
-        let dec_b =
-            decrypt_request(&wire_b, &server_priv, "GET", "/api/v1/root/example-vault").unwrap();
-        assert_ne!(dec_a.nonce_req, dec_b.nonce_req);
-        // Both requests rode the same client keypair — one session secret,
-        // exactly like the real plugin's per-session channel. The request
-        // nonce is therefore the ONLY thing distinguishing the two AADs.
-        assert_eq!(dec_a.shared_secret, dec_b.shared_secret);
-        let resp_for_a = encrypt_response(
-            b"stale root",
-            &dec_a.shared_secret,
-            "GET",
-            "/api/v1/root/example-vault",
-            &dec_a.nonce_req,
-        )
-        .unwrap();
-
-        let nonce: [u8; NONCE_LEN] = resp_for_a[1..1 + NONCE_LEN].try_into().unwrap();
-        let ct = &resp_for_a[RESPONSE_HEADER_LEN..];
-        let key = hkdf_key(&dec_a.shared_secret, &nonce, INFO_S2C);
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
-
-        // Verifying against request B's nonce must fail...
-        let replayed = cipher.decrypt(
-            Nonce::from_slice(&nonce),
-            Payload {
-                msg: ct,
-                aad: &build_response_aad("GET", "/api/v1/root/example-vault", &dec_b.nonce_req),
-            },
-        );
-        assert!(
-            replayed.is_err(),
-            "response replay across requests must fail"
-        );
-
-        // ...while the legitimate nonce still opens it.
-        let ok = cipher.decrypt(
-            Nonce::from_slice(&nonce),
-            Payload {
-                msg: ct,
-                aad: &build_response_aad("GET", "/api/v1/root/example-vault", &dec_a.nonce_req),
-            },
-        );
-        assert_eq!(ok.unwrap(), b"stale root");
-    }
-
-    #[test]
-    fn tampered_ciphertext_is_rejected() {
-        let (server_priv, server_pub) = make_server_keypair();
-        let (client_priv, _) = make_client_keypair();
-        let mut wire =
-            encrypt_request_for_tests(&client_priv, &server_pub, &bearer_64(), "GET", "/x", b"hi");
-
-        // Flip a byte deep in the ciphertext.
-        let idx = wire.len() - 5;
-        wire[idx] ^= 0x01;
-
-        let err = decrypt_request(&wire, &server_priv, "GET", "/x");
-        assert!(matches!(err, Err(SecureError::AeadOpen)));
-    }
-
-    #[test]
-    fn wrong_server_key_is_rejected() {
-        let (_, server_pub) = make_server_keypair();
-        let (client_priv, _) = make_client_keypair();
-        let wire =
-            encrypt_request_for_tests(&client_priv, &server_pub, &bearer_64(), "GET", "/x", b"hi");
-
-        let (wrong_priv, _) = make_server_keypair();
-        let err = decrypt_request(&wire, &wrong_priv, "GET", "/x");
-        assert!(matches!(err, Err(SecureError::AeadOpen)));
-    }
-
-    #[test]
-    fn aad_mismatch_is_rejected() {
-        let (server_priv, server_pub) = make_server_keypair();
-        let (client_priv, _) = make_client_keypair();
-        let wire = encrypt_request_for_tests(
-            &client_priv,
-            &server_pub,
-            &bearer_64(),
-            "PUT",
-            "/api/v1/root/vault-a",
-            b"evicted",
-        );
-
-        // Client encrypted for vault-a; server claims it's vault-b → decrypt fails.
-        let err = decrypt_request(&wire, &server_priv, "PUT", "/api/v1/root/vault-b");
-        assert!(matches!(err, Err(SecureError::AeadOpen)));
-    }
-
-    #[test]
-    fn too_short_is_rejected() {
-        let (server_priv, _) = make_server_keypair();
-        let err = decrypt_request(&[0u8; 10], &server_priv, "GET", "/x");
-        assert!(matches!(err, Err(SecureError::TooShort(10, _))));
-    }
-
-    #[test]
-    fn bad_version_is_rejected() {
-        let (server_priv, server_pub) = make_server_keypair();
-        let (client_priv, _) = make_client_keypair();
-        let mut wire =
-            encrypt_request_for_tests(&client_priv, &server_pub, &bearer_64(), "GET", "/x", b"hi");
-        wire[0] = 0xFF;
-
-        let err = decrypt_request(&wire, &server_priv, "GET", "/x");
-        assert!(matches!(err, Err(SecureError::BadVersion(0xFF))));
-    }
-
-    #[test]
-    fn independent_ephemerals_produce_independent_keys() {
-        let (server_priv, server_pub) = make_server_keypair();
-        let (client_a, _) = make_client_keypair();
-        let (client_b, _) = make_client_keypair();
-
-        let wire_a = encrypt_request_for_tests(
-            &client_a,
-            &server_pub,
-            &bearer_64(),
-            "GET",
-            "/a",
-            b"msg from a",
-        );
-        let wire_b = encrypt_request_for_tests(
-            &client_b,
-            &server_pub,
-            &bearer_64(),
-            "GET",
-            "/b",
-            b"msg from b",
-        );
-
-        let dec_a = decrypt_request(&wire_a, &server_priv, "GET", "/a").unwrap();
-        let dec_b = decrypt_request(&wire_b, &server_priv, "GET", "/b").unwrap();
-
-        assert_ne!(dec_a.shared_secret, dec_b.shared_secret);
-        assert_eq!(dec_a.inner_body, b"msg from a");
-        assert_eq!(dec_b.inner_body, b"msg from b");
-    }
 }
 
 #[cfg(test)]

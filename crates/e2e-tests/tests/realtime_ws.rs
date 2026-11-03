@@ -152,6 +152,10 @@ mod v2 {
 
     const WS_AAD_PREFIX: &[u8] = b"obsetync/ws/v2";
 
+    pub type Socket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
     pub struct WsCrypto {
         c2s: [u8; 32],
         s2c: [u8; 32],
@@ -222,12 +226,7 @@ mod v2 {
         env: &E2eEnv,
         client: &WireClient,
         vault: &str,
-    ) -> (
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        WsCrypto,
-    ) {
+    ) -> (Socket, WsCrypto) {
         // Ephemeral keys + mint with our pubkey.
         use rand::RngCore;
         let mut priv_bytes = [0u8; 32];
@@ -288,6 +287,20 @@ mod v2 {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         (ws, crypto)
+    }
+
+    pub async fn receive(ws: &mut Socket, crypto: &mut WsCrypto) -> serde_json::Value {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Binary(data))) => return crypto.open(&data),
+                    Some(Ok(_)) => continue,
+                    other => panic!("ws ended before a sealed frame: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("no sealed frame")
     }
 }
 
@@ -401,7 +414,56 @@ async fn v2_presence_roundtrip_between_sessions() {
     assert_eq!(offline["name"], "presence-bob");
 }
 
-// --- Ph4: CRDT op relay + durable per-note log --------------------------------
+#[tokio::test]
+async fn old_session_messages_and_close_preserve_reconnected_device_presence() {
+    let env = harness().await;
+    let vault = unique_vault_id("ws-reconnect");
+    let observer = WireClient::new(&env, env.enroll_device("observer").await.unwrap());
+    let device = WireClient::new(&env, env.enroll_device("reconnecting").await.unwrap());
+    let (mut watching, mut watching_crypto) = v2::open_v2_session(&env, &observer, &vault).await;
+    let (mut old, mut old_crypto) = v2::open_v2_session(&env, &device, &vault).await;
+    let (mut current, mut crypto) = v2::open_v2_session(&env, &device, &vault).await;
+    let frame = crypto.seal(
+        &serde_json::json!({
+            "v": 2, "t": "presence", "vault": vault, "file": "new.md", "state": "active"
+        })
+        .to_string(),
+    );
+    current.send(Message::Binary(frame.into())).await.unwrap();
+    let announced = v2::receive(&mut watching, &mut watching_crypto).await;
+    assert_eq!(announced["file"], "new.md");
+
+    let late_frame = old_crypto.seal(
+        &serde_json::json!({
+            "v": 2, "t": "presence", "vault": vault, "file": "old.md", "state": "active"
+        })
+        .to_string(),
+    );
+    old.send(Message::Binary(late_frame.into())).await.unwrap();
+    old.send(Message::Binary(
+        old_crypto.seal(r#"{"v":2,"t":"ping"}"#).into(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(v2::receive(&mut old, &mut old_crypto).await["t"], "pong");
+    drop(old);
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            v2::receive(&mut watching, &mut watching_crypto),
+        )
+        .await
+        .is_err(),
+        "old messages and close must not replace the current socket's presence"
+    );
+
+    drop(current);
+    let offline = v2::receive(&mut watching, &mut watching_crypto).await;
+    assert_eq!(offline["name"], "reconnecting");
+    assert_eq!(offline["state"], "offline");
+}
+
+// --- Legacy CRDT relay and log readback (no crash durability assertion) -------
 
 /// Split a raw CRDT log ([u32 LE len][blob]…) into blobs (mirrors the server).
 fn split_crdt_frames(log: &[u8]) -> Vec<Vec<u8>> {
@@ -420,7 +482,7 @@ fn split_crdt_frames(log: &[u8]) -> Vec<Vec<u8>> {
 }
 
 #[tokio::test]
-async fn crdt_ops_relay_and_durable_log() {
+async fn crdt_ops_relay_log_readback_and_compaction() {
     let env = harness().await;
     let vault = unique_vault_id("crdt");
     let a = WireClient::new(&env, env.enroll_device("crdt-a").await.unwrap());
@@ -477,8 +539,8 @@ async fn crdt_ops_relay_and_durable_log() {
         "relayed op must carry A's exact update bytes",
     );
 
-    // (2) DURABILITY: a fresh device fetches the note's log over sealed HTTP
-    // and finds A's update — durability doesn't depend on any client staying.
+    // (2) READBACK: a fresh device fetches the log from the same live server.
+    // This proves storage visibility, not survival of a crash or power loss.
     let c = WireClient::new(&env, env.enroll_device("crdt-c").await.unwrap());
     let r = c
         .raw("POST", &format!("/api/v1/crdt/{vault}"), note.as_bytes())
@@ -489,7 +551,7 @@ async fn crdt_ops_relay_and_durable_log() {
     assert_eq!(
         frames,
         vec![update.clone()],
-        "durable log must hold A's update"
+        "stored log must hold A's update"
     );
 
     // (3) COMPACT: replace the log with a snapshot; the log is now just that.

@@ -244,6 +244,7 @@ impl StorageWriter {
 
     /// Enqueue authenticated API work under a bounded fairness owner. The
     /// owner key is scheduling-only and is never persisted or returned.
+    #[cfg(test)]
     pub(crate) async fn store_batch_for(
         &self,
         owner: &str,

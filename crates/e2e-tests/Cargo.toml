@@ -5,9 +5,7 @@ edition.workspace = true
 publish = false
 
 [features]
-# Tests are gated behind this feature so `cargo test --workspace` (default
-# members exclude this crate anyway) does not try to talk to a docker stack
-# that may not be running.
+# Network tests require this feature; `cargo test --workspace` stays offline.
 default = []
 e2e = []
 

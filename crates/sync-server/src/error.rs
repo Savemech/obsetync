@@ -3,7 +3,6 @@ use axum::response::{IntoResponse, Response};
 use sync_core::chunk::ChunkError;
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum ServerError {
     Io(std::io::Error),
     Chunk(ChunkError),
@@ -15,7 +14,6 @@ pub enum ServerError {
     /// The enrolled identity is still valid, but this process does not speak
     /// the active data format. Clients must update/reload, never re-enroll.
     UpgradeRequired(String),
-    Unauthorized,
     Internal(String),
 }
 
@@ -30,7 +28,6 @@ impl std::fmt::Display for ServerError {
             Self::ServiceUnavailable(msg) => write!(f, "service unavailable: {}", msg),
             Self::Conflict(msg) => write!(f, "conflict: {}", msg),
             Self::UpgradeRequired(msg) => write!(f, "upgrade required: {}", msg),
-            Self::Unauthorized => write!(f, "unauthorized"),
             Self::Internal(msg) => write!(f, "internal: {}", msg),
         }
     }
@@ -48,7 +45,6 @@ impl IntoResponse for ServerError {
             Self::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
             Self::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
             Self::UpgradeRequired(msg) => (StatusCode::UPGRADE_REQUIRED, msg.clone()),
-            Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".into()),
             Self::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
         };
         (status, body).into_response()
@@ -144,13 +140,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unauthorized_renders_401() {
-        let (s, b) = status_and_body(ServerError::Unauthorized.into_response()).await;
-        assert_eq!(s, StatusCode::UNAUTHORIZED);
-        assert_eq!(b, "unauthorized");
-    }
-
-    #[tokio::test]
     async fn internal_renders_500() {
         let (s, b) = status_and_body(ServerError::Internal("oops".into()).into_response()).await;
         assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
@@ -200,7 +189,6 @@ mod tests {
 
     #[test]
     fn display_contains_variant_marker() {
-        assert!(format!("{}", ServerError::Unauthorized).contains("unauthorized"));
         assert!(format!("{}", ServerError::NotFound("x".into())).contains("not found"));
         assert!(format!("{}", ServerError::BadRequest("y".into())).contains("bad request"));
         assert!(format!("{}", ServerError::Conflict("z".into())).contains("conflict"));

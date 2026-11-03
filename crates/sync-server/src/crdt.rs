@@ -121,9 +121,9 @@ pub fn compact(
     Ok(())
 }
 
-/// Split a raw log buffer into individual update frames — used by tests and
-/// available for any server-side consumer. Malformed tails are ignored.
-pub fn split_frames(log: &[u8]) -> Vec<&[u8]> {
+/// Inspect update boundaries in storage fixtures; malformed tails are ignored.
+#[cfg(test)]
+fn split_frames(log: &[u8]) -> Vec<&[u8]> {
     let mut out = Vec::new();
     let mut i = 0;
     while i + 4 <= log.len() {

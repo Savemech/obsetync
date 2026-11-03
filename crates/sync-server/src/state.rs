@@ -10,6 +10,7 @@ use crate::storage::{StorageLayout, VaultStore};
 use crate::storage_writer::StorageWriter;
 use crate::transport_memory::TransportMemoryBudget;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Instant;
 use tokio::sync::Mutex as AsyncMutex;
@@ -67,6 +68,7 @@ pub struct AppState {
     /// Ephemeral presence: vault → device → (name, file, state). Ph3. Never
     /// persisted; refreshed by clients, expired by TTL, cleared on close.
     presence: StdMutex<HashMap<String, HashMap<String, PresenceEntry>>>,
+    presence_session_sequence: AtomicU64,
 }
 
 impl AppState {
@@ -107,6 +109,7 @@ impl AppState {
             vault_locks: StdMutex::new(HashMap::new()),
             notifiers: StdMutex::new(HashMap::new()),
             presence: StdMutex::new(HashMap::new()),
+            presence_session_sequence: AtomicU64::new(1),
         }
     }
 
@@ -161,46 +164,63 @@ impl AppState {
     // Ephemeral only: who is looking at which file right now. Never persisted;
     // entries expire when not refreshed and are cleared on session close.
 
+    /// Order overlapping sessions so delayed old frames cannot replace new presence.
+    pub fn new_presence_session_id(&self) -> u64 {
+        self.presence_session_sequence
+            .fetch_add(1, Ordering::Relaxed)
+    }
+
     /// Record a device's presence and broadcast it to the vault's subscribers.
     pub fn set_presence(
         &self,
         vault_id: &str,
         device_id: &str,
+        session_id: u64,
         device_name: &str,
         file: Option<String>,
         state: &str,
     ) {
         let now = now_ms();
+        let mut map = self.presence.lock().expect("presence poisoned");
+        let vault = map.entry(vault_id.to_string()).or_default();
+        // Expired sessions must not prevent a still-live session from publishing.
+        vault.retain(|_, e| now.saturating_sub(e.updated_ms) < PRESENCE_TTL_MS);
+        if vault
+            .get(device_id)
+            .is_some_and(|entry| entry.session_id > session_id)
         {
-            let mut map = self.presence.lock().expect("presence poisoned");
-            let vault = map.entry(vault_id.to_string()).or_default();
-            vault.insert(
-                device_id.to_string(),
-                PresenceEntry {
-                    device_name: device_name.to_string(),
-                    file: file.clone(),
-                    state: state.to_string(),
-                    updated_ms: now,
-                },
-            );
-            // Opportunistic sweep of stale entries for this vault.
-            vault.retain(|_, e| now.saturating_sub(e.updated_ms) < PRESENCE_TTL_MS);
+            return;
         }
+        vault.insert(
+            device_id.to_string(),
+            PresenceEntry {
+                session_id,
+                device_name: device_name.to_string(),
+                file: file.clone(),
+                state: state.to_string(),
+                updated_ms: now,
+            },
+        );
+        // Publish under the same lock so concurrent updates cannot reverse frames.
         self.publish_frame(
             vault_id,
             presence_frame(vault_id, device_id, device_name, file.as_deref(), state),
         );
     }
 
-    /// Remove a device's presence (session closed) and broadcast "offline".
-    pub fn clear_presence(&self, vault_id: &str, device_id: &str) {
-        let removed = {
-            let mut map = self.presence.lock().expect("presence poisoned");
-            map.get_mut(vault_id)
-                .map(|vault| vault.remove(device_id))
-                .flatten()
+    /// A closing session can only remove the last presence it published.
+    pub fn clear_presence(&self, vault_id: &str, device_id: &str, session_id: u64) {
+        let mut map = self.presence.lock().expect("presence poisoned");
+        let Some(vault) = map.get_mut(vault_id) else {
+            return;
         };
-        if let Some(entry) = removed {
+        if vault
+            .get(device_id)
+            .is_none_or(|entry| entry.session_id != session_id)
+        {
+            return;
+        }
+        if let Some(entry) = vault.remove(device_id) {
             self.publish_frame(
                 vault_id,
                 presence_frame(vault_id, device_id, &entry.device_name, None, "offline"),
@@ -236,11 +256,12 @@ impl AppState {
 /// every ~45s while a file is open.
 const PRESENCE_TTL_MS: u64 = 90_000;
 
-pub struct PresenceEntry {
-    pub device_name: String,
-    pub file: Option<String>,
-    pub state: String,
-    pub updated_ms: u64,
+struct PresenceEntry {
+    session_id: u64,
+    device_name: String,
+    file: Option<String>,
+    state: String,
+    updated_ms: u64,
 }
 
 fn presence_frame(
@@ -270,3 +291,65 @@ fn now_ms() -> u64 {
 }
 
 pub type SharedState = Arc<AppState>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn old_socket_cannot_replace_or_clear_a_reconnected_devices_presence() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        layout.init_directories().unwrap();
+        box_key::init_box_keypair(&layout).unwrap();
+        let state = AppState::new(ServerConfig::new(dir.path().to_path_buf()));
+        let mut events = state.subscribe_roots("vault");
+        let old_session = state.new_presence_session_id();
+        let new_session = state.new_presence_session_id();
+        state.set_presence(
+            "vault",
+            "device",
+            old_session,
+            "Laptop",
+            Some("old.md".into()),
+            "active",
+        );
+        state.set_presence(
+            "vault",
+            "device",
+            new_session,
+            "Laptop",
+            Some("new.md".into()),
+            "idle",
+        );
+        events.try_recv().unwrap();
+        let latest = events.try_recv().unwrap();
+
+        state.set_presence(
+            "vault",
+            "device",
+            old_session,
+            "Laptop",
+            Some("late-old.md".into()),
+            "active",
+        );
+        assert_eq!(state.presence_snapshot("vault"), vec![latest.clone()]);
+        assert!(
+            events.try_recv().is_err(),
+            "late old frames must not replace the new session"
+        );
+        state.clear_presence("vault", "device", old_session);
+        assert_eq!(state.presence_snapshot("vault"), vec![latest]);
+        assert!(
+            events.try_recv().is_err(),
+            "old close must not broadcast offline"
+        );
+
+        state.clear_presence("vault", "device", new_session);
+        assert!(state.presence_snapshot("vault").is_empty());
+        let offline: serde_json::Value = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
+        assert_eq!(offline["state"], "offline");
+        state.clear_presence("vault", "device", new_session);
+        assert!(events.try_recv().is_err(), "cleanup is idempotent");
+    }
+}
