@@ -112,7 +112,7 @@ export class ObsetyncSettingTab extends PluginSettingTab {
             .setDesc("Your ObsetyNC server address (e.g., http://localhost:27182)")
             .addText((text) =>
                 text
-                    .setPlaceholder("https://sync.example.com:27182")
+                    .setPlaceholder("http://sync.example.com:27182")
                     .setValue(this.plugin.settings.serverUrl)
                     .onChange(async (value) => {
                         this.plugin.authorizeSettingsMutation();

@@ -81,38 +81,21 @@ test("CI and release run the browser hash worker only after a fresh WASM build",
             `${label} must run the packaged browser hash worker after build and dependency install`);
         assert.equal(workflow.match(/npm run test:browser-hash-worker/g)?.length, 1,
             `${label} must own exactly one packaged browser hash worker gate`);
-        assert.match(job,
-            /binaryen\/releases\/download\/version_117\/binaryen-version_117-x86_64-linux\.tar\.gz/,
-            `${label} must pin the wasm-pack-compatible Binaryen release`);
-        assert.match(job, /3dc677006555b355ea2da5e82602065a161d5e83eaefd3f759afa00b96e83212/,
-            `${label} must pin the official Binaryen x86_64 digest`);
-        assert.match(job, /c539d91ccab2591a7e975bcf82c82e1911b03335c80aa83d67ad25ed2ad06539/,
-            `${label} must pin the official wasm-pack x86_64 digest`);
-        assert.equal(job.match(/sha256sum -c -/g)?.length, 2,
-            `${label} must verify both privileged tool downloads before extraction`);
+        const toolInstall = job.indexOf("run: sudo bash scripts/install-wasm-tools.sh");
+        assert.ok(toolInstall >= 0 && toolInstall < wasmBuild,
+            `${label} must use the shared verified installer before building WASM`);
     }
 });
 
-test("Docker WASM tools are checksum-pinned for every supported build architecture", async () => {
-    const dockerfile = await readFile(new URL("../../Dockerfile", import.meta.url), "utf8");
-    for (const digest of [
-        "3dc677006555b355ea2da5e82602065a161d5e83eaefd3f759afa00b96e83212",
-        "ad560204426015a815faa45693c83bef7d58677d38a39422c272a30ba4b6da2a",
-        "c539d91ccab2591a7e975bcf82c82e1911b03335c80aa83d67ad25ed2ad06539",
-        "2e65038769f8bbaa5fc237ad4bb523e692df99458cbd3e3d92525b89d8762379",
-    ]) assert.match(dockerfile, new RegExp(digest));
-    assert.match(dockerfile,
-        /tool_arch="\$\{TARGETARCH\}";\s*\\\s*if \[ -z "\$\{tool_arch\}" \]; then\s*\\\s*tool_arch="\$\(dpkg --print-architecture\)";/,
-        "an empty automatic TARGETARCH must fall back to the native builder architecture");
-    assert.match(dockerfile, /case "\$\{tool_arch\}" in/,
-        "explicit and host-derived architectures must share the same fail-closed allowlist");
-    assert.match(dockerfile, /amd64\)[\s\S]*binaryen_arch=x86_64;[\s\S]*wasm_pack_arch=x86_64;/);
-    assert.match(dockerfile, /arm64\)[\s\S]*binaryen_arch=aarch64;[\s\S]*wasm_pack_arch=aarch64;/);
-    assert.match(dockerfile,
-        /\*\) echo "unsupported Docker build TARGETARCH\/host architecture: \$\{tool_arch:-<empty>\}" >&2; exit 2 ;;/,
-        "unsupported explicit and native builder architectures must fail closed");
-    assert.equal(dockerfile.match(/sha256sum -c -/g)?.length, 2,
-        "Docker must verify both architecture-selected tool archives");
+test("both Docker toolchains use the shared architecture-aware WASM installer", async () => {
+    for (const name of ["Dockerfile", "Dockerfile.dev"]) {
+        const dockerfile = await readFile(new URL(`../../${name}`, import.meta.url), "utf8");
+        assert.match(dockerfile, /ARG TARGETARCH/);
+        assert.match(dockerfile, /COPY scripts\/install-wasm-tools\.sh \/tmp\/install-wasm-tools\.sh/);
+        assert.match(dockerfile, /RUN bash \/tmp\/install-wasm-tools\.sh "\$\{TARGETARCH\}"/);
+        assert.doesNotMatch(dockerfile, /wasm-pack\/releases|binaryen\/releases/,
+            `${name} must not retain a second set of tool versions or digests`);
+    }
 });
 
 test("Docker plugin builds carry the build-identity helper and exact release inputs", async () => {

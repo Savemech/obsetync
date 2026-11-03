@@ -14,8 +14,7 @@ serde_json.workspace = true
 hex.workspace = true
 blake3.workspace = true
 
-# ws: the Ph2 notify channel (see tasks/realtime-roadmap.md) — server→client
-# "root changed" frames; clients then pull over the sealed HTTP channel.
+# Sealed realtime notifications and the separate bulk/control data lane.
 axum = { version = "0.8", features = ["ws"] }
 http-body = "1"
 # Split the WebSocket into sink/stream halves so one task can forward

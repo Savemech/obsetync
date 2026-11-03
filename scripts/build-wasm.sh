@@ -16,7 +16,7 @@ if [[ "$(basename "$wasm_opt_path")" != "wasm-opt" ]]; then
     echo "WASM_OPT must resolve to an executable named wasm-opt: $wasm_opt_path" >&2
     exit 2
 fi
-wasm_opt_version="$($wasm_opt_path --version 2>/dev/null || true)"
+wasm_opt_version="$("$wasm_opt_path" --version 2>/dev/null || true)"
 if [[ ! "$wasm_opt_version" =~ ^wasm-opt\ version\ ([0-9]+) ]] || (( BASH_REMATCH[1] < 117 )); then
     echo "wasm optimizer version 117 or newer required; found: ${wasm_opt_version:-unknown}" >&2
     exit 2

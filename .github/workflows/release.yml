@@ -223,21 +223,7 @@ jobs:
           target: wasm32-unknown-unknown
 
       - name: Install WASM tools
-        run: |
-          curl -sSfL https://github.com/WebAssembly/binaryen/releases/download/version_117/binaryen-version_117-x86_64-linux.tar.gz \
-            -o /tmp/binaryen-version_117-x86_64-linux.tar.gz
-          echo "3dc677006555b355ea2da5e82602065a161d5e83eaefd3f759afa00b96e83212  /tmp/binaryen-version_117-x86_64-linux.tar.gz" \
-            | sha256sum -c -
-          sudo tar -xz -C /usr/local/bin --strip-components=2 \
-            -f /tmp/binaryen-version_117-x86_64-linux.tar.gz \
-            binaryen-version_117/bin/wasm-opt
-          curl -sSfL https://github.com/rustwasm/wasm-pack/releases/download/v0.13.1/wasm-pack-v0.13.1-x86_64-unknown-linux-musl.tar.gz \
-            -o /tmp/wasm-pack-v0.13.1-x86_64-unknown-linux-musl.tar.gz
-          echo "c539d91ccab2591a7e975bcf82c82e1911b03335c80aa83d67ad25ed2ad06539  /tmp/wasm-pack-v0.13.1-x86_64-unknown-linux-musl.tar.gz" \
-            | sha256sum -c -
-          sudo tar -xz -C /usr/local/bin --strip-components=1 \
-            -f /tmp/wasm-pack-v0.13.1-x86_64-unknown-linux-musl.tar.gz \
-            wasm-pack-v0.13.1-x86_64-unknown-linux-musl/wasm-pack
+        run: sudo bash scripts/install-wasm-tools.sh
 
       - uses: actions/setup-node@v4
         with:

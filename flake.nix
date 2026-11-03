@@ -2,7 +2,7 @@
   description = "ObsetyNC — self-hosted Obsidian vault sync (hermetic Nix build)";
 
   # Every input is pinned in flake.lock by content hash.
-  # Same inputs → byte-identical outputs on any machine.
+  # Source, build identity and target system are also derivation inputs.
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
     flake-utils.url = "github:numtide/flake-utils";
@@ -244,7 +244,7 @@
 
         # ------------------------------------------------------------------
         # Docker image built entirely by Nix — no Dockerfile involved.
-        # Reproducible: same flake.lock + same nixpkgs → byte-identical image.
+        # Source identity, locked dependencies and target system determine the image.
         # Only Linux systems can produce Linux images directly; on macOS use
         # `nix build .#dockerImage --system x86_64-linux` with a remote builder.
         # ------------------------------------------------------------------
@@ -328,6 +328,7 @@
             rustToolchain
             nodejs_20
             wasm-bindgen-cli
+            wasm-pack
             binaryen
             just
             clang

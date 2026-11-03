@@ -1,11 +1,11 @@
 status	path	role	evidence
 pending	.cargo/config.toml	configuration/schema	Not reviewed
-pending	.github/workflows/ci.yml	configuration/schema	Not reviewed
-pending	.github/workflows/release.yml	configuration/schema	Not reviewed
+read	.github/workflows/ci.yml	configuration/schema	Read full CI DAG; shared verified installer preserves build-before-browser/native gates; helper contracts pass; external CI run pending
+read	.github/workflows/release.yml	configuration/schema	Read plugin/native/Nix gate sections; shared installer removes duplicated pins; full workflow provenance/publication review pending
 pending	Cargo.lock	generated/lock	Not reviewed
-read	Cargo.toml	configuration/schema	Entry-point/build inventory; behavior/callers still under review
+reviewed	Cargo.toml	configuration/schema	Workspace members/features and release settings traced to crate manifests and test commands; corrected --workspace/default-members comment; workspace tests pass
 read	Dockerfile	configuration/schema	Read production pinned WASM toolchain and artifact stages; remaining container/runtime validation pending
-read	Dockerfile.dev	configuration/schema	Read full file; x86-only unchecked wasm-pack and distro optimizer conflict with production toolchain; fix/runtime verification pending
+reviewed	Dockerfile.dev	configuration/schema	Read complete toolchain; shared pinned x86/ARM installer; replaced absent apt just with Cargo; actual just build-dev and all tool versions pass on x86
 pending	benchmarks/after-1.11.1/Tree-v1-prefix-slice2.json	historical evidence	Not reviewed
 pending	benchmarks/after-1.11.1/W1-bulk-http-slice5.json	historical evidence	Not reviewed
 pending	benchmarks/after-1.11.1/W1-group-commit-slice6.json	historical evidence	Not reviewed
@@ -77,17 +77,17 @@ read	crates/sync-schema/Cargo.toml	configuration/schema	Entry-point/build invent
 read	crates/sync-schema/schema/chunk.fbs	configuration/schema	Entry-point/build inventory; behavior/callers still under review
 pending	crates/sync-schema/src/chunk_generated.rs	generated/lock	Not reviewed
 read	crates/sync-schema/src/lib.rs	production	Entry-point/build inventory; behavior/callers still under review
-read	crates/sync-server/Cargo.toml	configuration/schema	Entry-point/build inventory; behavior/callers still under review
+read	crates/sync-server/Cargo.toml	configuration/schema	Dependency and entry-point inventory read; corrected missing roadmap reference; per-dependency reachability audit pending
 pending	crates/sync-server/build.rs	production	Not reviewed
 pending	crates/sync-server/src/admin.rs	production	Not reviewed
 pending	crates/sync-server/src/api.rs	production	Not reviewed
 pending	crates/sync-server/src/api_root_outcome_tests.rs	production	Not reviewed
 pending	crates/sync-server/src/blocking_io.rs	production	Not reviewed
-pending	crates/sync-server/src/box_key.rs	production	Not reviewed
+read	crates/sync-server/src/box_key.rs	production	Read generation/loading/permissions and tests; audit key creation durability/concurrent initialization before final disposition
 pending	crates/sync-server/src/bridge.rs	production	Not reviewed
 pending	crates/sync-server/src/build_identity.rs	production	Not reviewed
 pending	crates/sync-server/src/bulk.rs	production	Not reviewed
-pending	crates/sync-server/src/config.rs	production	Not reviewed
+reviewed	crates/sync-server/src/config.rs	production	All callers traced; retired unused port/password fields; explicit data-dir owns storage after restore; old JSON and moved-directory unit/native Nix startup tests pass
 pending	crates/sync-server/src/crdt.rs	production	Not reviewed
 pending	crates/sync-server/src/devices.rs	production	Not reviewed
 removed	crates/sync-server/src/doc_store.rs	production	Only main.rs declaration and own tests referenced the prototype; active CRDT routes use crdt.rs; ADR/roadmap updated; workspace tests pass
@@ -96,26 +96,26 @@ pending	crates/sync-server/src/eph_rotation.rs	production	Not reviewed
 pending	crates/sync-server/src/error.rs	production	Not reviewed
 pending	crates/sync-server/src/guard.rs	production	Not reviewed
 pending	crates/sync-server/src/ignore_match.rs	production	Not reviewed
-read	crates/sync-server/src/main.rs	production	Read entry points and module graph; removed disconnected doc_store declaration; native workspace tests pass; runtime/error paths pending
+reviewed	crates/sync-server/src/main.rs	production	Read CLI/startup/listener/background/health paths; offline cleanup validates initialized identity; CLI tests and native Nix reset/restore/loopback health smoke pass
 pending	crates/sync-server/src/pack_store.rs	production	Not reviewed
 pending	crates/sync-server/src/perf.rs	production	Not reviewed
 pending	crates/sync-server/src/root_head.rs	production	Not reviewed
 pending	crates/sync-server/src/root_outcome.rs	production	Not reviewed
 pending	crates/sync-server/src/secure.rs	production	Not reviewed
-pending	crates/sync-server/src/seq_tracker.rs	production	Not reviewed
-pending	crates/sync-server/src/state.rs	production	Not reviewed
-read	crates/sync-server/src/storage.rs	production	Layout and root authority readers inspected; loose/packed/recovery paths traced for docs; full durability review pending
+reviewed	crates/sync-server/src/seq_tracker.rs	production	Read full reservation/window/persistence and tests; API authenticates before lookup and admits durable work on control pool; reorder/restart/corruption/fast-path tests pass
+read	crates/sync-server/src/state.rs	production	Read full state and constructor; removed unread config copy; traced auth/storage owners and presence callers; WS connection ownership review remains
+read	crates/sync-server/src/storage.rs	production	Layout/reset paths reviewed with writer recovery; native/unit cleanup tests preserve keys/devices/replay state and reject symlinks; full root publication/IO review pending
 pending	crates/sync-server/src/storage_writer.rs	production	Not reviewed
 pending	crates/sync-server/src/transport_memory.rs	production	Not reviewed
 pending	crates/sync-server/src/ws.rs	production	Not reviewed
 pending	crates/sync-server/src/ws_data.rs	production	Not reviewed
 pending	crates/sync-server/src/ws_ticket.rs	production	Not reviewed
 pending	docker-compose.e2e.yml	configuration/schema	Not reviewed
-read	docker-compose.yml	configuration/schema	Read full services, bind mounts, extraction and healthcheck; outdated directory/cache comments found; runtime review pending
+reviewed	docker-compose.yml	configuration/schema	Read services/mounts/build args/artifact extraction/healthcheck; reconciled comments with packed storage and bind mounts; dev service actual build passes; release runtime gates remain
 pending	docs/native-root-read-concurrency-2026-09-05.json	historical evidence	Not reviewed
 pending	docs/root-drain-reviewed-counts-2026-09-05.json	historical evidence	Not reviewed
-read	flake.nix	configuration/schema	Read package graph; fixed missing CSS; actual plugin build has seven files; server/image and check outputs still pending
-read	justfile	configuration/schema	Read build/release/ship graph and maintenance commands; clean-server omits packed state; isolated destructive-command test pending
+read	flake.nix	configuration/schema	Read package graph; verified seven-file plugin, server and dev shell (added missing wasm-pack); full flake/image release gates pending
+read	justfile	configuration/schema	Read all recipes; clean-server now stop/native-clear/start and failure stops sequence, verified using actual just with Docker recorder; ship/deploy helper audit pending
 pending	manifest.json	configuration/schema	Not reviewed
 read	plugin/esbuild.config.mjs	production	Entry-point/build inventory; behavior/callers still under review
 pending	plugin/manifest.json	configuration/schema	Not reviewed
@@ -129,7 +129,7 @@ pending	plugin/scripts/browser-hash-worker.test.mjs	tests	Not reviewed
 pending	plugin/scripts/browser-probe.test.mjs	tests	Not reviewed
 pending	plugin/scripts/build-identity-config.mjs	tooling	Not reviewed
 pending	plugin/scripts/build-identity-config.test.mjs	tests	Not reviewed
-pending	plugin/scripts/build-wasm-contract.test.mjs	tests	Not reviewed
+reviewed	plugin/scripts/build-wasm-contract.test.mjs	tests	Read all tests; fixture now reproduces executable paths with spaces; installer tests cover both architecture aliases/native detection and each checksum failure; 26 targeted tests pass
 pending	plugin/scripts/conflict-ui-lifecycle.test.mjs	tests	Not reviewed
 read	plugin/scripts/diagnose-root-drain.mjs	tooling	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
 pending	plugin/scripts/lib/native-root-audit-diagnostic.mjs	tooling	Not reviewed
@@ -142,7 +142,7 @@ pending	plugin/scripts/lib/native-root-io.mjs	tooling	Not reviewed
 pending	plugin/scripts/lib/native-root-metrics.mjs	tooling	Not reviewed
 pending	plugin/scripts/lib/native-root-publication.ts	tooling	Not reviewed
 pending	plugin/scripts/lib/native-root-qualification.mjs	tooling	Not reviewed
-pending	plugin/scripts/lib/native-root-server.mjs	tooling	Not reviewed
+read	plugin/scripts/lib/native-root-server.mjs	tooling	Read startup/config.json identity check and owned-loopback gate; config compatibility retained; full process/teardown ownership review pending
 pending	plugin/scripts/native-root-audit-diagnostic.test.mjs	tests	Not reviewed
 pending	plugin/scripts/native-root-auto-diagnostic.test.mjs	tests	Not reviewed
 pending	plugin/scripts/native-root-child.test.mjs	tests	Not reviewed
@@ -152,7 +152,7 @@ pending	plugin/scripts/native-root-metrics.test.mjs	tests	Not reviewed
 pending	plugin/scripts/native-root-qualification.test.mjs	tests	Not reviewed
 pending	plugin/scripts/run-resource-governor-bench.mjs	tooling	Not reviewed
 read	plugin/scripts/run-tests.mjs	tooling	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
-pending	plugin/scripts/run-tests.test.mjs	tests	Not reviewed
+read	plugin/scripts/run-tests.test.mjs	tests	Updated build/installer contracts and verified 26 targeted cases; full runner fixture semantics still under review
 pending	plugin/scripts/settings-fence.test.mjs	tests	Not reviewed
 pending	plugin/scripts/test-main-lifecycle.mjs	tooling	Not reviewed
 read	plugin/scripts/test-native-root-crash-recovery.mjs	tooling	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
@@ -355,7 +355,7 @@ pending	plugin/src/segmented-store.test.ts	tests	Not reviewed
 pending	plugin/src/segmented-store.ts	production	Not reviewed
 pending	plugin/src/settings-persistence.test.ts	tests	Not reviewed
 pending	plugin/src/settings-persistence.ts	production	Not reviewed
-read	plugin/src/settings.ts	production	Connection/default settings read; HTTPS placeholder contradicts HTTP server; remaining settings handlers pending
+read	plugin/src/settings.ts	production	Fixed HTTPS placeholder to match actual direct HTTP port; tsc passes; remaining settings/persistence handlers pending
 pending	plugin/src/startup-activation.test.ts	tests	Not reviewed
 pending	plugin/src/startup-activation.ts	production	Not reviewed
 read	plugin/src/startup-replay.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
@@ -412,8 +412,9 @@ reviewed	plugin/tsconfig.json	configuration/schema	Enabled noUnusedLocals/noUnus
 pending	rust-toolchain.toml	configuration/schema	Not reviewed
 pending	scripts/benchmark-hash-workers.mjs	tooling	Not reviewed
 pending	scripts/benchmark-wasm-hash.mjs	tooling	Not reviewed
-pending	scripts/build-wasm.sh	tooling	Not reviewed
+reviewed	scripts/build-wasm.sh	tooling	Read complete scalar/SIMD build and output isolation with Docker/CI/Nix callers; fixed unquoted optimizer path; version/whitespace refusal and accepted-path contract tests pass
 pending	scripts/check-release-version.mjs	tooling	Not reviewed
+reviewed	scripts/install-wasm-tools.sh	tooling	Shared Linux installer; architecture allowlist, pinned hashes, both checks before install, cleanup and quoted paths reviewed; mock refusal/selection tests and real x86 dev image install pass
 pending	scripts/check-release-version.test.mjs	tests	Not reviewed
 pending	scripts/deploy-plugin.sh	tooling	Not reviewed
 pending	scripts/deploy-plugin.test.sh	tests	Not reviewed

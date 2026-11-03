@@ -16,8 +16,6 @@ use tokio::sync::Mutex as AsyncMutex;
 
 /// Shared application state, passed to all axum handlers.
 pub struct AppState {
-    #[allow(dead_code)]
-    pub config: ServerConfig,
     pub layout: StorageLayout,
     pub vaults: VaultStore,
     /// Changes on every process startup, including a restored backup. This
@@ -41,8 +39,8 @@ pub struct AppState {
     /// Reserved blocking capacity for tickets, enrollment, and durable admin
     /// mutations. Kept separate from bulk storage reads to prevent starvation.
     pub control_io: BlockingPool,
-    /// Dedicated bounded immutable-object writer. One checksummed journal
-    /// fdatasync commits a whole group before loose mirrors become visible.
+    /// Dedicated bounded immutable-object writer; each packed group is durable
+    /// before its objects become visible to readers.
     pub storage_writer: StorageWriter,
     /// One process-wide owner for all sealed HTTP and bulk WS byte buffers.
     /// Admission happens before body receive/decrypt or logical frame
@@ -94,7 +92,6 @@ impl AppState {
         let transport_memory = TransportMemoryBudget::process_default();
 
         Self {
-            config,
             layout,
             vaults,
             root_incarnation: hex::encode(rand::random::<[u8; 32]>()),

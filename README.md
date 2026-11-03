@@ -12,7 +12,7 @@ Your notes stay on your infrastructure. Desktop and iOS sync through your own se
 - **Cross-platform** — desktop (Windows, macOS, Linux) and iOS
 - **Content-addressed storage** — blake3-hashed blobs, automatic deduplication
 - **Incremental sync** — FastCDC chunking means a small edit to a 200 MB binary usually uploads about one content-defined chunk, not the whole file
-- **Merkle tree index** — O(log n) diff, constant-time cached roots on reconnect
+- **Merkle tree index** — compare subtree hashes and reuse cached roots on reconnect
 - **Application-layer encrypted transport** — X25519 ECDH + HKDF-SHA256 + AES-256-GCM wrap every request body. No TLS, no CA, no cert install ceremony. The server's long-term key is pinned at enrollment; each plugin channel combines it with a rotating memory-only server key, and the bearer stays inside the AEAD envelope. Full protocol at [`docs/transport.md`](docs/transport.md)
 - **Three-way merge** — server reconciles concurrent edits; conflicts preserved as copies instead of clobbered
 
@@ -31,19 +31,19 @@ The plugin runs WASM in the Obsidian renderer. Blake3 hashing, FastCDC chunking,
 
 Just **Docker** with the Compose plugin. No Rust, no Node.js, no `wasm-pack` on your host — every build runs inside a container.
 
-Optionally install [`just`](https://github.com/casey/just) for shorter commands (see [Using `just`](#using-just) below). The justfile is a thin wrapper over the same compose calls; both work.
+Optionally install [`just`](https://github.com/casey/just) for shorter commands (see [Using `just`](#using-just) below). Basic builds wrap Compose; release deployment also uses Nix, identity checks and rollback.
 
 ## Build
 
-Two output modes, pick whichever fits your deployment:
+Choose artifacts or a runnable image, built with Docker or Nix:
 
 ### Option 1 — clean artifacts (bare-metal / manual install)
 
 Extract the server binary + plugin files to `./dist/`:
 
 ```sh
-docker compose run --rm binary    # → ./dist/bin/sync-server
-docker compose run --rm plugin    # → ./dist/plugin/{main.js,manifest.json,wasm/}
+docker compose run --build --rm binary    # → ./dist/bin/sync-server
+docker compose run --build --rm plugin    # → ./dist/plugin/ (seven flat files)
 
 # or in one step:
 just build-artifacts
@@ -58,7 +58,11 @@ dist/
 └── plugin/
     ├── main.js
     ├── manifest.json
-    └── wasm/
+    ├── styles.css
+    ├── sync_core.js
+    ├── sync_core_bg.wasm
+    ├── sync_core_simd.js
+    └── sync_core_simd_bg.wasm
 ```
 
 Use this when you want to drop the binary onto a VPS with systemd, or copy the plugin files into an Obsidian vault manually.
@@ -89,13 +93,13 @@ just build                              # image AND artifacts
 
 ### Option 3 — hermetic build with Nix
 
-For bit-for-bit reproducible builds (same inputs → identical outputs on any machine, now or in five years), there's a Nix flake alongside the Docker setup. Use it if you have [Nix installed](https://nixos.org/download) with flakes enabled.
+The Nix flake pins the toolchain and dependencies. Reproducing an artifact also requires the same source revision, build parameters and target platform. Use it if you have [Nix installed](https://nixos.org/download) with flakes enabled.
 
 ```sh
 # Everything pinned via flake.lock — Rust toolchain, nixpkgs, build inputs.
 nix build .#server           # -> ./result/bin/sync-server
 nix build .#wasm             # -> ./result/  (scalar + SIMD wasm-bindgen output)
-nix build .#plugin           # -> ./result/  (main.js + manifest.json + both WASM variants)
+nix build .#plugin           # -> ./result/  (the same seven flat plugin files)
 
 nix flake check              # runs the full cargo test suite
 nix develop                  # shell with the exact toolchain
@@ -106,7 +110,7 @@ The `npmDepsHash` in `flake.nix` is pinned. If you ever bump `plugin/package-loc
 
 ### Option 4 — Nix-built Docker image (hermetic + ready-to-run)
 
-The best of both: Nix compiles the binary deterministically, then *builds the OCI image itself* (no Dockerfile). Same `flake.lock` → byte-identical image hash, loadable into any Docker or Podman.
+Nix compiles the binary and builds the OCI image itself without a Dockerfile. The image carries the source commit and version, and can be loaded into Docker or Podman on the matching target architecture.
 
 ```sh
 just build-nix-image         # runs both steps below:
@@ -119,13 +123,13 @@ docker run --rm -v ./data:/data -p 27182:27182 -p 27183:27183 \
 # Or swap it into compose by setting image: obsetync-server:nix on the server service.
 ```
 
-This is the strongest guarantee: the *image itself* is reproducible. Two people running `nix build .#dockerImage` with the same `flake.lock` will get the same image digest.
+The image fixes its creation timestamp; source, lockfile, build identity and target platform are all inputs to its digest.
 
 Docker, Nix, and Nix-built Docker images are independent routes to the same functional artifacts. Pick the one that fits your environment.
 
 ## Run the server
 
-State lives on the host at `./data/server/` — a plain directory you can back up, inspect, or `tar` around. No Docker named volumes anywhere.
+State lives on the host at `./data/`; `./data/server/` contains only the server identity. Stop the server before taking a filesystem backup of the complete data directory. The production Compose service uses a bind mount.
 
 ```sh
 # First-time: create the X25519 box keypair + directory layout in ./data/.
@@ -137,7 +141,7 @@ docker compose down
 docker compose logs -f
 docker compose restart
 
-# Shell inside the running container (diagnostics).
+# Shell in the Dockerfile image (the Nix image has no shell).
 docker compose exec server sh
 ```
 
@@ -165,15 +169,23 @@ Everything is under `./data/` (gitignored):
 ./data/devices/           enrolled devices + bearer-token index
 ./data/enrollments/       pending enrollment codes (10-minute TTL)
 ./data/vaults/            per-vault root pointers and root history
-./data/index/             Merkle tree chunks (leaf + internal nodes)
-./data/content/           content-addressed file storage (blobs + manifests + chunks)
+./data/objects-v1/        primary packed objects and checksummed segment indexes
+./data/index/             legacy loose Merkle tree chunks (imported into packs)
+./data/content/           legacy loose blobs, manifests and chunks (imported into packs)
+./data/storage-writer/    legacy acknowledged groups and migration state
+./data/crdt/              legacy live-edit logs, if present
+./data/config.json        initialization metadata (legacy fields remain readable)
 ./data/cache/cargo-*/     dev shell: cargo dep cache (optional, speeds up rebuilds)
 ./data/cache/target/      dev shell: incremental compile cache (optional)
-./dist/bin/sync-server    extracted binary (from `docker compose run --rm binary`)
-./dist/plugin/            extracted plugin files (from `docker compose run --rm plugin`)
+./dist/bin/sync-server    extracted binary (from `docker compose run --build --rm binary`)
+./dist/plugin/            extracted plugin files (from `docker compose run --build --rm plugin`)
 ```
 
-Wipe any of these freely. The server's `init` subcommand recreates the layout from scratch. *But* — see [Reconcile with server](#reconcile-with-server) below before wiping `content/` while devices still hold a local sync-base: it silently causes drift.
+Build caches and extracted artifacts can be regenerated. Server keys, device registrations, roots and stored content require a backup; `init` cannot recover them. For an intentional vault reset that preserves identity and enrollment, see [Maintenance](#maintenance).
+
+`--data-dir` selects the storage directory, and `--sync-port` / `--admin-port`
+override the default ports. Old port and password fields in `config.json` are
+ignored; the admin UI has no built-in password authentication.
 
 The server exposes two ports on the host:
 
@@ -200,7 +212,7 @@ Obsidian keeps it up to date automatically. Until the directory listing lands, u
 1. In Obsidian, open **Settings → Community plugins** and disable Restricted Mode if it's on.
 2. **Browse**, search for *BRAT*, install it, and enable it.
 3. Open **BRAT** settings → **Add Beta plugin** → paste `Savemech/obsetync` and confirm.
-4. BRAT downloads `main.js`, `manifest.json`, and the scalar/SIMD WASM artifacts from our latest GitHub release into your vault.
+4. BRAT installs the plugin from our latest GitHub release into your vault; the production bundle embeds its WASM modules.
 5. Back in **Community plugins**, enable *ObsetyNC*.
 
 Subsequent releases auto-update via BRAT — no further action needed.
@@ -208,7 +220,7 @@ Subsequent releases auto-update via BRAT — no further action needed.
 ### C. Manual install (no BRAT, fully offline after first download)
 
 1. Go to the [Releases page](https://github.com/Savemech/obsetync/releases/latest) and download `obsetync-<version>.zip`.
-2. Unzip it — you'll see an `obsetync/` folder containing `main.js`, `manifest.json`, and scalar (`sync_core*`) plus SIMD (`sync_core_simd*`) WASM artifacts. ObsetyNC validates SIMD at runtime and automatically falls back to scalar on older WebViews.
+2. Unzip it — you'll see an `obsetync/` folder containing `main.js`, `manifest.json`, `styles.css`, and scalar (`sync_core*`) plus SIMD (`sync_core_simd*`) WASM artifacts. ObsetyNC validates SIMD at runtime and automatically falls back to scalar on older WebViews.
 3. Drop that `obsetync/` folder into `<your-vault>/.obsidian/plugins/`.
 4. In Obsidian, **Settings → Community plugins** → disable Restricted Mode → refresh the list → enable *ObsetyNC*.
 
@@ -224,7 +236,7 @@ On **iOS**, the same flow works via the Files app:
 
 1. Open the server admin UI (`http://<server>:27183/admin`), click **Add device**, name it, copy the enrollment code.
 2. In Obsidian → **Settings → ObsetyNC**, fill in:
-   - **Server URL** — `http://your-server:27182` (plain HTTP; the AEAD envelope encrypts the payload itself, so HTTPS is unnecessary and actively wrong)
+   - **Server URL** — `http://your-server:27182` (the direct sync port speaks HTTP; the AEAD envelope encrypts its payload)
    - **Vault ID** — a simple ASCII ID such as `personal-notes`; use the same ID on every device that syncs the vault
    - **Enrollment code** — paste it from the admin UI
 3. Hit **Enroll**. First device bulk-pushes its vault; every later device does a first-sync pull (downloads the vault from the server) — progress shown in the status bar + notices.
@@ -241,7 +253,7 @@ The **bearer token** lives inside the encrypted plaintext, not in a header — s
 
 ## Reconcile with server
 
-The client maintains a local `sync-base.json` that caches "what hashes the server has". If server storage is wiped, partially restored, or corrupted, that cache can lie. **Settings → ObsetyNC → Reconcile with server** checks Merkle index nodes, small blobs, and large-file manifests in bounded batches; malformed manifests or missing referenced chunks are treated as absent, then local bytes are re-chunked and only missing/corrupt content is uploaded. The parity path transfers metadata only. This also runs automatically on every **Sync Now**.
+The client keeps its last synchronized file states in `sync-base.store-v1/` under the plugin directory; older `sync-base.json` files are migration inputs. If server storage is wiped, partially restored, or corrupted, those local records no longer prove that the content still exists remotely. **Settings → ObsetyNC → Reconcile with server** checks Merkle index nodes, small blobs, and large-file manifests in bounded batches; malformed manifests or missing referenced chunks are treated as absent, then local bytes are re-chunked and only missing/corrupt content is uploaded. The parity path transfers metadata only. **Sync Now** also reconciles content when it can start a sync cycle.
 
 ## Optional: sync your `.obsidian/` folder
 
@@ -257,13 +269,18 @@ The plugin settings include a toggle to sync your `.obsidian/` directory alongsi
 ├── devices/        enrolled devices + bearer-token index
 ├── enrollments/    pending enrollment codes (10-minute TTL)
 ├── vaults/         per-vault root pointers and root history
-├── index/          Merkle tree chunks (leaf + internal nodes)
-└── content/        content-addressed file storage
-    ├── manifests/  per-file chunk manifests (large files ≥ 1 MB)
-    └── chunks/     FastCDC chunks (large files)
+├── objects-v1/
+│   └── segments/   primary .pack objects and sealed .idx indexes
+├── storage-writer/ legacy group journal and migration state
+├── index/          legacy loose Merkle tree chunks
+├── content/        legacy loose content-addressed storage
+│   ├── manifests/  per-file chunk manifests
+│   └── chunks/     FastCDC chunks
+├── crdt/           legacy live-edit logs, if present
+└── config.json     initialization metadata
 ```
 
-Small files (< 1 MB) go to `content/<hash>` whole. Large files are chunked via FastCDC; the manifest records chunk hashes and offsets. All storage is content-addressed — identical files across multiple paths use one physical blob. Ordinary wire-v2 traffic has window-bounded forward secrecy from the rotating in-memory server key: after the applicable current/previous slot is gone, theft of `box.key` alone cannot open that captured traffic. Bootstrap traffic and the other limits are spelled out in [`docs/transport.md`](docs/transport.md).
+The writer stores new blobs, manifests, content chunks and Merkle index chunks in packs. Small files are whole blobs; larger files use FastCDC chunks and a manifest of hashes and offsets. Loose objects and the old writer journal remain recovery sources until migrated. All storage is content-addressed — identical files across multiple paths share content. Ordinary wire-v2 traffic has window-bounded forward secrecy from the rotating in-memory server key: after the applicable current/previous slot is gone, theft of `box.key` alone cannot open that captured traffic. Bootstrap traffic and the other limits are spelled out in [`docs/transport.md`](docs/transport.md).
 
 ## Development
 
@@ -277,25 +294,27 @@ docker compose run --rm test
 
 `just` shortcuts: `just dev`, `just test`.
 
-The dev container has Rust, Node, wasm-pack, cargo-watch, and `just` pre-installed. A cargo registry + target cache is stored in named volumes so incremental builds are fast.
+The dev container has Rust, Node, wasm-pack, Binaryen, cargo-watch, and `just` pre-installed. Docker and CI share the checksum-pinned WASM tool installer. Cargo registry, Git and target caches are bind-mounted from `./data/cache/`.
 
 ## Maintenance
 
 ```sh
-just clean-server   # wipe synced content (preserves server/box.key + enrolled devices)
+just clean-server   # stop, erase all vault storage, restart; preserves identity and devices
 just clean-cache    # drop Docker BuildKit caches
-just nuke           # remove all ObsetyNC images + volumes (fresh start)
+just nuke           # remove Docker-built images and BuildKit caches; ./data survives
 ```
 
-**After `clean-server` (or any time the server loses data while clients still hold a sync-base)**: every enrolled device should run **Settings → ObsetyNC → Reconcile with server** once. That uploads every file the server is missing. Without it, `Sync Now` will say "Already up to date" while the server silently holds only the Merkle tree, no content.
+`clean-server` uses the server's `clear-vault-data` command, so it works with Docker and shell-free Nix images. It removes roots, packed and loose objects, legacy writer recovery state and CRDT logs. Keys, configuration, device registrations and replay windows remain. A cleanup failure leaves the server stopped. The CLI command must only run while the server is stopped.
+
+**After `clean-server` or a server restore**: run **Settings → ObsetyNC → Reconcile with server** on devices that hold the missing files. **Sync Now** also performs this check during a new sync cycle. Recovery can upload content still available locally; it cannot recover files erased from every copy.
 
 ## Troubleshooting
 
-**"In sync" but the server clearly has nothing** — the client's `sync-base.json` cache is lying. Use **Reconcile with server**.
+**"In sync" but server content is missing** — matching root hashes do not prove every stored object survived. Use **Reconcile with server** to check and repair content from local files.
 
-**`ERR_SSL_PROTOCOL_ERROR` from the plugin** — you saved the Server URL as `https://…`. The sync port is plaintext HTTP; the plugin auto-migrates stored URLs on load, but if you typed a fresh one manually, use `http://`. The AEAD envelope is the trust boundary — TLS would be double-encryption of the same bytes.
+**`ERR_SSL_PROTOCOL_ERROR` from the plugin** — the direct sync port expects `http://…`, not `https://…`. Use the address shown by the server. Payload encryption is provided by the AEAD envelope.
 
-**iPhone loops on `GET /api/v1/root/...` forever** — the plugin WASM module failed to load (check *Show debug info* → recent logs for `WASM load failed`). That drops the plugin to a stub that can't hash. Usually caused by an older iOS/WebKit missing a WASM feature; upgrade iOS first.
+**WASM initialization fails** — startup stops before syncing. The plugin tries bundled SIMD and scalar modules; it never uses incompatible hashing stubs on a real vault. Check **Show debug info** for the failing initialization step and build identity.
 
 **Obsidian disappears or restarts during a long iPad sync** — reopen it, then use **Settings → ObsetyNC → Show debug info**. “Previous interruption” reports the last durable phase/file-count/byte checkpoint even when iOS Jetsam killed the renderer before JavaScript could log an exception. Large downloads resume from their verified staging checkpoint; repeated interruption at a local upload above 128 MiB means that file must be uploaded from desktop or excluded.
 
@@ -303,7 +322,7 @@ just nuke           # remove all ObsetyNC images + volumes (fresh start)
 
 **Admin dashboard says `(empty)` next to a vault that should have data** — the vault dir exists but no root was ever pushed successfully. Check `docker logs obsetync-server` during the client's next Sync Now for `put_root:` events. If none appear, the push itself is failing (decrypt error, bearer rejected, etc — the log will say).
 
-**`Last error: [pull] getDiff failed: 404`** — the server has no root for this vault yet. This is harmless on a first-sync-to-an-empty-server (the client treats 404 as empty delta). If it persists across syncs, the server lost its `vaults/<id>/current_root` pointer — check file permissions under `data/vaults/`.
+**`Last error: [pull] getDiff failed: 404`** — the server has no root for this vault yet. This can occur before its first successful publication. If it persists for an existing vault, inspect server logs and permissions for `vaults/<id>/current`, the authoritative root and publication-receipt file.
 
 **Tailing live traffic with structured fields:**
 
@@ -319,7 +338,7 @@ ssh <server> 'docker logs obsetync-server' | grep 'device=<first 12 hex chars>'
 
 ## Using `just`
 
-[`just`](https://github.com/casey/just) is an optional command runner — it reads the `justfile` at the repo root and exposes each recipe as a short command. Every recipe here is a one-liner over `docker compose`, so running the underlying compose command directly is equivalent.
+[`just`](https://github.com/casey/just) reads the `justfile` at the repo root and exposes each workflow as a short command. Basic recipes wrap Compose; `ship` coordinates clean release builds, verification and rollback across Docker, Nix and SSH.
 
 **Install:**
 
@@ -342,15 +361,15 @@ just --evaluate            # print all justfile variables and their values
 just --choose              # interactive picker (requires fzf)
 ```
 
-**Recipe map** — every recipe and its compose equivalent:
+**Common recipes** and the commands or workflows they run:
 
-| `just` recipe        | `docker compose` equivalent                                |
+| `just` recipe        | Command or workflow                                       |
 |----------------------|------------------------------------------------------------|
-| `just build`         | `docker compose build server` + `run --rm binary` + `run --rm plugin` |
+| `just build`         | `docker compose build server` + `run --build --rm binary` + `run --build --rm plugin` |
 | `just build-image`   | `docker compose build server`                              |
-| `just build-artifacts`| `docker compose run --rm binary` + `docker compose run --rm plugin` |
-| `just build-binary`  | `docker compose run --rm binary`                           |
-| `just build-plugin`  | `docker compose run --rm plugin`                           |
+| `just build-artifacts`| `docker compose run --build --rm binary` + `docker compose run --build --rm plugin` |
+| `just build-binary`  | `docker compose run --build --rm binary`                   |
+| `just build-plugin`  | `docker compose run --build --rm plugin`                   |
 | `just build-dev`     | `docker compose --profile tools build dev`                 |
 | `just init`          | `docker compose run --rm server init --data-dir /data`     |
 | `just up`            | `docker compose up -d server`                              |
@@ -361,7 +380,7 @@ just --choose              # interactive picker (requires fzf)
 | `just dev`           | `docker compose run --rm dev`                              |
 | `just test`          | `docker compose run --rm test`                             |
 | `just ship`          | *(personal: strict release build + rollback-safe server deploy + local plugin install)* |
-| `just clean-server`  | `docker compose exec server sh -c '…wipe vaults+index+content…'` + `restart` |
+| `just clean-server`  | `stop server` → one-shot `clear-vault-data` → `up -d server` |
 | `just clean-cache`   | `docker builder prune -af`                                 |
 | `just nuke`          | `docker compose --profile tools down -v` + `docker rmi …` + `docker builder prune -af` |
 

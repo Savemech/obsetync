@@ -3,30 +3,11 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ServerConfig {
     pub data_dir: PathBuf,
-    #[serde(default = "default_sync_port")]
-    pub sync_port: u16,
-    #[serde(default = "default_admin_port")]
-    pub admin_port: u16,
-    #[serde(default)]
-    pub admin_password_hash: String,
-}
-
-fn default_sync_port() -> u16 {
-    27182
-}
-
-fn default_admin_port() -> u16 {
-    27183
 }
 
 impl ServerConfig {
     pub fn new(data_dir: PathBuf) -> Self {
-        Self {
-            data_dir,
-            sync_port: default_sync_port(),
-            admin_port: default_admin_port(),
-            admin_password_hash: String::new(),
-        }
+        Self { data_dir }
     }
 
     pub fn config_path(data_dir: &Path) -> PathBuf {
@@ -43,8 +24,11 @@ impl ServerConfig {
     pub fn load(data_dir: &Path) -> Result<Self, std::io::Error> {
         let path = Self::config_path(data_dir);
         let data = std::fs::read_to_string(&path)?;
-        serde_json::from_str(&data)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        let mut config: Self = serde_json::from_str(&data)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        // A restored/moved config must never redirect storage to its old copy.
+        config.data_dir = data_dir.to_path_buf();
+        Ok(config)
     }
 }
 
@@ -52,15 +36,6 @@ impl ServerConfig {
 mod tests {
     use super::*;
     use tempfile::tempdir;
-
-    #[test]
-    fn defaults_are_27182_27183() {
-        let cfg = ServerConfig::new(PathBuf::from("/data"));
-        assert_eq!(cfg.sync_port, 27182);
-        assert_eq!(cfg.admin_port, 27183);
-        assert_eq!(cfg.data_dir, PathBuf::from("/data"));
-        assert!(cfg.admin_password_hash.is_empty());
-    }
 
     #[test]
     fn config_path_lives_inside_data_dir() {
@@ -76,8 +51,6 @@ mod tests {
 
         let loaded = ServerConfig::load(dir.path()).unwrap();
         assert_eq!(loaded.data_dir, cfg.data_dir);
-        assert_eq!(loaded.sync_port, cfg.sync_port);
-        assert_eq!(loaded.admin_port, cfg.admin_port);
     }
 
     #[test]
@@ -85,6 +58,21 @@ mod tests {
         let dir = tempdir().unwrap();
         let err = ServerConfig::load(dir.path()).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn restored_config_uses_the_explicit_data_directory() {
+        let old = tempdir().unwrap();
+        let restored = tempdir().unwrap();
+        let cfg = ServerConfig::new(old.path().to_path_buf());
+        cfg.save().unwrap();
+        std::fs::copy(
+            ServerConfig::config_path(old.path()),
+            ServerConfig::config_path(restored.path()),
+        )
+        .unwrap();
+        let loaded = ServerConfig::load(restored.path()).unwrap();
+        assert_eq!(loaded.data_dir, restored.path());
     }
 
     #[test]
@@ -96,18 +84,11 @@ mod tests {
     }
 
     #[test]
-    fn load_uses_defaults_for_missing_optional_fields() {
-        // Only data_dir is required. The rest fall back through serde defaults.
+    fn old_unused_port_and_password_fields_remain_readable() {
         let dir = tempdir().unwrap();
-        let minimal = format!(
-            "{{\"data_dir\": \"{}\"}}",
-            dir.path().display().to_string().replace('\\', "/")
-        );
-        std::fs::write(ServerConfig::config_path(dir.path()), &minimal).unwrap();
-
+        std::fs::write(ServerConfig::config_path(dir.path()),
+            r#"{"data_dir":"/old","sync_port":28182,"admin_port":28183,"admin_password_hash":"unused"}"#).unwrap();
         let cfg = ServerConfig::load(dir.path()).unwrap();
-        assert_eq!(cfg.sync_port, 27182);
-        assert_eq!(cfg.admin_port, 27183);
-        assert!(cfg.admin_password_hash.is_empty());
+        assert_eq!(cfg.data_dir, dir.path());
     }
 }

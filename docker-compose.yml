@@ -7,21 +7,21 @@
 #   docker compose logs -f                    # tail logs
 #   docker compose run --rm server init \
 #         --data-dir /data                    # first-time: init ./data/server
-#   docker compose run --rm plugin            # extract plugin → ./dist/plugin
-#   docker compose run --rm binary            # extract binary → ./dist/bin
+#   docker compose run --build --rm plugin    # build/extract plugin → ./dist/plugin
+#   docker compose run --build --rm binary    # build/extract binary → ./dist/bin
 #   docker compose run --rm dev               # interactive dev shell
 #   docker compose run --rm test              # run the Rust test suite
 #
 # Host directory layout (all relative to the repo root; all created on first use):
-#   ./data/server/            persistent server state (certs, vaults, index, content)
+#   ./data/                   persistent keys, devices, vault roots and objects
 #   ./data/cache/cargo-registry/   dev shell: downloaded crates
 #   ./data/cache/cargo-git/        dev shell: git-sourced crates
 #   ./data/cache/target/           dev shell: incremental compile cache
 #   ./dist/bin/               extracted binary (from `run --rm binary`)
 #   ./dist/plugin/            extracted plugin files (from `run --rm plugin`)
 #
-# All of these are gitignored. Wipe them freely — `docker compose run --rm server
-# init --data-dir /data` will recreate the server layout.
+# These paths are gitignored. Back up ./data/; init creates directories and keys
+# but cannot recover erased data or registrations. Build caches are disposable.
 # ==============================================================================
 
 x-build-identity-args: &build-identity-args
@@ -65,8 +65,8 @@ services:
       - "27183:27183"
     volumes:
       # Host ./data → container /data (server's --data-dir).
-      # The server initializes sub-dirs (ca/, vaults/, index/, content/,
-      # enrollments/, devices/, server/) inside this path.
+      # Includes identity, enrollment, vault roots, packed objects and legacy
+      # loose-object recovery state; back up the whole data directory.
       - ./data:/data
     read_only: true
     tmpfs:
@@ -89,7 +89,7 @@ services:
       start_period: 10s
 
   # ---------------------------------------------------------------------------
-  # plugin — extract main.js + manifest.json + wasm/ → ./dist/plugin
+  # plugin — extract seven flat runtime artifacts → ./dist/plugin
   # ---------------------------------------------------------------------------
   plugin:
     build:

@@ -1,6 +1,4 @@
-# ObsetyNC — thin wrapper around `docker compose`.
-# Every recipe below is equivalent to a compose command; use compose directly
-# if you prefer.
+# ObsetyNC — build, test and release workflows for Docker and Nix.
 set dotenv-load := true
 
 # --- optional .env overrides for `just ship` (personal rsync deploy) ---
@@ -63,7 +61,7 @@ build-nix-binary:
 
 # --- run ------------------------------------------------------------------
 
-# First-run: create CA, server cert, directory layout inside the data volume.
+# First-run: create the X25519 identity and data directory layout.
 init:
     docker compose run --rm server init --data-dir /data
 
@@ -83,7 +81,7 @@ logs:
 restart:
     docker compose restart server
 
-# Shell inside the running server container (diagnostics).
+# Shell inside the Dockerfile runtime image (the Nix image has no shell).
 shell:
     docker compose exec server sh
 
@@ -235,14 +233,13 @@ ship-server: ship-server-preflight build-release-nix-image
 
 # --- maintenance ----------------------------------------------------------
 
-# Wipe synced vault content on the server. Preserves certs + enrolled devices.
+# Wipe all vault storage offline. Preserves server identity + enrolled devices.
 clean-server:
     @echo "This will erase all synced vault data on the server. Ctrl-C to abort."
     @sleep 3
-    docker compose exec server sh -c " \
-        rm -rf /data/vaults /data/index /data/content && \
-        mkdir -p /data/vaults /data/index /data/content/manifests /data/content/chunks"
-    docker compose restart server
+    docker compose stop server
+    docker compose run --rm --no-deps server clear-vault-data --data-dir /data
+    docker compose up -d server
     @echo "Server state wiped."
 
 # --- end-to-end tests ----------------------------------------------------
@@ -286,7 +283,7 @@ e2e-logs:
 clean-cache:
     docker builder prune -af
 
-# Nuke everything — images, volumes, caches. Fresh start next `just build`.
+# Remove Docker-built images and BuildKit caches. Bind-mounted ./data survives.
 nuke:
     -docker compose --profile tools down -v
     -docker rmi obsetync/server:local obsetync/plugin-builder:local obsetync/dev:local obsetync/rust-builder:local 2>/dev/null

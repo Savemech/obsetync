@@ -5,10 +5,10 @@
 # Build the server runtime image:
 #   docker build --target server -t obsetync/server:local .
 #
-# Extract plugin artifacts (main.js + manifest.json + wasm/) to ./dist/plugin:
+# Extract the seven flat plugin artifacts to ./dist/plugin:
 #   docker build --target plugin-dist -o type=local,dest=./dist/plugin .
 #
-# Or use the justfile wrappers: `just build-server`, `just build-plugin`.
+# Or use the justfile wrappers: `just build-image`, `just build-plugin`.
 # ==============================================================================
 
 
@@ -58,40 +58,9 @@ RUN apt-get update && \
         curl \
         && rm -rf /var/lib/apt/lists/*
 
-# Pin wasm-pack and its compatible optimizer for reproducibility.
-ENV WASM_PACK_VERSION=0.13.1 \
-    BINARYEN_VERSION=117
-# BuildKit supplies TARGETARCH. If a classic/default builder leaves it empty,
-# select tools for the architecture that is actually executing this stage.
-# A non-empty override still goes through the strict allowlist below.
-RUN tool_arch="${TARGETARCH}"; \
-    if [ -z "${tool_arch}" ]; then \
-        tool_arch="$(dpkg --print-architecture)"; \
-    fi; \
-    case "${tool_arch}" in \
-        amd64) \
-            binaryen_arch=x86_64; \
-            binaryen_sha=3dc677006555b355ea2da5e82602065a161d5e83eaefd3f759afa00b96e83212; \
-            wasm_pack_arch=x86_64; \
-            wasm_pack_sha=c539d91ccab2591a7e975bcf82c82e1911b03335c80aa83d67ad25ed2ad06539 ;; \
-        arm64) \
-            binaryen_arch=aarch64; \
-            binaryen_sha=ad560204426015a815faa45693c83bef7d58677d38a39422c272a30ba4b6da2a; \
-            wasm_pack_arch=aarch64; \
-            wasm_pack_sha=2e65038769f8bbaa5fc237ad4bb523e692df99458cbd3e3d92525b89d8762379 ;; \
-        *) echo "unsupported Docker build TARGETARCH/host architecture: ${tool_arch:-<empty>}" >&2; exit 2 ;; \
-    esac && \
-    curl -sSfL "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-${binaryen_arch}-linux.tar.gz" \
-        -o /tmp/binaryen.tar.gz && \
-    echo "${binaryen_sha}  /tmp/binaryen.tar.gz" | sha256sum -c - && \
-    tar -xz -C /usr/local/bin --strip-components=2 -f /tmp/binaryen.tar.gz \
-        "binaryen-version_${BINARYEN_VERSION}/bin/wasm-opt" && \
-    curl -sSfL "https://github.com/rustwasm/wasm-pack/releases/download/v${WASM_PACK_VERSION}/wasm-pack-v${WASM_PACK_VERSION}-${wasm_pack_arch}-unknown-linux-musl.tar.gz" \
-        -o /tmp/wasm-pack.tar.gz && \
-    echo "${wasm_pack_sha}  /tmp/wasm-pack.tar.gz" | sha256sum -c - && \
-    tar -xz -C /usr/local/bin --strip-components=1 -f /tmp/wasm-pack.tar.gz \
-        "wasm-pack-v${WASM_PACK_VERSION}-${wasm_pack_arch}-unknown-linux-musl/wasm-pack" && \
-    rm -f /tmp/binaryen.tar.gz /tmp/wasm-pack.tar.gz
+# Share the same architecture-checked tools with development and CI.
+COPY scripts/install-wasm-tools.sh /tmp/install-wasm-tools.sh
+RUN bash /tmp/install-wasm-tools.sh "${TARGETARCH}" && rm /tmp/install-wasm-tools.sh
 
 # Add WASM target (also declared in rust-toolchain.toml so this is idempotent).
 RUN rustup target add wasm32-unknown-unknown
@@ -212,7 +181,7 @@ RUN OBSETYNC_BUILD_GIT_COMMIT="${OBSETYNC_BUILD_GIT_COMMIT}" \
 # ------------------------------------------------------------------------------
 # Stage: server (runtime image — this is what you ship / run)
 # Tiny Debian base with just the server binary and CA certs.
-# Runs as a non-root user. Data directory must be mounted at /data.
+# Data directory must be mounted at /data; Compose applies runtime restrictions.
 # ------------------------------------------------------------------------------
 FROM debian:bookworm-slim AS server
 
@@ -235,13 +204,13 @@ RUN apt-get update && \
 COPY --from=rust-builder /out/sync-server /usr/local/bin/sync-server
 
 # Data directory — bind mount from the host via docker-compose. Writable by
-# whatever UID runs the container (no USER directive = root inside). Container
-# isolation comes from cap_drop: ALL + read_only + no-new-privileges in compose,
-# not from Linux user separation, so host-side file ownership matches your user.
+# the configured container UID (root by default in this image). Compose adds
+# cap_drop: ALL, read_only and no-new-privileges; bind-mount ownership follows
+# the container UID, not the invoking host user's UID.
 RUN mkdir -p /data
 WORKDIR /data
 
-# 27182 sync API (mTLS + bearer token)
+# 27182 sync API (AEAD payload + encrypted bearer token)
 # 27183 admin UI (plain HTTP — put behind reverse proxy / VPN)
 EXPOSE 27182 27183
 
@@ -256,6 +225,7 @@ CMD ["run", "--data-dir", "/data"]
 # produces:
 #   ./dist/plugin/main.js
 #   ./dist/plugin/manifest.json
+#   ./dist/plugin/styles.css
 #   ./dist/plugin/sync_core.js
 #   ./dist/plugin/sync_core_bg.wasm
 #   ./dist/plugin/sync_core_simd.js

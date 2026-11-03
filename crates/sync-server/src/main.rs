@@ -50,6 +50,12 @@ enum Command {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Permanently clear all vault data, preserving identity and enrolled devices.
+    /// Stop the server first; `just clean-server` handles the offline sequence.
+    ClearVaultData {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
     /// Print the server's X25519 public key (base64). Useful for ops /
     /// verifying what clients will see during enrollment.
     ShowBoxPub {
@@ -100,6 +106,12 @@ async fn main() {
         Command::Init { data_dir } => {
             if let Err(e) = cmd_init(&data_dir) {
                 tracing::error!("init failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Command::ClearVaultData { data_dir } => {
+            if let Err(e) = cmd_clear_vault_data(&data_dir) {
+                tracing::error!("vault cleanup failed; keep the server stopped: {}", e);
                 std::process::exit(1);
             }
         }
@@ -193,16 +205,22 @@ fn cmd_show_box_pub(data_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
+fn cmd_clear_vault_data(data_dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let layout = storage::StorageLayout::new(data_dir);
+    // A wrong or uninitialized data directory must fail before any deletion.
+    box_key::load_box_keypair(&layout)?;
+    layout.clear_vault_data()?;
+    println!("Vault data cleared; server identity and enrolled devices preserved.");
+    Ok(())
+}
+
 async fn cmd_run(
     data_dir: &PathBuf,
     bind_address: IpAddr,
     sync_port: u16,
     admin_port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut config = config::ServerConfig::load(data_dir)?;
-    config.sync_port = sync_port;
-    config.admin_port = admin_port;
-
+    let config = config::ServerConfig::load(data_dir)?;
     let state = Arc::new(state::AppState::new(config));
     eph_rotation::spawn_rotation_task(state.eph.clone());
 
@@ -303,6 +321,19 @@ async fn cmd_run(
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[test]
+    fn clear_vault_data_rejects_an_uninitialized_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = dir.path().join("content");
+        std::fs::create_dir(&content).unwrap();
+        std::fs::write(content.join("keep"), b"unrelated data").unwrap();
+        assert!(cmd_clear_vault_data(dir.path()).is_err());
+        assert_eq!(
+            std::fs::read(content.join("keep")).unwrap(),
+            b"unrelated data"
+        );
+    }
 
     #[test]
     fn bind_address_defaults_preserve_existing_listeners() {

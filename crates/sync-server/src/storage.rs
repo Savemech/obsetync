@@ -25,7 +25,6 @@ impl StorageLayout {
     /// Create the full directory tree on first init.
     pub fn init_directories(&self) -> Result<(), std::io::Error> {
         let dirs = [
-            "ca",
             "server",
             "devices",
             "devices/tokens",
@@ -42,6 +41,42 @@ impl StorageLayout {
             std::fs::create_dir_all(self.base.join(dir))?;
         }
         Ok(())
+    }
+
+    /// Offline maintenance only: also remove recovery sources so old objects
+    /// cannot reappear when the writer starts. Identity and device state stay.
+    pub fn clear_vault_data(&self) -> io::Result<()> {
+        let paths = [
+            "vaults",
+            "index",
+            "content",
+            "objects-v1",
+            "storage-writer",
+            "crdt",
+        ]
+        .map(|name| self.base.join(name));
+        // Reject unexpected files/symlinks before removing any directory.
+        for path in &paths {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("vault cleanup expects a directory: {}", path.display()),
+                    ))
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        for path in &paths {
+            match std::fs::remove_dir_all(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.init_directories()
     }
 
     // --- Index chunks ---
@@ -74,9 +109,7 @@ impl StorageLayout {
             .join(&hex[2..])
     }
 
-    /// Transitional group-commit journal used by the loose-object writer.
-    /// The journal is the durability source of truth; loose files remain the
-    /// current read/index backend until pack storage replaces them.
+    /// Legacy acknowledged groups imported into packed storage before serving.
     pub fn storage_writer_journal_path(&self) -> PathBuf {
         self.base.join("storage-writer/loose-groups-v1.log")
     }
@@ -1930,7 +1963,6 @@ mod tests {
         let layout = StorageLayout::new(dir.path());
         layout.init_directories().unwrap();
         for sub in [
-            "ca",
             "server",
             "devices",
             "devices/tokens",
@@ -1941,6 +1973,7 @@ mod tests {
             "content/manifests",
             "content/chunks",
             "storage-writer",
+            "objects-v1/segments",
         ] {
             assert!(
                 dir.path().join(sub).is_dir(),
@@ -1957,6 +1990,86 @@ mod tests {
         layout.init_directories().unwrap();
         // Calling twice must not error.
         layout.init_directories().unwrap();
+    }
+
+    #[test]
+    fn offline_cleanup_removes_all_vault_storage_and_preserves_identity() {
+        let dir = tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        layout.init_directories().unwrap();
+        let preserved = [
+            "server/box.key",
+            "server/box.pub",
+            "devices/device/seq-window",
+            "devices/tokens/token",
+            "enrollments/code.json",
+            "config.json",
+            "cache/keep",
+        ];
+        let removed = [
+            "vaults/v/current",
+            "vaults/v/roots/root.bin",
+            "index/ab/cd",
+            "content/ab/cd",
+            "content/manifests/ab/cd",
+            "content/chunks/ab/cd",
+            "objects-v1/segments/0000000000000001.pack",
+            "objects-v1/segments/0000000000000001.idx",
+            "storage-writer/loose-groups-v1.log",
+            "crdt/v/note.log",
+        ];
+        for path in preserved.iter().chain(removed.iter()) {
+            let path = dir.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"fixture").unwrap();
+        }
+        layout.clear_vault_data().unwrap();
+        layout.clear_vault_data().unwrap();
+        for path in preserved {
+            assert_eq!(
+                std::fs::read(dir.path().join(path)).unwrap(),
+                b"fixture",
+                "{path}"
+            );
+        }
+        for path in removed {
+            assert!(!dir.path().join(path).exists(), "{path} survived cleanup");
+        }
+        assert!(layout.object_segments_dir().is_dir());
+    }
+
+    #[test]
+    fn offline_cleanup_validates_every_target_before_deleting() {
+        let dir = tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        layout.init_directories().unwrap();
+        let root = layout.vault_current_path("v");
+        std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+        std::fs::write(&root, b"keep").unwrap();
+        std::fs::write(dir.path().join("crdt"), b"unexpected file").unwrap();
+        assert_eq!(
+            layout.clear_vault_data().unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(std::fs::read(root).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn offline_cleanup_rejects_symlinked_storage() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("keep"), b"outside").unwrap();
+        let layout = StorageLayout::new(dir.path());
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("content")).unwrap();
+        assert_eq!(
+            layout.clear_vault_data().unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            std::fs::read(outside.path().join("keep")).unwrap(),
+            b"outside"
+        );
     }
 
     #[test]
