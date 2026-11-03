@@ -11,9 +11,7 @@ const fixture = (): RootStreamSettings => ({
 function effective(value: string): string {
     // Explicit fixture model of the existing constructor, not a new production
     // URL policy. Tests below check the edge cases independently as well.
-    let url = value.replace(/\/$/, "");
-    if (url.startsWith("https://")) url = "http://" + url.slice(8);
-    return url;
+    return value.replace(/\/$/, "");
 }
 function capture(settings = fixture(), owner: object = {}) {
     return captureRootStreamScope(settings, owner, effective(settings.serverUrl));
@@ -88,7 +86,7 @@ async function canonicalEndpointPreservesDispatchSemantics() {
     for (const equivalent of [
         ["http://SYNC.invalid:80", "http://sync.invalid/"],
         ["http://SYNC.invalid:80/base/", "http://sync.invalid/base"],
-        ["https://sync.invalid:27182/", "http://sync.invalid:27182"],
+        ["https://sync.invalid:27182/", "HTTPS://sync.invalid:27182"],
         ["HTTP://SYNC.invalid/base", "http://sync.invalid/base/"],
         ["http://sync.invalid/a/../base", "http://sync.invalid/base"],
         ["http://[0:0:0:0:0:0:0:1]:80", "http://[::1]/"],
@@ -101,7 +99,7 @@ async function canonicalEndpointPreservesDispatchSemantics() {
     for (const different of [
         ["http://sync.invalid/", "http://sync.invalid//"],
         ["http://sync.invalid/base/", "http://sync.invalid/base//"],
-        ["https://sync.invalid/", "HTTPS://sync.invalid/"],
+        ["https://sync.invalid/", "http://sync.invalid/"],
         ["https://sync.invalid:443", "http://sync.invalid:80"],
         ["http://sync.invalid/base", "http://sync.invalid/Base"],
         ["http://sync.invalid/a%2Fb", "http://sync.invalid/a/b"],

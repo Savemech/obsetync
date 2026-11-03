@@ -129,6 +129,13 @@ Docker, Nix, and Nix-built Docker images are independent routes to the same func
 
 ## Run the server
 
+The native listeners use HTTP. An HTTPS reverse proxy is also supported: keep
+the HTTPS URL in plugin settings and route both sync and admin paths, or set a
+separate Enrollment admin URL. Only the native HTTP default sync port 27182 is
+automatically mapped to admin port 27183. Existing enrolled settings from older
+plugins retain their previously used HTTP endpoint once on upgrade; selecting
+HTTPS afterward is preserved across reloads.
+
 State lives on the host at `./data/`; `./data/server/` contains the server identity and short-lived connection tickets. Stop the server before taking a filesystem backup of the complete data directory. The production Compose service uses a bind mount.
 
 On Unix, `init` and server startup set `server/`, `server/ws-tickets/`, `devices/`, `devices/tokens/` and `enrollments/` to owner-only access (0700), including existing installations. Run the server as the owner of these directories and preserve that ownership when restoring a backup. Symlinked credential directories are rejected before startup; keys and registrations are preserved. Windows directory access remains controlled by host ACLs.
@@ -241,6 +248,7 @@ On **iOS**, the same flow works via the Files app:
    - **Server URL** — `http://your-server:27182` (the direct sync port speaks HTTP; the AEAD envelope encrypts its payload)
    - **Vault ID** — a simple ASCII ID such as `personal-notes`; use the same ID on every device that syncs the vault
    - **Enrollment code** — paste it from the admin UI
+   - **Enrollment admin URL** — optional separate admin address for custom ports or proxy routing
 3. Hit **Enroll**. First device bulk-pushes its vault; every later device does a first-sync pull (downloads the vault from the server) — progress shown in the status bar + notices.
 
 Repeat on each desktop + phone + tablet you want in the sync.

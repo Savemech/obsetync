@@ -161,7 +161,7 @@ async function fixtureYieldWork({ signal } = {}) {
     fixtureThrowIfWorkAborted(signal);
 }
 
-function fixture({ workers = false, mobile = false, legacyState = "none", enrolled = false } = {}) {
+function fixture({ workers = false, mobile = false, legacyState = "none", enrolled = false, storedSettings } = {}) {
     const events = [], gates = new Map(), waiters = [], engines = [], pools = [], browserPools = [], trees = [], saves = [];
     const conflictModals = [];
     const intervals = new Set(); let intervalSequence = 0;
@@ -210,7 +210,7 @@ function fixture({ workers = false, mobile = false, legacyState = "none", enroll
             message ?? `${first} must precede ${second}`);
     }
     const settings = {
-        enrolled, serverUrl: "http://synthetic.invalid", vaultId: "synthetic",
+        enrolled, serverUrl: "http://synthetic.invalid", serverUrlPolicy: 1, adminUrl: "", vaultId: "synthetic",
         deviceName: "fixture", deviceId: "fixture-device", serverBoxPub: "fixture-key",
         bearerToken: "fixture-token", wireVersion: "0x02", esPub: "fixture-ephemeral",
         esPubValidUntil: 0, lastOutgoingSeq: 0, ignorePatterns: [], resourceRecoveryHint: 0,
@@ -236,7 +236,7 @@ function fixture({ workers = false, mobile = false, legacyState = "none", enroll
         }
         async loadData() {
             await step(`plugin${this.fixtureId}:loadData`);
-            return structuredClone(settings);
+            return structuredClone(storedSettings ?? settings);
         }
         async saveData(value) {
             const id = saves.length + 1;
@@ -419,6 +419,12 @@ function fixture({ workers = false, mobile = false, legacyState = "none", enroll
         async negotiateTreeVersion() {
             await step(`api${this.id}:negotiate`);
             return { currentVersion: 1, activation: "active", readyDevices: 1, enrolledDevices: 1 };
+        }
+        async claimEnrollment() {
+            await step(`api${this.id}:enroll`);
+            if (state.enrollmentFailure) throw new Error("Invalid enrollment response");
+            return { device_id: "new-device", bearer_token: "new-token", server_box_pub: "new-pin",
+                wire_version: "0x02", Es_pub_initial: "new-ephemeral", Es_pub_valid_until: 123 };
         }
         async getHistory() {
             await step(`api${this.id}:history`);
@@ -609,6 +615,39 @@ function fixture({ workers = false, mobile = false, legacyState = "none", enroll
 
 const tests = [];
 function test(name, run) { tests.push({ name, run }); }
+
+test("URL upgrade preserves old enrolled dispatch and then honors explicit HTTPS", async () => {
+    for (const enrolled of [false, true]) {
+        const raw = { serverUrl: "https://fixture.invalid:27182", enrolled };
+        const f = fixture({ storedSettings: raw }), plugin = f.newPlugin();
+        await plugin.loadSettings();
+        equal(plugin.settings.serverUrl, enrolled ? "http://fixture.invalid:27182" : raw.serverUrl,
+            "Legacy enrollment keeps its actual endpoint; unenrolled setup keeps the chosen URL");
+        equal(plugin.settings.serverUrlPolicy, 1, "Upgrade persists the explicit URL policy");
+        plugin.settings.serverUrl = raw.serverUrl;
+        await plugin.saveSettings();
+        const next = fixture({ storedSettings: f.saves.at(-1) }), reloaded = next.newPlugin();
+        await reloaded.loadSettings();
+        equal(reloaded.settings.serverUrl, raw.serverUrl, "Explicit HTTPS was downgraded on reload");
+    }
+});
+
+test("failed or stale enrollment never replaces the existing credentials", async () => {
+    for (const changed of ["serverUrl", "adminUrl", "invalid-response"]) {
+        const f = fixture(), plugin = await f.loaded();
+        const before = { ...plugin.settings }, gate = f.block("api1:enroll");
+        const pending = observe(plugin.enroll("ABCD-1234"));
+        await f.waitFor("api1:enroll");
+        if (changed === "invalid-response") f.state.enrollmentFailure = true;
+        else plugin.settings[changed] = "https://new.invalid";
+        gate.resolve();
+        await assert.rejects(pending.promise, /enrollment/i);
+        for (const key of ["deviceId", "bearerToken", "serverBoxPub", "wireVersion", "esPub", "lastOutgoingSeq", "enrolled"])
+            equal(plugin.settings[key], before[key], `Failed enrollment changed ${key}`);
+        equal(f.saves.length, 0, "Failed enrollment published settings");
+        await f.unload(plugin);
+    }
+});
 
 test("startup waits 30 seconds; manual sync, pause and unload cancel its only timer", async () => {
     for (const action of ["timer", "manual", "pause", "unload"]) {

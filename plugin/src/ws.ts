@@ -175,8 +175,8 @@ export class ObsetyncWsChannel {
 
     private wsUrl(): string {
         const base = this.api.baseUrl
-            .replace(/^https:/, "wss:")
-            .replace(/^http:/, "ws:")
+            .replace(/^https:/i, "wss:")
+            .replace(/^http:/i, "ws:")
             .replace(/\/+$/, "");
         return `${base}/api/v1/ws`;
     }

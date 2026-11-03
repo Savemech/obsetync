@@ -1445,8 +1445,8 @@ export class ObsetyncWsDataLane {
 
     private wsUrl(): string {
         const base = this.options.baseUrl
-            .replace(/^https:/, "wss:")
-            .replace(/^http:/, "ws:")
+            .replace(/^https:/i, "wss:")
+            .replace(/^http:/i, "ws:")
             .replace(/\/+$/, "");
         return `${base}/api/v1/ws-data`;
     }

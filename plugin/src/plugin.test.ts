@@ -122,3 +122,4 @@ import "./ws-data.test";
 import "./ws-resume.test";
 import "./tree-negotiation.test";
 import "./tree-format.test";
+import "./api-enrollment.test";

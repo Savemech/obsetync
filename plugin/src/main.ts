@@ -1484,10 +1484,11 @@ export default class ObsetyncPlugin extends Plugin {
     }
 
     async loadSettings(): Promise<void> {
+        const stored = await this.loadData();
         this.settings = Object.assign(
             {},
             DEFAULT_SETTINGS,
-            await this.loadData()
+            stored
         );
         this.lastSavedSettings = cloneSyncSettings(this.settings);
         let settingsChanged = false;
@@ -1504,17 +1505,14 @@ export default class ObsetyncPlugin extends Plugin {
             console.log("[obsetync] added the atomic-save temp suffix to default ignores");
         }
 
-        // Migration 1.0.x → 1.1.x: server is plain HTTP now (the AEAD
-        // envelope is the trust boundary). Persist the rewrite so the
-        // settings UI reflects reality instead of showing a stale https URL.
-        if (this.settings.serverUrl.startsWith("https://")) {
-            this.settings.serverUrl =
-                "http://" + this.settings.serverUrl.slice("https://".length);
+        // Preserve the endpoint that old APIs actually used, including its
+        // durable root-intent scope. Subsequent user choices retain HTTPS.
+        if (stored && stored.serverUrlPolicy === undefined) {
+            if (this.settings.enrolled && this.settings.serverUrl.startsWith("https://")) {
+                this.settings.serverUrl = "http://" + this.settings.serverUrl.slice("https://".length);
+                console.warn("[obsetync] preserved the legacy HTTP endpoint; HTTPS can now be selected explicitly");
+            }
             settingsChanged = true;
-            console.warn(
-                "[obsetync] migrated server URL from https:// to http:// " +
-                "(transport is plaintext HTTP + AEAD envelope)"
-            );
         }
         this.settingsMigrationPending = settingsChanged;
     }
@@ -1548,19 +1546,20 @@ export default class ObsetyncPlugin extends Plugin {
     }
 
     private async enrollOwned(code: string, assertCurrent: () => void): Promise<void> {
-        // Enrollment is over plain HTTP to the admin port. We pass empty
+        // Enrollment uses the selected admin address. We pass empty
         // strings for box_pub + bearer_token since claimEnrollment doesn't
         // need an ObsetyncSecureChannel (admin endpoint is unauthenticated).
-        const tempApi = new ObsetyncApi(this.settings.serverUrl, "", "");
-        const result = await tempApi.claimEnrollment(code);
+        const serverUrl = this.settings.serverUrl, adminUrl = this.settings.adminUrl;
+        const tempApi = new ObsetyncApi(serverUrl, "", "");
+        const result = await tempApi.claimEnrollment(code, adminUrl);
         assertCurrent();
+        if (this.settings.serverUrl !== serverUrl || this.settings.adminUrl !== adminUrl) {
+            throw new Error("Server address changed during enrollment; try again");
+        }
 
         this.settings.deviceId     = result.device_id;
         this.settings.bearerToken  = result.bearer_token;
         this.settings.serverBoxPub = result.server_box_pub;
-        if (result.wire_version !== "0x02") {
-            throw new Error(`unsupported enrollment wire version: ${result.wire_version ?? "missing"}`);
-        }
         this.settings.wireVersion = result.wire_version;
         this.settings.esPub = result.Es_pub_initial;
         this.settings.esPubValidUntil = result.Es_pub_valid_until;

@@ -42,8 +42,7 @@ function invalid(): never { throw new RootStreamScopeError("INVALID"); }
  * the difference between a base ending '/' and one not ending '/' (their
  * actual `/api/...` requests have different path separators).
  *
- * No trailing slash removal or HTTPS rewrite here: an API's effective base
- * has already undergone those transformations exactly once. */
+ * The API's effective base has already had one trailing slash removed. */
 function canonicalEffectiveEndpoint(value: string): string {
     if (typeof value !== "string" || !value.length || value.length > MAX_ENDPOINT_UNITS ||
         /[\s\x00-\x1f\x7f\\?#]/.test(value)) invalid();
@@ -60,11 +59,8 @@ function canonicalEffectiveEndpoint(value: string): string {
 
 function settingsEndpoint(value: string): string {
     if (typeof value !== "string" || value.length > MAX_ENDPOINT_UNITS) invalid();
-    // Match ObsetyncApi's constructor exactly, including case sensitivity and
-    // removing ONE slash only. Do not invent a broader HTTPS/double-slash alias.
-    let effective = value.replace(/\/$/, "");
-    if (effective.startsWith("https://")) effective = "http://" + effective.slice("https://".length);
-    return canonicalEffectiveEndpoint(effective);
+    // Match ObsetyncApi's constructor: remove ONE slash only.
+    return canonicalEffectiveEndpoint(value.replace(/\/$/, ""));
 }
 
 interface CapturedIdentity {

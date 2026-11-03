@@ -2,8 +2,8 @@
  * Secure transport — client half.
  *
  * Wraps every sync-API request in an encrypted envelope: X25519 ECDH +
- * HKDF-SHA256 + AES-256-GCM over plain HTTP. No TLS, no certs, no CA trust
- * store involvement.
+ * HKDF-SHA256 + AES-256-GCM over HTTP or an HTTPS reverse proxy. TLS is
+ * independent of this application-level envelope and its server key pin.
  *
  * X25519 is handled by `@noble/curves/ed25519` because Web Crypto's X25519
  * algorithm only landed in Chromium 133 (Feb 2025), Safari 17, iOS 17. Older

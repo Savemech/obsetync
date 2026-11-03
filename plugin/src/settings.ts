@@ -15,6 +15,9 @@ export type SyncPriority =
 
 export interface SyncSettings {
     serverUrl: string;
+    /** Internal migration marker: older APIs silently dispatched HTTPS as HTTP. */
+    serverUrlPolicy: 1;
+    adminUrl: string;
     vaultId: string;
     deviceName: string;
     syncIntervalMs: number;
@@ -52,6 +55,8 @@ export interface SyncSettings {
 
 export const DEFAULT_SETTINGS: SyncSettings = {
     serverUrl: "",
+    serverUrlPolicy: 1,
+    adminUrl: "",
     vaultId: "",
     deviceName: "",
     syncIntervalMs: 30000,
@@ -109,7 +114,7 @@ export class ObsetyncSettingTab extends PluginSettingTab {
         // Server URL.
         new Setting(containerEl)
             .setName("Server URL")
-            .setDesc("Your ObsetyNC server address (e.g., http://localhost:27182)")
+            .setDesc("Server address: http://localhost:27182 or your HTTPS reverse proxy URL.")
             .addText((text) =>
                 text
                     .setPlaceholder("http://sync.example.com:27182")
@@ -120,6 +125,15 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                         await this.plugin.saveSettings();
                     })
             );
+
+        new Setting(containerEl)
+            .setName("Enrollment admin URL")
+            .setDesc("Optional. Set this if the admin GUI has a separate address or custom port.")
+            .addText(text => text.setValue(this.plugin.settings.adminUrl).onChange(async value => {
+                this.plugin.authorizeSettingsMutation();
+                this.plugin.settings.adminUrl = value;
+                await this.plugin.saveSettings();
+            }));
 
         // Vault ID.
         new Setting(containerEl)

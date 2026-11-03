@@ -435,9 +435,9 @@ async function withTransportSampleVisibility<T>(
  * HTTP client for the ObsetyNC sync server.
  *
  * Transport uses the AEAD envelope defined in `secure.ts`:
- *   X25519 ECDH + HKDF-SHA256 + AES-256-GCM over plain HTTP. No TLS, no certs,
- *   no CA trust store involvement — the server's X25519 public key, learned
- *   at enrollment, is the only pinning.
+ *   X25519 ECDH + HKDF-SHA256 + AES-256-GCM. Direct listeners use HTTP;
+ *   HTTPS reverse proxies additionally use the host's TLS certificate checks.
+ *   The server's X25519 public key is pinned at enrollment.
  *
  * Identical code path on desktop (Electron) and mobile (iOS WKWebView) via
  * Obsidian's `requestUrl`. One allowlist, one transport, one bug surface.
@@ -480,19 +480,7 @@ export class ObsetyncApi {
             snapshot?(): { capacityBytes: number };
         },
     ) {
-        // The sync port speaks plain HTTP — the AEAD envelope is the trust
-        // boundary. Fold legacy https:// URLs down to http:// transparently
-        // so users migrating from 1.0.x don't trip ERR_SSL_PROTOCOL_ERROR
-        // after the server drops its cert stack.
-        let u = serverUrl.replace(/\/$/, "");
-        if (u.startsWith("https://")) {
-            u = "http://" + u.slice("https://".length);
-            console.warn(
-                "[obsetync] rewrote legacy https:// server URL to http:// " +
-                "(transport is plaintext HTTP + AEAD envelope)"
-            );
-        }
-        this.serverUrl = u;
+        this.serverUrl = serverUrl.replace(/\/$/, "");
         this.sequences = new DurableSequenceAllocator({
             readReservedThrough: () =>
                 this.requireTransportPersistence().get().lastOutgoingSeq,
@@ -502,7 +490,7 @@ export class ObsetyncApi {
         });
     }
 
-    /** Normalized server base URL — the WS channel derives ws:// from it. */
+    /** Server base URL — WebSocket channels derive ws:// or wss:// from it. */
     get baseUrl(): string {
         return this.serverUrl;
     }
@@ -1909,7 +1897,7 @@ export class ObsetyncApi {
             return {
                 serverUrl: this.serverUrl,
                 ok: res.status >= 200 && res.status < 300,
-                transport: "http + AEAD envelope",
+                transport: this.serverUrl.toLowerCase().startsWith("https:") ? "https + AEAD envelope" : "http + AEAD envelope",
             };
         } catch (e: any) {
             return { serverUrl: this.serverUrl, ok: false, transport: `error: ${e?.message ?? e}` };
@@ -1918,21 +1906,38 @@ export class ObsetyncApi {
 
     // --- Enrollment ---
 
-    async claimEnrollment(code: string): Promise<EnrollmentBundle> {
-        // Admin port is plain HTTP (enrollment UX). User runs it behind
-        // whatever trust boundary they want (localhost, VPN, SSH tunnel).
-        const adminUrl = this.serverUrl
-            .replace(/^https:/, "http:")
-            .replace(/:\d+$/, ":27183");
+    async claimEnrollment(code: string, adminServerUrl = ""): Promise<EnrollmentBundle> {
+        if (!/^[A-Z]{4}-[0-9]{4}$/.test(code)) throw new Error("Invalid enrollment code");
+        const base = adminServerUrl ? adminServerUrl.replace(/\/$/, "") : this.serverUrl;
+        let url: URL;
+        try {
+            if (!/^https?:\/\//i.test(base) || base.length > 8192 || /[\s\x00-\x1f\x7f\\?#]/.test(base)) throw new Error();
+            url = new URL(`${base}/admin/enrollment/${code}`);
+            if (!/^https?:$/.test(url.protocol) || url.username || url.password ||
+                /^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/]*@/.test(base)) throw new Error();
+            // Only the native default port pair is inferable. Proxies retain
+            // their origin/path; custom native listeners use an explicit URL.
+            if (!adminServerUrl && url.protocol === "http:" && url.port === "27182") url.port = "27183";
+        } catch { throw new Error("Invalid enrollment server address"); }
         const res = await requestUrl({
-            url: `${adminUrl}/admin/enrollment/${code}`,
+            url: url.href,
             throw: false,
         });
-        const body = res.json;
         if (res.status < 200 || res.status >= 300) {
-            throw new Error(`enrollment failed: ${body?.error ?? res.status}`);
+            throw new Error(`enrollment failed: HTTP ${res.status}`);
         }
-        return body;
+        try {
+            const body = res.json;
+            if (!body || typeof body !== "object" || Array.isArray(body) || body.wire_version !== "0x02") throw new Error();
+            validateRootScopeId(body.device_id);
+            const key = (value: unknown) => typeof value === "string" && /^[A-Za-z0-9+/]{43}=$/.test(value) &&
+                atob(value).length === 32 && btoa(atob(value)) === value;
+            if (typeof body.device_name !== "string" || typeof body.bearer_token !== "string" ||
+                !/^[0-9a-fA-F]{64}$/.test(body.bearer_token) || !key(body.server_box_pub) || !key(body.Es_pub_initial) ||
+                !Number.isSafeInteger(body.Es_pub_valid_until) || body.Es_pub_valid_until < 0 ||
+                typeof body.eph_endpoint !== "string") throw new Error();
+            return body;
+        } catch { throw new Error("Invalid enrollment response (expected transport wire 0x02 credentials)"); }
     }
 
     // --- Internal: encrypted request/response ---

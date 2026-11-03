@@ -163,9 +163,10 @@ pending	plugin/scripts/test-wasm-memory.mjs	tooling	Not reviewed
 pending	plugin/src/adaptive-batches.test.ts	tests	Not reviewed
 pending	plugin/src/adaptive-batches.ts	production	Not reviewed
 pending	plugin/src/adaptive-transport-chaos.test.ts	tests	Not reviewed
+reviewed	plugin/src/api-enrollment.test.ts	tests	New actual-API regressions cover HTTPS/prefix/admin routing, valid and malformed bundles, rejected URLs/codes and no-dispatch validation; full test chain passes
 pending	plugin/src/api-memory.test.ts	tests	Not reviewed
 pending	plugin/src/api-root-outcome.test.ts	tests	Not reviewed
-read	plugin/src/api.ts	production	Constructor/enrollment HTTPS rewrite traced into durable root-stream endpoint scope and admin bundle; default-admin-port assumption recorded; full transport/queue/lifetime audit remains
+read	plugin/src/api.ts	production	HTTPS retained; enrollment URL/code/bundle validated with default/proxy/explicit-admin routes; native HTTPS proxy enroll and sealed negotiation pass; full transport/queue/lifetime audit remains
 pending	plugin/src/binary.ts	production	Not reviewed
 pending	plugin/src/bounded-append.test.ts	tests	Not reviewed
 pending	plugin/src/bounded-append.ts	production	Not reviewed
@@ -262,7 +263,7 @@ pending	plugin/src/legacy-source.test.ts	tests	Not reviewed
 pending	plugin/src/legacy-source.ts	production	Not reviewed
 pending	plugin/src/local-event-guards.ts	production	Not reviewed
 read	plugin/src/local-events.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
-read	plugin/src/main.ts	production	Enrollment owner/settings-save flow traced; credential mutation precedes wire-version validation; full activation/lifetime/settings audit remains
+read	plugin/src/main.ts	production	One-time legacy endpoint migration preserves existing scope; enrollment validates before credential changes and rejects changed addresses; bundled-main regressions pass; full activation/lifetime/settings audit remains
 reviewed	plugin/src/max-latency-coalescer.test.ts	tests	Read quiet/max-latency, failure and closure coverage; npm test passes
 reviewed	plugin/src/max-latency-coalescer.ts	production	Read timer, rerun, flush and close paths with production sync.ts callers and dedicated tests; npm test passes
 pending	plugin/src/mobile-ranged-source.ts	production	Not reviewed
@@ -333,8 +334,8 @@ read	plugin/src/root-reviewed-queue.test.ts	tests	Removed obsolete debounce mock
 pending	plugin/src/root-reviewed-queue.ts	production	Not reviewed
 pending	plugin/src/root-settlement.test.ts	tests	Not reviewed
 pending	plugin/src/root-settlement.ts	production	Not reviewed
-pending	plugin/src/root-stream-scope.test.ts	tests	Not reviewed
-read	plugin/src/root-stream-scope.ts	production	Read complete endpoint canonicalization, scope fingerprint and settings/owner fences; HTTPS rewrite mirrors API constructor; durable intent/recovery migration must be reviewed before change
+reviewed	plugin/src/root-stream-scope.test.ts	tests	Full six ownership/endpoint/bounds/secret-free suites read and run; stable legacy HTTP digest retained; HTTP and HTTPS partition scope, case aliases remain equivalent
+reviewed	plugin/src/root-stream-scope.ts	production	Read full canonicalization/fingerprint/fences and main callers; explicit HTTPS policy matches API; one-time enrolled-settings migration retains old HTTP scope and existing intents fail closed on genuine scope change
 pending	plugin/src/root-sync-runtime.test.ts	tests	Not reviewed
 pending	plugin/src/root-sync-runtime.ts	production	Not reviewed
 pending	plugin/src/root-tree-repair-job.test.ts	tests	Not reviewed
@@ -355,7 +356,7 @@ pending	plugin/src/segmented-store.test.ts	tests	Not reviewed
 pending	plugin/src/segmented-store.ts	production	Not reviewed
 pending	plugin/src/settings-persistence.test.ts	tests	Not reviewed
 pending	plugin/src/settings-persistence.ts	production	Not reviewed
-read	plugin/src/settings.ts	production	Fixed HTTPS placeholder to match actual direct HTTP port; tsc passes; remaining settings/persistence handlers pending
+read	plugin/src/settings.ts	production	Connection fields support explicit HTTPS and optional admin URL; internal URL migration marker persists with snapshots; type/full plugin tests pass; remaining settings/persistence handlers pending
 pending	plugin/src/startup-activation.test.ts	tests	Not reviewed
 pending	plugin/src/startup-activation.ts	production	Not reviewed
 read	plugin/src/startup-replay.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending

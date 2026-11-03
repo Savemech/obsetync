@@ -6,7 +6,9 @@ a v1 server must re-enroll. The capability-negotiated bulk HTTP and WS data
 extensions are additive in 1.11.1 and do not change enrollment identity or the
 stable HTTP outer wire.
 
-The sync port uses plain HTTP as a carrier. Request and response bodies are
+The native sync port uses plain HTTP as a carrier; clients can also use HTTPS
+through a reverse proxy with normal host certificate verification. Explicit
+HTTPS URLs are retained for API, enrollment and WebSocket connections. Request and response bodies are
 protected with X25519, HKDF-SHA256, and AES-256-GCM. The public `/health`
 route and the separate admin/enrollment port are outside this envelope.
 Enrollment therefore has to happen over a trusted local network, VPN, or SSH
