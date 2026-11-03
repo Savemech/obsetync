@@ -11,6 +11,7 @@
 use crate::storage::StorageLayout;
 use rand::Rng;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -25,8 +26,8 @@ pub struct WsTicket {
     /// v2 sealed-frame session keys (hex), derived at mint time from
     /// X25519(server_eph, client_eph) — present only when the client sent
     /// its ephemeral pubkey. Empty = ticket is only valid for a legacy v1
-    /// (plaintext, root-frames-only) session. The file lives ≤ 10 minutes
-    /// inside the data dir that already holds the server's long-term key.
+    /// (plaintext, root-frames-only) session. Tickets expire after 10 minutes;
+    /// abandoned files are swept when new tickets are minted.
     #[serde(default)]
     pub c2s_key_hex: String,
     #[serde(default)]
@@ -108,7 +109,13 @@ pub fn mint(
     fs::create_dir_all(&dir)?;
     let path = ticket_path(layout, &ticket).expect("hex ticket is always a valid path");
     let encoded = Zeroizing::new(serde_json::to_string(&info)?);
-    fs::write(&path, encoded.as_bytes())?;
+    let mut staged = tempfile::Builder::new()
+        .prefix(".mint-")
+        .tempfile_in(&dir)?;
+    staged.write_all(encoded.as_bytes())?;
+    staged
+        .persist_noclobber(&path)
+        .map_err(|error| error.error)?;
 
     // Opportunistic sweep so abandoned tickets don't accumulate forever.
     sweep_expired(layout);
@@ -130,6 +137,9 @@ pub fn claim(layout: &StorageLayout, ticket: &str) -> Option<WsTicket> {
     fs::rename(&path, &claimed_path).ok()?;
     let data = fs::read_to_string(&claimed_path).map(Zeroizing::new);
     let _ = fs::remove_file(&claimed_path);
+    // A successful handshake must not leave a replayable ticket after power loss.
+    #[cfg(unix)]
+    fs::File::open(tickets_dir(layout)).ok()?.sync_all().ok()?;
     let data = data.ok()?;
     let info: WsTicket = serde_json::from_str(&data).ok()?;
     if now_ms() > info.expires_at {
@@ -144,6 +154,32 @@ fn sweep_expired(layout: &StorageLayout) {
         return;
     };
     for entry in entries.filter_map(|e| e.ok()) {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with(".mint-") {
+            let age = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok());
+            if age.is_some_and(|age| age.as_millis() >= u128::from(TICKET_TTL_MS)) {
+                let _ = fs::remove_file(entry.path());
+            }
+            continue;
+        }
+        let ticket = match name.split_once(".claim-") {
+            Some((ticket, nonce))
+                if nonce.len() == 16 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+            {
+                ticket
+            }
+            None => name,
+            _ => continue,
+        };
+        // Only published tickets and abandoned claims belong to the sweeper.
+        if ticket_path(layout, ticket).is_none() {
+            continue;
+        }
         let Ok(data) = fs::read_to_string(entry.path()).map(Zeroizing::new) else {
             continue;
         };
@@ -200,6 +236,18 @@ mod tests {
         let client_pub = x25519_dalek::PublicKey::from(&client_secret);
 
         let m = mint(&layout, "device-v2", Some(*client_pub.as_bytes())).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(ticket_path(&layout, &m.ticket.ticket).unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
         let server_pub_b64 = m.server_eph_pub_b64.expect("v2 mint returns server pub");
 
         // Client derives with ITS secret + server's pub — must match stored keys.
@@ -237,6 +285,68 @@ mod tests {
             .filter(|won| *won)
             .count();
         assert_eq!(winners, 1);
+    }
+
+    #[test]
+    fn parallel_mints_are_all_claimable() {
+        let (_d, layout) = fresh_layout();
+        let barrier = std::sync::Barrier::new(16);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..16)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        (0..16)
+                            .map(|_| {
+                                let minted = mint(&layout, &"d".repeat(32), None).unwrap();
+                                claim(&layout, &minted.ticket.ticket).is_some()
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            let successes: Vec<_> = workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect();
+            assert!(
+                successes.iter().all(|ok| *ok),
+                "a fresh ticket was swept during publication"
+            );
+        });
+    }
+
+    #[test]
+    fn sweep_preserves_unpublished_files_and_cleans_abandoned_claims() {
+        use std::io::Write;
+        let (_d, layout) = fresh_layout();
+        let mut ticket = mint(&layout, "abandoned", None).unwrap().ticket;
+        let path = ticket_path(&layout, &ticket.ticket).unwrap();
+        let claimed = path.with_extension("claim-0123456789abcdef");
+        fs::rename(path, &claimed).unwrap();
+        let mut staged = tempfile::Builder::new()
+            .prefix(".mint-")
+            .tempfile_in(tickets_dir(&layout))
+            .unwrap();
+        staged.write_all(b"{").unwrap();
+        sweep_expired(&layout);
+        assert!(
+            staged.path().exists(),
+            "the sweeper must not unlink an active write"
+        );
+        assert!(claimed.exists(), "an unexpired claim may still be in use");
+        ticket.expires_at = 0;
+        fs::write(&claimed, serde_json::to_vec(&ticket).unwrap()).unwrap();
+        staged
+            .as_file()
+            .set_times(fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+            .unwrap();
+        sweep_expired(&layout);
+        assert!(!claimed.exists());
+        assert!(
+            !staged.path().exists(),
+            "abandoned publication is swept after the TTL"
+        );
     }
 
     #[test]

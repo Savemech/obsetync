@@ -61,6 +61,21 @@ async fn claimed_code_cannot_be_reclaimed() {
 }
 
 #[tokio::test]
+async fn simultaneous_claims_have_one_winner() {
+    let env = harness().await;
+    let code = env.create_enrollment_code("parallel-claim").await.unwrap();
+    let url = format!("{}/admin/enrollment/{code}", env.admin_url);
+    let (first, second) = tokio::join!(env.http.get(&url).send(), env.http.get(&url).send());
+    let first = first.unwrap().status();
+    let second = second.unwrap().status();
+    assert!(
+        (first == StatusCode::OK && second == StatusCode::BAD_REQUEST)
+            || (second == StatusCode::OK && first == StatusCode::BAD_REQUEST),
+        "exactly one request must receive credentials: {first}, {second}"
+    );
+}
+
+#[tokio::test]
 async fn revoked_device_is_forbidden() {
     let env = harness().await;
     let creds = env.enroll_device("revocation-target").await.unwrap();

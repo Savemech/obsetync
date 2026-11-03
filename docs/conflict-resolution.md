@@ -319,6 +319,7 @@ deterministic answer the server gives, locked in by the named test.
 | Bearer registered → first authenticated request                          | accepted                                  | `enrollment::enrolled_device_can_authenticate_against_sync_api`           |
 | Claim a code that was never issued                                       | 400 with JSON `{ "error": ... }`          | `enrollment::unknown_enrollment_code_is_rejected`                         |
 | Claim the same code twice                                                | second claim 400 (file deleted on first claim) | `enrollment::claimed_code_cannot_be_reclaimed`                       |
+| Claim one code concurrently                                             | exactly one 200 and one 400 | `enrollment::simultaneous_claims_have_one_winner` |
 | Revoke device, then make a request with that bearer                      | encrypted semantic 403                    | `enrollment::revoked_device_is_forbidden`                                 |
 | Enrollment older than 10 minutes                                         | 400 "enrollment code expired", file purged | unit-tested in `crates/sync-server/src/enrollment.rs::tests`             |
 

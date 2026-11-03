@@ -105,9 +105,8 @@ impl E2eEnv {
         }
     }
 
-    /// Create an enrollment via the admin form, then claim the code.
-    /// Returns full credentials including the server's pinned X25519 pubkey.
-    pub async fn enroll_device(&self, device_name: &str) -> Result<DeviceCreds> {
+    /// Create an unclaimed code through the same form used by the operator.
+    pub async fn create_enrollment_code(&self, device_name: &str) -> Result<String> {
         // 1. POST /admin/devices/new (form-urlencoded) — issues a code, returns HTML
         //    embedding the code. Parse the code out.
         let form = [("device_name", device_name)];
@@ -123,8 +122,14 @@ impl E2eEnv {
         if !status.is_success() {
             bail!("admin returned {}: {}", status, html);
         }
-        let code = parse_enrollment_code(&html)
-            .context("could not find enrollment code in admin HTML response")?;
+        parse_enrollment_code(&html)
+            .context("could not find enrollment code in admin HTML response")
+    }
+
+    /// Create an enrollment via the admin form, then claim the code.
+    /// Returns full credentials including the server's pinned X25519 pubkey.
+    pub async fn enroll_device(&self, device_name: &str) -> Result<DeviceCreds> {
+        let code = self.create_enrollment_code(device_name).await?;
 
         // 2. GET /admin/enrollment/{code} — claims it. Returns JSON bundle.
         let resp = self

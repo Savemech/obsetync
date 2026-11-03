@@ -30,10 +30,10 @@ pending	benchmarks/baseline-1.10.2/W7-smoke.json	historical evidence	Not reviewe
 pending	benchmarks/baseline-1.10.2/W8-smoke.json	historical evidence	Not reviewed
 pending	benchmarks/baseline-1.10.2/client-instrumentation-overhead.json	historical evidence	Not reviewed
 reviewed	crates/e2e-tests/Cargo.toml	configuration/schema	All network test files explicitly require e2e; verified the declared targets exhaust tests/*.rs; corrected workspace-default comment
-read	crates/e2e-tests/src/lib.rs	production	Read environment/enrollment/wire and snapshot helpers while tracing realtime tests; native harness used isolated loopback endpoints; complete harness audit remains
+read	crates/e2e-tests/src/lib.rs	production	Environment/enrollment/wire and snapshot helpers traced; shared unclaimed-code creator now drives concurrent-claim E2E; code-parser boundary/name-matching defect recorded; complete harness audit remains
 pending	crates/e2e-tests/tests/concurrency.rs	tests	Not reviewed
 pending	crates/e2e-tests/tests/conflicts.rs	tests	Not reviewed
-pending	crates/e2e-tests/tests/enrollment.rs	tests	Not reviewed
+reviewed	crates/e2e-tests/tests/enrollment.rs	tests	All six scenarios read and passed against isolated native server; concurrent claim gets exactly one 200 and one 400; registration/auth/revocation and reused-code paths verified
 pending	crates/e2e-tests/tests/history_export.rs	tests	Not reviewed
 reviewed	crates/e2e-tests/tests/realtime_ws.rs	tests	All six scenarios read and passed against isolated fixed binary; reconnect regression failed against previous binary; CRDT assertions correctly labeled live readback, not crash durability
 pending	crates/e2e-tests/tests/single_device.rs	tests	Not reviewed
@@ -89,9 +89,9 @@ reviewed	crates/sync-server/src/build_identity.rs	production	Read all constants/
 pending	crates/sync-server/src/bulk.rs	production	Not reviewed
 reviewed	crates/sync-server/src/config.rs	production	All callers traced; retired unused port/password fields; explicit data-dir owns storage after restore; old JSON and moved-directory unit/native Nix startup tests pass
 read	crates/sync-server/src/crdt.rs	production	Read complete legacy log implementation and HTTP/WS/E2E callers; test-only frame splitter gated; append durability, relay-on-error, snapshot races and unbounded readback remain open
-pending	crates/sync-server/src/devices.rs	production	Not reviewed
+reviewed	crates/sync-server/src/devices.rs	production	Complete implementation/tests read; registry/admin/auth/guard callers traced; five-winner bypass race fixed and tested; metadata now uses tempfile and ancestor sync; obsolete list/touch/purge test implementations removed; credential-directory permissions remain a cross-module follow-up
 removed	crates/sync-server/src/doc_store.rs	production	Only main.rs declaration and own tests referenced the prototype; active CRDT routes use crdt.rs; ADR/roadmap updated; workspace tests pass
-read	crates/sync-server/src/enrollment.rs	production	Read complete creation/claim and tests; runtime registry/control-pool callers traced; exclusive concurrent claim and failure/crash consumption need fixing
+reviewed	crates/sync-server/src/enrollment.rs	production	Complete creation/claim/tests and runtime callers traced; concurrent duplicate claim and ignored-consumption failures reproduced then fixed; registry failure retries and real child-process interruption tested; directory-permission follow-up recorded separately
 reviewed	crates/sync-server/src/eph_rotation.rs	production	Read generation/rotation/task and tests; startup/admin/bootstrap/decrypt consumers traced; current and previous slots zeroize on replacement, OS entropy and retry handling preserved
 reviewed	crates/sync-server/src/error.rs	production	Traced every variant and conversion; removed only test-constructed Unauthorized variant and dead-code blanket; active route status mappings and tests preserved
 pending	crates/sync-server/src/guard.rs	production	Not reviewed
@@ -109,7 +109,7 @@ read	crates/sync-server/src/storage_writer.rs	production	Read start/owner/admiss
 reviewed	crates/sync-server/src/transport_memory.rs	production	Read complete non-waiting semaphore ledger, HTTP response ownership and WS data reservation sites; checked overflow/capacity/error/drop cases; ledger deliberately does not prove RSS or notification-channel coverage
 read	crates/sync-server/src/ws.rs	production	Read all handshake/seal/subscription/presence/relay/tests and plugin consumer; JoinSet aborts forwarders on early return; stale-session updates and cleanup fixed; CRDT error/durability and notification memory bounds remain
 pending	crates/sync-server/src/ws_data.rs	production	Not reviewed
-read	crates/sync-server/src/ws_ticket.rs	production	Read complete mint/claim/sweep and tests plus both WS callers; publication/sweep race and interrupted claimed-file cleanup need review
+reviewed	crates/sync-server/src/ws_ticket.rs	production	Complete mint/claim/sweep and all consumers traced; concurrent lost-ticket race reproduced then fixed; staging/claim TTL cleanup, 0600 files and v2 keys tested; realtime and data E2E pass; directory-permission follow-up recorded separately
 pending	docker-compose.e2e.yml	configuration/schema	Not reviewed
 reviewed	docker-compose.yml	configuration/schema	Read services/mounts/build args/artifact extraction/healthcheck; reconciled comments with packed storage and bind mounts; dev service actual build passes; release runtime gates remain
 pending	docs/native-root-read-concurrency-2026-09-05.json	historical evidence	Not reviewed
@@ -165,7 +165,7 @@ pending	plugin/src/adaptive-batches.ts	production	Not reviewed
 pending	plugin/src/adaptive-transport-chaos.test.ts	tests	Not reviewed
 pending	plugin/src/api-memory.test.ts	tests	Not reviewed
 pending	plugin/src/api-root-outcome.test.ts	tests	Not reviewed
-pending	plugin/src/api.ts	production	Not reviewed
+read	plugin/src/api.ts	production	Enrollment subsection traced against admin bundle; unconditional HTTPS downgrade/default-admin-port assumption recorded; full transport/queue/lifetime audit remains
 pending	plugin/src/binary.ts	production	Not reviewed
 pending	plugin/src/bounded-append.test.ts	tests	Not reviewed
 pending	plugin/src/bounded-append.ts	production	Not reviewed

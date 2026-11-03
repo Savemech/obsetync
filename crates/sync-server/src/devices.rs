@@ -229,16 +229,6 @@ impl DeviceRegistry {
         devices
     }
 
-    /// Request hot path: atomics only after the id lookup. Persistence is
-    /// coalesced by `flush_last_seen` instead of rewriting JSON per request.
-    #[cfg(test)]
-    fn touch_last_seen(&self, device_id: &str) {
-        let Some(entry) = self.entry(device_id) else {
-            return;
-        };
-        entry.last_seen.fetch_max(now_ms(), Ordering::AcqRel);
-    }
-
     pub fn session_token(&self, device_id: &str) -> Option<CancellationToken> {
         let entry = self.entry(device_id)?;
         if entry.revoked.load(Ordering::Acquire) {
@@ -586,25 +576,6 @@ pub fn lookup_token(layout: &StorageLayout, token: &str) -> Option<String> {
 
 const TOUCH_THROTTLE_MS: u64 = 30_000;
 
-/// Update last_seen for a device. Throttled to ~once per 30s per device so
-/// big pushes don't rewrite device.json hundreds of times.
-#[cfg(test)]
-pub fn touch_last_seen(layout: &StorageLayout, device_id: &str) -> Result<(), std::io::Error> {
-    let path = layout.device_dir(device_id).join("device.json");
-    let data = fs::read_to_string(&path)?;
-    let mut info: DeviceInfo = serde_json::from_str(&data)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-    let now = now_ms();
-    if now.saturating_sub(info.last_seen) < TOUCH_THROTTLE_MS {
-        return Ok(());
-    }
-
-    info.last_seen = now;
-    persist_device_info(layout, &info)?;
-    Ok(())
-}
-
 /// Mark a device revoked — subsequent requests with its bearer token are
 /// rejected. The revocation timestamp is written so a background sweep can
 /// rotate the device out completely after the TTL.
@@ -650,39 +621,6 @@ pub fn delete_device(layout: &StorageLayout, device_id: &str) -> Result<(), std:
     Ok(())
 }
 
-/// Delete revoked devices whose revocation is older than `ttl_secs`. Old empty
-/// markers (pre-timestamp) get their clock started now, so they age out over
-/// the next window instead of vanishing at once. Returns the count removed.
-#[cfg(test)]
-pub fn purge_expired_revoked(layout: &StorageLayout, ttl_secs: u64) -> usize {
-    let now = now_ms();
-    let ttl_ms = ttl_secs.saturating_mul(1000);
-    let mut removed = 0;
-    let Ok(entries) = fs::read_dir(layout.base.join("devices")) else {
-        return 0;
-    };
-    for entry in entries.filter_map(|e| e.ok()) {
-        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        if entry.file_name() == "tokens" {
-            continue;
-        }
-        let device_id = entry.file_name().to_string_lossy().to_string();
-        match revoked_at(layout, &device_id) {
-            None => {}
-            Some(0) => {
-                let _ = fs::write(entry.path().join("revoked"), now.to_string());
-            }
-            Some(ts) if now.saturating_sub(ts) >= ttl_ms => {
-                removed += delete_device(layout, &device_id).is_ok() as usize;
-            }
-            Some(_) => {}
-        }
-    }
-    removed
-}
-
 /// Grant a ONE-TIME guard bypass for this device's next push — lets an operator
 /// approve an intentional bulk change (e.g. deleting a 40k-file build tree) that
 /// the blast-radius guard would otherwise reject. Stored with an expiry so an
@@ -703,10 +641,16 @@ pub fn grant_deletion_bypass(
 /// once, even if it turns out to be expired) and returns whether it was valid.
 pub fn consume_deletion_bypass(layout: &StorageLayout, device_id: &str) -> bool {
     let p = layout.device_dir(device_id).join("guard-bypass");
-    let Ok(s) = fs::read_to_string(&p) else {
+    let claimed = p.with_extension(format!("claim-{:016x}", rand::random::<u64>()));
+    if fs::rename(&p, &claimed).is_err() {
         return false;
-    };
-    let _ = fs::remove_file(&p);
+    }
+    let value = fs::read_to_string(&claimed);
+    let _ = fs::remove_file(&claimed);
+    if sync_directory(&layout.device_dir(device_id)).is_err() {
+        return false;
+    }
+    let Ok(s) = value else { return false };
     s.trim()
         .parse::<u64>()
         .map(|exp| now_ms() < exp)
@@ -719,35 +663,6 @@ pub fn deletion_bypass_remaining_ms(layout: &StorageLayout, device_id: &str) -> 
     let s = fs::read_to_string(layout.device_dir(device_id).join("guard-bypass")).ok()?;
     let exp = s.trim().parse::<u64>().ok()?;
     exp.checked_sub(now_ms()).filter(|&r| r > 0)
-}
-
-#[cfg(test)]
-pub fn list_devices(layout: &StorageLayout) -> Result<Vec<DeviceInfo>, std::io::Error> {
-    let devices_dir = layout.base.join("devices");
-    let mut devices = Vec::new();
-
-    if !devices_dir.exists() {
-        return Ok(devices);
-    }
-
-    for entry in fs::read_dir(&devices_dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        if entry.file_name() == "tokens" {
-            continue;
-        }
-        let json_path = entry.path().join("device.json");
-        if let Ok(data) = fs::read_to_string(&json_path) {
-            if let Ok(info) = serde_json::from_str::<DeviceInfo>(&data) {
-                devices.push(info);
-            }
-        }
-    }
-
-    devices.sort_by_key(|device| std::cmp::Reverse(device.last_seen));
-    Ok(devices)
 }
 
 pub fn get_device(layout: &StorageLayout, device_id: &str) -> Option<DeviceInfo> {
@@ -993,39 +908,19 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
         .parent()
         .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "metadata path has no parent"))?;
     fs::create_dir_all(parent)?;
-    let nonce = rand::random::<u64>();
-    let temp = path.with_extension(format!("tmp-{}-{nonce:016x}", std::process::id()));
-    let result = (|| {
-        let mut file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        replace_file(&temp, path)?;
-        sync_directory(parent)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
+    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+    staged.write_all(bytes)?;
+    staged.as_file().sync_all()?;
+    staged.persist(path).map_err(|error| error.error)?;
+    // New device directories and retries after ambiguous mkdir errors need ancestors synced too.
+    for ancestor in parent.ancestors() {
+        sync_directory(if ancestor.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            ancestor
+        })?;
     }
-    result
-}
-
-#[cfg(not(windows))]
-fn replace_file(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
-    fs::rename(source, destination)
-}
-
-#[cfg(windows)]
-fn replace_file(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
-    // Rust's Windows rename cannot replace an existing file. This fallback
-    // preserves write-before-publish ordering, though NTFS replacement is not
-    // atomic across the short remove/rename gap.
-    if destination.exists() {
-        fs::remove_file(destination)?;
-    }
-    fs::rename(source, destination)
+    Ok(())
 }
 
 fn sync_directory(path: &Path) -> Result<(), std::io::Error> {
@@ -1079,6 +974,19 @@ mod tests {
             lookup_token(&layout, &token_64()),
             Some("dev-id-1".to_string())
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [
+                layout.device_dir("dev-id-1").join("device.json"),
+                layout.token_path(&token_64()),
+            ] {
+                assert_eq!(
+                    fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
     }
 
     #[test]
@@ -1144,7 +1052,8 @@ mod tests {
         )
         .unwrap();
 
-        let removed = purge_expired_revoked(&layout, 30 * 86_400);
+        let registry = DeviceRegistry::load(layout.clone()).unwrap();
+        let removed = registry.purge_expired_revoked(30 * 86_400).unwrap();
         assert_eq!(removed, 1);
         assert!(get_device(&layout, "fresh").is_some()); // within TTL — kept
         assert!(get_device(&layout, "stale").is_none()); // expired — gone
@@ -1158,7 +1067,8 @@ mod tests {
         fs::write(layout.device_dir("old").join("revoked"), "").unwrap();
         assert_eq!(revoked_at(&layout, "old"), Some(0));
 
-        let removed = purge_expired_revoked(&layout, 30 * 86_400);
+        let registry = DeviceRegistry::load(layout.clone()).unwrap();
+        let removed = registry.purge_expired_revoked(30 * 86_400).unwrap();
         assert_eq!(removed, 0); // not deleted — clock only just started
         assert!(revoked_at(&layout, "old").unwrap() > 0); // now stamped
     }
@@ -1189,6 +1099,35 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_deletion_bypass_consumers_have_one_winner() {
+        let (_d, layout) = fresh_layout();
+        register_device(&layout, "dev", "Desktop", &token_64()).unwrap();
+        for _ in 0..8 {
+            grant_deletion_bypass(&layout, "dev", 900).unwrap();
+            let barrier = std::sync::Barrier::new(16);
+            let winners = std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..16)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            consume_deletion_bypass(&layout, "dev")
+                        })
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().unwrap())
+                    .filter(|won| *won)
+                    .count()
+            });
+            assert_eq!(
+                winners, 1,
+                "one admin approval must authorize at most one push"
+            );
+        }
+    }
+
+    #[test]
     fn get_device_missing_returns_none() {
         let (_d, layout) = fresh_layout();
         assert!(get_device(&layout, "nope").is_none());
@@ -1209,7 +1148,7 @@ mod tests {
         info.last_seen = 0;
         fs::write(&old_path, serde_json::to_string_pretty(&info).unwrap()).unwrap();
 
-        let list = list_devices(&layout).unwrap();
+        let list = DeviceRegistry::load(layout).unwrap().list();
         let ids: Vec<_> = list.iter().map(|d| d.device_id.as_str()).collect();
         assert_eq!(ids, vec!["new-dev", "old-dev"]);
     }
@@ -1218,43 +1157,8 @@ mod tests {
     fn list_devices_returns_empty_when_no_devices_dir() {
         let dir = tempdir().unwrap();
         let layout = StorageLayout::new(dir.path()); // no init_directories
-        let list = list_devices(&layout).unwrap();
+        let list = DeviceRegistry::load(layout).unwrap().list();
         assert!(list.is_empty());
-    }
-
-    #[test]
-    fn touch_last_seen_throttle_skips_recent_writes() {
-        let (_d, layout) = fresh_layout();
-        register_device(&layout, "dev", "x", &token_64()).unwrap();
-
-        let path = layout.device_dir("dev").join("device.json");
-        let before: DeviceInfo = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-
-        // Right after register, last_seen is `now`. A touch within 30s is throttled
-        // and must NOT bump last_seen.
-        touch_last_seen(&layout, "dev").unwrap();
-        let after: DeviceInfo = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(before.last_seen, after.last_seen);
-    }
-
-    #[test]
-    fn touch_last_seen_updates_after_throttle_window() {
-        let (_d, layout) = fresh_layout();
-        register_device(&layout, "dev", "x", &token_64()).unwrap();
-
-        // Backdate last_seen so the throttle gate opens.
-        let path = layout.device_dir("dev").join("device.json");
-        let mut info: DeviceInfo =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        let original = info.last_seen;
-        info.last_seen = 0;
-        fs::write(&path, serde_json::to_string_pretty(&info).unwrap()).unwrap();
-
-        touch_last_seen(&layout, "dev").unwrap();
-        let updated: DeviceInfo =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(updated.last_seen > 0);
-        assert!(updated.last_seen >= original);
     }
 
     #[test]
@@ -1409,16 +1313,16 @@ mod tests {
         let registry = DeviceRegistry::load(layout.clone()).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(2));
-        registry.touch_last_seen("dev");
-        registry.touch_last_seen("dev");
-        registry.touch_last_seen("dev");
+        registry.authenticate(&token).unwrap();
+        registry.authenticate(&token).unwrap();
+        registry.authenticate(&token).unwrap();
         assert_eq!(get_device(&layout, "dev").unwrap().last_seen, 1);
         assert_eq!(registry.flush_last_seen(false).unwrap(), 1);
         let persisted = get_device(&layout, "dev").unwrap().last_seen;
         assert!(persisted > 1);
 
         std::thread::sleep(std::time::Duration::from_millis(2));
-        registry.touch_last_seen("dev");
+        registry.authenticate(&token).unwrap();
         assert_eq!(registry.flush_last_seen(false).unwrap(), 0);
         assert_eq!(registry.flush_last_seen(true).unwrap(), 1);
     }

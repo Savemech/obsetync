@@ -300,6 +300,13 @@ shape used by realtime v2:
 {"v":2,"t":"auth","ticket":"64 lowercase hex characters"}
 ```
 
+Tickets are published as complete files, then consumed by atomic rename so
+concurrent handshakes cannot spend one ticket twice. Unix servers sync the
+directory before accepting the claim, preventing a successfully spent ticket
+from reappearing after an interrupted filesystem write. Cleanup skips active
+publication files and removes abandoned ones after the ticket TTL. Tickets are
+short-lived connection credentials; clients mint another if a crash loses one.
+
 Both peers derive the existing directional WS keys with
 `obsetync/ws/v2/c2s` and `obsetync/ws/v2/s2c`. Data frames use their own AAD
 domain so a valid realtime frame cannot be replayed or misrouted into this
