@@ -129,7 +129,9 @@ Docker, Nix, and Nix-built Docker images are independent routes to the same func
 
 ## Run the server
 
-State lives on the host at `./data/`; `./data/server/` contains only the server identity. Stop the server before taking a filesystem backup of the complete data directory. The production Compose service uses a bind mount.
+State lives on the host at `./data/`; `./data/server/` contains the server identity and short-lived connection tickets. Stop the server before taking a filesystem backup of the complete data directory. The production Compose service uses a bind mount.
+
+On Unix, `init` and server startup set `server/`, `server/ws-tickets/`, `devices/`, `devices/tokens/` and `enrollments/` to owner-only access (0700), including existing installations. Run the server as the owner of these directories and preserve that ownership when restoring a backup. Symlinked credential directories are rejected before startup; keys and registrations are preserved. Windows directory access remains controlled by host ACLs.
 
 ```sh
 # First-time: create the X25519 box keypair + directory layout in ./data/.

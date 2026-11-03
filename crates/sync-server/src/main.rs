@@ -29,7 +29,7 @@ mod ws_ticket;
 
 use clap::{Parser, Subcommand};
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Parser)]
@@ -174,12 +174,12 @@ fn cmd_healthcheck(url: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn cmd_init(data_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_init(data_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let layout = storage::StorageLayout::new(data_dir);
     layout.init_directories()?;
 
     let (_priv, pub_key) = box_key::init_box_keypair(&layout)?;
-    let config = config::ServerConfig::new(data_dir.clone());
+    let config = config::ServerConfig::new(data_dir.to_path_buf());
     config.save()?;
 
     use base64::prelude::*;
@@ -198,14 +198,14 @@ fn cmd_init(data_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn cmd_show_box_pub(data_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_show_box_pub(data_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let layout = storage::StorageLayout::new(data_dir);
     let pub_b64 = box_key::load_box_pub_base64(&layout)?;
     println!("{}", pub_b64);
     Ok(())
 }
 
-fn cmd_clear_vault_data(data_dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_clear_vault_data(data_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let layout = storage::StorageLayout::new(data_dir);
     // A wrong or uninitialized data directory must fail before any deletion.
     box_key::load_box_keypair(&layout)?;
@@ -215,12 +215,13 @@ fn cmd_clear_vault_data(data_dir: &std::path::Path) -> Result<(), Box<dyn std::e
 }
 
 async fn cmd_run(
-    data_dir: &PathBuf,
+    data_dir: &Path,
     bind_address: IpAddr,
     sync_port: u16,
     admin_port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = config::ServerConfig::load(data_dir)?;
+    storage::StorageLayout::new(&config.data_dir).protect_credential_directories()?;
     let state = Arc::new(state::AppState::new(config));
     eph_rotation::spawn_rotation_task(state.eph.clone());
 

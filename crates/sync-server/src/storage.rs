@@ -24,11 +24,8 @@ impl StorageLayout {
 
     /// Create the full directory tree on first init.
     pub fn init_directories(&self) -> Result<(), std::io::Error> {
+        self.protect_credential_directories()?;
         let dirs = [
-            "server",
-            "devices",
-            "devices/tokens",
-            "enrollments",
             "vaults",
             "index",
             "content",
@@ -39,6 +36,50 @@ impl StorageLayout {
         ];
         for dir in &dirs {
             std::fs::create_dir_all(self.base.join(dir))?;
+        }
+        Ok(())
+    }
+
+    /// Credential filenames are secrets too; repair legacy modes before serving.
+    pub fn protect_credential_directories(&self) -> io::Result<()> {
+        let paths = [
+            "server",
+            "server/ws-tickets",
+            "devices",
+            "devices/tokens",
+            "enrollments",
+        ]
+        .map(|path| self.base.join(path));
+        for path in &paths {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "credential storage expects a real directory: {}",
+                            path.display()
+                        ),
+                    ))
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        for path in paths {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder.create(&path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+            }
         }
         Ok(())
     }
@@ -69,6 +110,7 @@ impl StorageLayout {
                 Err(error) => return Err(error),
             }
         }
+        self.protect_credential_directories()?;
         for path in &paths {
             match std::fs::remove_dir_all(path) {
                 Ok(()) => {}
@@ -1992,6 +2034,83 @@ mod tests {
         layout.init_directories().unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn init_hides_credential_names_and_repairs_old_directory_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        layout.init_directories().unwrap();
+        let credentials = [
+            "server",
+            "server/ws-tickets",
+            "devices",
+            "devices/tokens",
+            "enrollments",
+        ];
+        for path in credentials {
+            let path = dir.path().join(path);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let existing = dir.path().join("devices/tokens/existing-token");
+        std::fs::write(&existing, b"existing-device").unwrap();
+        std::fs::set_permissions(
+            dir.path().join("vaults"),
+            std::fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+        layout.init_directories().unwrap();
+        for path in credentials {
+            assert_eq!(
+                std::fs::metadata(dir.path().join(path))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        assert_eq!(std::fs::read(existing).unwrap(), b"existing-device");
+        assert_eq!(
+            std::fs::metadata(dir.path().join("vaults"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o750
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_rejects_credential_symlinks_before_changing_other_directories() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        std::fs::create_dir(dir.path().join("server")).unwrap();
+        std::fs::set_permissions(
+            dir.path().join("server"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        symlink(outside.path(), dir.path().join("enrollments")).unwrap();
+        assert!(layout.init_directories().is_err());
+        assert_eq!(
+            std::fs::metadata(dir.path().join("server"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert!(!dir.path().join("devices").exists());
+    }
+
     #[test]
     fn offline_cleanup_removes_all_vault_storage_and_preserves_identity() {
         let dir = tempdir().unwrap();
@@ -2057,19 +2176,25 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn offline_cleanup_rejects_symlinked_storage() {
-        let dir = tempdir().unwrap();
-        let outside = tempdir().unwrap();
-        std::fs::write(outside.path().join("keep"), b"outside").unwrap();
-        let layout = StorageLayout::new(dir.path());
-        std::os::unix::fs::symlink(outside.path(), dir.path().join("content")).unwrap();
-        assert_eq!(
-            layout.clear_vault_data().unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
-        assert_eq!(
-            std::fs::read(outside.path().join("keep")).unwrap(),
-            b"outside"
-        );
+        for target in ["content", "enrollments"] {
+            let dir = tempdir().unwrap();
+            let outside = tempdir().unwrap();
+            std::fs::write(outside.path().join("keep"), b"outside").unwrap();
+            let layout = StorageLayout::new(dir.path());
+            let root = layout.vault_current_path("v");
+            std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+            std::fs::write(&root, b"keep").unwrap();
+            std::os::unix::fs::symlink(outside.path(), dir.path().join(target)).unwrap();
+            assert_eq!(
+                layout.clear_vault_data().unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(std::fs::read(root).unwrap(), b"keep");
+            assert_eq!(
+                std::fs::read(outside.path().join("keep")).unwrap(),
+                b"outside"
+            );
+        }
     }
 
     #[test]
