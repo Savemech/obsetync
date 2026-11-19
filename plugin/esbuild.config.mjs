@@ -1,5 +1,6 @@
 import esbuild from "esbuild";
 import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
 import { stat } from "node:fs/promises";
 import { resolveBuildIdentity } from "./scripts/build-identity-config.mjs";
 
@@ -17,86 +18,46 @@ for (const name of ["sync_core_bg.wasm", "sync_core_simd_bg.wasm"]) {
     }
 }
 
-async function bundleHashWorker() {
-    const result = await esbuild.build({
-        entryPoints: ["src/hash-worker-entry.ts"],
-        bundle: true,
-        platform: "node",
-        format: "cjs",
-        target: "node18",
-        loader: { ".wasm": "binary" },
-        write: false,
-        minify: production,
-        keepNames: true,
-        sourcemap: production ? false : "inline",
-        logLevel: production ? "warning" : "silent",
-    });
-    const output = result.outputFiles.find((file) => file.path.endsWith(".js")) ??
-        result.outputFiles[0];
-    if (!output) throw new Error("hash worker bundle produced no JavaScript output");
-    return output.text;
-}
+const workerEntries = new Map([
+    ["obsetync-hash-worker-source", "src/hash-worker-entry.ts"],
+    ["obsetync-browser-probe-source", "src/browser-probe-entry.ts"],
+    ["obsetync-browser-hash-worker-source", "src/browser-hash-worker-entry.ts"],
+]);
 
-let hashWorkerSource = await bundleHashWorker();
-async function bundleBrowserProbe() {
-    const result = await esbuild.build({
-        entryPoints: ["src/browser-probe-entry.ts"],
-        bundle: true, platform: "browser", format: "iife", target: "es2020",
-        write: false, minify: production, keepNames: true,
-        logLevel: production ? "warning" : "silent",
-    });
-    const output = result.outputFiles[0];
-    if (!output) throw new Error("browser probe bundle produced no JavaScript output");
-    return output.text;
-}
-let browserProbeSource = await bundleBrowserProbe();
-async function bundleBrowserHashWorker() {
-    const result = await esbuild.build({
-        entryPoints: ["src/browser-hash-worker-entry.ts"],
-        bundle: true, platform: "browser", format: "iife", target: "es2020",
-        write: false, minify: production, keepNames: true,
-        logLevel: production ? "warning" : "silent",
-    });
-    const output = result.outputFiles[0];
-    if (!output) throw new Error("browser hash worker bundle produced no JavaScript output");
-    if (output.text.length > BROWSER_HASH_WORKER_MAX_SOURCE_CHARS) {
-        throw new Error(`browser hash worker source violates bound: ${output.text.length} chars`);
-    }
-    return output.text;
-}
-let browserHashWorkerSource = await bundleBrowserHashWorker();
 const hashWorkerSourcePlugin = {
-    name: "obsetync-hash-worker-source",
+    name: "obsetync-worker-sources",
     setup(build) {
-        build.onResolve({ filter: /^obsetync-browser-hash-worker-source$/ }, () => ({
-            path: "obsetync-browser-hash-worker-source", namespace: "obsetync-browser-hash-worker",
-        }));
-        build.onLoad({ filter: /.*/, namespace: "obsetync-browser-hash-worker" }, async () => {
-            if (!production) browserHashWorkerSource = await bundleBrowserHashWorker();
-            return { contents: browserHashWorkerSource, loader: "text", watchDirs: [sourceDir, wasmDir] };
+        build.onResolve({ filter: /^obsetync-.*-source$/ }, ({ path }) => {
+            if (workerEntries.has(path)) return { path, namespace: "embedded-worker" };
         });
-        build.onResolve({ filter: /^obsetync-browser-probe-source$/ }, () => ({
-            path: "obsetync-browser-probe-source", namespace: "obsetync-browser-probe",
-        }));
-        build.onLoad({ filter: /.*/, namespace: "obsetync-browser-probe" }, async () => {
-            if (!production) browserProbeSource = await bundleBrowserProbe();
-            return { contents: browserProbeSource, loader: "text", watchDirs: [sourceDir, wasmDir] };
+        build.onLoad({ filter: /.*/, namespace: "embedded-worker" }, async ({ path }) => {
+            const desktop = path === "obsetync-hash-worker-source";
+            const result = await esbuild.build({
+                absWorkingDir: pluginDirectory,
+                entryPoints: [workerEntries.get(path)],
+                bundle: true,
+                platform: desktop ? "node" : "browser",
+                format: desktop ? "cjs" : "iife",
+                target: desktop ? "node18" : "es2020",
+                loader: desktop ? { ".wasm": "binary" } : {},
+                sourcemap: desktop && !production ? "inline" : false,
+                minify: production,
+                keepNames: true,
+                write: false,
+                metafile: !production,
+                logLevel: production ? "warning" : "silent",
+            });
+            const contents = result.outputFiles[0]?.text;
+            if (!contents) throw new Error(`${path} produced no JavaScript output`);
+            if (path === "obsetync-browser-hash-worker-source" && contents.length > BROWSER_HASH_WORKER_MAX_SOURCE_CHARS) {
+                throw new Error(`browser hash worker source violates bound: ${contents.length} chars`);
+            }
+            return {
+                contents, loader: "text",
+                watchFiles: Object.keys(result.metafile?.inputs ?? {}).map(input => resolve(pluginDirectory, input)),
+                watchDirs: [sourceDir, wasmDir],
+            };
         });
-        build.onResolve(
-            { filter: /^obsetync-hash-worker-source$/ },
-            () => ({ path: "obsetync-hash-worker-source", namespace: "obsetync-worker" }),
-        );
-        build.onLoad(
-            { filter: /.*/, namespace: "obsetync-worker" },
-            async () => {
-                if (!production) hashWorkerSource = await bundleHashWorker();
-                return {
-                    contents: hashWorkerSource,
-                    loader: "text",
-                    watchDirs: [sourceDir, wasmDir],
-                };
-            },
-        );
     },
 };
 

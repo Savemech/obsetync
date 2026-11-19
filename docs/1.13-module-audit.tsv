@@ -117,7 +117,7 @@ pending	docs/root-drain-reviewed-counts-2026-09-05.json	historical evidence	Not 
 read	flake.nix	configuration/schema	Read package graph; verified seven-file plugin, server and dev shell (added missing wasm-pack); full flake/image release gates pending
 read	justfile	configuration/schema	Read all recipes; clean-server now stop/native-clear/start and failure stops sequence, verified using actual just with Docker recorder; ship/deploy helper audit pending
 pending	manifest.json	configuration/schema	Not reviewed
-read	plugin/esbuild.config.mjs	production	Entry-point/build inventory; behavior/callers still under review
+reviewed	plugin/esbuild.config.mjs	production	Read all build paths and checked npm/Nix/Docker entry points; production build and six browser tests pass; editing each worker entry independently updates the running dev bundle
 pending	plugin/manifest.json	configuration/schema	Not reviewed
 pending	plugin/package-lock.json	generated/lock	Not reviewed
 read	plugin/package.json	configuration/schema	Entry-point/build inventory; behavior/callers still under review
@@ -172,11 +172,11 @@ pending	plugin/src/bounded-append.test.ts	tests	Not reviewed
 pending	plugin/src/bounded-append.ts	production	Not reviewed
 pending	plugin/src/browser-capability-probe.test.ts	tests	Not reviewed
 pending	plugin/src/browser-capability-probe.ts	production	Not reviewed
-pending	plugin/src/browser-hash-worker-entry.ts	production	Not reviewed
+read	plugin/src/browser-hash-worker-entry.ts	production	Read initialization, job lifecycle, cancellation, heap and transfer paths; embedded entry rebuild and production worker fixtures pass; qualification readiness and input bounds still require review
 pending	plugin/src/browser-hash-worker-protocol.ts	production	Not reviewed
 pending	plugin/src/browser-hash-workers.test.ts	tests	Not reviewed
 reviewed	plugin/src/browser-hash-workers.ts	production	Read worker qualification, transfers, cancellation, fallback and disposal; removed write-only detached-buffer field; npm test worker ownership cases pass; real browser gate remains
-pending	plugin/src/browser-probe-entry.ts	production	Not reviewed
+read	plugin/src/browser-probe-entry.ts	production	Read single-run validation, scalar/SIMD initialization, synthetic digest and transfer-back; generated glue receives embedded bytes; browser fixture passes, physical iPad unverified
 pending	plugin/src/browser-probe-protocol.ts	production	Not reviewed
 pending	plugin/src/build-identity-contract.ts	production	Not reviewed
 pending	plugin/src/build-identity.test.ts	tests	Not reviewed
