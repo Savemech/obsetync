@@ -4404,14 +4404,14 @@ export class ObsetyncSyncEngine {
             try {
                 hash = await hashFileStreaming(
                     path, this.io, this.wasm, perf, perfWeight, signal,
-                    this.browserHash,
+                    this.browserHash, current,
                 );
             } catch (error) {
                 // A note can grow during an uncancellable adapter read. Treat
                 // this specific admission drift like the worker fingerprint
                 // drift above; never retry/classify unrelated I/O or oversize
                 // failures as absence or a successful hash.
-                if (error instanceof HashSourceGrowthError && attempt === 0) {
+                if ((error instanceof HashSourceGrowthError || error instanceof HashWorkerFileDriftError) && attempt === 0) {
                     const refreshed = await this.io.stat(path);
                     if (refreshed) {
                         current = refreshed;

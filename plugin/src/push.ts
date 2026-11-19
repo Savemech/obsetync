@@ -710,6 +710,16 @@ async function prepareRangedPushLookahead(
     }
 }
 
+async function statBeforeHashRead(io: PlatformIO, path: string, size: number, mtime: number,
+    signal?: AbortSignal) {
+    const current = await io.stat(path);
+    throwIfWorkAborted(signal);
+    if (!current || current.size !== size || Math.abs(current.mtime - mtime) > 1) {
+        throw new HashWorkerFileDriftError("hash source changed before admitted read");
+    }
+    return current;
+}
+
 /** One bounded future window, never a tail-sized promise graph. Source bytes
  * are admitted and released inside each read/hash; only missing-object hints
  * survive. The owning upload batch always resolves unknown source bytes again;
@@ -753,16 +763,20 @@ async function preparePushLookahead(
         !wasm.wasm_should_chunk(change.size));
     const settled = await Promise.allSettled(toHash.map(async change => {
         assertApplicable?.(change.path);
-        const before = await io.stat(change.path);
-        throwIfWorkAborted(signal);
-        if (!before || before.size !== change.size || Math.abs(before.mtime - change.mtime!) > 1) {
-            throw new HashWorkerFileDriftError("lookahead source changed before hashing");
-        }
+        const size = change.size!;
+        let mtime = change.mtime!;
         const hash = await withHashSource({
-            sourceBytes: before.size,
+            sourceBytes: size,
             feedBytes: tuning.maxFeedBytes,
             signal,
-            read: () => io.readFile(change.path),
+            read: async () => {
+                mtime = (await statBeforeHashRead(io, change.path, size, mtime, signal)).mtime;
+                throwIfWorkAborted(signal);
+                assertApplicable?.(change.path);
+                const data = await io.readFile(change.path);
+                if (data.byteLength < size) throw new HashWorkerFileDriftError("lookahead source shrank during read");
+                return data;
+            },
             consume: browserHash ? async data => (await hashAdmittedBytesWithBrowserWorker(
                 wasm, data, perf, signal, tuning.maxFeedBytes, browserHash,
             )).hash : data => {
@@ -775,7 +789,7 @@ async function preparePushLookahead(
         const after = await io.stat(change.path);
         throwIfWorkAborted(signal);
         assertApplicable?.(change.path);
-        if (!after || after.size !== before.size || Math.abs(after.mtime - before.mtime) > 1) {
+        if (!after || after.size !== size || Math.abs(after.mtime - mtime) > 1) {
             throw new HashWorkerFileDriftError("lookahead source changed while hashing");
         }
         return { change, hash };
@@ -3053,6 +3067,7 @@ export async function hashFileStreaming(
     perfWeight = 1,
     signal?: AbortSignal,
     browserHash?: BrowserHashWorkerRuntime | null,
+    expectedStat?: { size: number; mtime: number },
 ): Promise<string> {
     throwIfWorkAborted(signal);
     const absPath = io.getAbsolutePath(path);
@@ -3130,7 +3145,7 @@ export async function hashFileStreaming(
     }
     // Mobile / no-fs fallback: stat before admission/native allocation. The
     // adapter still cannot bound a source that grows after this stat.
-    const stat = await io.stat(path);
+    const stat = expectedStat ?? await io.stat(path);
     if (!stat) {
         const error = new Error("hash source no longer exists");
         Object.assign(error, { code: "ENOENT" });
@@ -3147,6 +3162,8 @@ export async function hashFileStreaming(
         feedBytes: reservedFeedBytes,
         signal,
         read: async () => {
+            await statBeforeHashRead(io, path, sourceStat.size, sourceStat.mtime, signal);
+            throwIfWorkAborted(signal);
             assertCurrent?.();
             const readStarted = perf ? monotonicNow() : 0;
             try {
@@ -3175,15 +3192,10 @@ export async function hashFileStreaming(
         if (!(error instanceof BrowserHashFreshReadRequired)) throw error;
         browserHash?.assertCurrent();
         throwIfWorkAborted(signal);
-        const refreshed = await io.stat(path);
-        browserHash?.assertCurrent();
-        if (!refreshed || refreshed.size !== stat.size || Math.abs(refreshed.mtime - stat.mtime) > 1) {
-            throw new HashWorkerFileDriftError("source changed before browser hash fallback reread");
-        }
         // The first withHashSource lease has settled. Re-enter without the
         // worker so a lost-but-safely-released transfer is read only under a
         // fresh admission and the same captured runtime generation fence.
-        return await attempt(refreshed, null, () => browserHash?.assertCurrent());
+        return await attempt(stat, null, () => browserHash?.assertCurrent());
     }
 }
 

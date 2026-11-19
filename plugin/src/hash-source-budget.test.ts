@@ -14,6 +14,8 @@ import {
 import { hashAdmittedBytesWithBrowserWorker, hashFileStreaming, streamingHash,
     type WasmModule } from "./push";
 import { BrowserHashWorkerError, type BrowserHashWorkerRuntime } from "./browser-hash-workers";
+import { reserveTransientWorkset, transientMemorySnapshot } from "./transient-memory";
+import { HashWorkerFileDriftError } from "./desktop-hash-workers";
 import type { PlatformIO } from "./platform";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -247,6 +249,20 @@ async function actualFallbackRejectsBeforeRead(): Promise<void> {
     const error = await rejected(hashFileStreaming("missing", missing, wasm));
     check((error as { code?: string }).code === "ENOENT" && reads === 0,
         "missing stat reached readFile instead of remaining a source error");
+
+    let size = 1;
+    const held = await reserveTransientWorkset(transientMemorySnapshot().capacityBytes);
+    const queued = rejected(hashFileStreaming("growing.bin", {
+        ...io, stat: async () => ({ size, mtime: 1 }),
+    } as PlatformIO, wasm));
+    try {
+        await microtasks();
+        check(transientMemorySnapshot().queuedRequests === 1, "hash did not wait for memory");
+        size = 500 * 1024 * 1024;
+    } finally { held.release(); }
+    check(await queued instanceof HashWorkerFileDriftError && reads === 0,
+        "a file that grew while queued reached native readFile");
+    check(transientMemorySnapshot().usedBytes === 0, "queued drift leaked its lease");
 }
 
 async function actualNativeStreamClosesOnHasherFailureAndAbort(): Promise<void> {
