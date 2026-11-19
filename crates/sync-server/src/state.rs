@@ -113,15 +113,20 @@ impl AppState {
         }
     }
 
-    /// The write lock for one vault. One entry per vault ever touched —
-    /// unbounded in theory, a handful in practice for a self-hosted server.
-    pub fn vault_lock(&self, vault_id: &str) -> Arc<AsyncMutex<()>> {
-        self.vault_locks
+    /// The entry lives while any operation owns or is waiting for this lock.
+    pub fn vault_lock<'a>(&'a self, vault_id: &'a str) -> VaultLock<'a> {
+        let mutex = self
+            .vault_locks
             .lock()
             .expect("vault_locks poisoned")
             .entry(vault_id.to_string())
             .or_default()
-            .clone()
+            .clone();
+        VaultLock {
+            state: self,
+            vault_id,
+            mutex: Some(mutex),
+        }
     }
 
     /// Publish a ready-to-send inner frame (JSON string) to a vault's live
@@ -284,6 +289,32 @@ impl AppState {
     }
 }
 
+pub struct VaultLock<'a> {
+    state: &'a AppState,
+    vault_id: &'a str,
+    mutex: Option<Arc<AsyncMutex<()>>>,
+}
+
+impl VaultLock<'_> {
+    pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.mutex.as_ref().expect("live vault lock").lock().await
+    }
+}
+
+impl Drop for VaultLock<'_> {
+    fn drop(&mut self) {
+        let mut locks = self.state.vault_locks.lock().expect("vault_locks poisoned");
+        drop(self.mutex.take());
+        // Lookup and the last-reference check use the same registry lock.
+        if locks
+            .get(self.vault_id)
+            .is_some_and(|mutex| Arc::strong_count(mutex) == 1)
+        {
+            locks.remove(self.vault_id);
+        }
+    }
+}
+
 pub struct VaultSubscription {
     receiver: Option<broadcast::Receiver<String>>,
     state: SharedState,
@@ -365,6 +396,43 @@ pub type SharedState = Arc<AppState>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn vault_lock_cleanup_preserves_waiters_and_independent_vaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        layout.init_directories().unwrap();
+        box_key::init_box_keypair(&layout).unwrap();
+        let state = AppState::new(ServerConfig::new(dir.path().to_path_buf()));
+        use std::task::{Context, Waker};
+        let mut cx = Context::from_waker(Waker::noop());
+        let first = state.vault_lock("a");
+        let held = first.lock().await;
+        {
+            let cancelled = state.vault_lock("a");
+            let mut waiting = Box::pin(cancelled.lock());
+            assert!(std::future::Future::poll(waiting.as_mut(), &mut cx).is_pending());
+        }
+        {
+            let other = state.vault_lock("b");
+            let _guard = other.lock().await;
+        }
+        assert_eq!(state.vault_locks.lock().unwrap().len(), 1);
+        let second = state.vault_lock("a");
+        let mut waiting = Box::pin(second.lock());
+        assert!(std::future::Future::poll(waiting.as_mut(), &mut cx).is_pending());
+        drop(held);
+        drop(first);
+        let next = waiting.await;
+        {
+            let third = state.vault_lock("a");
+            let mut waiting = Box::pin(third.lock());
+            assert!(std::future::Future::poll(waiting.as_mut(), &mut cx).is_pending());
+        }
+        drop(next);
+        drop(second);
+        assert!(state.vault_locks.lock().unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn last_subscription_releases_channel_on_disconnect_or_task_abort() {
