@@ -10,8 +10,8 @@
 //! commutative + idempotent, so order and duplicates don't matter.
 //!
 //! Log format: a sequence of `[u32 LE length][update bytes]` records.
-//! Append uses O_APPEND. A successful write is visible to readers but does
-//! not yet establish crash durability.
+//! Non-empty appends sync the file before relay, and on Unix also sync its
+//! directory ancestry so a newly created log can be found after restart.
 //!
 //! At-rest posture matches the rest of obsetync: the self-hosted server is
 //! trusted and already stores all vault content in the clear; CRDT logs
@@ -66,6 +66,9 @@ pub fn append(
         .append(true)
         .open(&path)?;
     f.write_all(&record)?;
+    f.sync_all()?;
+    #[cfg(unix)]
+    crate::storage::sync_directory_ancestors(path.parent().expect("note log has parent"))?;
     Ok(())
 }
 
@@ -118,19 +121,15 @@ pub fn compact(
         ));
     }
     let path = log_path(layout, vault_id, note_path);
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("log.tmp");
-    {
-        let mut record = Vec::with_capacity(4 + snapshot.len());
-        record.extend_from_slice(&(snapshot.len() as u32).to_le_bytes());
-        record.extend_from_slice(snapshot);
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(&record)?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, &path)?;
+    let parent = path.parent().expect("note log has parent");
+    fs::create_dir_all(parent)?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+    staged.write_all(&(snapshot.len() as u32).to_le_bytes())?;
+    staged.write_all(snapshot)?;
+    staged.as_file().sync_all()?;
+    staged.persist(&path).map_err(|err| err.error)?;
+    #[cfg(unix)]
+    crate::storage::sync_directory_ancestors(parent)?;
     Ok(())
 }
 
@@ -192,6 +191,26 @@ mod tests {
         compact(&l, "v", "a.md", b"SNAPSHOT").unwrap();
         let log = read_log(&l, "v", "a.md", 1024).unwrap();
         assert_eq!(split_frames(&log), vec![&b"SNAPSHOT"[..]]);
+    }
+
+    #[test]
+    fn competing_compactions_publish_only_complete_snapshots() {
+        let (_dir, l) = layout();
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for id in 0..8 {
+                let (layout, start) = (&l, &start);
+                scope.spawn(move || {
+                    start.wait();
+                    compact(layout, "v", "a.md", &vec![id; 65536]).unwrap();
+                });
+            }
+        });
+        let log = read_log(&l, "v", "a.md", 65540).unwrap();
+        let frames = split_frames(&log);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].len(), 65536);
+        assert!(frames[0].iter().all(|&byte| byte == frames[0][0]));
     }
 
     #[test]

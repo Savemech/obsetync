@@ -1524,8 +1524,13 @@ async fn post_crdt_compact(
     let note = std::str::from_utf8(&body[2..2 + path_len])
         .map_err(|_| ServerError::BadRequest("note path not UTF-8".into()))?
         .to_owned();
-    let snapshot = &body[2 + path_len..];
-    crate::crdt::compact(&state.layout, &vault_id, &note, snapshot)
+    let layout = state.layout.clone();
+    let snapshot = body.slice(2 + path_len..);
+    state
+        .storage_writer
+        .run_blocking(move |_| crate::crdt::compact(&layout, &vault_id, &note, &snapshot))
+        .await
+        .map_err(|e| ServerError::ServiceUnavailable(e.to_string()))?
         .map_err(|e| ServerError::Internal(format!("crdt compact: {}", e)))?;
     Ok((
         StatusCode::OK,

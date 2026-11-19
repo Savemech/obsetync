@@ -693,7 +693,7 @@ fn ensure_durable_directories(path: &Path) -> io::Result<u64> {
     Ok(ancestor_syncs + 2)
 }
 
-fn sync_directory_ancestors(path: &Path) -> io::Result<u64> {
+pub(crate) fn sync_directory_ancestors(path: &Path) -> io::Result<u64> {
     let mut count = 0;
     for ancestor in path.ancestors() {
         let ancestor = if ancestor.as_os_str().is_empty() {

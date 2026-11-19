@@ -369,9 +369,9 @@ async fn session_v2(
                                                 if let Err(e) = state.relay_crdt_update(
                                                     vault,
                                                     note,
-                                                    &update,
+                                                    update,
                                                     inner,
-                                                ) {
+                                                ).await {
                                                     tracing::warn!(vault, note, err = %e, "ws: crdt append failed");
                                                 }
                                             }

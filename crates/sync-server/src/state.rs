@@ -140,16 +140,23 @@ impl AppState {
         }
     }
 
-    pub fn relay_crdt_update(
-        &self,
+    pub async fn relay_crdt_update(
+        self: &Arc<Self>,
         vault_id: &str,
         note: &str,
-        update: &[u8],
+        update: Vec<u8>,
         frame: String,
     ) -> std::io::Result<()> {
-        crate::crdt::append(&self.layout, vault_id, note, update)?;
-        self.publish_frame(vault_id, frame);
-        Ok(())
+        let state = Arc::clone(self);
+        let (vault, note) = (vault_id.to_owned(), note.to_owned());
+        self.storage_writer
+            .run_blocking(move |_| {
+                crate::crdt::append(&state.layout, &vault, &note, &update)?;
+                state.publish_frame(&vault, frame);
+                Ok(())
+            })
+            .await
+            .map_err(std::io::Error::other)?
     }
 
     /// Announce a new current root to any live WebSocket subscribers.
@@ -314,14 +321,15 @@ mod tests {
         let layout = StorageLayout::new(dir.path());
         layout.init_directories().unwrap();
         box_key::init_box_keypair(&layout).unwrap();
-        let state = AppState::new(ServerConfig::new(dir.path().to_path_buf()));
+        let state = Arc::new(AppState::new(ServerConfig::new(dir.path().to_path_buf())));
         let mut events = state.subscribe_roots("vault");
 
         let parent = layout.crdt_log_path("vault", "unused");
         std::fs::create_dir_all(parent.parent().unwrap().parent().unwrap()).unwrap();
         std::fs::write(parent.parent().unwrap(), b"cannot create logs here").unwrap();
         assert!(state
-            .relay_crdt_update("vault", "a.md", b"update", "frame".into())
+            .relay_crdt_update("vault", "a.md", b"update".to_vec(), "frame".into())
+            .await
             .is_err());
         assert!(matches!(
             events.try_recv(),
