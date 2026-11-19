@@ -456,3 +456,23 @@ The repository tests both independent implementations and the full middleware:
 - wrong key, bad fingerprint, AAD mismatch, tamper, and bad-version decoys;
 - encrypted 204/304 and handler-error delivery;
 - v2 E2E client compilation and full-stack security cases.
+
+## Legacy note log compaction
+
+Read the framed note log with sealed `POST /api/v1/crdt/{vault_id}` and the
+UTF-8 note path as the request body. To compact a nonempty log, apply the
+returned records and encode a snapshot. Send a sealed
+`POST /api/v1/crdt/{vault_id}/compact-prefix` with these consecutive fields:
+
+| Field | Encoding |
+| --- | --- |
+| Bytes covered by the snapshot | u32 little-endian, from 1 through 64 MiB |
+| Digest of exactly those log bytes, including record lengths | 32 raw BLAKE3 bytes |
+| Note path | u16 little-endian byte length followed by UTF-8 bytes |
+| Snapshot | Nonempty opaque update, up to 4 MiB |
+
+The server verifies the prefix under the note writer lock and publishes the
+snapshot followed by all later records. On HTTP 409, fetch the log again and
+recompute the snapshot and digest. The legacy `/compact` body contains only
+the path and snapshot. The server accepts that snapshot as another update and
+retains the existing log, so repeated legacy snapshots can grow its size.

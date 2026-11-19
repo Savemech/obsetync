@@ -778,11 +778,13 @@ pub fn sync_router(state: SharedState) -> Router {
         )
         .route("/api/v1/rollback/{vault_id}", post(post_rollback))
         .route("/api/v1/ws-ticket", post(post_ws_ticket))
-        // Ph4 CRDT: fetch a note's durable update log (bootstrap a hot doc);
-        // replace it with a compacted snapshot. Live deltas flow over the WS
-        // `ops` frame; these two ride the sealed HTTP channel.
+        // Legacy note logs and snapshots use sealed HTTP; live edits use WS ops.
         .route("/api/v1/crdt/{vault_id}", post(post_crdt_get))
         .route("/api/v1/crdt/{vault_id}/compact", post(post_crdt_compact))
+        .route(
+            "/api/v1/crdt/{vault_id}/compact-prefix",
+            post(post_crdt_compact_prefix),
+        )
         // `Bytes` extractors otherwise retain Axum's implicit 2 MiB ceiling.
         // The envelope already bounds every wire body at MAX_BODY_BYTES, while
         // individual handlers enforce their smaller advertised protocol caps.
@@ -1510,14 +1512,39 @@ async fn post_crdt_get(
     Ok((StatusCode::OK, log))
 }
 
-/// POST /api/v1/crdt/{vault_id}/compact — body is
-/// `[u16 LE path_len][note path][snapshot update]`. Replaces the note's log
-/// with one compacted Yjs update (client sends encodeStateAsUpdateV2 when the
-/// log grows or the note goes cold). Atomic replace.
+// Legacy callers supply no base. Their snapshot is an idempotent Yjs update,
+// so append it without discarding any previously accepted frames.
 async fn post_crdt_compact(
     State(state): State<SharedState>,
     Path(vault_id): Path<String>,
     body: axum::body::Bytes,
+) -> Result<impl IntoResponse, ServerError> {
+    crdt_snapshot(state, vault_id, body, None).await
+}
+
+// Prefix the legacy request with [u32 LE byte count][32 byte BLAKE3 digest]
+// of the framed log the client actually applied when constructing its snapshot.
+async fn post_crdt_compact_prefix(
+    State(state): State<SharedState>,
+    Path(vault_id): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<impl IntoResponse, ServerError> {
+    let header = body
+        .get(..36)
+        .ok_or_else(|| ServerError::BadRequest("missing CRDT base".into()))?;
+    let len = u32::from_le_bytes(header[..4].try_into().unwrap());
+    if len == 0 || len as usize > MAX_BODY_BYTES {
+        return Err(ServerError::BadRequest("invalid CRDT base length".into()));
+    }
+    let digest = blake3::Hash::from_bytes(header[4..].try_into().unwrap());
+    crdt_snapshot(state, vault_id, body.slice(36..), Some((len, digest))).await
+}
+
+async fn crdt_snapshot(
+    state: SharedState,
+    vault_id: String,
+    body: axum::body::Bytes,
+    base: Option<(u32, blake3::Hash)>,
 ) -> Result<impl IntoResponse, ServerError> {
     if body.len() < 2 {
         return Err(ServerError::BadRequest("compact body too short".into()));
@@ -1533,12 +1560,25 @@ async fn post_crdt_compact(
         .to_owned();
     let layout = state.layout.clone();
     let snapshot = body.slice(2 + path_len..);
-    state
+    if snapshot.len() > crate::crdt::MAX_UPDATE_BYTES || (base.is_some() && snapshot.is_empty()) {
+        return Err(ServerError::BadRequest("invalid CRDT snapshot size".into()));
+    }
+    let accepted = state
         .storage_writer
-        .run_blocking(move |_| crate::crdt::compact(&layout, &vault_id, &note, &snapshot))
+        .run_blocking(move |_| match base {
+            Some((len, digest)) => {
+                crate::crdt::compact(&layout, &vault_id, &note, &snapshot, len, &digest)
+            }
+            None => crate::crdt::append(&layout, &vault_id, &note, &snapshot).map(|()| true),
+        })
         .await
         .map_err(|e| ServerError::ServiceUnavailable(e.to_string()))?
         .map_err(|e| ServerError::Internal(format!("crdt compact: {}", e)))?;
+    if !accepted {
+        return Err(ServerError::Conflict(
+            "CRDT base changed; read the log again".into(),
+        ));
+    }
     Ok((
         StatusCode::OK,
         serde_json::json!({ "ok": true }).to_string(),

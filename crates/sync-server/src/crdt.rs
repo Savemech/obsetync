@@ -225,15 +225,16 @@ pub fn read_log(
     }
 }
 
-/// Replace a note's log with a single compacted snapshot update (client
-/// sends `Y.encodeStateAsUpdateV2` when the log grows or the note goes cold).
-/// Atomic via tmp + rename so a concurrent reader never sees a half-written log.
+/// Replace exactly the prefix used to make the snapshot, preserving later
+/// appends. False means the prefix no longer matches or splits a record.
 pub fn compact(
     layout: &StorageLayout,
     vault_id: &str,
     note_path: &str,
     snapshot: &[u8],
-) -> Result<(), std::io::Error> {
+    prefix_bytes: u32,
+    digest: &blake3::Hash,
+) -> io::Result<bool> {
     if snapshot.len() > MAX_UPDATE_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -243,9 +244,37 @@ pub fn compact(
     let path = log_path(layout, vault_id, note_path);
     let parent = path.parent().expect("note log has parent");
     let _writer = lock_writer(&path)?;
+    let mut source = match fs::File::open(&path) {
+        Ok(file) => BufReader::new(file),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if prefix_bytes == 0 || u64::from(prefix_bytes) > source.get_ref().metadata()?.len() {
+        return Ok(false);
+    }
+    let mut remaining = u64::from(prefix_bytes);
+    let mut hash = blake3::Hasher::new();
+    while remaining >= 4 {
+        let mut header = [0; 4];
+        source.read_exact(&mut header)?;
+        let size = frame_size(header)? as u64;
+        if size > remaining - 4 {
+            return Ok(false);
+        }
+        hash.update(&header);
+        if io::copy(&mut source.by_ref().take(size), &mut hash)? != size {
+            return Ok(false);
+        }
+        remaining -= 4 + size;
+    }
+    if remaining != 0 || hash.finalize() != *digest {
+        return Ok(false);
+    }
     let mut staged = tempfile::NamedTempFile::new_in(parent)?;
     staged.write_all(&(snapshot.len() as u32).to_le_bytes())?;
     staged.write_all(snapshot)?;
+    io::copy(&mut source, &mut staged)?;
+    drop(source);
     staged.as_file().sync_all()?;
     #[cfg(unix)]
     if let Ok(old) = fs::metadata(&path) {
@@ -254,7 +283,7 @@ pub fn compact(
     staged.persist(&path).map_err(|err| err.error)?;
     #[cfg(unix)]
     crate::storage::sync_directory_ancestors(parent)?;
-    Ok(())
+    Ok(true)
 }
 
 /// Inspect update boundaries in storage fixtures; malformed tails are ignored.
@@ -382,28 +411,72 @@ mod tests {
     }
 
     #[test]
-    fn compact_replaces_the_whole_log() {
+    fn compact_preserves_appends_after_snapshot_base() {
         let (_d, l) = layout();
         append(&l, "v", "a.md", b"one").unwrap();
         append(&l, "v", "a.md", b"two").unwrap();
-        compact(&l, "v", "a.md", b"SNAPSHOT").unwrap();
+        let base = read_log(&l, "v", "a.md", 1024).unwrap();
+        append(&l, "v", "a.md", b"later").unwrap();
+        assert!(compact(
+            &l,
+            "v",
+            "a.md",
+            b"SNAPSHOT",
+            base.len() as u32,
+            &blake3::hash(&base)
+        )
+        .unwrap());
         let log = read_log(&l, "v", "a.md", 1024).unwrap();
-        assert_eq!(split_frames(&log), vec![&b"SNAPSHOT"[..]]);
+        assert_eq!(split_frames(&log), vec![&b"SNAPSHOT"[..], b"later"]);
+    }
+
+    #[test]
+    fn prefix_must_end_at_a_record_boundary_and_match_the_bytes() {
+        let (_dir, l) = layout();
+        append(&l, "v", "a.md", b"first").unwrap();
+        let original = read_log(&l, "v", "a.md", 1024).unwrap();
+        for n in 0..original.len() {
+            assert!(!compact(
+                &l,
+                "v",
+                "a.md",
+                b"s",
+                n as u32,
+                &blake3::hash(&original[..n])
+            )
+            .unwrap());
+        }
+        assert!(!compact(
+            &l,
+            "v",
+            "a.md",
+            b"s",
+            original.len() as u32,
+            &blake3::hash(b"different")
+        )
+        .unwrap());
+        assert_eq!(read_log(&l, "v", "a.md", 1024).unwrap(), original);
     }
 
     #[test]
     fn competing_compactions_publish_only_complete_snapshots() {
         let (_dir, l) = layout();
+        append(&l, "v", "a.md", b"old").unwrap();
+        let base = blake3::hash(b"\x03\0\0\0old");
+        let winners = std::sync::atomic::AtomicUsize::new(0);
         let start = std::sync::Barrier::new(8);
         std::thread::scope(|scope| {
             for id in 0..8 {
-                let (layout, start) = (&l, &start);
+                let (layout, start, winners) = (&l, &start, &winners);
                 scope.spawn(move || {
                     start.wait();
-                    compact(layout, "v", "a.md", &vec![id; 65536]).unwrap();
+                    if compact(layout, "v", "a.md", &vec![id; 65536], 7, &base).unwrap() {
+                        winners.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 });
             }
         });
+        assert_eq!(winners.into_inner(), 1);
         let log = read_log(&l, "v", "a.md", 65540).unwrap();
         let frames = split_frames(&log);
         assert_eq!(frames.len(), 1);

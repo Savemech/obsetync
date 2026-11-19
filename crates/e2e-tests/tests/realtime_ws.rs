@@ -553,27 +553,34 @@ async fn crdt_ops_relay_log_readback_and_compaction() {
         "stored log must hold A's update"
     );
 
-    // (3) COMPACT: replace the log with a snapshot; the log is now just that.
+    // A legacy snapshot arriving after the observed base must survive compaction.
+    let mut checked = (r.body.len() as u32).to_le_bytes().to_vec();
+    checked.extend_from_slice(blake3::hash(&r.body).as_bytes());
     let snapshot = b"YJS-SNAPSHOT-V2".to_vec();
     let mut compact_body = (note.len() as u16).to_le_bytes().to_vec();
     compact_body.extend_from_slice(note.as_bytes());
     compact_body.extend_from_slice(&snapshot);
+    let mut legacy = (note.len() as u16).to_le_bytes().to_vec();
+    legacy.extend_from_slice(note.as_bytes());
+    legacy.extend_from_slice(b"later");
     let r = c
-        .raw(
-            "POST",
-            &format!("/api/v1/crdt/{vault}/compact"),
-            &compact_body,
-        )
+        .raw("POST", &format!("/api/v1/crdt/{vault}/compact"), &legacy)
         .await
         .unwrap();
-    assert!(r.status.is_success(), "crdt compact: {}", r.status);
+    assert!(r.status.is_success());
+    checked.extend_from_slice(&compact_body);
+    let route = format!("/api/v1/crdt/{vault}/compact-prefix");
+    let r = c.raw("POST", &route, &checked).await.unwrap();
+    assert!(r.status.is_success());
+    let stale = c.raw("POST", &route, &checked).await.unwrap();
+    assert_eq!(stale.status.as_u16(), 409);
     let r = c
         .raw("POST", &format!("/api/v1/crdt/{vault}"), note.as_bytes())
         .await
         .unwrap();
     assert_eq!(
         split_crdt_frames(&r.body),
-        vec![snapshot],
-        "after compaction the log is exactly the snapshot",
+        vec![snapshot, b"later".to_vec()],
+        "compaction must preserve every frame after the verified base",
     );
 }
