@@ -96,7 +96,7 @@ reviewed	crates/sync-server/src/eph_rotation.rs	production	Read generation/rotat
 reviewed	crates/sync-server/src/error.rs	production	Traced every variant and conversion; removed only test-constructed Unauthorized variant and dead-code blanket; active route status mappings and tests preserved
 pending	crates/sync-server/src/guard.rs	production	Not reviewed
 pending	crates/sync-server/src/ignore_match.rs	production	Not reviewed
-read	crates/sync-server/src/main.rs	production	Read full CLI/startup/listener/background/health paths; native reset/restore and credential-mode upgrade smoke pass with existing identities; health deadline/status and listener-error follow-up remains
+reviewed	crates/sync-server/src/main.rs	production	Read full CLI/startup/listener/background/health paths; native reset/restore and credential-mode upgrade smoke pass with existing identities; bounded end-to-end health deadline and status-line tests; both serve errors reach CLI exit
 pending	crates/sync-server/src/pack_store.rs	production	Not reviewed
 pending	crates/sync-server/src/perf.rs	production	Not reviewed
 pending	crates/sync-server/src/root_head.rs	production	Not reviewed

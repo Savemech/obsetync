@@ -132,7 +132,7 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Healthcheck { url } => match cmd_healthcheck(&url) {
+        Command::Healthcheck { url } => match cmd_healthcheck(&url).await {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("healthcheck failed: {}", e);
@@ -142,36 +142,38 @@ async fn main() {
     }
 }
 
-/// Minimal blocking HTTP/1.1 GET over std::net — no client-lib dependency,
-/// works inside the read-only distroless-style runtime image.
-fn cmd_healthcheck(url: &str) -> Result<(), Box<dyn std::error::Error>> {
-    use std::io::{Read, Write};
+async fn cmd_healthcheck(url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
     let rest = url
         .strip_prefix("http://")
         .ok_or("healthcheck expects an http:// URL")?;
+    if rest.bytes().any(|b| b.is_ascii_control() || b == b' ') {
+        return Err("invalid healthcheck URL".into());
+    }
     let (host_port, path) = match rest.split_once('/') {
         Some((hp, p)) => (hp, format!("/{}", p)),
         None => (rest, "/health".to_string()),
     };
 
-    let mut stream = std::net::TcpStream::connect(host_port)?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
-    write!(
-        stream,
-        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-        path, host_port
-    )?;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut stream = tokio::net::TcpStream::connect(host_port).await?;
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await?;
 
-    let mut response = String::new();
-    stream.take(4096).read_to_string(&mut response)?;
-    let status_line = response.lines().next().unwrap_or("");
-    if status_line.contains(" 200 ") {
+        let mut line = Vec::new();
+        BufReader::new(stream.take(4096))
+            .read_until(b'\n', &mut line)
+            .await?;
+        if !line.ends_with(b"\r\n")
+            || !(line.starts_with(b"HTTP/1.1 200 ") || line.starts_with(b"HTTP/1.0 200 "))
+        {
+            return Err("unexpected HTTP healthcheck status line".into());
+        }
         Ok(())
-    } else {
-        Err(format!("unexpected response: {}", status_line).into())
-    }
+    })
+    .await?
 }
 
 fn cmd_init(data_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -309,10 +311,10 @@ async fn cmd_run(
 
     tokio::select! {
         r = axum::serve(sync_listener, sync_app) => {
-            if let Err(e) = r { tracing::error!("sync server error: {}", e); }
+            r.map_err(|e| std::io::Error::new(e.kind(), format!("sync server: {e}")))?;
         }
         r = axum::serve(admin_listener, admin_app) => {
-            if let Err(e) = r { tracing::error!("admin server error: {}", e); }
+            r.map_err(|e| std::io::Error::new(e.kind(), format!("admin server: {e}")))?;
         }
     }
 
@@ -322,6 +324,33 @@ async fn cmd_run(
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn healthcheck_uses_the_http_status_before_connection_close() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (status, healthy) in [
+            ("HTTP/1.1 200 OK", true),
+            ("HTTP/1.0 200 ", true),
+            ("HTTP/1.1 503 expected 200 here", false),
+            ("garbage 200 OK", false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = async {
+                let (mut peer, _) = listener.accept().await.unwrap();
+                let request = b"GET /health HTTP/1.1\r\n";
+                let mut received = vec![0; request.len()];
+                peer.read_exact(&mut received).await.unwrap();
+                assert_eq!(received, request);
+                peer.write_all(format!("{status}\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                peer
+            };
+            let (_, result) = tokio::join!(server, cmd_healthcheck(&url));
+            assert_eq!(result.is_ok(), healthy, "{status}");
+        }
+    }
 
     #[test]
     fn clear_vault_data_rejects_an_uninitialized_directory() {
