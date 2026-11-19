@@ -1,3 +1,4 @@
+import { isSafeVaultPath } from "./delta-validation";
 import type { DirtyFileChange } from "./dirty-set";
 import type { FileChange } from "./push";
 import { throwIfWorkAborted } from "./work-scheduler";
@@ -36,6 +37,14 @@ export function isMissingPathError(error: unknown): boolean {
         "code" in error && error.code === "ENOENT";
 }
 
+function snapshotFileStat(path: string, stat: FileStat): FileStat {
+    const size = stat?.size, mtime = stat?.mtime;
+    if (!Number.isSafeInteger(size) || size < 0 || !Number.isFinite(mtime)) {
+        throw new Error(`invalid file metadata: ${path}`);
+    }
+    return { mtime, size };
+}
+
 /** Preserve the four filesystem outcomes: regular file, missing, directory,
  * and unavailable. The last two reject with distinct errors so existing file
  * readers cannot accidentally accept directory metadata or swallow EIO. */
@@ -52,13 +61,8 @@ export async function readFileStat(
     }
     if (stat === null) return null;
     if (stat?.type === "folder") throw new PathIsDirectoryError(path);
-    if (
-        stat?.type !== "file" || !Number.isFinite(stat.mtime) ||
-        !Number.isFinite(stat.size) || stat.size < 0
-    ) {
-        throw new Error(`invalid file metadata: ${path}`);
-    }
-    return { mtime: stat.mtime, size: stat.size };
+    if (stat?.type !== "file") throw new Error(`invalid file metadata: ${path}`);
+    return snapshotFileStat(path, stat);
 }
 
 /** A config listing is authoritative only if every directory and listed file
@@ -86,7 +90,17 @@ export async function collectAdapterFileStats(
     const result = new Map<string, FileStat>();
     const visit = async (dir: string): Promise<void> => {
         const listing = await adapter.list(dir);
+        if (!Array.isArray(listing?.files) || !Array.isArray(listing.folders)) {
+            throw new Error(`invalid configuration listing: ${dir}`);
+        }
+        const seen = new Set<string>();
+        const checkChild = (path: string) => {
+            if (!isSafeVaultPath(path) || !path.startsWith(dir + "/") || path.lastIndexOf("/") !== dir.length ||
+                seen.has(path)) throw new Error(`invalid configuration listing: ${dir}`);
+            seen.add(path);
+        };
         for (const path of listing.files) {
+            checkChild(path);
             const stat = await readFileStat(path, (file) => adapter.stat(file));
             if (!stat) {
                 // A moving snapshot must be retried, not silently truncated.
@@ -94,7 +108,10 @@ export async function collectAdapterFileStats(
             }
             result.set(path, stat);
         }
-        for (const folder of listing.folders) await visit(folder);
+        for (const folder of listing.folders) {
+            checkChild(folder);
+            await visit(folder);
+        }
     };
     await visit(root);
     return result;
@@ -170,7 +187,7 @@ export async function materializeFileChanges(
             work.push((async () => {
                 throwIfWorkAborted(signal);
                 const stat = await statFile(row.path);
-                return stat ? { mtime: stat.mtime, size: stat.size } : null;
+                return stat === null ? null : snapshotFileStat(row.path, stat);
             })());
         }
         const settled = work.length ? await Promise.allSettled(work) : [];
@@ -184,7 +201,7 @@ export async function materializeFileChanges(
             if (row.excluded) { onOmission?.(path, "excluded"); continue; }
             const result = settled[row.statIndex];
             if (result.status === "rejected") {
-                if (!(result.reason instanceof PathIsDirectoryError)) throw result.reason;
+                if (!(result.reason instanceof PathIsDirectoryError) || result.reason.path !== path) throw result.reason;
                 // Old versions journaled folder events. A tracked file replaced
                 // by a directory remains a deletion subject to normal guards.
                 if (tracked) materialized.push({ action: "deleted", path });

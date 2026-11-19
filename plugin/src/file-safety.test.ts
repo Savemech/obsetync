@@ -58,7 +58,7 @@ async function distinctStatOutcomes(): Promise<void> {
         "an ambiguous error message was treated as confirmed deletion",
     );
     check(!isMissingPathError(null), "null is not an ENOENT error");
-    for (const invalid of [undefined, { ...file(), size: NaN }, { ...file(), type: "unknown" }]) {
+    for (const invalid of [undefined, file(NaN), file(1.5), file(2 ** 53), { ...file(), type: "unknown" }]) {
         let rejected = false;
         try { await readFileStat("bad", async () => invalid as AdapterPathStat); } catch { rejected = true; }
         check(rejected, "invalid adapter metadata became file/missing state");
@@ -119,6 +119,27 @@ async function listingsFailClosed(): Promise<void> {
             collectAdapterFileStats(".obsidian", adapter), error,
             `root ${code} became an empty configuration tree`,
         );
+    }
+
+    for (const listing of [
+        { files: "", folders: [] },
+        { files: [], folders: "" },
+        { files: ["outside.json"], folders: [] },
+        { files: [".obsidian/../outside.json"], folders: [] },
+        { files: [".obsidian/app.json", ".obsidian/app.json"], folders: [] },
+        { files: [".obsidian/app.json"], folders: [".obsidian/app.json"] },
+        { files: [], folders: [".obsidian"] },
+    ]) {
+        const adapter = new ListingAdapter();
+        let visits = 0;
+        adapter.list = async dir => {
+            check(++visits === 1 && dir === ".obsidian", "scanner entered an invalid directory");
+            return listing as { files: string[]; folders: string[] };
+        };
+        let error: unknown;
+        try { await collectAdapterFileStats(".obsidian", adapter); } catch (caught) { error = caught; }
+        check(error instanceof Error && error.message.includes("invalid configuration listing"),
+            "malformed directory listing was accepted as an authoritative snapshot");
     }
 
     const moved = new ListingAdapter();
@@ -205,6 +226,18 @@ async function explicitMaterializationOmissions(): Promise<void> {
     const absent = await materializeFileChanges([{ action: "created", path: "absent.md" }], async () => null,
         () => false, () => false, observe);
     check(absent.length === 1 && absent[0].action === "deleted" && omissions.length === 0, "confirmed absence was misclassified as an omission");
+    const otherDirectory = new PathIsDirectoryError("other-folder");
+    await rejectsWith(materializeFileChanges([{ action: "modified", path: "tracked.md" }],
+        async () => { throw otherDirectory; }, () => true, () => false),
+        otherDirectory, "a directory result for another path authorized a tracked deletion");
+    for (const invalid of [undefined, false, file(1.5), file(2 ** 53), file(1, NaN)]) {
+        let rejected = false;
+        try {
+            await materializeFileChanges([{ action: "modified", path: "tracked.md" }],
+                async () => invalid as FileStat, () => true, () => false);
+        } catch { rejected = true; }
+        check(rejected, "invalid file stat was published as a change");
+    }
     const callbackError = new Error("observation callback failed");
     await rejectsWith(materializeFileChanges([{ action: "modified", path: "excluded.md" }], async () => null,
         () => false, () => true, () => { throw callbackError; }), callbackError, "observation failure allowed materialization to appear complete");

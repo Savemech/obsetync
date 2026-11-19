@@ -226,8 +226,8 @@ read	plugin/src/engine-root.test.ts	tests	Removed obsolete debounce mocks or unu
 read	plugin/src/engine-urgent-upload.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
 pending	plugin/src/engine-work.test.ts	tests	Not reviewed
 pending	plugin/src/engine-work.ts	production	Not reviewed
-pending	plugin/src/file-safety.test.ts	tests	Not reviewed
-pending	plugin/src/file-safety.ts	production	Not reviewed
+reviewed	plugin/src/file-safety.test.ts	tests	Checked serial/parallel ordering, cancellation, errors, missing paths and config listing; 150 assertions including malformed responses
+reviewed	plugin/src/file-safety.ts	production	Traced adapter stats, config enumeration, grouped metadata reads and deletion classification through platform and both scan paths; validate sizes, exact directory error paths and direct unique listed children
 pending	plugin/src/hash-runtime.test.ts	tests	Not reviewed
 pending	plugin/src/hash-runtime.ts	production	Not reviewed
 reviewed	plugin/src/hash-source-budget.test.ts	tests	Verified cancellation, concurrent leases, worker fallback and native streaming; real shared pool queued-growth regression; 59 assertions passed
