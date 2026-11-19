@@ -195,8 +195,8 @@ pending	plugin/src/conflict-path.ts	production	Not reviewed
 pending	plugin/src/conflict-ui.ts	production	Not reviewed
 reviewed	plugin/src/current-host-work.test.ts	tests	Read all four groups; actual admission bounds, synchronous lease revocation, sibling drain, failure aggregation and late-close behavior pass in full plugin suite
 reviewed	plugin/src/current-host-work.ts	production	Read entire bounded owner; main run/close/replacement callers traced; four owner and bundled-main enrollment/retirement suites pass; only failures crossing the captured retirement cut poison drain
-pending	plugin/src/debug-log.test.ts	tests	Not reviewed
-pending	plugin/src/debug-log.ts	production	Not reviewed
+reviewed	plugin/src/debug-log.test.ts	tests	Tested layered console hooks, hostile error getter, missing/unreadable/existing logs, rotation and 2000 duplicate events during stalled IO through install/uninstall
+reviewed	plugin/src/debug-log.ts	production	Traced console and window hooks to plugin load/unload; failed reads preserve existing logs, stalled writes coalesce, stale hooks only forward, stack splitting bounded to six lines
 pending	plugin/src/debug-modal.ts	production	Not reviewed
 pending	plugin/src/deferred-changes.test.ts	tests	Not reviewed
 pending	plugin/src/deferred-changes.ts	production	Not reviewed

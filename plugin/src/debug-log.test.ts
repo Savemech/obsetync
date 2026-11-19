@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { debugLog, sanitizeDebugLogLine } from "./debug-log";
+import type { App } from "obsidian";
+import { crashLog, debugLog, sanitizeDebugLogLine } from "./debug-log";
 
 const samples: string[] = [
     "[obsetync] pushPending: 784 final path states — first 3 paths: " +
@@ -40,6 +41,18 @@ try {
     console.log("[obsetync] pull-echo verification failed for Secret/note.md:", new Error(
         "ENOENT: open '/home/me/Vault/Secret/note.md'",
     ));
+    const inner = console.log;
+    const otherPlugin = (...args: unknown[]) => inner(...args);
+    console.log = otherPlugin;
+    debugLog.uninstall();
+    assert.equal(console.log, otherPlugin, "unload removed another plugin's console hook");
+    console.log("[obsetync] inactive");
+    debugLog.install();
+    const hostile = Object.defineProperty(new Error(), "stack", { get() { throw new Error("unavailable"); } });
+    assert.doesNotThrow(() => console.log("[obsetync] hostile argument", hostile));
+    console.log("[obsetync] reinstalled");
+    assert.equal(debugLog.recent().filter(line => line.includes("reinstalled")).length, 1);
+    assert.ok(debugLog.recent().every(line => !line.includes("inactive")));
     debugLog.uninstall();
     const captured = debugLog.recent().join("\n");
     assert.equal(captured.includes("Secret/note.md"), true);
@@ -50,4 +63,83 @@ try {
     debugLog.clear();
 }
 
-console.log("debug-log.test: 11 assertions passed");
+async function crashLogPreservesExistingReports(): Promise<void> {
+    let content: string | null = "previous report";
+    let readable = false;
+    const adapter = {
+        async read() { if (!readable || content === null) throw new Error("unavailable"); return content; },
+        async stat() { return content === null ? null : { type: "file", size: content.length, mtime: 1 }; },
+        async write(_path: string, value: string) { content = value; },
+        async append(_path: string, value: string) { content = (content ?? "") + value; },
+    };
+    async function record(message: string): Promise<void> {
+        const host = Object.assign(new EventTarget(), { setTimeout: () => 1, clearTimeout() {} });
+        const original = Object.getOwnPropertyDescriptor(globalThis, "window");
+        Object.defineProperty(globalThis, "window", { configurable: true, value: host });
+        try {
+            crashLog.install({ vault: { adapter } } as unknown as App, "test");
+            host.dispatchEvent(Object.assign(new Event("error"), { message }));
+            crashLog.uninstall();
+        } finally {
+            if (original) Object.defineProperty(globalThis, "window", original);
+            else Reflect.deleteProperty(globalThis, "window");
+        }
+        await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    await record("unreadable");
+    assert.equal(content, "previous report", "read failure overwrote the existing crash log");
+    content = null;
+    await record("first error");
+    assert.match(content ?? "", /session start.*\n.*first error/s);
+    readable = true;
+    const previous = content;
+    await record("second error");
+    assert.ok(String(content).startsWith(String(previous)));
+    assert.match(content ?? "", /second error/);
+    content = "old line\n".repeat(65_000) + "surviving line\n";
+    await record("after rotation");
+    assert.ok(content.startsWith("[rotated]\n") && content.length < 101_000);
+    assert.match(content, /surviving line\n.*after rotation/s);
+}
+
+async function stalledFlushCoalescesDuplicates(): Promise<void> {
+    let fire: (() => void) | undefined;
+    const host = Object.assign(new EventTarget(), {
+        setTimeout(callback: () => void) { fire = callback; return 1; },
+        clearTimeout() { fire = undefined; },
+    });
+    let release!: (text: string) => void;
+    const stalled = new Promise<string>(resolve => { release = resolve; });
+    const blocks: string[] = [];
+    const adapter = {
+        read: () => stalled,
+        async append(_path: string, text: string) { blocks.push(text); },
+    };
+    const original = Object.getOwnPropertyDescriptor(globalThis, "window");
+    Object.defineProperty(globalThis, "window", { configurable: true, value: host });
+    try {
+        crashLog.install({ vault: { adapter } } as unknown as App, "test");
+        const emit = () => host.dispatchEvent(Object.assign(new Event("error"), { message: "repeated" }));
+        emit();
+        const first = fire!;
+        fire = undefined;
+        first();
+        for (let n = 0; n < 2000; n++) emit();
+        assert.equal(fire, undefined, "stalled IO queued more timed flushes");
+        release("");
+        await new Promise<void>(resolve => setImmediate(resolve));
+        assert.equal(typeof fire, "function", "settlement did not schedule pending repeats");
+        crashLog.uninstall();
+        await new Promise<void>(resolve => setImmediate(resolve));
+        assert.equal(blocks.length, 2);
+        assert.match(blocks[1], /repeated 2000 more times/);
+    } finally {
+        release("");
+        crashLog.uninstall();
+        if (original) Object.defineProperty(globalThis, "window", original);
+        else Reflect.deleteProperty(globalThis, "window");
+    }
+}
+
+void crashLogPreservesExistingReports().then(stalledFlushCoalescesDuplicates).then(() => console.log("debug-log.test: passed"))
+    .catch(error => { console.error(error); process.exitCode = 1; });

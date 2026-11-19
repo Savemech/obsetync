@@ -1,4 +1,5 @@
 import type { App } from "obsidian";
+import { readFileStat } from "./file-safety";
 
 /**
  * Ring-buffer capture of every `[obsetync] …` console line the plugin emits.
@@ -32,43 +33,36 @@ export function sanitizeDebugLogLine(input: string): string {
 class ObsetyncDebugLog {
     private buf: LogEntry[] = [];
     private readonly MAX = 200;
-    private installed = false;
-
-    private origLog:   typeof console.log   | null = null;
-    private origWarn:  typeof console.warn  | null = null;
-    private origError: typeof console.error | null = null;
+    private restoreConsole?: () => void;
 
     install(): void {
-        if (this.installed) return;
-        this.installed = true;
-
-        this.origLog   = console.log;
-        this.origWarn  = console.warn;
-        this.origError = console.error;
-
-        const make = (level: LogLevel, orig: (...a: any[]) => void) =>
-            (...args: any[]) => {
-                orig.apply(console, args);
-                if (
-                    args.length > 0 &&
-                    typeof args[0] === "string" &&
-                    args[0].includes("[obsetync]")
-                ) {
-                    this.append(level, args.map(stringify).join(" "));
+        if (this.restoreConsole) return;
+        let capturing = true;
+        const restorers = (["log", "warn", "error"] as const).map(method => {
+            const original = console[method];
+            const wrapped = (...args: unknown[]) => {
+                original.apply(console, args);
+                if (!capturing || typeof args[0] !== "string" || !args[0].includes("[obsetync]")) return;
+                try {
+                    this.append(method === "log" ? "info" : method, args.map(stringify).join(" "));
+                } catch {
+                    // Console arguments may have throwing stack or serialization getters.
                 }
             };
-
-        console.log   = make("info",  this.origLog)   as any;
-        console.warn  = make("warn",  this.origWarn)  as any;
-        console.error = make("error", this.origError) as any;
+            console[method] = wrapped;
+            return () => {
+                if (console[method] === wrapped) console[method] = original;
+            };
+        });
+        this.restoreConsole = () => {
+            capturing = false;
+            for (const restore of restorers) restore();
+        };
     }
 
     uninstall(): void {
-        if (!this.installed) return;
-        if (this.origLog)   console.log   = this.origLog;
-        if (this.origWarn)  console.warn  = this.origWarn;
-        if (this.origError) console.error = this.origError;
-        this.installed = false;
+        this.restoreConsole?.();
+        this.restoreConsole = undefined;
     }
 
     private append(level: LogLevel, msg: string): void {
@@ -173,7 +167,7 @@ class ObsetyncCrashLogger {
     private flushTimer: number | null = null;
     private lastFlushMs = 0;
     /** Serialises read+write cycles so appends never interleave. */
-    private writeChain: Promise<void> = Promise.resolve();
+    private writeChain: Promise<void> | null = null;
     private lastKey = "";
     private repeats = 0;
 
@@ -258,8 +252,7 @@ class ObsetyncCrashLogger {
             let line = `${new Date().toISOString()} ${key}`;
             if (stack) {
                 const frames = String(stack)
-                    .split("\n")
-                    .slice(0, MAX_STACK_LINES)
+                    .split("\n", MAX_STACK_LINES)
                     .map(sanitizeDebugLogLine)
                     .map(s => s.length > MAX_STACK_LINE_CHARS
                         ? s.slice(0, MAX_STACK_LINE_CHARS) + "…"
@@ -283,7 +276,7 @@ class ObsetyncCrashLogger {
     }
 
     private scheduleFlush(): void {
-        if (this.flushTimer !== null) return;
+        if (this.flushTimer !== null || this.writeChain) return;
         // Leading edge: the first entry after an idle period writes
         // immediately — the fatal error right before a renderer kill must
         // not wait out a debounce timer. Followers batch up for a second.
@@ -306,26 +299,39 @@ class ObsetyncCrashLogger {
         }
         const block = this.pending.splice(0).join("\n") + "\n";
         this.lastFlushMs = Date.now();
-        this.writeChain = this.writeChain
+        const write = (this.writeChain ?? Promise.resolve())
             .then(async () => {
-                let current = "";
+                const adapter = app.vault.adapter;
+                let current: string;
                 try {
-                    current = await app.vault.adapter.read(CRASH_LOG_PATH);
+                    current = await adapter.read(CRASH_LOG_PATH);
                 } catch {
-                    // No file yet — start fresh.
+                    if (await readFileStat(CRASH_LOG_PATH, path => adapter.stat(path)) === null) {
+                        await adapter.write(CRASH_LOG_PATH, block);
+                    }
+                    return;
                 }
                 if (current.length + block.length > ROTATE_ABOVE_CHARS) {
                     const tail = current.slice(-ROTATE_KEEP_CHARS);
                     // Cut at a line boundary so the rotated file starts clean.
                     const nl = tail.indexOf("\n");
                     current = "[rotated]\n" + (nl >= 0 ? tail.slice(nl + 1) : tail);
+                    const sep = current.endsWith("\n") ? "" : "\n";
+                    await adapter.write(CRASH_LOG_PATH, current + sep + block);
+                } else {
+                    const sep = current && !current.endsWith("\n") ? "\n" : "";
+                    await adapter.append(CRASH_LOG_PATH, sep + block);
                 }
-                const sep = current && !current.endsWith("\n") ? "\n" : "";
-                await app.vault.adapter.write(CRASH_LOG_PATH, current + sep + block);
             })
             .catch(() => {
                 // Disk full / adapter gone — drop the lines, never throw.
             });
+        this.writeChain = write;
+        void write.then(() => {
+            if (this.writeChain !== write) return;
+            this.writeChain = null;
+            if (this.app && (this.pending.length || this.repeats)) this.scheduleFlush();
+        });
     }
 }
 
