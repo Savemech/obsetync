@@ -78,6 +78,7 @@ function fixture(enrolled = true) {
     const effects = { authorized: 0, saves: 0, stops: 0, enrolls: 0, syncs: 0,
         scans: 0, reconciles: 0, histories: 0, rollbacks: 0, forces: 0 };
     const engine = {
+        setUploadPriority(value) { effects.priority = value; },
         stop() { effects.stops++; },
         async reconcileContent() { effects.reconciles++; return { smallUploaded: 0, largeUploaded: 0, treeChunksUploaded: 0 }; },
         async forceSync() { effects.forces++; },
@@ -125,11 +126,20 @@ test("blocked handoff fences every settings mutation before memory or engine sid
         ["Server URL:text", "http://changed"], ["Vault ID:text", "changed"], ["Device Name:text", "changed"],
         ["Sync Interval:text", "9"], ["Startup delay:text", "45"], ["Auto-Sync:toggle", false], ["Sync Obsidian config (.obsidian/):toggle", true],
         ["Ignore patterns:textarea", "changed/**"], ["Realtime sync:toggle", false], ["Share presence:toggle", false],
-        ["Sync Priority:dropdown", "newest"], ["Reset enrollment:button", undefined],
+        ["Upload priority:dropdown", "newest"], ["Reset enrollment:button", undefined],
     ]) await invoke(key, value);
     assert.deepEqual(plugin.settings, before);
     assert.equal(effects.saves, 0); assert.equal(effects.stops, 0);
     assert.equal(effects.authorized, 12);
+});
+
+test("upload priority reaches the running engine from the dropdown", async () => {
+    const f = fixture(true);
+    f.setBlocked(false);
+    await invoke("Upload priority:dropdown", "newest");
+    assert.equal(f.effects.priority, "newest");
+    assert.equal(f.plugin.settings.syncPriority, "newest");
+    assert.equal(f.effects.saves, 1);
 });
 
 test("startup delay defaults to 30 seconds and accepts only bounded whole seconds", async () => {

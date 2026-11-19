@@ -1132,7 +1132,7 @@ export default class ObsetyncPlugin extends Plugin {
         push(`Sync interval:     ${this.settings.syncIntervalMs}ms`);
         push(`Startup delay:     ${this.settings.startupDelayMs}ms`);
         push(`Startup crash hold: ${this.startupInterruptionId !== null ? "paused — use Sync now" : "off"}`);
-        push(`Sync priority:     ${this.settings.syncPriority}`);
+        push(`Upload priority:   ${this.settings.syncPriority}`);
         push(`Sync .obsidian/:   ${this.settings.syncObsidianConfig}`);
         push(`Ignore patterns:   ${this.settings.ignorePatterns.length} (${this.settings.ignorePatterns.slice(0, 4).join(", ")}${this.settings.ignorePatterns.length > 4 ? ", …" : ""})`);
         push(`Auto-sync:         ${this.settings.autoSync}`);
@@ -1894,7 +1894,7 @@ export default class ObsetyncPlugin extends Plugin {
             tree,
             rootScope.vaultId,
             syncSettings.syncIntervalMs,
-            syncSettings.syncPriority,
+            this.settings.syncPriority,
             (text) => { if (isCurrent()) this.updateStatusBar(text); },
             cachedRootHash,
             syncSettings.syncObsidianConfig,

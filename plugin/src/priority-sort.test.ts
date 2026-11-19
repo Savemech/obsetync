@@ -13,6 +13,12 @@ const tags = (values: readonly FileChange[]) => values.map(item => (item as Tagg
 
 async function deterministicModesMatchStableCompatibilityOrder(): Promise<void> {
     const priorities: SyncPriority[] = ["oldest", "newest", "smallest", "biggest", "alphabetic"];
+    const distinct = [row(1, "a", 2, 1), row(2, "c", 3, 2), row(3, "b", 1, 3)];
+    const expectedOrder = { oldest: [3, 1, 2], newest: [2, 1, 3], smallest: [1, 2, 3],
+        biggest: [3, 2, 1], alphabetic: [1, 3, 2] };
+    for (const [priority, order] of Object.entries(expectedOrder)) {
+        assert.deepEqual(tags(sortByPriority(distinct, priority as SyncPriority)), order);
+    }
     const input = Array.from({ length: 600 }, (_, index) => row(index,
         [`z/${String(599 - index).padStart(4, "0")}.md`, "ä.md", "Å.md", "a.md", "á.md"][index % 5],
         index % 7 === 0 ? undefined : index % 11, index % 9 === 0 ? undefined : index % 13));

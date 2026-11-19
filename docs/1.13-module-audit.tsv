@@ -288,8 +288,8 @@ pending	plugin/src/prepared-mobile-manifest.test.ts	tests	Not reviewed
 pending	plugin/src/prepared-mobile-manifest.ts	production	Not reviewed
 pending	plugin/src/prepared-retirement.test.ts	tests	Not reviewed
 pending	plugin/src/prepared-retirement.ts	production	Not reviewed
-pending	plugin/src/priority-sort.test.ts	tests	Not reviewed
-pending	plugin/src/priority-sort.ts	production	Not reviewed
+reviewed	plugin/src/priority-sort.test.ts	tests	Checked direction for all five deterministic modes, stable ties, random draws, admission, cancellation and cooperative yields
+reviewed	plugin/src/priority-sort.ts	production	Traced synchronous and reviewed upload paths, shared deterministic comparator, preserved legacy random and sequential behavior
 pending	plugin/src/pull-echo.test.ts	tests	Not reviewed
 pending	plugin/src/pull-echo.ts	production	Not reviewed
 pending	plugin/src/pull.test.ts	tests	Not reviewed

@@ -631,7 +631,7 @@ async function repeatedDriftAndReviewRebuildStayDrainBounded() {
             await heavy(...args);
             if (args[0] === "root continuation") {
                 rebuildFences++;
-                a.engine.syncPriority = a.engine.syncPriority === "oldest" ? "newest" : "oldest";
+                a.engine.setUploadPriority(a.engine.syncPriority === "oldest" ? "newest" : "oldest");
             }
         };
 
@@ -923,7 +923,7 @@ async function prioritySortWaitHasNoPartialEffectsAndRevalidatesLateEdit() {
     for (const [priority, heldCheckpoint] of [["oldest", 1], ["random", 2]] as const) {
         const f = await fixture(300), a = await f.create(`priority-sort-edit-${priority}`), held = gate();
         try {
-            a.engine.syncPriority = priority;
+            a.engine.setUploadPriority(priority);
             const old = await f.queue(a.engine, paths(300), 2), work = observeWork(a.engine);
             const diskCut = f.storage.events.length;
             const sort = a.engine.sortReviewedChanges.bind(a.engine); let intercepted = false, checkpoints = 0;
@@ -1054,7 +1054,7 @@ async function finalInitialDispatchChecksChangesAcrossEveryPrepareAwait() {
             assert(intercepted); assert.equal(f.server.requests.length, 0);
             if (change === "callback") await f.event(a.engine, pathAt(0), 3);
             else if (change === "rename") await renameEvent(f, a.engine, pathAt(0), pathAt(2));
-            else if (change === "policy") a.engine.syncPriority = "newest";
+            else if (change === "policy") a.engine.setUploadPriority("newest");
             else a.tree.tree_version = () => 2;
             const unacknowledged = structuredClone(f.journal.unsynced());
             held.resolve(); await pending.done; assert.equal(pending.state.error, undefined);

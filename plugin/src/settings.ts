@@ -363,8 +363,8 @@ export class ObsetyncSettingTab extends PluginSettingTab {
             );
 
         new Setting(containerEl)
-            .setName("Sync Priority")
-            .setDesc("Order in which files are uploaded during a sync.")
+            .setName("Upload priority")
+            .setDesc("Choose which local changes to upload first. Newest and oldest use the file’s modification time.")
             .addDropdown((drop) =>
                 drop
                     .addOption("sequential", "Sequential (default)")
@@ -377,7 +377,9 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                     .setValue(this.plugin.settings.syncPriority)
                     .onChange(async (value) => {
                         this.plugin.authorizeSettingsMutation();
-                        this.plugin.settings.syncPriority = value as SyncPriority;
+                        const priority = value as SyncPriority;
+                        this.plugin.settings.syncPriority = priority;
+                        this.plugin.syncEngineOrNull()?.setUploadPriority(priority);
                         await this.plugin.saveSettings();
                     })
             );

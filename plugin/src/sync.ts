@@ -569,6 +569,10 @@ export class ObsetyncSyncEngine {
         try { return this.syncBase.lastSyncTimestamp; } catch { return 0; }
     }
 
+    setUploadPriority(priority: SyncPriority): void {
+        this.syncPriority = priority;
+    }
+
     /** Most recent network/sync failure observed. */
     getLastError(): { ts: number; message: string; origin: string } | null {
         return this.lastError;

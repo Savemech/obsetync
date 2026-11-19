@@ -97,15 +97,9 @@ function admittedLimit(value: number | undefined): number {
 /** Exact synchronous compatibility behavior, including the historical random
  * comparator and sequential no-copy result. */
 export function sortByPriority(changes: FileChange[], priority: SyncPriority): FileChange[] {
-    switch (priority) {
-        case "oldest": return [...changes].sort((a, b) => (a.mtime ?? 0) - (b.mtime ?? 0));
-        case "newest": return [...changes].sort((a, b) => (b.mtime ?? 0) - (a.mtime ?? 0));
-        case "smallest": return [...changes].sort((a, b) => (a.size ?? 0) - (b.size ?? 0));
-        case "biggest": return [...changes].sort((a, b) => (b.size ?? 0) - (a.size ?? 0));
-        case "alphabetic": return [...changes].sort((a, b) => a.path.localeCompare(b.path));
-        case "random": return [...changes].sort(() => Math.random() - 0.5);
-        default: return changes;
-    }
+    if (priority === "random") return [...changes].sort(() => Math.random() - 0.5);
+    const compare = deterministicComparator(priority);
+    return compare ? [...changes].sort(compare) : changes;
 }
 
 /** Stable cooperative preparation sort for deterministic priorities. Random
