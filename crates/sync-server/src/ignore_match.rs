@@ -33,6 +33,7 @@ fn matches_one(path: &str, segments: &[&str], raw: &str) -> bool {
     if dir_only {
         p = &p[..p.len() - 1];
     }
+    let anchored = p.starts_with('/');
     if let Some(rest) = p.strip_prefix('/') {
         p = rest; // anchored
     }
@@ -42,7 +43,13 @@ fn matches_one(path: &str, segments: &[&str], raw: &str) -> bool {
 
     if p.contains('/') {
         // Anchored path prefix: the path IS `p` or lives under `p/`.
-        return path == p || path.starts_with(&format!("{}/", p));
+        return (!dir_only && path == p)
+            || path
+                .strip_prefix(p)
+                .is_some_and(|tail| tail.starts_with('/'));
+    }
+    if anchored {
+        return (!dir_only || segments.len() > 1) && wildcard(segments[0], p);
     }
     if dir_only {
         // Directory anywhere: only a non-final segment (an ancestor dir) counts,
@@ -126,6 +133,19 @@ mod tests {
         assert!(matches_any("notes/.DS_Store", &p));
         assert!(!matches_any("templates/note.tmpl", &p)); // .tmpl != .tmp
         assert!(!matches_any("real/note.md", &p));
+    }
+
+    #[test]
+    fn anchored_directory_never_matches_an_exact_file_or_nested_name() {
+        for pattern in ["/cache/", "/ca*e/"] {
+            let p = pats(&[pattern]);
+            assert!(matches_any("cache/data", &p));
+            assert!(!matches_any("notes/cache/data", &p));
+            assert!(!matches_any("cache", &p));
+        }
+        assert!(!matches_any("notes/cache", &pats(&["notes/cache/"])));
+        assert!(matches_any("a.tmp", &pats(&["/*.tmp"])));
+        assert!(!matches_any("notes/a.tmp", &pats(&["/*.tmp"])));
     }
 
     #[test]

@@ -288,7 +288,7 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                 "builds a full-text index of every note, often 200–500 MB) that waste bandwidth " +
                 "and regenerate automatically on each device anyway. " +
                 "The plugin's own state files (sync-base, journal, cached-root) are always " +
-                "excluded regardless of this setting."
+                "excluded regardless of this setting. Takes effect after reloading the plugin."
             )
             .addToggle((toggle) =>
                 toggle

@@ -1,42 +1,11 @@
 use crate::storage_writer::StorageWriter;
 use sync_core::chunk::RootNode;
 use sync_core::diff::FileDelta;
-#[cfg(test)]
-use sync_core::merge::MergeResult;
 use sync_core::merge::VersionedMergeResult;
 use sync_core::versioned_root::VersionedRoot;
 
 const MAX_ROOT_FILES: u64 = 5_000_000;
 const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
-
-/// Run sync-core's `merge_trees` in a blocking task with a LocalSet
-/// to handle the `!Send` futures from `ChunkStore` trait.
-///
-/// The same packed store supplies index nodes and small-file bytes. Merged
-/// index/content objects return through its single durable writer.
-#[cfg(test)]
-pub async fn run_merge(
-    store: StorageWriter,
-    base: RootNode,
-    side_a: RootNode,
-    side_b: RootNode,
-) -> Result<MergeResult, String> {
-    store
-        .run_blocking(move |store| {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| e.to_string())?;
-            let local = tokio::task::LocalSet::new();
-            local.block_on(&rt, async {
-                sync_core::merge::merge_trees(&store, &store, &base, &side_a, &side_b)
-                    .await
-                    .map_err(|e| e.to_string())
-            })
-        })
-        .await
-        .map_err(|e| e.to_string())?
-}
 
 pub async fn run_versioned_merge(
     store: StorageWriter,
@@ -55,40 +24,6 @@ pub async fn run_versioned_merge(
                 sync_core::merge::merge_versioned_trees(&store, &store, &base, &side_a, &side_b)
                     .await
                     .map_err(|e| e.to_string())
-            })
-        })
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-/// Load every file entry reachable from a root (all subtrees flattened),
-/// in a blocking task with a LocalSet — used by the admin export to
-/// materialize a snapshot without touching merge/diff logic.
-#[cfg(test)]
-pub async fn run_list_entries(
-    store: StorageWriter,
-    root: RootNode,
-) -> Result<Vec<sync_core::chunk::FileEntry>, String> {
-    store
-        .run_blocking(move |store| {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| e.to_string())?;
-            let local = tokio::task::LocalSet::new();
-            local.block_on(&rt, async {
-                // Stored roots are normally trusted, but never turn a corrupt
-                // total_files field into a giant eager allocation.
-                let mut entries =
-                    Vec::with_capacity(usize::try_from(root.total_files).unwrap_or(0).min(100_000));
-                for (_prefix, child_hash) in &root.children {
-                    let mut child = sync_core::tree::load_all_entries(&store, child_hash)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    entries.append(&mut child);
-                }
-                entries.sort();
-                Ok(entries)
             })
         })
         .await
@@ -184,8 +119,7 @@ pub async fn run_validate_root(
                 .map_err(|e| e.to_string())?;
             let local = tokio::task::LocalSet::new();
             local.block_on(&rt, async {
-                let mut entries =
-                    Vec::with_capacity(usize::try_from(root.total_files).unwrap_or(0).min(100_000));
+                let mut entries = Vec::new();
                 let mut previous_prefix: Option<&str> = None;
                 for (prefix, child_hash) in &root.children {
                     if previous_prefix.is_some_and(|previous| previous >= prefix.as_str()) {
@@ -203,8 +137,11 @@ pub async fn run_validate_root(
                     // order puts the root-level prefix (`""`) first, but a root
                     // file such as `seed.md` can lexically follow `notes/x.md` in
                     // the next prefix, so ordering must not leak across children.
-                    let mut previous_path: Option<String> = None;
-                    for entry in child {
+                    if entries.len() as u64 + child.len() as u64 > root.total_files {
+                        return Err("root contains more entries than declared".to_string());
+                    }
+                    let mut previous_path: Option<&str> = None;
+                    for entry in &child {
                         if !valid_vault_path(&entry.path) {
                             return Err(format!("unsafe vault path {:?}", entry.path));
                         }
@@ -214,10 +151,7 @@ pub async fn run_validate_root(
                                 entry.path, prefix
                             ));
                         }
-                        if previous_path
-                            .as_ref()
-                            .is_some_and(|previous| previous >= &entry.path)
-                        {
+                        if previous_path.is_some_and(|previous| previous >= entry.path.as_str()) {
                             return Err("root entries are not strictly path-sorted".to_string());
                         }
                         if entry.size_bytes > JS_MAX_SAFE_INTEGER
@@ -228,12 +162,9 @@ pub async fn run_validate_root(
                                 entry.path
                             ));
                         }
-                        previous_path = Some(entry.path.clone());
-                        entries.push(entry);
-                        if entries.len() as u64 > root.total_files {
-                            return Err("root contains more entries than declared".to_string());
-                        }
+                        previous_path = Some(&entry.path);
                     }
+                    entries.extend(child);
                 }
                 if entries.len() as u64 != root.total_files {
                     return Err(format!(
@@ -320,49 +251,7 @@ fn valid_top_level_prefix(prefix: &str) -> bool {
     !segment.contains('/') && valid_vault_path(segment)
 }
 
-/// Rebuild `root` with every entry matching one of `patterns` removed — the
-/// admin "purge" action (Slice 2b). A one-shot, COW-reversible cleanup that
-/// lifts a build-output tree (target/, node_modules/, …) out of the shared
-/// Merkle tree so that ignoring clients can reach parity again. Returns
-/// `(new_root, removed, kept)`. Reuses the same flatten-then-rebuild path as
-/// export + build_tree, so it can't desync from how roots are normally built.
-#[cfg(test)]
-pub async fn run_purge(
-    store: StorageWriter,
-    root: RootNode,
-    patterns: Vec<String>,
-) -> Result<(RootNode, usize, usize), String> {
-    store
-        .run_blocking(move |store| {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| e.to_string())?;
-            let local = tokio::task::LocalSet::new();
-            local.block_on(&rt, async {
-                let vault_id = root.vault_id.clone();
-                let mut entries = Vec::with_capacity(root.total_files as usize);
-                for (_prefix, child_hash) in &root.children {
-                    let mut child = sync_core::tree::load_all_entries(&store, child_hash)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    entries.append(&mut child);
-                }
-                let before = entries.len();
-                entries.retain(|e| !crate::ignore_match::matches_any(&e.path, &patterns));
-                let kept = entries.len();
-                let removed = before - kept;
-                let new_root =
-                    sync_core::tree::build_tree(&store, entries, &vault_id, "admin-purge")
-                        .await
-                        .map_err(|e| e.to_string())?;
-                Ok((new_root, removed, kept))
-            })
-        })
-        .await
-        .map_err(|e| e.to_string())?
-}
-
+/// Remove matching entries while preserving tree format and linking the new root to its parent.
 pub async fn run_versioned_purge(
     store: StorageWriter,
     root: VersionedRoot,
@@ -397,39 +286,6 @@ pub async fn run_versioned_purge(
                 .map_err(|e| e.to_string())?;
                 new_root.set_history_metadata(0, Some(parent), "admin-purge");
                 Ok((new_root, removed, kept))
-            })
-        })
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-/// Run sync-core's `compute_deltas` in a blocking task with a LocalSet.
-#[cfg(test)]
-pub async fn run_diff(
-    store: StorageWriter,
-    from_root: RootNode,
-    to_root: RootNode,
-) -> Result<Vec<FileDelta>, String> {
-    Ok(run_diff_with_stats(store, from_root, to_root).await?.deltas)
-}
-
-#[cfg(test)]
-pub async fn run_diff_with_stats(
-    store: StorageWriter,
-    from_root: RootNode,
-    to_root: RootNode,
-) -> Result<sync_core::diff::DiffResult, String> {
-    store
-        .run_blocking(move |store| {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| e.to_string())?;
-            let local = tokio::task::LocalSet::new();
-            local.block_on(&rt, async {
-                sync_core::diff::compute_deltas_with_stats(&store, &from_root, &to_root)
-                    .await
-                    .map_err(|e| e.to_string())
             })
         })
         .await
@@ -512,7 +368,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = test_writer(dir.path());
         let root = build_tree_on_store(store.clone(), vec![make_entry("a.md", "x")]).await;
-        let deltas = run_diff(store, root.clone(), root).await.unwrap();
+        let deltas = run_versioned_diff(
+            store,
+            VersionedRoot::V1(root.clone()),
+            VersionedRoot::V1(root),
+        )
+        .await
+        .unwrap();
         assert!(deltas.is_empty());
     }
 
@@ -526,7 +388,9 @@ mod tests {
             vec![make_entry("a.md", "x"), make_entry("b.md", "y")],
         )
         .await;
-        let deltas = run_diff(store, r1, r2).await.unwrap();
+        let deltas = run_versioned_diff(store, VersionedRoot::V1(r1), VersionedRoot::V1(r2))
+            .await
+            .unwrap();
         assert_eq!(deltas.len(), 1);
         assert!(matches!(
             &deltas[0],
@@ -576,9 +440,16 @@ mod tests {
         let base = build_tree_on_store(store.clone(), vec![make_entry("a.md", "x")]).await;
         let side_a = build_tree_on_store(store.clone(), vec![make_entry("a.md", "y")]).await;
         let side_b = base.clone();
-        let result = run_merge(store, base, side_a, side_b).await.unwrap();
+        let result = run_versioned_merge(
+            store,
+            VersionedRoot::V1(base),
+            VersionedRoot::V1(side_a),
+            VersionedRoot::V1(side_b),
+        )
+        .await
+        .unwrap();
         assert!(result.file_conflicts.is_empty());
-        assert_eq!(result.new_root.total_files, 1);
+        assert_eq!(result.new_root.total_files(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -592,25 +463,31 @@ mod tests {
                 make_entry("proj/target/debug/lib.rmeta", "junk1"),
                 make_entry("proj/target/deps/other.rlib", "junk2"),
                 make_entry("proj/src/main.rs", "code"),
+                make_entry("cache/index.json", "generated"),
+                make_entry("notes/cache/index.json", "keep"),
                 make_entry("target.md", "a note that merely mentions target"),
             ],
         )
         .await;
 
-        let (new_root, removed, kept) = run_purge(store.clone(), root, vec!["target/".to_string()])
-            .await
-            .unwrap();
+        let (new_root, removed, kept) = run_versioned_purge(
+            store.clone(),
+            VersionedRoot::V1(root),
+            vec!["target/".to_string(), "/cache/".to_string()],
+        )
+        .await
+        .unwrap();
 
-        // The two files under a `target/` dir go; the real note that merely has
-        // "target" in its name stays, as do the other real files.
-        assert_eq!(removed, 2);
-        assert_eq!(kept, 3);
-        assert_eq!(new_root.total_files, 3);
+        assert_eq!(removed, 3);
+        assert_eq!(kept, 4);
+        assert_eq!(new_root.total_files(), 4);
 
-        let entries = run_list_entries(store, new_root).await.unwrap();
+        let entries = run_versioned_list_entries(store, new_root).await.unwrap();
         let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
         assert!(paths.contains(&"notes/a.md"));
         assert!(paths.contains(&"proj/src/main.rs"));
+        assert!(paths.contains(&"notes/cache/index.json"));
+        assert!(!paths.contains(&"cache/index.json"));
         assert!(paths.contains(&"target.md")); // a real note, NOT purged
         assert!(!paths.iter().any(|p| p.contains("/target/")));
     }
@@ -624,9 +501,13 @@ mod tests {
             vec![make_entry("a.md", "x"), make_entry("b.md", "y")],
         )
         .await;
-        let (_new, removed, kept) = run_purge(store, root, vec!["node_modules/".to_string()])
-            .await
-            .unwrap();
+        let (_new, removed, kept) = run_versioned_purge(
+            store,
+            VersionedRoot::V1(root),
+            vec!["node_modules/".to_string()],
+        )
+        .await
+        .unwrap();
         assert_eq!(removed, 0);
         assert_eq!(kept, 2);
     }
@@ -638,7 +519,14 @@ mod tests {
         let base = build_tree_on_store(store.clone(), vec![make_entry("a.md", "x")]).await;
         let side_a = build_tree_on_store(store.clone(), vec![make_entry("a.md", "side-a")]).await;
         let side_b = build_tree_on_store(store.clone(), vec![make_entry("a.md", "side-b")]).await;
-        let result = run_merge(store, base, side_a, side_b).await.unwrap();
+        let result = run_versioned_merge(
+            store,
+            VersionedRoot::V1(base),
+            VersionedRoot::V1(side_a),
+            VersionedRoot::V1(side_b),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.file_conflicts.len(), 1);
         assert_eq!(result.file_conflicts[0].path, "a.md");
     }

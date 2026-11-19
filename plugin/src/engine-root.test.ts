@@ -2422,6 +2422,25 @@ async function deferredFreshPullWithoutAHeadKeepsItsDurableFence() {
     } finally { await f.close(); }
 }
 
+async function disabledConfigScanPreservesPreviouslyTrackedSettings() {
+    const f = await fixture(2), settingsPath = ".obsidian/hotkeys.json";
+    try {
+        const enabled = await f.create("config-enabled", { syncConfig: true });
+        await f.queue(enabled.engine, [settingsPath], 3);
+        await enabled.engine.pushPending();
+        assert.equal(f.server.entries.get(settingsPath)?.hash, hashFor(3));
+        await enabled.engine.stopAndDrain();
+        f.source.delete(settingsPath);
+        const a = await f.create("config-disabled");
+        const publications = f.server.requests.length;
+        await a.engine.partialMtimeScan();
+        assert.equal(f.server.requests.length, publications, "disabled config scan published a deletion");
+        assert.equal(f.server.entries.get(settingsPath)?.hash, hashFor(3));
+        assert.equal(f.base.getHash(settingsPath), hashFor(3), "device dropped its tracked config during scan");
+        assert.equal(a.engine.pendingChanges.size, 0, "disabled config entered the push queue");
+    } finally { await f.close(); }
+}
+
 async function ignoredFreshPullCannotAdoptOrPublishMissingLeaves() {
     const f = await fixture(0), a = await f.create("ignored-first-pull");
     const target = "e".repeat(64);
@@ -2496,8 +2515,9 @@ async function run() {
         await completedPagedCheckpointRebuildsNonemptyStaleTree();
         await deferredFreshPullKeepsItsVerifiedDiffFallback();
         await deferredFreshPullWithoutAHeadKeepsItsDurableFence();
+        await disabledConfigScanPreservesPreviouslyTrackedSettings();
         await ignoredFreshPullCannotAdoptOrPublishMissingLeaves();
-        console.log("engine-root.test: 38 actual engine/root/journal/base integration suites passed (synthetic tree/transport)");
+        console.log("engine-root.test: 39 actual engine/root/journal/base integration suites passed (synthetic tree/transport)");
     } finally {
         if (globals.__obsetyncTestNotice === notice) {
             if (oldNotice === undefined) delete globals.__obsetyncTestNotice; else globals.__obsetyncTestNotice = oldNotice;

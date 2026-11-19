@@ -84,7 +84,7 @@ read	crates/sync-server/src/api.rs	production	Removed disabled HTTP v1 middlewar
 pending	crates/sync-server/src/api_root_outcome_tests.rs	production	Not reviewed
 reviewed	crates/sync-server/src/blocking_io.rs	production	Read complete permit ownership and callers; control/storage pools are separate and permit moves into blocking closure; parallelism/panic/isolation tests passed
 reviewed	crates/sync-server/src/box_key.rs	production	All runtime/init/admin callers traced; race and interrupted-public-copy regressions reproduced then fixed with existing tempfile no-replace publication; existing invalid keys preserved; Unix permissions and 16-thread initialization tested
-pending	crates/sync-server/src/bridge.rs	production	Not reviewed
+reviewed	crates/sync-server/src/bridge.rs	production	Traced validation/projection/list/merge/diff/purge through API/admin; removed five test-only duplicate bridge functions; V1 validation borrows paths and grows output with checked children; purge survivors asserted on temporary storage
 reviewed	crates/sync-server/src/build_identity.rs	production	Read all constants/serialization and CLI consumer; protocol fields derive from live endpoints; canonical identity tests passed and build-script inputs exercised separately
 pending	crates/sync-server/src/bulk.rs	production	Not reviewed
 reviewed	crates/sync-server/src/config.rs	production	All callers traced; retired unused port/password fields; explicit data-dir owns storage after restore; old JSON and moved-directory unit/native Nix startup tests pass
@@ -95,7 +95,7 @@ reviewed	crates/sync-server/src/enrollment.rs	production	Complete creation/claim
 reviewed	crates/sync-server/src/eph_rotation.rs	production	Read generation/rotation/task and tests; startup/admin/bootstrap/decrypt consumers traced; current and previous slots zeroize on replacement, OS entropy and retry handling preserved
 reviewed	crates/sync-server/src/error.rs	production	Traced every variant and conversion; removed only test-constructed Unauthorized variant and dead-code blanket; active route status mappings and tests preserved
 pending	crates/sync-server/src/guard.rs	production	Not reviewed
-pending	crates/sync-server/src/ignore_match.rs	production	Not reviewed
+reviewed	crates/sync-server/src/ignore_match.rs	production	Traced all matcher calls to versioned admin purge; checked conservative supported subset and rooted glob/directory regressions
 reviewed	crates/sync-server/src/main.rs	production	Read full CLI/startup/listener/background/health paths; native reset/restore and credential-mode upgrade smoke pass with existing identities; bounded end-to-end health deadline and status-line tests; both serve errors reach CLI exit
 pending	crates/sync-server/src/pack_store.rs	production	Not reviewed
 pending	crates/sync-server/src/perf.rs	production	Not reviewed
@@ -237,8 +237,8 @@ pending	plugin/src/hash-worker-protocol.ts	production	Not reviewed
 pending	plugin/src/hash-worker-source.d.ts	production	Not reviewed
 pending	plugin/src/host-runtime.test.ts	tests	Not reviewed
 pending	plugin/src/host-runtime.ts	production	Not reviewed
-pending	plugin/src/ignore.test.ts	tests	Not reviewed
-pending	plugin/src/ignore.ts	production	Not reviewed
+reviewed	plugin/src/ignore.test.ts	tests	Checked built-in and custom patterns, legacy settings migration, anchored file/directory matches and nested negative cases
+reviewed	plugin/src/ignore.ts	production	Traced matcher through event capture, scans, legacy and paged pulls; rooted single-segment patterns and directory-only anchored paths corrected
 pending	plugin/src/incremental-tree-test-abi.ts	production	Not reviewed
 pending	plugin/src/index-upload.test.ts	tests	Not reviewed
 pending	plugin/src/index-upload.ts	production	Not reviewed

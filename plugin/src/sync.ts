@@ -1443,7 +1443,7 @@ export class ObsetyncSyncEngine {
 
             // --- Partition sync-base: small files (whole blobs) vs large (manifests+chunks).
             contentIndex = buildReconcileContentIndex(
-                this.syncBase.allPaths().map((path) => {
+                this.syncBase.allPaths().filter(path => !this.isExcluded(path)).map((path) => {
                     const entry = this.syncBase.getEntry(path)!;
                     return { path, hash: entry.hash.toLowerCase(), size: entry.size };
                 }),
@@ -4731,6 +4731,7 @@ export class ObsetyncSyncEngine {
      *  propagating target/ DELETIONS to the fleet — ignored paths that vanish
      *  from disk are simply not tracked, never deleted. */
     private isExcluded(path: string): boolean {
-        return this.isSyncInternal(path) || this.isIgnored(path);
+        return this.isSyncInternal(path) || (!this.syncObsidianConfig && path.startsWith(".obsidian/")) ||
+            this.isIgnored(path);
     }
 }

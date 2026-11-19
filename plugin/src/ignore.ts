@@ -13,6 +13,7 @@
  *                          (file or dir) at any depth.
  *   - `*.tmp` / `.DS_Store`no-slash glob/name — matched against every segment
  *                          (so it catches basenames at any depth).
+ *   - `/target/`           directory at the vault root only.
  *   - `docs/target/`        contains `/` → anchored at the vault root.
  *   - `*`  matches within a segment; `**` matches across segments; `?` one char.
  *
@@ -66,8 +67,8 @@ function compileRule(pattern: string): Rule | null {
     const hasSlash = p.includes("/");
 
     if (!hasSlash) {
-        // Floating pattern — matches at any depth.
         const rx = new RegExp("^" + globToSource(p) + "$");
+        if (anchored) return segments => (!dirOnly || segments.length > 1) && rx.test(segments[0]);
         if (dirOnly) {
             // `target/` — only a DIRECTORY match excludes the subtree, so test
             // every segment EXCEPT the basename (a file named `target` is not a
@@ -85,7 +86,7 @@ function compileRule(pattern: string): Rule | null {
 
     // Anchored path pattern (`a/b`, `docs/target/`, `docs/**/tmp`). Matches the
     // path exactly or as a directory prefix (`a/b` also excludes `a/b/**`).
-    const rx = new RegExp("^" + globToSource(p) + "(?:/.*)?$");
+    const rx = new RegExp("^" + globToSource(p) + (dirOnly ? "/" : "(?:/|$)"));
     return (_segments, path) => rx.test(path);
 }
 

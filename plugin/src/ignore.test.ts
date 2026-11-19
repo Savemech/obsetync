@@ -64,6 +64,16 @@ ok("anchored dir matches", g.test("_attachments/big/video.mp4"));
 ok("anchored dir NOT matched elsewhere", !g.test("other/_attachments/big/x"));
 ok("comment/blank contributed no rules", g.size === 3);
 
+for (const pattern of ["/cache/", "/ca*e/"]) {
+    const root = compileIgnore([pattern]);
+    ok("root directory includes descendants", root.test("cache/data"));
+    ok("root directory excludes nested names", !root.test("notes/cache/data"));
+    ok("root directory rule keeps same-named file", !root.test("cache"));
+}
+ok("anchored directory keeps exact file", !g.test("_attachments/big"));
+ok("root file rule keeps nested file", !compileIgnore(["/*.tmp"]).test("notes/a.tmp"));
+ok("root file rule matches root file", compileIgnore(["/*.tmp"]).test("a.tmp"));
+
 // --- ** across segments ------------------------------------------------------
 const gg = compileIgnore(["docs/**/tmp/"]);
 ok("** crosses segments", gg.test("docs/a/b/tmp/x.md"));
