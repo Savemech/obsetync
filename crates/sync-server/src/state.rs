@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Instant;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
 /// Shared application state, passed to all axum handlers.
 pub struct AppState {
@@ -169,13 +169,19 @@ impl AppState {
     }
 
     /// Subscribe to a vault's frames (creates the channel on first use).
-    pub fn subscribe_roots(&self, vault_id: &str) -> tokio::sync::broadcast::Receiver<String> {
-        self.notifiers
+    pub fn subscribe_roots(self: &Arc<Self>, vault_id: &str) -> VaultSubscription {
+        let receiver = self
+            .notifiers
             .lock()
             .expect("notifiers poisoned")
-            .entry(vault_id.to_string())
-            .or_insert_with(|| tokio::sync::broadcast::channel(16).0)
-            .subscribe()
+            .entry(vault_id.to_owned())
+            .or_insert_with(|| broadcast::channel(16).0)
+            .subscribe();
+        VaultSubscription {
+            receiver: Some(receiver),
+            state: Arc::clone(self),
+            vault_id: vault_id.to_owned(),
+        }
     }
 
     // --- Presence (Ph3) ---------------------------------------------------
@@ -245,6 +251,9 @@ impl AppState {
                 presence_frame(vault_id, device_id, &entry.device_name, None, "offline"),
             );
         }
+        if vault.is_empty() {
+            map.remove(vault_id);
+        }
     }
 
     /// Current live presence for a vault as ready-to-send frames — served to
@@ -256,6 +265,10 @@ impl AppState {
             return Vec::new();
         };
         vault.retain(|_, e| now.saturating_sub(e.updated_ms) < PRESENCE_TTL_MS);
+        if vault.is_empty() {
+            map.remove(vault_id);
+            return Vec::new();
+        }
         vault
             .iter()
             .map(|(device_id, e)| {
@@ -268,6 +281,44 @@ impl AppState {
                 )
             })
             .collect()
+    }
+}
+
+pub struct VaultSubscription {
+    receiver: Option<broadcast::Receiver<String>>,
+    state: SharedState,
+    vault_id: String,
+}
+
+impl VaultSubscription {
+    pub async fn recv(&mut self) -> Result<String, broadcast::error::RecvError> {
+        self.receiver
+            .as_mut()
+            .expect("live subscription")
+            .recv()
+            .await
+    }
+
+    #[cfg(test)]
+    pub fn try_recv(&mut self) -> Result<String, broadcast::error::TryRecvError> {
+        self.receiver
+            .as_mut()
+            .expect("live subscription")
+            .try_recv()
+    }
+}
+
+impl Drop for VaultSubscription {
+    fn drop(&mut self) {
+        drop(self.receiver.take());
+        let mut channels = self.state.notifiers.lock().expect("notifiers poisoned");
+        // A reconnect may have subscribed while the old forwarder was closing.
+        if channels
+            .get(&self.vault_id)
+            .is_some_and(|tx| tx.receiver_count() == 0)
+        {
+            channels.remove(&self.vault_id);
+        }
     }
 }
 
@@ -316,6 +367,24 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn last_subscription_releases_channel_on_disconnect_or_task_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        layout.init_directories().unwrap();
+        box_key::init_box_keypair(&layout).unwrap();
+        let state = Arc::new(AppState::new(ServerConfig::new(dir.path().to_path_buf())));
+        let old = state.subscribe_roots("vault");
+        let mut new = state.subscribe_roots("vault");
+        drop(old);
+        state.publish_frame("vault", "still live".into());
+        assert_eq!(new.try_recv().unwrap(), "still live");
+        let forwarder = tokio::spawn(async move { new.recv().await });
+        forwarder.abort();
+        assert!(forwarder.await.unwrap_err().is_cancelled());
+        assert!(state.notifiers.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn failed_crdt_append_does_not_publish_a_peer_update() {
         let dir = tempfile::tempdir().unwrap();
         let layout = StorageLayout::new(dir.path());
@@ -343,7 +412,7 @@ mod tests {
         let layout = StorageLayout::new(dir.path());
         layout.init_directories().unwrap();
         box_key::init_box_keypair(&layout).unwrap();
-        let state = AppState::new(ServerConfig::new(dir.path().to_path_buf()));
+        let state = Arc::new(AppState::new(ServerConfig::new(dir.path().to_path_buf())));
         let mut events = state.subscribe_roots("vault");
         let old_session = state.new_presence_session_id();
         let new_session = state.new_presence_session_id();
@@ -387,10 +456,24 @@ mod tests {
         );
 
         state.clear_presence("vault", "device", new_session);
+        assert!(state.presence.lock().unwrap().is_empty());
         assert!(state.presence_snapshot("vault").is_empty());
         let offline: serde_json::Value = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
         assert_eq!(offline["state"], "offline");
         state.clear_presence("vault", "device", new_session);
         assert!(events.try_recv().is_err(), "cleanup is idempotent");
+
+        state.set_presence("vault", "device", new_session, "Laptop", None, "idle");
+        state
+            .presence
+            .lock()
+            .unwrap()
+            .get_mut("vault")
+            .unwrap()
+            .get_mut("device")
+            .unwrap()
+            .updated_ms = 0;
+        assert!(state.presence_snapshot("vault").is_empty());
+        assert!(state.presence.lock().unwrap().is_empty());
     }
 }

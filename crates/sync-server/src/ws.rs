@@ -531,15 +531,20 @@ async fn read_sub_plain(stream: &mut SplitStream<WebSocket>) -> Option<Vec<Strin
 }
 
 fn extract_vaults(v: &serde_json::Value) -> Vec<String> {
-    v.get("vaults")
-        .and_then(|x| x.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|s| s.as_str().map(String::from))
-                .take(MAX_VAULTS_PER_SUB)
-                .collect()
-        })
-        .unwrap_or_default()
+    let mut vaults = Vec::new();
+    if let Some(ids) = v.get("vaults").and_then(|ids| ids.as_array()) {
+        for id in ids.iter().filter_map(|v| v.as_str()) {
+            if crate::devices::validate_vault_id(id).is_ok()
+                && !vaults.iter().any(|existing| existing == id)
+            {
+                vaults.push(id.to_owned());
+                if vaults.len() == MAX_VAULTS_PER_SUB {
+                    break;
+                }
+            }
+        }
+    }
+    vaults
 }
 
 fn bye(reason: &str) -> String {
@@ -564,6 +569,23 @@ fn is_own_presence(frame: &str, my_device: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::is_own_presence;
+
+    #[test]
+    fn subscriptions_preserve_order_and_bound_distinct_valid_vaults() {
+        let mut ids = vec![
+            "a".to_owned(),
+            "".into(),
+            "a".into(),
+            "bad\n".into(),
+            "x".repeat(1025),
+        ];
+        ids.extend((0..20).map(|n| n.to_string()));
+        let actual = super::extract_vaults(&serde_json::json!({"vaults": ids}));
+        let expected: Vec<_> = std::iter::once("a".to_owned())
+            .chain((0..15).map(|n| n.to_string()))
+            .collect();
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn own_presence_frame_is_filtered_others_are_not() {

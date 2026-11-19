@@ -888,7 +888,7 @@ fn normalize_capabilities(capabilities: &[String]) -> Result<Vec<String>, std::i
     Ok(normalized)
 }
 
-fn validate_vault_id(vault_id: &str) -> Result<&str, std::io::Error> {
+pub(crate) fn validate_vault_id(vault_id: &str) -> Result<&str, std::io::Error> {
     if vault_id.is_empty()
         || vault_id.len() > MAX_VAULT_ID_LEN
         || vault_id
