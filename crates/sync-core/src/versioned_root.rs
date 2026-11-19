@@ -196,12 +196,16 @@ pub async fn load_all_entries<S: ChunkStore>(
     }
     let entries = match root {
         VersionedRoot::V1(root) => {
-            let capacity = usize::try_from(root.total_files)
-                .unwrap_or(0)
-                .min(crate::tree_v2::MAX_LOADED_ENTRIES);
-            let mut entries = Vec::with_capacity(capacity);
+            let mut entries = Vec::new();
             for (_, hash) in &root.children {
-                entries.extend(crate::tree::load_all_entries(store, hash).await?);
+                let child = crate::tree::load_all_entries(store, hash).await?;
+                if (entries.len() + child.len()) as u64 > root.total_files {
+                    return Err(ChunkError::Deserialize(format!(
+                        "root declares {} files but its loaded children already exceed that count",
+                        root.total_files
+                    )));
+                }
+                entries.extend(child);
             }
             entries.sort();
             entries
@@ -259,6 +263,29 @@ mod tests {
         assert!(RootNode::deserialize(&v2_bytes).is_err());
         assert_eq!(load_all_entries(&v1_store, &v1).await.unwrap(), entries);
         assert_eq!(load_all_entries(&v2_store, &v2).await.unwrap(), entries);
+    }
+
+    #[tokio::test]
+    async fn v1_entry_count_overrun_stops_before_loading_the_next_directory() {
+        let store = MemoryChunkStore::new();
+        let mut root = build_root(
+            &store,
+            vec![entry("a/1.md", 1), entry("b/2.md", 2)],
+            TREE_V1,
+            "vault",
+            "device",
+        )
+        .await
+        .unwrap();
+        let VersionedRoot::V1(v1) = &mut root else {
+            unreachable!()
+        };
+        v1.total_files = 0;
+        v1.children[1].1 = hash_bytes(b"unavailable");
+        assert!(matches!(
+            load_all_entries(&store, &root).await,
+            Err(ChunkError::Deserialize(_))
+        ));
     }
 
     #[test]

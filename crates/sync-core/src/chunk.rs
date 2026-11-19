@@ -2,6 +2,12 @@ use crate::hash::{FileHash, IncrementalHasher};
 use flatbuffers::FlatBufferBuilder;
 use sync_schema::sync_chunk;
 
+fn decode_hash(bytes: &[u8], field: &str) -> Result<FileHash, ChunkError> {
+    bytes
+        .try_into()
+        .map_err(|_| ChunkError::Deserialize(format!("{field} length {} != 32", bytes.len())))
+}
+
 /// A single file entry inside a leaf chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
@@ -126,15 +132,7 @@ impl LeafChunk {
         let mut entries = Vec::with_capacity(fb_entries.len());
         for fb_entry in fb_entries.iter() {
             let path = fb_entry.path().to_string();
-            let hash_vec = fb_entry.hash();
-            if hash_vec.len() != 32 {
-                return Err(ChunkError::Deserialize(format!(
-                    "hash length {} != 32",
-                    hash_vec.len()
-                )));
-            }
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(hash_vec.bytes());
+            let hash = decode_hash(fb_entry.hash().bytes(), "hash")?;
             entries.push(FileEntry {
                 path,
                 hash,
@@ -277,15 +275,7 @@ impl InternalNode {
         let mut children = Vec::with_capacity(fb_children.len());
         for child in fb_children.iter() {
             let prefix = child.prefix().to_string();
-            let hash_vec = child.hash();
-            if hash_vec.len() != 32 {
-                return Err(ChunkError::Deserialize(format!(
-                    "hash length {} != 32",
-                    hash_vec.len()
-                )));
-            }
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(hash_vec.bytes());
+            let hash = decode_hash(child.hash().bytes(), "hash")?;
             children.push((prefix, hash));
         }
 
@@ -389,30 +379,17 @@ impl RootNode {
 
         let device_id = root.device_id().unwrap_or("").to_string();
 
-        let parent_hash = root.parent_hash().and_then(|h| {
-            if h.len() == 32 {
-                let mut hash = [0u8; 32];
-                hash.copy_from_slice(h.bytes());
-                Some(hash)
-            } else {
-                None
-            }
-        });
+        let parent_hash = root
+            .parent_hash()
+            .map(|hash| decode_hash(hash.bytes(), "parent hash"))
+            .transpose()?;
 
         let fb_children = root.children();
 
         let mut children = Vec::with_capacity(fb_children.len());
         for child in fb_children.iter() {
             let prefix = child.prefix().to_string();
-            let hash_vec = child.hash();
-            if hash_vec.len() != 32 {
-                return Err(ChunkError::Deserialize(format!(
-                    "hash length {} != 32",
-                    hash_vec.len()
-                )));
-            }
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(hash_vec.bytes());
+            let hash = decode_hash(child.hash().bytes(), "hash")?;
             children.push((prefix, hash));
         }
 
@@ -529,6 +506,42 @@ mod tests {
         let bytes = root.serialize();
         let decoded = RootNode::deserialize(&bytes).unwrap();
         assert_eq!(decoded.parent_hash, None);
+    }
+
+    #[test]
+    fn malformed_parent_hash_is_not_treated_as_missing_history() {
+        for length in [0, 31, 33] {
+            let mut builder = FlatBufferBuilder::new();
+            let vault_id = builder.create_string("vault");
+            let children =
+                builder.create_vector::<flatbuffers::WIPOffset<sync_chunk::ChildRef>>(&[]);
+            let parent_hash = builder.create_vector(&vec![1u8; length]);
+            let root = sync_chunk::RootNode::create(
+                &mut builder,
+                &sync_chunk::RootNodeArgs {
+                    version: 1,
+                    vault_id: Some(vault_id),
+                    children: Some(children),
+                    parent_hash: Some(parent_hash),
+                    ..Default::default()
+                },
+            );
+            let envelope = sync_chunk::ChunkEnvelope::create(
+                &mut builder,
+                &sync_chunk::ChunkEnvelopeArgs {
+                    node_type: sync_chunk::NodeType::RootNode,
+                    node: Some(root.as_union_value()),
+                },
+            );
+            builder.finish(envelope, None);
+            assert!(
+                matches!(
+                    RootNode::deserialize(builder.finished_data()),
+                    Err(ChunkError::Deserialize(_))
+                ),
+                "accepted {length}-byte parent"
+            );
+        }
     }
 
     #[test]
