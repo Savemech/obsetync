@@ -3,15 +3,13 @@ import type { FileDelta } from "./api";
 const MAX_DELTAS = 2_000_000;
 const HASH = /^[0-9a-f]{64}$/i;
 
+const INVALID_PATH_CHARACTER = /[\\\x00-\x1f\x7f]/;
+const DOT_SEGMENT = /(?:^|\/)\.{1,2}(?:\/|$)/;
+
 export function isSafeVaultPath(path: unknown): path is string {
-    if (typeof path !== "string" || path.length === 0 || path.length > 4096) return false;
-    if (path.startsWith("/") || path.includes("\\")) return false;
-    if ([...path].some((char) => {
-        const code = char.codePointAt(0)!;
-        return code < 0x20 || code === 0x7f;
-    })) return false;
-    const segments = path.split("/");
-    return segments.every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
+    return typeof path === "string" && path.length > 0 && path.length <= 4096 &&
+        !path.startsWith("/") && !path.endsWith("/") && !path.includes("//") &&
+        !INVALID_PATH_CHARACTER.test(path) && !DOT_SEGMENT.test(path);
 }
 
 export function validateFileDeltas(value: unknown): FileDelta[] {

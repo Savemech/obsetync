@@ -200,8 +200,8 @@ pending	plugin/src/debug-log.ts	production	Not reviewed
 pending	plugin/src/debug-modal.ts	production	Not reviewed
 pending	plugin/src/deferred-changes.test.ts	tests	Not reviewed
 pending	plugin/src/deferred-changes.ts	production	Not reviewed
-pending	plugin/src/delta-validation.test.ts	tests	Not reviewed
-pending	plugin/src/delta-validation.ts	production	Not reviewed
+reviewed	plugin/src/delta-validation.test.ts	tests	60 assertions including dot and empty segments, Unicode, controls and length boundaries
+reviewed	plugin/src/delta-validation.ts	production	Reviewed legacy JSON actions, path/rename uniqueness and bounds; shared path predicate no longer expands code points or splits segments; differential parity over 131966 inputs
 pending	plugin/src/desktop-hash-workers.test.ts	tests	Not reviewed
 pending	plugin/src/desktop-hash-workers.ts	production	Not reviewed
 pending	plugin/src/desktop-ranged-upload.bench.ts	tooling	Not reviewed
@@ -211,8 +211,8 @@ pending	plugin/src/desktop-reconcile-upload.test.ts	tests	Not reviewed
 pending	plugin/src/desktop-reconcile-upload.ts	production	Not reviewed
 pending	plugin/src/desktop-verified-read.test.ts	tests	Not reviewed
 pending	plugin/src/desktop-verified-read.ts	production	Not reviewed
-pending	plugin/src/diff-page-codec.test.ts	tests	Not reviewed
-pending	plugin/src/diff-page-codec.ts	production	Not reviewed
+reviewed	plugin/src/diff-page-codec.test.ts	tests	1933 assertions cover negotiation, binary framing, fuzzed pages, Unicode name preservation and independence from Node Buffer input
+reviewed	plugin/src/diff-page-codec.ts	production	Traced HTTP request, strict cursor/record ordering, UTF-8 and safe integer decoding; preserve leading U+FEFF and copy only the retained cursor bytes
 pending	plugin/src/dirty-set.test.ts	tests	Not reviewed
 pending	plugin/src/dirty-set.ts	production	Not reviewed
 pending	plugin/src/editor-pull-guard.test.ts	tests	Not reviewed

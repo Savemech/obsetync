@@ -141,12 +141,12 @@ function seededPage(word: () => number, count: number): { bytes: Uint8Array; del
     const deltas: SeededDelta[] = [];
     for (let index = 0; index < count; index++) {
         const action = 1 + word() % 4;
-        const path = `notes/p-${String(index).padStart(3, "0")}-${(word() & 0xffff).toString(16).padStart(4, "0")}.md`;
+        const path = `\uFEFFnotes/p-${String(index).padStart(3, "0")}-${(word() & 0xffff).toString(16).padStart(4, "0")}.md`;
         const pathBytes = new TextEncoder().encode(path);
         const parts = [new Uint8Array([action]), varint(pathBytes.byteLength), pathBytes];
         let old_path: string | undefined;
         if (action === 4) {
-            old_path = `archive/old-${String(index).padStart(3, "0")}.md`;
+            old_path = `\uFEFFarchive/old-${String(index).padStart(3, "0")}.md`;
             const oldBytes = new TextEncoder().encode(old_path);
             parts.push(varint(oldBytes.byteLength), oldBytes);
         }
@@ -402,6 +402,10 @@ function run(): void {
     withCursor.set(pageBytes.slice(74), 74 + finalCursor.length);
     check(decodeDiffPage(withCursor, root(1), null, null, limits).nextCursor !== null,
         "valid exact-key continuation was rejected");
+    const bufferPage = Buffer.from(withCursor);
+    const retained = decodeDiffPage(bufferPage, root(1), null, null, limits).nextCursor;
+    bufferPage.fill(0);
+    check(retained?.join() === finalCursor.join(), "continuation aliased the consumed page buffer");
     const forgedCursor = withCursor.slice();
     forgedCursor[74 + 74] = "z".charCodeAt(0);
     checkRejected(forgedCursor, "decoder accepted a cursor not naming the final record");

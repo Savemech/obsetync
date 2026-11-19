@@ -1,9 +1,18 @@
-import { validateFileDeltas } from "./delta-validation";
+import { isSafeVaultPath, validateFileDeltas } from "./delta-validation";
 
+let assertions = 0;
 const check = (condition: unknown, message: string) => {
+    assertions++;
     if (!condition) throw new Error(message);
 };
 
+for (const path of ["a", ".obsidian/themes/x.css", "Работа/😀.md", "...", "a/.../b", "a..", "a".repeat(4096)]) {
+    check(isSafeVaultPath(path), "valid vault path rejected");
+}
+for (const path of [null, "", "/a", "a/", "a//b", ".", "..", "./x", "a/./b", "a/../b", "a/..",
+    "a\\b", "a".repeat(4097), ...Array.from({ length: 32 }, (_, i) => "a" + String.fromCharCode(i)), "a\x7f"]) {
+    check(!isSafeVaultPath(path), "invalid vault path accepted");
+}
 const hash = "ab".repeat(32);
 const valid = validateFileDeltas([{
     action: "renamed",
@@ -28,4 +37,4 @@ for (const bad of [
     check(rejected, `unsafe delta was accepted: ${JSON.stringify(bad)}`);
 }
 
-console.log("delta-validation.test: 7 assertions passed");
+console.log(`delta-validation.test: ${assertions} assertions passed`);

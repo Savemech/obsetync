@@ -14,7 +14,8 @@ const HARD_MAX_PATH_BYTES = 4_096;
 const HARD_MAX_CURSOR_BYTES = 4 + 1 + 32 + 32 + 1 + 2 + 2 + 2 * HARD_MAX_PATH_BYTES;
 const MOBILE_PAGE_BYTES = 512 * 1024;
 const HASH_HEX = /^[0-9a-f]{64}$/i;
-const UTF8 = new TextDecoder("utf-8", { fatal: true });
+// A leading U+FEFF is part of a length-prefixed filename.
+const UTF8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 export interface DiffPageLimits {
     maxBytes: number;
@@ -112,8 +113,8 @@ export function decodeDiffPage(
     if (body.byteLength < PAGE_HEADER_BYTES) throw new Error("diff page is truncated");
     requireMagic(body, 0, PAGE_MAGIC, "diff page");
 
-    const fromRootBytes = body.slice(4, 36);
-    const toRootBytes = body.slice(36, 68);
+    const fromRootBytes = body.subarray(4, 36);
+    const toRootBytes = body.subarray(36, 68);
     const fromRoot = encodeHex(fromRootBytes);
     const toRoot = encodeHex(toRootBytes);
     if (fromRoot !== expectedFromRoot.toLowerCase()) throw new Error("diff page source root changed");
@@ -130,7 +131,7 @@ export function decodeDiffPage(
     let offset = checkedAdd(PAGE_HEADER_BYTES, nextLength, body.byteLength, "diff cursor");
     const nextCursor = nextLength === 0
         ? null
-        : body.slice(PAGE_HEADER_BYTES, PAGE_HEADER_BYTES + nextLength);
+        : new Uint8Array(body.subarray(PAGE_HEADER_BYTES, PAGE_HEADER_BYTES + nextLength));
     const previousCursor = requestCursor === null ? null : decodeCursor(requestCursor, limits);
     if (previousCursor) {
         requireEqualBytes(previousCursor.fromRoot, fromRootBytes, "request cursor source root");
@@ -151,11 +152,11 @@ export function decodeDiffPage(
             throw new Error(`diff record ${index} path length is invalid`);
         }
         const pathEnd = checkedAdd(offset, pathLength.value, body.byteLength, `diff record ${index} path`);
-        const pathBytes = body.slice(offset, pathEnd);
+        const pathBytes = body.subarray(offset, pathEnd);
         offset = pathEnd;
         const path = decodePath(pathBytes, `diff record ${index} path`);
 
-        let oldPathBytes = new Uint8Array();
+        let oldPathBytes: Uint8Array = body.subarray(offset, offset);
         let oldPath: string | undefined;
         if (action === 4) {
             const oldLength = decodeVarint(body, offset);
@@ -164,7 +165,7 @@ export function decodeDiffPage(
                 throw new Error(`diff record ${index} rename source length is invalid`);
             }
             const oldEnd = checkedAdd(offset, oldLength.value, body.byteLength, `diff record ${index} rename source`);
-            oldPathBytes = body.slice(offset, oldEnd);
+            oldPathBytes = body.subarray(offset, oldEnd);
             offset = oldEnd;
             oldPath = decodePath(oldPathBytes, `diff record ${index} rename source`);
             if (oldPath === path) throw new Error(`diff record ${index} renames a path onto itself`);
@@ -244,8 +245,8 @@ function decodeCursor(bytes: Uint8Array, limits: DiffPageLimits): CursorKey {
     }
     requireMagic(bytes, 0, CURSOR_MAGIC, "diff cursor");
     if (bytes[4] !== CURSOR_VERSION) throw new Error("unsupported diff cursor version");
-    const fromRoot = bytes.slice(5, 37);
-    const toRoot = bytes.slice(37, 69);
+    const fromRoot = bytes.subarray(5, 37);
+    const toRoot = bytes.subarray(37, 69);
     const action = bytes[69];
     if (action < 1 || action > 4) throw new Error("diff cursor action is invalid");
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -258,8 +259,8 @@ function decodeCursor(bytes: Uint8Array, limits: DiffPageLimits): CursorKey {
     const pathEnd = checkedAdd(fixed, pathLength, bytes.byteLength, "diff cursor path");
     const expectedEnd = checkedAdd(pathEnd, oldPathLength, bytes.byteLength, "diff cursor old path");
     if (expectedEnd !== bytes.byteLength) throw new Error("diff cursor has trailing bytes");
-    const pathBytes = bytes.slice(fixed, pathEnd);
-    const oldPathBytes = bytes.slice(pathEnd, expectedEnd);
+    const pathBytes = bytes.subarray(fixed, pathEnd);
+    const oldPathBytes = bytes.subarray(pathEnd, expectedEnd);
     const path = decodePath(pathBytes, "diff cursor path");
     if (oldPathBytes.byteLength > 0) {
         const oldPath = decodePath(oldPathBytes, "diff cursor old path");
