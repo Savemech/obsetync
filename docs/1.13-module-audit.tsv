@@ -125,7 +125,7 @@ pending	plugin/scripts/bench-journal.mjs	tooling	Not reviewed
 read	plugin/scripts/bench-native-root.mjs	tooling	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
 pending	plugin/scripts/bench-prepared-manifest.mjs	tooling	Not reviewed
 pending	plugin/scripts/bench-sync-base.mjs	tooling	Not reviewed
-pending	plugin/scripts/browser-hash-worker.test.mjs	tests	Not reviewed
+reviewed	plugin/scripts/browser-hash-worker.test.mjs	tests	Read and ran minified browser entry with actual modules, transferred input ownership, successful SIMD/scalar and failed self-test outcomes
 pending	plugin/scripts/browser-probe.test.mjs	tests	Not reviewed
 pending	plugin/scripts/build-identity-config.mjs	tooling	Not reviewed
 pending	plugin/scripts/build-identity-config.test.mjs	tests	Not reviewed
@@ -172,8 +172,8 @@ pending	plugin/src/bounded-append.test.ts	tests	Not reviewed
 pending	plugin/src/bounded-append.ts	production	Not reviewed
 pending	plugin/src/browser-capability-probe.test.ts	tests	Not reviewed
 pending	plugin/src/browser-capability-probe.ts	production	Not reviewed
-read	plugin/src/browser-hash-worker-entry.ts	production	Read initialization, job lifecycle, cancellation, heap and transfer paths; embedded entry rebuild and production worker fixtures pass; qualification readiness and input bounds still require review
-pending	plugin/src/browser-hash-worker-protocol.ts	production	Not reviewed
+reviewed	plugin/src/browser-hash-worker-entry.ts	production	Read init, cancellation, feed, heap checks and buffer return; actual SIMD and forced scalar qualify; failed qualification cannot process subsequent files
+reviewed	plugin/src/browser-hash-worker-protocol.ts	production	Traced fixture/hash and byte/feed bounds across worker, pool and push; real module transfer/hash parity and host lifecycle tests pass
 pending	plugin/src/browser-hash-workers.test.ts	tests	Not reviewed
 reviewed	plugin/src/browser-hash-workers.ts	production	Read worker qualification, transfers, cancellation, fallback and disposal; removed write-only detached-buffer field; npm test worker ownership cases pass; real browser gate remains
 read	plugin/src/browser-probe-entry.ts	production	Read single-run validation, scalar/SIMD initialization, synthetic digest and transfer-back; generated glue receives embedded bytes; browser fixture passes, physical iPad unverified

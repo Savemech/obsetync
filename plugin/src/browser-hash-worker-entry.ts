@@ -6,6 +6,7 @@ import {
     BROWSER_HASH_WORKER_MAX_INPUT_BYTES,
     BROWSER_HASH_WORKER_MAX_HEAP_BYTES,
     BROWSER_HASH_WORKER_MAX_MODULE_BYTES,
+    BROWSER_HASH_WORKER_QUALIFICATION_BYTES,
     BROWSER_HASH_WORKER_QUALIFICATION_HASH,
     BROWSER_HASH_WORKER_SCHEMA,
     type BrowserHashWorkerMode,
@@ -15,15 +16,19 @@ import {
 
 interface WorkerHasher { update(bytes: Uint8Array): void; finalize(): string; free(): void }
 interface WorkerExports { Hasher: new () => WorkerHasher }
+interface WorkerModule {
+    exports: WorkerExports;
+    mode: BrowserHashWorkerMode;
+    memory: WebAssembly.Memory;
+}
+
 const host = globalThis as unknown as {
     onmessage: ((event: MessageEvent<BrowserHashWorkerRequest>) => void) | null;
     postMessage(message: unknown, transfer?: Transferable[]): void;
 };
 
 let generation: number | null = null;
-let wasm: WorkerExports | null = null;
-let wasmMode: BrowserHashWorkerMode | null = null;
-let wasmMemory: WebAssembly.Memory | null = null;
+let qualified: WorkerModule | null = null;
 let activeJob: number | null = null;
 const cancelled = new Set<number>();
 
@@ -31,27 +36,22 @@ const reply = (message: unknown, transfer: Transferable[] = []) => host.postMess
 const envelope = (message: object) => ({ schema: BROWSER_HASH_WORKER_SCHEMA, generation, ...message });
 const yieldWorker = () => new Promise<void>(resolve => setTimeout(resolve, 0));
 
-async function initialize(scalarBuffer: ArrayBuffer, simdBuffer: ArrayBuffer): Promise<void> {
+async function initialize(scalarBuffer: ArrayBuffer, simdBuffer: ArrayBuffer): Promise<WorkerModule> {
     const simdBytes = new Uint8Array(simdBuffer);
     try {
         if (WebAssembly.validate(simdBytes as BufferSource)) {
             const initialized = await initSimd({ module_or_path: simdBytes });
-            wasm = simd as unknown as WorkerExports;
-            wasmMemory = initialized.memory;
-            wasmMode = "simd";
-            return;
+            return { exports: simd, mode: "simd", memory: initialized.memory };
         }
     } catch { /* scalar is the independently qualified fallback */ }
     const scalarBytes = new Uint8Array(scalarBuffer);
     if (!WebAssembly.validate(scalarBytes as BufferSource)) throw new Error("scalar validation failed");
     const initialized = await initScalar({ module_or_path: scalarBytes });
-    wasm = scalar as unknown as WorkerExports;
-    wasmMemory = initialized.memory;
-    wasmMode = "scalar";
+    return { exports: scalar, mode: "scalar", memory: initialized.memory };
 }
 
-async function hash(bytes: Uint8Array, feedBytes: number, cpuSliceMs: number, jobId: number): Promise<string | null> {
-    const hasher = new wasm!.Hasher();
+async function hash(wasm: WorkerExports, bytes: Uint8Array, feedBytes: number, cpuSliceMs: number, jobId: number): Promise<string | null> {
+    const hasher = new wasm.Hasher();
     try {
         let sliceStarted = performance.now();
         for (let offset = 0; offset < bytes.byteLength;) {
@@ -89,14 +89,16 @@ host.onmessage = async (event) => {
         }
         generation = input.generation;
         try {
-            await initialize(input.scalarWasm, input.simdWasm);
-            const digest = await hash(new Uint8Array(input.qualification), 64 * 1024, 8, 0);
-            const wasmHeapBytes = wasmMemory?.buffer.byteLength ?? Number.POSITIVE_INFINITY;
-            if (digest !== BROWSER_HASH_WORKER_QUALIFICATION_HASH || !wasmMode ||
+            if (input.qualification.byteLength !== BROWSER_HASH_WORKER_QUALIFICATION_BYTES) throw new Error("invalid fixture size");
+            const candidate = await initialize(input.scalarWasm, input.simdWasm);
+            const digest = await hash(candidate.exports, new Uint8Array(input.qualification), 64 * 1024, 8, 0);
+            const wasmHeapBytes = candidate.memory.buffer.byteLength;
+            if (digest !== BROWSER_HASH_WORKER_QUALIFICATION_HASH ||
                 wasmHeapBytes > BROWSER_HASH_WORKER_MAX_HEAP_BYTES) throw new Error("self-test failed");
             reply(envelope({ type: "qualified", qualification: input.qualification,
-                scalarWasm: input.scalarWasm, simdWasm: input.simdWasm, wasmMode, wasmHeapBytes }),
+                scalarWasm: input.scalarWasm, simdWasm: input.simdWasm, wasmMode: candidate.mode, wasmHeapBytes }),
             [input.qualification, input.scalarWasm, input.simdWasm]);
+            qualified = candidate;
         } catch {
             reply(envelope({ type: "failed", jobId: null, reason: "INIT",
                 qualification: input.qualification, scalarWasm: input.scalarWasm,
@@ -104,7 +106,7 @@ host.onmessage = async (event) => {
         }
         return;
     }
-    if (input.type !== "hash" || input.generation !== generation || !wasm || activeJob !== null ||
+    if (input.type !== "hash" || input.generation !== generation || !qualified || activeJob !== null ||
         !Number.isSafeInteger(input.jobId) || input.jobId <= 0 || !(input.bytes instanceof ArrayBuffer) ||
         input.bytes.byteLength > BROWSER_HASH_WORKER_MAX_INPUT_BYTES ||
         !validBrowserHashFeedBytes(input.feedBytes) || !Number.isFinite(input.cpuSliceMs) ||
@@ -117,8 +119,8 @@ host.onmessage = async (event) => {
     activeJob = input.jobId;
     const started = performance.now();
     try {
-        const digest = await hash(new Uint8Array(input.bytes), input.feedBytes, input.cpuSliceMs, input.jobId);
-        const wasmHeapBytes = wasmMemory?.buffer.byteLength ?? Number.POSITIVE_INFINITY;
+        const digest = await hash(qualified.exports, new Uint8Array(input.bytes), input.feedBytes, input.cpuSliceMs, input.jobId);
+        const wasmHeapBytes = qualified.memory.buffer.byteLength;
         if (wasmHeapBytes > BROWSER_HASH_WORKER_MAX_HEAP_BYTES) throw new Error("worker heap exceeded bound");
         if (digest === null) {
             reply(envelope({ type: "cancelled", jobId: input.jobId, bytes: input.bytes }), [input.bytes]);

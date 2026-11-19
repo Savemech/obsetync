@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { once } from "node:events";
 import { Worker } from "node:worker_threads";
 import test from "node:test";
 import { build } from "esbuild";
@@ -33,10 +34,7 @@ async function bundleWorker() {
     return result.outputFiles[0].text;
 }
 
-test("production browser hash worker qualifies and hashes with exact transferred ownership", async () => {
-    assert.ok(scalarModule.byteLength <= protocol.BROWSER_HASH_WORKER_MAX_MODULE_BYTES);
-    assert.ok(simdModule.byteLength <= protocol.BROWSER_HASH_WORKER_MAX_MODULE_BYTES);
-    const source = await bundleWorker();
+function startWorker(source) {
     const bridge = `
         const { parentPort } = require("node:worker_threads");
         globalThis.self = globalThis;
@@ -45,11 +43,18 @@ test("production browser hash worker qualifies and hashes with exact transferred
         globalThis.importScripts = () => { throw new Error("unexpected external worker script"); };
         parentPort.on("message", data => globalThis.onmessage({ data }));
     `;
-    const worker = new Worker(`${bridge}\n${source}`, { eval: true });
+    return new Worker(`${bridge}\n${source}`, { eval: true });
+}
+
+async function checkQualifiedWorker(simdBytes, expectedMode) {
+    assert.ok(scalarModule.byteLength <= protocol.BROWSER_HASH_WORKER_MAX_MODULE_BYTES);
+    assert.ok(simdModule.byteLength <= protocol.BROWSER_HASH_WORKER_MAX_MODULE_BYTES);
+    const source = await bundleWorker();
+    const worker = startWorker(source);
     const generation = 17;
     const fixture = protocol.browserHashQualificationFixture().buffer;
     const scalarWasm = Uint8Array.from(scalarModule).buffer;
-    const simdWasm = Uint8Array.from(simdModule).buffer;
+    const simdWasm = Uint8Array.from(simdBytes).buffer;
     let deadline;
     try {
         const completed = new Promise((resolve, reject) => {
@@ -63,13 +68,13 @@ test("production browser hash worker qualifies and hashes with exact transferred
                     assert.equal(message.generation, generation);
                     if (phase === "qualified") {
                         assert.equal(message.type, "qualified");
-                        assert.ok(message.wasmMode === "scalar" || message.wasmMode === "simd");
+                        assert.equal(message.wasmMode, expectedMode);
                         assert.ok(message.wasmHeapBytes > 0 &&
                             message.wasmHeapBytes <= protocol.BROWSER_HASH_WORKER_MAX_HEAP_BYTES);
                         assert.deepEqual(new Uint8Array(message.qualification),
                             protocol.browserHashQualificationFixture());
                         assert.deepEqual(new Uint8Array(message.scalarWasm), Uint8Array.from(scalarModule));
-                        assert.deepEqual(new Uint8Array(message.simdWasm), Uint8Array.from(simdModule));
+                        assert.deepEqual(new Uint8Array(message.simdWasm), Uint8Array.from(simdBytes));
                         const bytes = protocol.browserHashQualificationFixture().buffer;
                         phase = "result";
                         worker.postMessage({ schema: protocol.BROWSER_HASH_WORKER_SCHEMA, type: "hash",
@@ -98,6 +103,39 @@ test("production browser hash worker qualifies and hashes with exact transferred
         await completed;
     } finally {
         clearTimeout(deadline);
+        await worker.terminate();
+    }
+}
+
+test("production browser worker qualifies and hashes with exact transferred ownership", async () => {
+    await checkQualifiedWorker(simdModule, WebAssembly.validate(simdModule) ? "simd" : "scalar");
+});
+
+test("production browser worker qualifies using the scalar fallback", async () => {
+    await checkQualifiedWorker(new Uint8Array(8), "scalar");
+});
+
+test("a failed self-test leaves the worker unavailable for file hashing", { timeout: 10000 }, async () => {
+    const worker = startWorker(await bundleWorker());
+    try {
+        const qualification = protocol.browserHashQualificationFixture();
+        qualification[0] ^= 1;
+        const scalarWasm = Uint8Array.from(scalarModule).buffer;
+        const simdWasm = Uint8Array.from(simdModule).buffer;
+        const header = { schema: protocol.BROWSER_HASH_WORKER_SCHEMA, generation: 1 };
+        const failed = once(worker, "message");
+        worker.postMessage({ ...header, type: "init", qualification: qualification.buffer,
+            scalarWasm, simdWasm }, [qualification.buffer, scalarWasm, simdWasm]);
+        assert.equal((await failed)[0].reason, "INIT");
+        const bytes = Uint8Array.of(42).buffer;
+        const job = once(worker, "message");
+        worker.postMessage({ ...header, type: "hash", jobId: 1, bytes,
+            feedBytes: 65536, cpuSliceMs: 8 }, [bytes]);
+        const [reply] = await job;
+        assert.equal(reply.type, "failed");
+        assert.equal(reply.reason, "PROTOCOL");
+        assert.deepEqual(new Uint8Array(reply.bytes), Uint8Array.of(42));
+    } finally {
         await worker.terminate();
     }
 });
