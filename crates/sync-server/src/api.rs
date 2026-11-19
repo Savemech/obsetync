@@ -1496,10 +1496,17 @@ async fn post_crdt_get(
     Path(vault_id): Path<String>,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
-    let note = std::str::from_utf8(&body)
-        .map_err(|_| ServerError::BadRequest("note path not UTF-8".into()))?;
-    let log = crate::crdt::read_log(&state.layout, &vault_id, note, MAX_BODY_BYTES)
-        .map_err(|e| ServerError::Internal(format!("crdt read: {}", e)))?;
+    let layout = state.layout.clone();
+    let log = state
+        .storage_writer
+        .run_blocking(move |_| {
+            let note = std::str::from_utf8(&body)
+                .map_err(|_| ServerError::BadRequest("note path not UTF-8".into()))?;
+            crate::crdt::read_log(&layout, &vault_id, note, MAX_BODY_BYTES)
+                .map_err(|e| ServerError::Internal(format!("crdt read: {}", e)))
+        })
+        .await
+        .map_err(|e| ServerError::ServiceUnavailable(e.to_string()))??;
     Ok((StatusCode::OK, log))
 }
 

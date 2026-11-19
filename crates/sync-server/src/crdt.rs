@@ -98,6 +98,22 @@ pub fn read_log(
             if buf.len() == max_bytes && f.read(&mut [0])? != 0 {
                 return Err(too_large());
             }
+            // A reader can overlap an append or reopen a log after a torn write.
+            let mut end = 0;
+            while let Some(header) = buf[end..].first_chunk::<4>() {
+                let size = u32::from_le_bytes(*header) as usize;
+                if size > MAX_UPDATE_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid CRDT frame length",
+                    ));
+                }
+                if buf.len() - end < 4 + size {
+                    break;
+                }
+                end += 4 + size;
+            }
+            buf.truncate(end);
             Ok(buf)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -170,6 +186,31 @@ mod tests {
         let log = read_log(&l, "v", "notes/a.md", 1024).unwrap();
         let frames = split_frames(&log);
         assert_eq!(frames, vec![&b"update-1"[..], &b"update-two"[..]]);
+    }
+
+    #[test]
+    fn read_returns_complete_frames_at_every_interrupted_write_boundary() {
+        let (_dir, layout) = layout();
+        append(&layout, "v", "a.md", b"saved").unwrap();
+        let path = log_path(&layout, "v", "a.md");
+        let first = fs::read(&path).unwrap();
+        let second = [3, 0, 0, 0, b'n', b'e', b'w'];
+        for cut in 0..=second.len() {
+            let disk = [first.as_slice(), &second[..cut]].concat();
+            fs::write(&path, &disk).unwrap();
+            let expected = if cut == second.len() { &disk } else { &first };
+            assert_eq!(
+                &read_log(&layout, "v", "a.md", 1024).unwrap(),
+                expected,
+                "cut {cut}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), disk);
+        }
+        fs::write(&path, [first.as_slice(), &u32::MAX.to_le_bytes()].concat()).unwrap();
+        assert_eq!(
+            read_log(&layout, "v", "a.md", 1024).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
     }
 
     #[test]

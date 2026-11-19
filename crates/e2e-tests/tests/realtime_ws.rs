@@ -465,16 +465,15 @@ async fn old_session_messages_and_close_preserve_reconnected_device_presence() {
 
 // --- Legacy CRDT relay and log readback (no crash durability assertion) -------
 
-/// Split a raw CRDT log ([u32 LE len][blob]…) into blobs (mirrors the server).
+/// Decode complete frames; any extra bytes in the HTTP response fail the test.
 fn split_crdt_frames(log: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let mut i = 0;
-    while i + 4 <= log.len() {
+    while i < log.len() {
+        assert!(log.len() - i >= 4, "truncated CRDT length");
         let len = u32::from_le_bytes([log[i], log[i + 1], log[i + 2], log[i + 3]]) as usize;
         i += 4;
-        if i + len > log.len() {
-            break;
-        }
+        assert!(len <= log.len() - i, "truncated CRDT payload");
         out.push(log[i..i + len].to_vec());
         i += len;
     }
