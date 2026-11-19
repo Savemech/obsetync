@@ -142,8 +142,9 @@ fn http_response_plaintext_bound(method: &Method, path: &str) -> usize {
     } else if (method == Method::PUT && path.starts_with("/api/v1/root/"))
         || (method == Method::POST && path.starts_with("/api/v1/diff/"))
         || (method == Method::POST
-            && path.starts_with("/api/v1/crdt/")
-            && !path.ends_with("/compact"))
+            && path
+                .strip_prefix("/api/v1/crdt/")
+                .is_some_and(|vault| !vault.is_empty() && !vault.contains('/')))
     {
         MAX_BODY_BYTES
     } else if method == Method::POST && path == "/api/v1/bulk/get" {
@@ -1497,7 +1498,7 @@ async fn post_crdt_get(
 ) -> Result<impl IntoResponse, ServerError> {
     let note = std::str::from_utf8(&body)
         .map_err(|_| ServerError::BadRequest("note path not UTF-8".into()))?;
-    let log = crate::crdt::read_log(&state.layout, &vault_id, note)
+    let log = crate::crdt::read_log(&state.layout, &vault_id, note, MAX_BODY_BYTES)
         .map_err(|e| ServerError::Internal(format!("crdt read: {}", e)))?;
     Ok((StatusCode::OK, log))
 }
@@ -3627,6 +3628,18 @@ mod integration_tests {
         let _second_root = budget.try_reserve(root_get).unwrap();
         let _ws = budget.try_reserve(ws_receive).unwrap();
         assert!(budget.available_bytes() > 0);
+    }
+
+    #[test]
+    fn vault_named_compact_gets_the_log_read_budget() {
+        assert_eq!(
+            http_response_plaintext_bound(&Method::POST, "/api/v1/crdt/compact"),
+            MAX_BODY_BYTES
+        );
+        assert_eq!(
+            http_response_plaintext_bound(&Method::POST, "/api/v1/crdt/compact/compact"),
+            HTTP_CONTROL_RESPONSE_BYTES
+        );
     }
 
     #[test]

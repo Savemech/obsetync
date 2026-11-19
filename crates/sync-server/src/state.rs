@@ -140,6 +140,18 @@ impl AppState {
         }
     }
 
+    pub fn relay_crdt_update(
+        &self,
+        vault_id: &str,
+        note: &str,
+        update: &[u8],
+        frame: String,
+    ) -> std::io::Result<()> {
+        crate::crdt::append(&self.layout, vault_id, note, update)?;
+        self.publish_frame(vault_id, frame);
+        Ok(())
+    }
+
     /// Announce a new current root to any live WebSocket subscribers.
     pub fn notify_root_changed(&self, vault_id: &str, root_hex: &str) {
         self.publish_frame(
@@ -295,6 +307,27 @@ pub type SharedState = Arc<AppState>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_crdt_append_does_not_publish_a_peer_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        layout.init_directories().unwrap();
+        box_key::init_box_keypair(&layout).unwrap();
+        let state = AppState::new(ServerConfig::new(dir.path().to_path_buf()));
+        let mut events = state.subscribe_roots("vault");
+
+        let parent = layout.crdt_log_path("vault", "unused");
+        std::fs::create_dir_all(parent.parent().unwrap().parent().unwrap()).unwrap();
+        std::fs::write(parent.parent().unwrap(), b"cannot create logs here").unwrap();
+        assert!(state
+            .relay_crdt_update("vault", "a.md", b"update", "frame".into())
+            .is_err());
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
 
     #[tokio::test]
     async fn old_socket_cannot_replace_or_clear_a_reconnected_devices_presence() {

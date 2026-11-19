@@ -9,9 +9,9 @@
 //! note by fetching the log and applying every frame; Yjs updates are
 //! commutative + idempotent, so order and duplicates don't matter.
 //!
-//! Log format: a sequence of `[u32 LE length][update bytes]` records. Each
-//! record is written in a single `O_APPEND` write() so concurrent appends
-//! from multiple devices never interleave (atomic per record on local FS).
+//! Log format: a sequence of `[u32 LE length][update bytes]` records.
+//! Append uses O_APPEND. A successful write is visible to readers but does
+//! not yet establish crash durability.
 //!
 //! At-rest posture matches the rest of obsetync: the self-hosted server is
 //! trusted and already stores all vault content in the clear; CRDT logs
@@ -57,7 +57,6 @@ pub fn append(
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    // One framed record, one write() → atomic append under O_APPEND.
     let mut record = Vec::with_capacity(4 + update.len());
     record.extend_from_slice(&(update.len() as u32).to_le_bytes());
     record.extend_from_slice(update);
@@ -76,12 +75,26 @@ pub fn read_log(
     layout: &StorageLayout,
     vault_id: &str,
     note_path: &str,
+    max_bytes: usize,
 ) -> Result<Vec<u8>, std::io::Error> {
     let path = log_path(layout, vault_id, note_path);
     match fs::File::open(&path) {
         Ok(mut f) => {
-            let mut buf = Vec::new();
-            f.read_to_end(&mut buf)?;
+            let len = f.metadata()?.len();
+            let too_large = || {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "crdt log exceeds response limit",
+                )
+            };
+            if len > max_bytes as u64 {
+                return Err(too_large());
+            }
+            let mut buf = Vec::with_capacity(len as usize);
+            (&mut f).take(max_bytes as u64).read_to_end(&mut buf)?;
+            if buf.len() == max_bytes && f.read(&mut [0])? != 0 {
+                return Err(too_large());
+            }
             Ok(buf)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -155,7 +168,7 @@ mod tests {
         let (_d, l) = layout();
         append(&l, "v", "notes/a.md", b"update-1").unwrap();
         append(&l, "v", "notes/a.md", b"update-two").unwrap();
-        let log = read_log(&l, "v", "notes/a.md").unwrap();
+        let log = read_log(&l, "v", "notes/a.md", 1024).unwrap();
         let frames = split_frames(&log);
         assert_eq!(frames, vec![&b"update-1"[..], &b"update-two"[..]]);
     }
@@ -165,8 +178,8 @@ mod tests {
         let (_d, l) = layout();
         append(&l, "v", "a.md", b"aaa").unwrap();
         append(&l, "v", "b.md", b"bbb").unwrap();
-        let a = read_log(&l, "v", "a.md").unwrap();
-        let b = read_log(&l, "v", "b.md").unwrap();
+        let a = read_log(&l, "v", "a.md", 1024).unwrap();
+        let b = read_log(&l, "v", "b.md", 1024).unwrap();
         assert_eq!(split_frames(&a), vec![&b"aaa"[..]]);
         assert_eq!(split_frames(&b), vec![&b"bbb"[..]]);
     }
@@ -177,8 +190,16 @@ mod tests {
         append(&l, "v", "a.md", b"one").unwrap();
         append(&l, "v", "a.md", b"two").unwrap();
         compact(&l, "v", "a.md", b"SNAPSHOT").unwrap();
-        let log = read_log(&l, "v", "a.md").unwrap();
+        let log = read_log(&l, "v", "a.md", 1024).unwrap();
         assert_eq!(split_frames(&log), vec![&b"SNAPSHOT"[..]]);
+    }
+
+    #[test]
+    fn log_read_limit_includes_record_headers() {
+        let (_dir, l) = layout();
+        append(&l, "v", "a.md", b"x").unwrap();
+        assert_eq!(read_log(&l, "v", "a.md", 5).unwrap().len(), 5);
+        assert!(read_log(&l, "v", "a.md", 4).is_err());
     }
 
     #[test]
@@ -191,7 +212,7 @@ mod tests {
     #[test]
     fn missing_note_reads_empty() {
         let (_d, l) = layout();
-        assert!(read_log(&l, "v", "never.md").unwrap().is_empty());
+        assert!(read_log(&l, "v", "never.md", 1024).unwrap().is_empty());
     }
 
     #[test]
@@ -201,6 +222,8 @@ mod tests {
         // Written under a hashed filename, not the traversal path.
         let escaped = l.crdt_log_path("v", "../../etc/passwd");
         assert!(!escaped.exists());
-        assert!(!read_log(&l, "v", "../../etc/passwd").unwrap().is_empty());
+        assert!(!read_log(&l, "v", "../../etc/passwd", 1024)
+            .unwrap()
+            .is_empty());
     }
 }

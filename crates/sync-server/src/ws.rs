@@ -366,15 +366,14 @@ async fn session_v2(
                                             Ok(update)
                                                 if update.len() <= crate::crdt::MAX_UPDATE_BYTES =>
                                             {
-                                                if let Err(e) = crate::crdt::append(
-                                                    &state.layout,
+                                                if let Err(e) = state.relay_crdt_update(
                                                     vault,
                                                     note,
                                                     &update,
+                                                    inner,
                                                 ) {
                                                     tracing::warn!(vault, note, err = %e, "ws: crdt append failed");
                                                 }
-                                                state.publish_frame(vault, inner.clone());
                                             }
                                             Ok(_) => tracing::warn!(
                                                 device = %device_short,
