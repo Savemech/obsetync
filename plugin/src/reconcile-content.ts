@@ -31,6 +31,7 @@ export interface ReconcileManifestRange {
 export function buildReconcileContentIndex(
     sources: Iterable<ReconcileContentSource>,
     largeFileThreshold: number,
+    isExcluded: (path: string) => boolean,
 ): ReconcileContentIndex {
     const smallByHash = new Map<string, ReconcileContentRef>();
     const largeByHash = new Map<string, ReconcileContentRef>();
@@ -38,11 +39,13 @@ export function buildReconcileContentIndex(
     let bytesTotal = 0;
 
     for (const source of sources) {
+        if (isExcluded(source.path)) continue;
         filesTotal++;
         bytesTotal += source.size;
         const index = source.size >= largeFileThreshold ? largeByHash : smallByHash;
-        if (!index.has(source.hash)) {
-            index.set(source.hash, { path: source.path, size: source.size });
+        const hash = source.hash.toLowerCase();
+        if (!index.has(hash)) {
+            index.set(hash, { path: source.path, size: source.size });
         }
     }
 
@@ -71,11 +74,9 @@ export function selectReconcileMissingRanges(
     missingHashes: Iterable<string>,
 ): ReconcileManifestRange[] {
     const missing = new Set(missingHashes);
-    const selected = new Set<string>();
     const ranges: ReconcileManifestRange[] = [];
     for (const chunk of chunks) {
-        if (missing.has(chunk.hash) && !selected.has(chunk.hash)) {
-            selected.add(chunk.hash);
+        if (missing.delete(chunk.hash)) {
             ranges.push(chunk);
         }
     }

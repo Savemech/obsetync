@@ -7,11 +7,12 @@ import {
 
 function run(): void {
     const index = buildReconcileContentIndex([
-        { path: "first.md", hash: "same", size: 10 },
+        { path: "ignored.md", hash: "same", size: 10 },
+        { path: "first.md", hash: "SAME", size: 10 },
         { path: "copy.md", hash: "same", size: 10 },
         { path: "other.md", hash: "other", size: 5 },
         { path: "large.bin", hash: "large", size: 20 },
-    ], 16);
+    ].values(), 16, path => path === "ignored.md");
 
     assert.equal(index.filesTotal, 4, "physical tracked file count was deduplicated");
     assert.equal(index.bytesTotal, 45, "physical tracked bytes were deduplicated");

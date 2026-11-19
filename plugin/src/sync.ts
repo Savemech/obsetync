@@ -1443,11 +1443,9 @@ export class ObsetyncSyncEngine {
 
             // --- Partition sync-base: small files (whole blobs) vs large (manifests+chunks).
             contentIndex = buildReconcileContentIndex(
-                this.syncBase.allPaths().filter(path => !this.isExcluded(path)).map((path) => {
-                    const entry = this.syncBase.getEntry(path)!;
-                    return { path, hash: entry.hash.toLowerCase(), size: entry.size };
-                }),
+                this.syncBase.captureTreeEntries().entries(),
                 LARGE_FILE_THRESHOLD,
+                path => this.isExcluded(path),
             );
             perf?.setWorkload({
                 filesTotal: contentIndex.filesTotal,
