@@ -1865,7 +1865,7 @@ impl PrefixMutation {
                 PrefixPhase::Leaves(offset) => {
                     if offset < self.merged.len() {
                         let end = (offset + TARGET_CHUNK_ENTRIES).min(self.merged.len());
-                        let bytes = LeafChunk::new(self.merged[offset..end].to_vec()).serialize();
+                        let bytes = LeafChunk::serialize_entries(&self.merged[offset..end]);
                         self.leaves.push(stage(overlay, staged_bytes, bytes)?);
                         self.phase = PrefixPhase::Leaves(end);
                         return Ok(true);

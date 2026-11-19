@@ -789,8 +789,7 @@ pub fn build_root_for_files(
     let mut root_children = Vec::new();
     let mut total_files = 0u64;
 
-    for (prefix, mut group) in by_prefix {
-        group.sort();
+    for (prefix, group) in by_prefix {
         total_files += group.len() as u64;
         let leaf = LeafChunk::new(group);
         let bytes = leaf.serialize();

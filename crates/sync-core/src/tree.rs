@@ -44,8 +44,12 @@ pub async fn build_tree<S: ChunkStore>(
     // 1. Group entries by top-level directory.
     let mut groups: BTreeMap<String, Vec<FileEntry>> = BTreeMap::new();
     for entry in entries {
-        let prefix = top_level_prefix(&entry.path).to_string();
-        groups.entry(prefix).or_default().push(entry);
+        let prefix = top_level_prefix(&entry.path);
+        if let Some(group) = groups.get_mut(prefix) {
+            group.push(entry);
+        } else {
+            groups.insert(prefix.to_owned(), vec![entry]);
+        }
     }
 
     let mut total_files = 0u64;
@@ -101,17 +105,7 @@ async fn build_leaf_chunks<S: ChunkStore>(
     let mut hashes = Vec::new();
 
     for chunk_entries in entries.chunks(TARGET_CHUNK_ENTRIES) {
-        let leaf = LeafChunk::new(chunk_entries.to_vec());
-        let bytes = leaf.serialize();
-        let hash = crate::hash::hash_bytes(&bytes);
-        store.put(hash, bytes).await?;
-        hashes.push(hash);
-    }
-
-    if hashes.is_empty() {
-        // Empty directory — create an empty leaf chunk.
-        let leaf = LeafChunk::new(vec![]);
-        let bytes = leaf.serialize();
+        let bytes = LeafChunk::serialize_entries(chunk_entries);
         let hash = crate::hash::hash_bytes(&bytes);
         store.put(hash, bytes).await?;
         hashes.push(hash);

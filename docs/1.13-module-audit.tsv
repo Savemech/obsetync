@@ -47,9 +47,9 @@ read	crates/perf-harness/Cargo.toml	tooling	Entry-point/build inventory; behavio
 pending	crates/perf-harness/src/lib.rs	tooling	Not reviewed
 pending	crates/perf-harness/src/main.rs	tooling	Not reviewed
 read	crates/sync-core/Cargo.toml	configuration/schema	Entry-point/build inventory; behavior/callers still under review
-pending	crates/sync-core/src/candidate_mutation_v1.rs	production	Not reviewed
+read	crates/sync-core/src/candidate_mutation_v1.rs	production	Traced sorted append and merged-row inputs to leaf staging; borrowed encoding passes native mutation parity tests; remaining cursor phases pending
 pending	crates/sync-core/src/candidate_mutation_v2.rs	production	Not reviewed
-pending	crates/sync-core/src/chunk.rs	production	Not reviewed
+read	crates/sync-core/src/chunk.rs	production	Traced v1 table layout and sorted leaf encoder, decode and root-parent paths; optional parent hash length and path-only Ord/Eq discrepancy remain for follow-up
 pending	crates/sync-core/src/conflict.rs	production	Not reviewed
 pending	crates/sync-core/src/content_store.rs	production	Not reviewed
 pending	crates/sync-core/src/diff.rs	production	Not reviewed
@@ -66,17 +66,17 @@ pending	crates/sync-core/src/store.rs	production	Not reviewed
 pending	crates/sync-core/src/sync_rules.rs	production	Not reviewed
 pending	crates/sync-core/src/transactional_tree.rs	production	Not reviewed
 pending	crates/sync-core/src/transactional_tree_v2.rs	production	Not reviewed
-pending	crates/sync-core/src/tree.rs	production	Not reviewed
+read	crates/sync-core/src/tree.rs	production	Initial group build, normalization and leaf rebuild call sites traced; borrowed sorted leaf encoding and prefix-key reuse verified by allocation comparison and legacy parity tests; remaining paths pending
 pending	crates/sync-core/src/tree_metadata.rs	production	Not reviewed
 pending	crates/sync-core/src/tree_v2.rs	production	Not reviewed
 pending	crates/sync-core/src/tree_work_memory.rs	production	Not reviewed
 pending	crates/sync-core/src/versioned_root.rs	production	Not reviewed
 pending	crates/sync-core/src/wasm.rs	production	Not reviewed
 pending	crates/sync-core/src/wasm_memory.rs	production	Not reviewed
-read	crates/sync-schema/Cargo.toml	configuration/schema	Entry-point/build inventory; behavior/callers still under review
-read	crates/sync-schema/schema/chunk.fbs	configuration/schema	Entry-point/build inventory; behavior/callers still under review
-pending	crates/sync-schema/src/chunk_generated.rs	generated/lock	Not reviewed
-read	crates/sync-schema/src/lib.rs	production	Entry-point/build inventory; behavior/callers still under review
+reviewed	crates/sync-schema/Cargo.toml	configuration/schema	Single workspace FlatBuffers dependency; schema unit suite and wasm32 downstream check passed
+reviewed	crates/sync-schema/schema/chunk.fbs	configuration/schema	Checked six table declarations against generated slots and required-field checks; enum and round-trip tests passed
+read	crates/sync-schema/src/chunk_generated.rs	generated/lock	Compared all 20 vtable slots and required-field builder checks to schema, exercised generated readers/writers; compiler output regeneration not verified
+reviewed	crates/sync-schema/src/lib.rs	production	Read generated binding export and five enum, leaf, internal-node and decode tests; all five passed
 read	crates/sync-server/Cargo.toml	configuration/schema	Dependency and entry-point inventory read; corrected missing roadmap reference; per-dependency reachability audit pending
 reviewed	crates/sync-server/build.rs	production	Read complete input validation; 15 real compiled-script cases cover local/clean/dirty identity, exact release inputs, missing/malformed/mismatched hashes/version and invalid flags
 pending	crates/sync-server/src/admin.rs	production	Not reviewed
