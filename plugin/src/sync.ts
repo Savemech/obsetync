@@ -57,7 +57,7 @@ import { EditorPullGuard } from "./editor-pull-guard";
 import { DIRTY_CLAIM_LIMIT, DirtyPathSet, type DirtyFileChange, type DirtyPathCapture } from "./dirty-set";
 import { LocalEventGuards } from "./local-event-guards";
 import { DeferredChangeTracker, type DeferredChangeSummary } from "./deferred-changes";
-import { materializeFileChanges } from "./file-safety";
+import { type RootLocalOmission, materializeFileChanges } from "./file-safety";
 import { OperationCheckpoint } from "./operation-checkpoint";
 import { exactArrayBuffer } from "./binary";
 import { getHashTuning } from "./hash-runtime";
@@ -98,7 +98,6 @@ import {
 import { RootSyncRuntime, type RootDowngradeAuthoritySnapshot, type RootSyncIdentity } from "./root-sync-runtime";
 import type { RootBatchDeferrals } from "./root-batch";
 import { runRootBatchDrain } from "./root-batch-drain";
-import type { RootLocalOmission } from "./root-local-omissions";
 import { RootReviewedQueue, RootReviewInvalidated, RootReviewPaused, RootReviewPreempted, ROOT_REVIEW_LIMITS,
     type RootReviewedQueuePorts, type RootReviewedSelection } from "./root-reviewed-queue";
 import { hasPendingRootTreeRetirement, rebuildRootTreeFromBase,

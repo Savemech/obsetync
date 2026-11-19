@@ -312,8 +312,8 @@ pending	plugin/src/resource-budget.ts	production	Not reviewed
 pending	plugin/src/resource-governor.bench.ts	tooling	Not reviewed
 pending	plugin/src/resource-governor.test.ts	tests	Not reviewed
 pending	plugin/src/resource-governor.ts	production	Not reviewed
-pending	plugin/src/root-batch-drain.test.ts	tests	Not reviewed
-pending	plugin/src/root-batch-drain.ts	production	Not reviewed
+reviewed	plugin/src/root-batch-drain.test.ts	tests	1068 assertions cover 257 sequential batches, progress gates, errors, held cleanup and closure
+reviewed	plugin/src/root-batch-drain.ts	production	Traced serial pushPendingInner, real host yield, both continuation checks and tracked cleanup into sync.ts
 pending	plugin/src/root-batch-plan.test.ts	tests	Not reviewed
 pending	plugin/src/root-batch-plan.ts	production	Not reviewed
 pending	plugin/src/root-batch.test.ts	tests	Not reviewed
@@ -322,8 +322,8 @@ read	plugin/src/root-conflicts.test.ts	tests	Removed obsolete debounce mocks or 
 pending	plugin/src/root-conflicts.ts	production	Not reviewed
 pending	plugin/src/root-intent.test.ts	tests	Not reviewed
 pending	plugin/src/root-intent.ts	production	Not reviewed
-pending	plugin/src/root-local-omissions.test.ts	tests	Not reviewed
-pending	plugin/src/root-local-omissions.ts	production	Not reviewed
+removed	plugin/src/root-local-omissions.test.ts	tests	Tests of retired selector; moved backlog-limit and distant shared-ID coverage to the live queue alongside its classification and provenance cases
+removed	plugin/src/root-local-omissions.ts	production	Selector was called only by its own tests; live local omission selection is RootReviewedQueue.takeLocal; carried the shared type to file-safety
 pending	plugin/src/root-outcome.test.ts	tests	Not reviewed
 pending	plugin/src/root-outcome.ts	production	Not reviewed
 pending	plugin/src/root-publication-memory.test.ts	tests	Not reviewed
@@ -331,7 +331,7 @@ pending	plugin/src/root-publication-memory.ts	production	Not reviewed
 pending	plugin/src/root-recovery.test.ts	tests	Not reviewed
 pending	plugin/src/root-recovery.ts	production	Not reviewed
 read	plugin/src/root-reviewed-queue.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
-pending	plugin/src/root-reviewed-queue.ts	production	Not reviewed
+reviewed	plugin/src/root-reviewed-queue.ts	production	Traced creation, review, overlay, dependency checks, claim, settlement and dispose; takeLocal uses the actual retirement limit; distant linked omissions tested through next()
 pending	plugin/src/root-settlement.test.ts	tests	Not reviewed
 pending	plugin/src/root-settlement.ts	production	Not reviewed
 reviewed	plugin/src/root-stream-scope.test.ts	tests	Full six ownership/endpoint/bounds/secret-free suites read and run; stable legacy HTTP digest retained; HTTP and HTTPS partition scope, case aliases remain equivalent

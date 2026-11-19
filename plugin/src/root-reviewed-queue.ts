@@ -1,8 +1,8 @@
-import { DIRTY_CLAIM_LIMIT, DirtyPathSet, type DirtyFileChange, type DirtyPathTracking } from "./dirty-set";
+import type { RootLocalOmission } from "./file-safety";
+import { DIRTY_CLAIM_LIMIT, DIRTY_RETIREMENT_LIMIT, DirtyPathSet, type DirtyFileChange, type DirtyPathTracking } from "./dirty-set";
 import { DeferredChangeTracker, DeferredDependencyCaptureError, DeferredPartitionError,
     type DeferredPartition, type RenameDependencySnapshot } from "./deferred-changes";
 import type { FileChange, DeferredPushChange } from "./push";
-import type { RootLocalOmission } from "./root-local-omissions";
 import { createRootBatchPlan, type RootBatchPlan } from "./root-batch-plan";
 import { selectRootBatch, ROOT_BATCH_LIMITS, rootBatchPathBytesSteps, emptyRootBatchDeferrals, type RootBatchDeferrals } from "./root-batch";
 import { isSafeVaultPath } from "./delta-validation";
@@ -656,10 +656,10 @@ export class RootReviewedQueue {
             if (row && this.isOmission(row.kind) && row.hint.journalId !== undefined && !this.linked(row.hint)) candidates.push(row.hint);
         };
         for (const path of this.localOverlay) {
-            if (candidates.length >= 256) break;
+            if (candidates.length >= DIRTY_RETIREMENT_LIMIT) break;
             this.localOverlay.delete(path); add(path);
         }
-        while (this.localCursor < this.localPaths.length && candidates.length < 256) {
+        while (this.localCursor < this.localPaths.length && candidates.length < DIRTY_RETIREMENT_LIMIT) {
             add(this.localPaths[this.localCursor++]);
             if (this.localCursor % 256 === 0) await this.cooperate();
         }

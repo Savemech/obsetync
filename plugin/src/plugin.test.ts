@@ -39,7 +39,6 @@ import "./root-batch.test";
 import "./root-batch-plan.test";
 import "./root-reviewed-queue.test";
 import "./root-batch-drain.test";
-import "./root-local-omissions.test";
 import "./root-conflicts.test";
 import "./conflict-file-verification.test";
 import "./verified-conflict-content.test";

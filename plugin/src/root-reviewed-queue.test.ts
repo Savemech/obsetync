@@ -1,10 +1,9 @@
 import { strict as assert } from "node:assert";
 import { DirtyPathSet, type DirtyFileChange } from "./dirty-set";
 import { DeferredChangeTracker, DeferredDependencyCaptureError } from "./deferred-changes";
-import { materializeFileChanges, PathIsDirectoryError, type FileStat } from "./file-safety";
+import { type RootLocalOmission, materializeFileChanges, PathIsDirectoryError, type FileStat } from "./file-safety";
 import { RootReviewedQueue, RootReviewInvalidated, RootReviewPaused, RootReviewPreempted, ROOT_REVIEW_LIMITS,
     type RootReviewedQueuePorts } from "./root-reviewed-queue";
-import type { RootLocalOmission } from "./root-local-omissions";
 import { PrioritySortError, sortByPriorityCooperatively } from "./priority-sort";
 import { SyncMemoryArbiter } from "./sync-memory-arbiter";
 import { ROOT_BATCH_PLAN_ADMISSION } from "./root-batch-plan";
@@ -330,6 +329,22 @@ async function positiveLocalOmissionsAndGroups() {
                 "local omission split a linked/shared-ID group with a materialized peer");
         } finally { held.dispose(); }
     }
+    const names = Array.from({ length: 300 }, (_, index) => `excluded-${index}.md`);
+    const large = fixture(names);
+    large.dirty.take();
+    for (const [index, path] of names.entries()) {
+        large.dirty.add(hint(path), index === 299 ? 1 : index + 1);
+        large.states.set(path, "excluded");
+    }
+    const many = await RootReviewedQueue.create(large.ports);
+    try {
+        for (const expected of [names.slice(1, 257), names.slice(257, 299)]) {
+            const batch = await many.next();
+            same(paths(batch!.queued), expected, "omission cut exceeded its cap or split a distant shared ID");
+            many.settled(new Set(expected), [], true);
+        }
+        check(await many.next() === null && large.dirty.size === 2, "linked omissions were retired");
+    } finally { many.dispose(); }
     const noID = fixture(["note.md"]); noID.dirty.add(hint("note.md", 2, 2)); noID.states.set("note.md", "excluded");
     const unproven = await RootReviewedQueue.create(noID.ports);
     try {

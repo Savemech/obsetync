@@ -14,6 +14,10 @@ export interface AdapterPathStat extends FileStat {
 
 /** Positive local policy/type classifications only, not an IO fallback. */
 export type FileChangeOmissionReason = "excluded" | "untracked-directory";
+export interface RootLocalOmission {
+    readonly path: string;
+    readonly reason: FileChangeOmissionReason;
+}
 
 /** A directory is a distinct state, not an absent or unreadable file. */
 export class PathIsDirectoryError extends Error {
