@@ -682,6 +682,26 @@ test("changed credentials fence enrollment response and post-save activation", a
     }
 });
 
+test("Sync Now persists a failed enrollment write before using the already claimed identity", async () => {
+    const f = fixture(), plugin = await f.loaded(), write = f.block("save:1");
+    const claim = observe(plugin.enroll("ABCD-1234"));
+    await f.waitFor("save:1");
+    write.reject(new Error("storage full"));
+    await assert.rejects(claim.promise, /Sync Now/i);
+    equal(f.engines.length, 0, "Enrollment started with unsaved credentials");
+    const retryWrite = f.block("save:2"), retry = observe(plugin.syncNow());
+    await f.waitFor("save:2");
+    equal(f.engines.length, 0, "Sync started before credential persistence");
+    retryWrite.reject(new Error("storage still full"));
+    await assert.rejects(retry.promise, /storage still full/);
+    equal(f.engines.length, 0, "Failed retry started sync");
+    await plugin.syncNow();
+    equal(f.saves[2].deviceId, "new-device", "Retry did not persist the claimed identity");
+    equal(f.events.filter(event => /^api\d+:enroll$/.test(event)).length, 1, "Retry must reuse the claimed credentials");
+    equal(f.engines.length, 1, "Retry did not start sync");
+    await f.unload(plugin);
+});
+
 test("failed enrollment releases admission for a fresh code", async () => {
     const f = fixture(), plugin = await f.loaded();
     f.state.enrollmentFailure = true;

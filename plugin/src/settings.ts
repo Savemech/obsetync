@@ -196,9 +196,10 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                             this.plugin.authorizeSettingsMutation();
                             await this.plugin.enroll(enrollCode);
                             new Notice("Enrolled successfully!");
-                            this.display(); // Refresh UI.
                         } catch (e: any) {
-                            new Notice(`Enrollment failed: ${e.message}`);
+                            new Notice(e.message);
+                        } finally {
+                            this.display();
                         }
                     })
                 );

@@ -153,8 +153,8 @@ pending	plugin/scripts/native-root-qualification.test.mjs	tests	Not reviewed
 reviewed	plugin/scripts/run-resource-governor-bench.mjs	tooling	Traced worker bundling, child exit, result recording and cleanup; live x86 record run passes and leaves historical reports intact
 read	plugin/scripts/run-tests.mjs	tooling	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
 read	plugin/scripts/run-tests.test.mjs	tests	Updated build/installer contracts and verified 26 targeted cases; full runner fixture semantics still under review
-pending	plugin/scripts/settings-fence.test.mjs	tests	Not reviewed
-read	plugin/scripts/test-main-lifecycle.mjs	tooling	Read bundle fixture/owner/IO ports and enrollment regressions; actual main has 37 passing scenarios / 389 assertions; entire runner and all scenario bodies still require review
+reviewed	plugin/scripts/settings-fence.test.mjs	tests	Read bundled settings controls and fixture; five cases pass, including all 13 settings mutation controls and recovery UI after a failed credential save
+read	plugin/scripts/test-main-lifecycle.mjs	tooling	Read bundle fixture/owner/IO ports and enrollment regressions; actual main has 38 passing scenarios / 395 assertions; entire runner and all scenario bodies still require review
 read	plugin/scripts/test-native-root-crash-recovery.mjs	tooling	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
 pending	plugin/scripts/test-native-root-mutation-complexity.mjs	tooling	Not reviewed
 pending	plugin/scripts/test-native-root-server.mjs	tooling	Not reviewed
@@ -263,7 +263,7 @@ pending	plugin/src/legacy-source.test.ts	tests	Not reviewed
 pending	plugin/src/legacy-source.ts	production	Not reviewed
 pending	plugin/src/local-event-guards.ts	production	Not reviewed
 read	plugin/src/local-events.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
-read	plugin/src/main.ts	production	Legacy endpoint migration and enrollment owner traced; duplicate requests rejected before dispatch; credential/address changes fence response and saved continuation; 37 bundled-main scenarios pass; native-save rejection recovery and full host audit remain
+read	plugin/src/main.ts	production	Legacy endpoint migration and enrollment owner traced; duplicate requests rejected before dispatch; credential/address changes fence response and saved continuation; 38 bundled-main scenarios pass, including two failed credential writes followed by successful retry without a second claim; full host audit remains
 reviewed	plugin/src/max-latency-coalescer.test.ts	tests	Read quiet/max-latency, failure and closure coverage; npm test passes
 reviewed	plugin/src/max-latency-coalescer.ts	production	Read timer, rerun, flush and close paths with production sync.ts callers and dedicated tests; npm test passes
 pending	plugin/src/mobile-ranged-source.ts	production	Not reviewed

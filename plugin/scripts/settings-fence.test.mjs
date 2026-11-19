@@ -123,14 +123,29 @@ test("blocked handoff fences every settings mutation before memory or engine sid
     const { plugin, effects } = fixture(true);
     const before = structuredClone(plugin.settings);
     for (const [key, value] of [
-        ["Server URL:text", "http://changed"], ["Vault ID:text", "changed"], ["Device Name:text", "changed"],
+        ["Server URL:text", "http://changed"], ["Enrollment admin URL:text", "http://new-admin"], ["Vault ID:text", "changed"], ["Device Name:text", "changed"],
         ["Sync Interval:text", "9"], ["Startup delay:text", "45"], ["Auto-Sync:toggle", false], ["Sync Obsidian config (.obsidian/):toggle", true],
         ["Ignore patterns:textarea", "changed/**"], ["Realtime sync:toggle", false], ["Share presence:toggle", false],
         ["Upload priority:dropdown", "newest"], ["Reset enrollment:button", undefined],
     ]) await invoke(key, value);
     assert.deepEqual(plugin.settings, before);
     assert.equal(effects.saves, 0); assert.equal(effects.stops, 0);
-    assert.equal(effects.authorized, 12);
+    assert.equal(effects.authorized, 13);
+});
+
+test("claimed credentials with a failed save expose recovery in the settings tab", async () => {
+    const f = fixture(false);
+    f.setBlocked(false);
+    f.plugin.enroll = async () => {
+        f.plugin.settings.enrolled = true;
+        throw new Error("Select Sync Now to retry");
+    };
+    await invoke("Enrollment Code:text", "CODE");
+    await invoke("Enrollment Code:button");
+    assert(controls.has("Reset enrollment:button"), "Tab did not refresh after claim");
+    assert.equal(globalThis.__settingsFence.notices.at(-1), "Select Sync Now to retry");
+    await invoke("Sync Now:button");
+    assert.equal(f.effects.syncs, 1);
 });
 
 test("upload priority reaches the running engine from the dropdown", async () => {

@@ -130,6 +130,12 @@ function cloneSyncSettings(settings: SyncSettings): SyncSettings {
     return { ...settings, ignorePatterns: [...settings.ignorePatterns] };
 }
 
+function sameEnrollment(a: SyncSettings, b: SyncSettings): boolean {
+    return a.enrolled === b.enrolled && a.deviceId === b.deviceId &&
+        a.bearerToken === b.bearerToken && a.serverBoxPub === b.serverBoxPub &&
+        a.serverUrl === b.serverUrl && a.adminUrl === b.adminUrl;
+}
+
 function hostStateForLegacyDowngrade(state: LegacyDowngradeState):
     "none" | "interrupted" | "active-awaiting-import" | "import-authorized" | "current-active" {
     if (state === "legacy-active") return "active-awaiting-import";
@@ -1557,11 +1563,7 @@ export default class ObsetyncPlugin extends Plugin {
         const before = { ...this.settings };
         const assertEnrollmentCurrent = (expected: SyncSettings): void => {
             assertCurrent();
-            for (const field of ["serverUrl", "adminUrl", "deviceId", "bearerToken", "serverBoxPub", "enrolled"] as const) {
-                if (this.settings[field] !== expected[field]) {
-                    throw new Error("Settings changed during enrollment; try again");
-                }
-            }
+            if (!sameEnrollment(this.settings, expected)) throw new Error("Settings changed during enrollment; try again");
         };
         const tempApi = new ObsetyncApi(before.serverUrl, "", "");
         const result = await tempApi.claimEnrollment(code, before.adminUrl);
@@ -1576,7 +1578,11 @@ export default class ObsetyncPlugin extends Plugin {
         this.settings.lastOutgoingSeq = 0;
         this.settings.enrolled     = true;
         const published = { ...this.settings };
-        await this.saveSettings();
+        try { await this.saveSettings(); }
+        catch (error) {
+            assertEnrollmentCurrent(published);
+            throw Object.assign(new Error("Device claimed, but saving credentials failed. Fix local storage and select Sync Now before closing Obsidian."), { cause: error });
+        }
         assertEnrollmentCurrent(published);
 
         await this.initSync();
@@ -1648,6 +1654,13 @@ export default class ObsetyncPlugin extends Plugin {
         // closes its span and shows how long it ran before dying.
         const endSpan = perfSpan("init");
         try {
+            if (this.settings.enrolled && this.lastSavedSettings && !sameEnrollment(this.settings, this.lastSavedSettings)) {
+                const identity = { ...this.settings };
+                await this.saveSettings();
+                hostToken?.assertCurrent();
+                if (this.unloaded || generation !== this.syncInitGeneration) return;
+                if (!sameEnrollment(identity, this.settings)) throw new Error("Enrollment changed before sync could start");
+            }
             if (this.startupInterruptionId !== null) {
                 this.settings.resumedInterruptionId = this.startupInterruptionId;
                 await this.saveSettings();
