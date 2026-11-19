@@ -59,13 +59,16 @@ pub fn hash_to_hex(hash: &FileHash) -> String {
 
 /// Parse a hex string into a FileHash.
 pub fn hex_to_hash(s: &str) -> Result<FileHash, hex::FromHexError> {
-    let bytes = hex::decode(s)?;
-    let mut hash = [0u8; 32];
-    if bytes.len() != 32 {
-        return Err(hex::FromHexError::InvalidStringLength);
+    // Preserve the variable-length decoder's first bad byte on even, nonstandard lengths.
+    if s.len() != 64 && s.len().is_multiple_of(2) {
+        if let Some((index, byte)) = s.bytes().enumerate().find(|(_, b)| !b.is_ascii_hexdigit()) {
+            return Err(hex::FromHexError::InvalidHexCharacter {
+                c: byte as char,
+                index,
+            });
+        }
     }
-    hash.copy_from_slice(&bytes);
-    Ok(hash)
+    hex::FromHex::from_hex(s)
 }
 
 #[cfg(test)]
@@ -146,20 +149,27 @@ mod tests {
     }
 
     #[test]
-    fn hex_to_hash_rejects_wrong_length() {
-        // 31-byte hex (62 chars) — must fail with InvalidStringLength.
-        let short = "ab".repeat(31);
-        assert!(hex_to_hash(&short).is_err());
-
-        let long = "ab".repeat(33);
-        assert!(hex_to_hash(&long).is_err());
-    }
-
-    #[test]
-    fn hex_to_hash_rejects_non_hex() {
-        // 64 chars but 'z' is not hex.
-        let bad = "z".repeat(64);
-        assert!(hex_to_hash(&bad).is_err());
+    fn hex_to_hash_preserves_values_and_decode_errors() {
+        use hex::FromHexError::{InvalidHexCharacter, InvalidStringLength, OddLength};
+        assert_eq!(hex_to_hash(&"aB".repeat(32)), Ok([0xab; 32]));
+        for length in [0, 62, 66] {
+            assert_eq!(hex_to_hash(&"0".repeat(length)), Err(InvalidStringLength));
+        }
+        assert_eq!(hex_to_hash("z00"), Err(OddLength));
+        for prefix_len in [1, 63, 65] {
+            let input = format!("{}z", "0".repeat(prefix_len));
+            assert_eq!(
+                hex_to_hash(&input),
+                Err(InvalidHexCharacter {
+                    c: 'z',
+                    index: prefix_len
+                })
+            );
+        }
+        assert_eq!(
+            hex_to_hash("01é"),
+            Err(InvalidHexCharacter { c: 'Ã', index: 2 })
+        );
     }
 
     #[test]
