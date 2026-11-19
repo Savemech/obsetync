@@ -1,8 +1,8 @@
 status	path	role	evidence
-pending	.cargo/config.toml	configuration/schema	Not reviewed
+reviewed	.cargo/config.toml	configuration/schema	Read both path remaps; Docker/CI/WASM flag overrides traced and scope comment corrected
 read	.github/workflows/ci.yml	configuration/schema	Read full CI DAG; shared verified installer preserves build-before-browser/native gates; helper contracts pass; external CI run pending
 read	.github/workflows/release.yml	configuration/schema	Read plugin/native/Nix gate sections; shared installer removes duplicated pins; full workflow provenance/publication review pending
-pending	Cargo.lock	generated/lock	Not reviewed
+reviewed	Cargo.lock	generated/lock	Checked five workspace versions and 225 checksummed registry packages; locked offline Cargo resolution passed on x86 Linux
 reviewed	Cargo.toml	configuration/schema	Workspace members/features and release settings traced to crate manifests and test commands; corrected --workspace/default-members comment; workspace tests pass
 read	Dockerfile	configuration/schema	Read production pinned WASM toolchain and artifact stages; remaining container/runtime validation pending
 reviewed	Dockerfile.dev	configuration/schema	Read complete toolchain; shared pinned x86/ARM installer; replaced absent apt just with Cargo; actual just build-dev and all tool versions pass on x86
@@ -116,10 +116,10 @@ pending	docs/native-root-read-concurrency-2026-09-05.json	historical evidence	No
 pending	docs/root-drain-reviewed-counts-2026-09-05.json	historical evidence	Not reviewed
 read	flake.nix	configuration/schema	Read package graph; verified seven-file plugin, server and dev shell (added missing wasm-pack); full flake/image release gates pending
 read	justfile	configuration/schema	Read all recipes; clean-server now stop/native-clear/start and failure stops sequence, verified using actual just with Docker recorder; ship/deploy helper audit pending
-pending	manifest.json	configuration/schema	Not reviewed
+reviewed	manifest.json	configuration/schema	Current version and minimum, packaged copy and byte-parity release preflight verified
 reviewed	plugin/esbuild.config.mjs	production	Read all build paths and checked npm/Nix/Docker entry points; production build and six browser tests pass; editing each worker entry independently updates the running dev bundle
-pending	plugin/manifest.json	configuration/schema	Not reviewed
-pending	plugin/package-lock.json	generated/lock	Not reviewed
+reviewed	plugin/manifest.json	configuration/schema	Verified root copy byte parity; mobile-availability discrepancy regression added
+reviewed	plugin/package-lock.json	generated/lock	Fresh offline npm ci and npm ls succeeded on Linux; release checker verifies both version declarations
 read	plugin/package.json	configuration/schema	Entry-point/build inventory; behavior/callers still under review
 pending	plugin/scripts/bench-journal.mjs	tooling	Not reviewed
 read	plugin/scripts/bench-native-root.mjs	tooling	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
@@ -410,13 +410,13 @@ pending	plugin/src/ws-resume.test.ts	tests	Not reviewed
 read	plugin/src/ws.ts	production	Read complete connection-generation, foreground, encryption-chain and event lifecycle; server protocol traced; caller/test and queue-bound audit remains
 pending	plugin/styles.css	production	Not reviewed
 reviewed	plugin/tsconfig.json	configuration/schema	Enabled noUnusedLocals/noUnusedParameters; tsc and actual Nix plugin compilation pass
-pending	rust-toolchain.toml	configuration/schema	Not reviewed
+reviewed	rust-toolchain.toml	configuration/schema	Local rustc 1.95.0 and wasm32 target verified; CI and release Rust setup version pins match
 pending	scripts/benchmark-hash-workers.mjs	tooling	Not reviewed
 pending	scripts/benchmark-wasm-hash.mjs	tooling	Not reviewed
 reviewed	scripts/build-wasm.sh	tooling	Read complete scalar/SIMD build and output isolation with Docker/CI/Nix callers; fixed unquoted optimizer path; version/whitespace refusal and accepted-path contract tests pass
-pending	scripts/check-release-version.mjs	tooling	Not reviewed
+reviewed	scripts/check-release-version.mjs	tooling	Read structured JSON/Cargo/Nix checks and release callers; centralized manifest parity and corrected quoted Nix delimiters; release regression suite passes
 reviewed	scripts/install-wasm-tools.sh	tooling	Shared Linux installer; architecture allowlist, pinned hashes, both checks before install, cleanup and quoted paths reviewed; mock refusal/selection tests and real x86 dev image install pass
-pending	scripts/check-release-version.test.mjs	tests	Not reviewed
+reviewed	scripts/check-release-version.test.mjs	tests	Read release/tag/schema/compatibility cases; added exact-byte and quoted delimiter regressions, reproduced both failures before fixes
 pending	scripts/deploy-plugin.sh	tooling	Not reviewed
 pending	scripts/deploy-plugin.test.sh	tests	Not reviewed
 pending	scripts/deploy-server.sh	tooling	Not reviewed
@@ -427,4 +427,4 @@ pending	scripts/release-provenance.mjs	tooling	Not reviewed
 pending	scripts/release-provenance.test.mjs	tests	Not reviewed
 pending	scripts/verify-wasm-memory.mjs	tooling	Not reviewed
 pending	scripts/verify-wasm-parity.mjs	tooling	Not reviewed
-pending	versions.json	configuration/schema	Not reviewed
+reviewed	versions.json	configuration/schema	Current compatibility entry passed shared release checker; verified minimums against 21 available tagged root manifests

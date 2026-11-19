@@ -250,19 +250,24 @@ function nixTokens(source) {
     return tokens;
 }
 
+function isSymbol(token, symbol) {
+    return token?.type === "symbol" && token.value === symbol;
+}
+
 function nixBlock(tokens, name) {
     const starts = [];
     for (let index = 0; index + 1 < tokens.length; index++) {
-        if (tokens[index].type === "ident" && tokens[index].value === name && tokens[index + 1].value === "=") {
+        if (tokens[index].type === "ident" && tokens[index].value === name && isSymbol(tokens[index + 1], "=")) {
             let open = index + 2;
-            while (open < tokens.length && tokens[open].value !== "{" && tokens[open].value !== ";") open++;
-            if (tokens[open]?.value === "{") starts.push(open);
+            while (open < tokens.length && !isSymbol(tokens[open], "{") && !isSymbol(tokens[open], ";")) open++;
+            if (isSymbol(tokens[open], "{")) starts.push(open);
         }
     }
     if (starts.length !== 1) fail(`flake.nix must declare ${name} as an attribute set exactly once (found ${starts.length})`);
     const open = starts[0];
     let depth = 1, close = open + 1;
     for (; close < tokens.length && depth > 0; close++) {
+        if (tokens[close].type !== "symbol") continue;
         if (tokens[close].value === "{") depth++;
         else if (tokens[close].value === "}") depth--;
     }
@@ -275,16 +280,19 @@ function directNixStrings(tokens, blockName, wanted) {
     let braces = 0, brackets = 0, parentheses = 0;
     for (let index = 0; index + 1 < tokens.length; index++) {
         const token = tokens[index];
-        if (token.value === "{") braces++;
-        else if (token.value === "}") braces--;
-        else if (token.value === "[") brackets++;
-        else if (token.value === "]") brackets--;
-        else if (token.value === "(") parentheses++;
-        else if (token.value === ")") parentheses--;
+        if (token.type === "symbol") {
+            if (token.value === "{") braces++;
+            else if (token.value === "}") braces--;
+            else if (token.value === "[") brackets++;
+            else if (token.value === "]") brackets--;
+            else if (token.value === "(") parentheses++;
+            else if (token.value === ")") parentheses--;
+            continue;
+        }
         if (braces !== 0 || brackets !== 0 || parentheses !== 0 || token.type !== "ident" ||
-            !found.has(token.value) || tokens[index + 1].value !== "=") continue;
+            !found.has(token.value) || !isSymbol(tokens[index + 1], "=")) continue;
         const value = tokens[index + 2];
-        if (value?.type !== "string" || tokens[index + 3]?.value !== ";") {
+        if (value?.type !== "string" || !isSymbol(tokens[index + 3], ";")) {
             fail(`flake.nix ${blockName}.${token.value} must be one literal string`);
         }
         found.get(token.value).push(value.value);
@@ -328,8 +336,12 @@ export async function checkReleaseVersion({ rootDir, eventName, refName }) {
     if (eventName !== "push") fail(`release event must be push (received ${eventName || "missing"})`);
     const tagVersion = releaseTag(refName);
     const cargoVersion = cargoWorkspaceVersion(await readFile(join(root, "Cargo.toml"), "utf8"));
-    const rootManifest = await jsonFile(root, "manifest.json");
-    const pluginManifest = await jsonFile(root, "plugin/manifest.json");
+    const [rootBytes, pluginBytes] = await Promise.all([
+        readFile(join(root, "manifest.json")),
+        readFile(join(root, "plugin/manifest.json")),
+    ]);
+    const rootManifest = parseJson(rootBytes.toString("utf8"), "manifest.json");
+    const pluginManifest = parseJson(pluginBytes.toString("utf8"), "plugin/manifest.json");
     const packageJson = await jsonFile(root, "plugin/package.json");
     const packageLock = await jsonFile(root, "plugin/package-lock.json");
     const compatibility = await jsonFile(root, "versions.json");
@@ -360,6 +372,7 @@ export async function checkReleaseVersion({ rootDir, eventName, refName }) {
     if (pluginMinimum !== rootMinimum) {
         fail(`plugin/manifest.json minAppVersion is ${pluginMinimum}, expected ${rootMinimum}`);
     }
+    if (!rootBytes.equals(pluginBytes)) fail("root and plugin manifests differ");
     const releaseMinimum = semanticVersion(requiredOwn(compatibility, cargoVersion,
         `versions.json release key ${cargoVersion}`), `versions.json[${cargoVersion}]`);
     if (releaseMinimum !== rootMinimum) {

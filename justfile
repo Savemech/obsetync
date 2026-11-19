@@ -125,8 +125,6 @@ release-preflight:
         Cargo.toml Cargo.lock Dockerfile docker-compose.yml flake.nix flake.lock \
         justfile manifest.json versions.json crates plugin scripts)" || \
         (echo "release checkout has untracked build inputs" >&2; exit 2)
-    @cmp -s manifest.json plugin/manifest.json || \
-        (echo "root and plugin manifests differ" >&2; exit 2)
     @OBSETYNC_RELEASE_EVENT_NAME=push \
      OBSETYNC_RELEASE_REF_NAME="{{release_version}}" \
      node scripts/check-release-version.mjs

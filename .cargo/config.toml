@@ -1,5 +1,5 @@
 # Strip build-time paths from debug info and panic messages.
-# Applies to every cargo invocation in this workspace.
+# Cargo uses these defaults when the caller has not supplied RUSTFLAGS.
 
 [build]
 rustflags = [

@@ -146,6 +146,27 @@ test("requires one matching versions.json compatibility entry and manifest minim
     }, new RegExp(`duplicate JSON key \\$\\.${escaped(VERSION)}`));
 });
 
+test("release metadata must match the installed plugin manifest byte for byte", async () => {
+    for (const change of [
+        source => source.replace('"isDesktopOnly": false', '"isDesktopOnly": true'),
+        source => source + "\n",
+    ]) {
+        await rejects(files => {
+            files["plugin/manifest.json"] = change(files["plugin/manifest.json"]);
+        }, /root and plugin manifests differ/);
+    }
+});
+
+test("quoted Nix delimiters do not hide a direct version declaration", async () => {
+    for (const delimiter of ["{", "}", "(", "["]) {
+        const result = await run(files => {
+            files["flake.nix"] = replaceOne(files["flake.nix"], 'pname = "obsetync";',
+                `example = "${delimiter}";\n          pname = "obsetync";`);
+        });
+        assert.equal(result.version, VERSION);
+    }
+});
+
 test("keeps Nix sha256 and Git SHA-1 domains separate", async () => {
     const withShaComment = await run(files => {
         files["flake.nix"] = `# release commit ${"b".repeat(40)}\n${files["flake.nix"]}`;
