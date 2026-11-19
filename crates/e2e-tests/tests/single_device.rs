@@ -83,13 +83,25 @@ async fn diff_against_zero_root_returns_full_inventory() {
     let diff = client.post_diff(&vault, ZERO_HASH_HEX).await.unwrap();
     match diff {
         DiffResponse::Deltas(deltas) => {
-            assert_eq!(deltas.len(), 2);
-            for d in &deltas {
-                match d {
-                    WireDelta::Added { .. } => {}
-                    other => panic!("expected Added, got {:?}", other),
+            let mut actual = Vec::new();
+            for delta in deltas {
+                match delta {
+                    WireDelta::Added { path, hash, size } => actual.push((path, hash, size)),
+                    other => panic!("expected Added, got {other:?}"),
                 }
             }
+            actual.sort();
+            let expected: Vec<_> = files
+                .iter()
+                .map(|(path, bytes)| {
+                    (
+                        path.clone(),
+                        hash_to_hex(&hash_bytes(bytes)),
+                        bytes.len() as u64,
+                    )
+                })
+                .collect();
+            assert_eq!(actual, expected);
         }
         DiffResponse::InSync => panic!("zero-root diff must NOT report in-sync"),
     }

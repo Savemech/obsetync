@@ -30,18 +30,18 @@ pending	benchmarks/baseline-1.10.2/W7-smoke.json	historical evidence	Not reviewe
 pending	benchmarks/baseline-1.10.2/W8-smoke.json	historical evidence	Not reviewed
 pending	benchmarks/baseline-1.10.2/client-instrumentation-overhead.json	historical evidence	Not reviewed
 reviewed	crates/e2e-tests/Cargo.toml	configuration/schema	All network test files explicitly require e2e; verified the declared targets exhaust tests/*.rs; corrected workspace-default comment
-read	crates/e2e-tests/src/lib.rs	production	Environment/enrollment/wire and snapshot helpers traced; exact code-element parser replaces arbitrary HTML scan; three unit tests and 16 native network tests pass; complete harness audit remains
+read	crates/e2e-tests/src/lib.rs	production	Environment/enrollment/wire and snapshot helpers traced; exact code-element parser replaces arbitrary HTML scan; snapshot setup stops on the first failed content PUT; four unit tests pass; complete harness audit remains
 reviewed	crates/e2e-tests/tests/concurrency.rs	tests	Read test and traced snapshot helpers; eight native same-parent push races preserved both edits on independent observer readback
 pending	crates/e2e-tests/tests/conflicts.rs	tests	Not reviewed
 reviewed	crates/e2e-tests/tests/enrollment.rs	tests	All seven scenarios read and passed against isolated native server; code-shaped device name enrolls and authenticates; concurrent claim gets one 200 and one 400; auth/revocation and reused-code paths verified
 pending	crates/e2e-tests/tests/history_export.rs	tests	Not reviewed
 reviewed	crates/e2e-tests/tests/realtime_ws.rs	tests	All six scenarios read and passed against isolated fixed binary; reconnect regression failed against previous binary; CRDT assertions correctly labeled live readback, not crash durability
-pending	crates/e2e-tests/tests/single_device.rs	tests	Not reviewed
+reviewed	crates/e2e-tests/tests/single_device.rs	tests	All six native-server cases pass; zero-root inventory now checks every path, content hash and size
 pending	crates/e2e-tests/tests/smoke.rs	tests	Not reviewed
 pending	crates/e2e-tests/tests/stale_tree_revert.rs	tests	Not reviewed
 pending	crates/e2e-tests/tests/text_merge.rs	tests	Not reviewed
 pending	crates/e2e-tests/tests/transport_security.rs	tests	Not reviewed
-pending	crates/e2e-tests/tests/two_device_sync.rs	tests	Not reviewed
+reviewed	crates/e2e-tests/tests/two_device_sync.rs	tests	All four native-server cases pass: cross-device readback, fast-forward, divergent merge and vault isolation
 pending	crates/e2e-tests/tests/ws_data.rs	tests	Not reviewed
 read	crates/perf-harness/Cargo.toml	tooling	Entry-point/build inventory; behavior/callers still under review
 pending	crates/perf-harness/src/lib.rs	tooling	Not reviewed

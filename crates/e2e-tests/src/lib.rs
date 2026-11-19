@@ -858,11 +858,12 @@ async fn push_vault_snapshot_with_root_retries(
         root.parent_hash = Some(hex_to_hash(parent_hex)?);
     }
 
-    // Upload content blobs (ignore "already exists" — the server is
-    // content-addressed and doesn't error on idempotent writes).
-    for (_path, content) in files {
+    for (path, content) in files {
         let hash = hash_bytes(content);
-        let _ = client.put_content(&hash, content).await;
+        client
+            .put_content(&hash, content)
+            .await
+            .with_context(|| format!("upload content for {path}"))?;
     }
 
     // Upload index chunks (LeafChunk bytes etc).
@@ -915,6 +916,42 @@ pub async fn pull_vault_snapshot(
 mod tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+    #[tokio::test]
+    async fn snapshot_stops_after_first_content_upload_failure() {
+        // Invalid URL makes the transport fail locally before any network I/O.
+        let env = E2eEnv {
+            base_url: "invalid-url".into(),
+            admin_url: String::new(),
+            http: reqwest::Client::new(),
+        };
+        let public = PublicKey::from(&StaticSecret::from([42; KEY_LEN]));
+        let client = WireClient::new(
+            &env,
+            DeviceCreds {
+                code: String::new(),
+                device_id: "fixture".into(),
+                device_name: "fixture".into(),
+                bearer: "0".repeat(BEARER_LEN),
+                server_box_pub: public,
+                server_eph_pub: public,
+            },
+        );
+        let error = push_vault_snapshot(
+            &client,
+            "fixture",
+            &[("first.md".into(), vec![1]), ("next.md".into(), vec![2])],
+            ZERO_HASH_HEX,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            client.sequence.load(Ordering::Relaxed),
+            2,
+            "only the first request may be attempted"
+        );
+        assert!(error.to_string().contains("first.md"));
+    }
 
     #[test]
     fn enrollment_code_comes_only_from_the_code_element() {
