@@ -1,7 +1,7 @@
 import esbuild from "esbuild";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { spawn } from "node:child_process";
 
 const worker = await esbuild.build({
@@ -63,17 +63,10 @@ try {
     const result = await readFile(resultPath, "utf8");
     const report = JSON.parse(result);
     if (process.argv.includes("--record")) {
-        const artifactNames = {
-            "x86-desktop": "x86-resource-governor-slice14.json",
-            "macos-arm64": "m1-resource-governor-slice14.json",
-            "windows-arm64": "snapdragon-resource-governor-slice14.json",
-        };
-        const artifactName = artifactNames[report.profile_family];
-        if (!artifactName) throw new Error("benchmark reported an unsupported profile family");
-        const output = resolve("../benchmarks/after-1.11.1", artifactName);
+        const outputDir = await mkdtemp(join(tmpdir(), "obsetync-governor-report-"));
+        const output = join(outputDir, "governor.json");
         await writeFile(output, result);
-        // Read-after-write catches a truncated filesystem result before CI accepts evidence.
-        JSON.parse(await readFile(output, "utf8"));
+        console.log(`Recorded ${report.profile_family} benchmark at ${output}`);
     }
 } finally {
     await rm(directory, { recursive: true, force: true });

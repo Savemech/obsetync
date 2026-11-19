@@ -1,15 +1,15 @@
 # Slice 14 hardware qualification matrix
 
-Status: **partial**. The reproducible desktop controller gate is implemented and
+Status: **partial**. The reproducible desktop hash-worker benchmark is implemented and
 has passed on real x86_64 hardware. Physical A17, M1, Windows ARM64, and slow-disk
 Obsidian runs remain release evidence requirements; this file deliberately does
 not substitute simulated profile tests for those runs.
 
 ## Recorded devices
 
-| Family | Device/runtime | Evidence | Median adaptive | Median conservative | Ratio | Worst event-loop p95 | Result |
+| Family | Device/runtime | Evidence | Median balanced | Median conservative | Ratio | Worst event-loop p95 | Result |
 |---|---|---|---:|---:|---:|---:|---|
-| x86_64 | AMD Ryzen 9 5950X, 32 logical cores, Linux x64 under WSL2, Node 22.23.2 | `x86-resource-governor-slice14.json` | 3,341.74 MiB/s | 1,652.08 MiB/s | 2.02x | 1.08 ms | controller gate passed |
+| x86_64 | AMD Ryzen 9 5950X, 32 logical cores, Linux x64 under WSL2, Node 22.23.2 | `x86-resource-governor-slice14.json` | 3,341.74 MiB/s | 1,652.08 MiB/s | 2.02x | 1.08 ms | worker benchmark passed |
 | Apple M1 | Physical macOS/Obsidian run required | pending | — | — | — | — | pending |
 | Snapdragon | Physical Windows ARM64/Obsidian run required | pending | — | — | — | — | pending |
 | A17-class | Physical iPhone/iPad WebKit/Obsidian W8 run required | pending | — | — | — | — | pending |
@@ -19,7 +19,7 @@ The recorded x86 run used the production minified SIMD worker bundle, 32 real
 sparse files of 8 MiB each (256 MiB per run), a warm filesystem cache, and three
 counterbalanced runs per profile. Conservative used two workers with 256 KiB
 feeds; the selected balanced profile used four workers with 512 KiB feeds. The
-gate requires adaptive throughput to remain within 5% of conservative and every
+gate requires balanced throughput to remain within 5% of conservative and every
 run's event-loop p95 to remain at or below 16 ms. Both conditions passed.
 
 RSS is recorded per run as both absolute peak and peak delta. It is diagnostic,
@@ -36,16 +36,10 @@ npm ci
 npm run bench:governor -- --record
 ```
 
-The runner builds the production SIMD worker and controller, refuses unsupported
-architectures, fails closed if either release gate fails, and records one of:
-
-- `x86-resource-governor-slice14.json`;
-- `m1-resource-governor-slice14.json`;
-- `snapdragon-resource-governor-slice14.json`.
-
-The M1 and Snapdragon artifacts must come from the named physical architecture;
-unit tests that instantiate those profile ladders are correctness coverage, not
-hardware evidence.
+The runner compares fixed startup profiles using the production SIMD worker.
+After both gates pass, `--record` prints the path to a fresh temporary JSON
+report. Copy that file alongside the candidate's other evidence for retention.
+The tracked slice 14 results describe the original campaign.
 
 ## Physical Obsidian protocol
 

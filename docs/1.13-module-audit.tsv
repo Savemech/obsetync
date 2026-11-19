@@ -6,29 +6,29 @@ pending	Cargo.lock	generated/lock	Not reviewed
 reviewed	Cargo.toml	configuration/schema	Workspace members/features and release settings traced to crate manifests and test commands; corrected --workspace/default-members comment; workspace tests pass
 read	Dockerfile	configuration/schema	Read production pinned WASM toolchain and artifact stages; remaining container/runtime validation pending
 reviewed	Dockerfile.dev	configuration/schema	Read complete toolchain; shared pinned x86/ARM installer; replaced absent apt just with Cargo; actual just build-dev and all tool versions pass on x86
-pending	benchmarks/after-1.11.1/Tree-v1-prefix-slice2.json	historical evidence	Not reviewed
-pending	benchmarks/after-1.11.1/W1-bulk-http-slice5.json	historical evidence	Not reviewed
-pending	benchmarks/after-1.11.1/W1-group-commit-slice6.json	historical evidence	Not reviewed
-pending	benchmarks/after-1.11.1/W1-pack-storage-slice7.json	historical evidence	Not reviewed
-pending	benchmarks/after-1.11.1/W1-ws-data-slice8.json	historical evidence	Not reviewed
-pending	benchmarks/after-1.11.1/W4-ranged-upload-slice13.json	historical evidence	Not reviewed
-pending	benchmarks/after-1.11.1/W5-paged-diff-slice10.json	historical evidence	Not reviewed
-pending	benchmarks/after-1.11.1/W5-tree-v2-slice11.json	historical evidence	Not reviewed
-pending	benchmarks/after-1.11.1/W6-slice1.json	historical evidence	Not reviewed
-pending	benchmarks/after-1.11.1/W6-smoke.json	historical evidence	Not reviewed
-pending	benchmarks/after-1.11.1/WASM-SIMD-feed-slice3.json	historical evidence	Not reviewed
-pending	benchmarks/after-1.11.1/desktop-workers-slice13.json	historical evidence	Not reviewed
-pending	benchmarks/after-1.11.1/desktop-workers-slice4.json	historical evidence	Not reviewed
-pending	benchmarks/after-1.11.1/x86-resource-governor-slice14.json	historical evidence	Not reviewed
-pending	benchmarks/baseline-1.10.2/W1-smoke.json	historical evidence	Not reviewed
-pending	benchmarks/baseline-1.10.2/W2-smoke.json	historical evidence	Not reviewed
-pending	benchmarks/baseline-1.10.2/W3-smoke.json	historical evidence	Not reviewed
-pending	benchmarks/baseline-1.10.2/W4-smoke.json	historical evidence	Not reviewed
-pending	benchmarks/baseline-1.10.2/W5-smoke.json	historical evidence	Not reviewed
-pending	benchmarks/baseline-1.10.2/W6-smoke.json	historical evidence	Not reviewed
-pending	benchmarks/baseline-1.10.2/W7-smoke.json	historical evidence	Not reviewed
-pending	benchmarks/baseline-1.10.2/W8-smoke.json	historical evidence	Not reviewed
-pending	benchmarks/baseline-1.10.2/client-instrumentation-overhead.json	historical evidence	Not reviewed
+reviewed	benchmarks/after-1.11.1/Tree-v1-prefix-slice2.json	historical evidence	Archived legacy/linear v1 update comparison; seven matching final roots
+reviewed	benchmarks/after-1.11.1/W1-bulk-http-slice5.json	historical evidence	Archived W1-bulk-http-slice5; parsed workload, runtime and recorded invariants: production_planner_imported, order_preserved
+reviewed	benchmarks/after-1.11.1/W1-group-commit-slice6.json	historical evidence	Archived W1-group-commit-slice6; parsed workload, runtime and recorded invariants: all_object_hashes_verified_before_append, success_ack_only_after_group_fdatasync
+reviewed	benchmarks/after-1.11.1/W1-pack-storage-slice7.json	historical evidence	Archived W1-pack-storage-slice7; parsed workload, runtime and recorded invariants: all_object_hashes_verified_before_append, check_path_uses_verified_index_without_payload_read
+reviewed	benchmarks/after-1.11.1/W1-ws-data-slice8.json	historical evidence	Archived W1-ws-data-slice8; parsed workload, runtime and recorded invariants: same_plaintext_pack_per_comparison, production_http_envelope
+reviewed	benchmarks/after-1.11.1/W4-ranged-upload-slice13.json	historical evidence	Archived W4-ranged-upload-slice13; parsed workload, runtime and recorded invariants: positional_reads_only, manifest_after_chunk_ack
+reviewed	benchmarks/after-1.11.1/W5-paged-diff-slice10.json	historical evidence	Archived encoder-only result; 85k records, eleven pages, maximum encoded size within 512 KiB
+reviewed	benchmarks/after-1.11.1/W5-tree-v2-slice11.json	historical evidence	Archived 100k-entry range-tree prototype; all three scenarios record matching deltas, final state and bounded churn
+reviewed	benchmarks/after-1.11.1/W6-slice1.json	historical evidence	Archived W6 x86_64 dataset: 10000 files, 1 runs, 10000 scenario operations/run; deterministic roots checked
+reviewed	benchmarks/after-1.11.1/W6-smoke.json	historical evidence	Archived W6 x86_64 dataset: 100 files, 3 runs, 100 scenario operations/run; deterministic roots checked
+reviewed	benchmarks/after-1.11.1/WASM-SIMD-feed-slice3.json	historical evidence	Archived scalar/SIMD feed comparison; hash parity recorded for tested feeds
+reviewed	benchmarks/after-1.11.1/desktop-workers-slice13.json	historical evidence	Archived desktop-workers-slice13; parsed workload, runtime and recorded invariants: scalar_simd_hash_parity_inherited_from_slice3, hash_manifest_parity
+reviewed	benchmarks/after-1.11.1/desktop-workers-slice4.json	historical evidence	Archived desktop-workers-slice4; parsed workload, runtime and recorded invariants: scalar_simd_hash_parity_inherited_from_slice3, hash_manifest_parity
+reviewed	benchmarks/after-1.11.1/x86-resource-governor-slice14.json	historical evidence	Archived x86 fixed hash-worker profile comparison; matrix scope corrected; current recorder uses fresh output
+reviewed	benchmarks/baseline-1.10.2/W1-smoke.json	historical evidence	Archived W1 x86_64 dataset: 1000 files, 3 runs, 0 scenario operations/run; deterministic roots checked
+reviewed	benchmarks/baseline-1.10.2/W2-smoke.json	historical evidence	Archived W2 x86_64 dataset: 250 files, 3 runs, 0 scenario operations/run; deterministic roots checked
+reviewed	benchmarks/baseline-1.10.2/W3-smoke.json	historical evidence	Archived W3 x86_64 dataset: 100 files, 3 runs, 0 scenario operations/run; deterministic roots checked
+reviewed	benchmarks/baseline-1.10.2/W4-smoke.json	historical evidence	Archived W4 x86_64 dataset: 1 files, 3 runs, 0 scenario operations/run; deterministic roots checked
+reviewed	benchmarks/baseline-1.10.2/W5-smoke.json	historical evidence	Archived W5 x86_64 dataset: 1000 files, 3 runs, 1 scenario operations/run; deterministic roots checked
+reviewed	benchmarks/baseline-1.10.2/W6-smoke.json	historical evidence	Archived W6 x86_64 dataset: 100 files, 3 runs, 100 scenario operations/run; deterministic roots checked
+reviewed	benchmarks/baseline-1.10.2/W7-smoke.json	historical evidence	Archived W7 x86_64 dataset: 500 files, 3 runs, 500 scenario operations/run; deterministic roots checked
+reviewed	benchmarks/baseline-1.10.2/W8-smoke.json	historical evidence	Archived W8 x86_64 dataset: 680 files, 3 runs, 0 scenario operations/run; deterministic roots checked
+reviewed	benchmarks/baseline-1.10.2/client-instrumentation-overhead.json	historical evidence	Archived instrumentation microbenchmark; paired median fell below the recorded 2% gate
 reviewed	crates/e2e-tests/Cargo.toml	configuration/schema	All network test files explicitly require e2e; verified the declared targets exhaust tests/*.rs; corrected workspace-default comment
 read	crates/e2e-tests/src/lib.rs	production	Environment/enrollment/wire and snapshot helpers traced; exact code-element parser replaces arbitrary HTML scan; snapshot setup stops on the first failed content PUT; four unit tests pass; complete harness audit remains
 reviewed	crates/e2e-tests/tests/concurrency.rs	tests	Read test and traced snapshot helpers; eight native same-parent push races preserved both edits on independent observer readback
@@ -150,7 +150,7 @@ pending	plugin/scripts/native-root-instrumentation.test.mjs	tests	Not reviewed
 pending	plugin/scripts/native-root-io.test.mjs	tests	Not reviewed
 pending	plugin/scripts/native-root-metrics.test.mjs	tests	Not reviewed
 pending	plugin/scripts/native-root-qualification.test.mjs	tests	Not reviewed
-pending	plugin/scripts/run-resource-governor-bench.mjs	tooling	Not reviewed
+reviewed	plugin/scripts/run-resource-governor-bench.mjs	tooling	Traced worker bundling, child exit, result recording and cleanup; live x86 record run passes and leaves historical reports intact
 read	plugin/scripts/run-tests.mjs	tooling	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
 read	plugin/scripts/run-tests.test.mjs	tests	Updated build/installer contracts and verified 26 targeted cases; full runner fixture semantics still under review
 pending	plugin/scripts/settings-fence.test.mjs	tests	Not reviewed
