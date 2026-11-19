@@ -218,19 +218,21 @@ struct EnrollmentBundle {
 }
 
 fn parse_enrollment_code(html: &str) -> Option<String> {
-    // The admin response renders the code inside `<code class="code">XXXX-9999</code>`.
-    // Accept anything matching the generator's shape: 4 letters, dash, 4 digits.
-    let bytes = html.as_bytes();
-    for i in 0..bytes.len().saturating_sub(9) {
-        let win = &bytes[i..i + 9];
-        if win[0..4].iter().all(|b| b.is_ascii_uppercase())
-            && win[4] == b'-'
-            && win[5..9].iter().all(|b| b.is_ascii_digit())
-        {
-            return Some(std::str::from_utf8(win).ok()?.to_string());
-        }
+    let code = html
+        .split_once("<code class=\"code\">")?
+        .1
+        .split_once("</code>")?
+        .0;
+    let bytes = code.as_bytes();
+    if bytes.len() == 9
+        && bytes[..4].iter().all(u8::is_ascii_uppercase)
+        && bytes[4] == b'-'
+        && bytes[5..].iter().all(u8::is_ascii_digit)
+    {
+        Some(code.to_string())
+    } else {
+        None
     }
-    None
 }
 
 // --- WireClient — per-device encrypted-envelope HTTP client ------------------
@@ -913,6 +915,30 @@ pub async fn pull_vault_snapshot(
 mod tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+    #[test]
+    fn enrollment_code_comes_only_from_the_code_element() {
+        assert_eq!(
+            parse_enrollment_code(
+                "<strong>ABCD-1234</strong><code class=\"code\">WXYZ-9876</code>"
+            ),
+            Some("WXYZ-9876".into())
+        );
+        for html in [
+            "ABCD-1234",
+            "<code>ABCD-1234</code>",
+            "<code class=\"code\">ABCD-12345</code>",
+            "<code class=\"code\">abcd-1234</code>",
+            "<code class=\"code\">ABCD-1234",
+            "<code class=\"code\">éBCD-1234</code>",
+        ] {
+            assert_eq!(parse_enrollment_code(html), None, "{html}");
+        }
+        assert_eq!(
+            parse_enrollment_code("<code class=\"code\">ABCD-1234</code>"),
+            Some("ABCD-1234".into())
+        );
+    }
 
     fn receive_memory_headers(retry_after: &'static str) -> HeaderMap {
         let mut headers = HeaderMap::new();

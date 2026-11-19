@@ -310,6 +310,7 @@ export default class ObsetyncPlugin extends Plugin {
     private readonly settingsWork = new Set<Promise<void>>();
     private settingsMigrationPending = false;
     private lastSavedSettings: SyncSettings | null = null;
+    private enrollmentPending = false;
     private legacyRecoveryProjectionOnly = false;
     private unloaded = false;
     private loadWork: Promise<void> | null = null;
@@ -1541,21 +1542,30 @@ export default class ObsetyncPlugin extends Plugin {
 
     /** Enroll this device with the server using an enrollment code. */
     async enroll(code: string): Promise<void> {
-        return this.runCurrentHostWork("settings", lease =>
-            this.enrollOwned(code, () => lease.assertCurrent()));
+        if (this.enrollmentPending) throw new Error("Enrollment already in progress");
+        this.enrollmentPending = true;
+        try {
+            await this.runCurrentHostWork("settings", lease =>
+                this.enrollOwned(code, () => lease.assertCurrent()));
+        } finally { this.enrollmentPending = false; }
     }
 
     private async enrollOwned(code: string, assertCurrent: () => void): Promise<void> {
         // Enrollment uses the selected admin address. We pass empty
         // strings for box_pub + bearer_token since claimEnrollment doesn't
         // need an ObsetyncSecureChannel (admin endpoint is unauthenticated).
-        const serverUrl = this.settings.serverUrl, adminUrl = this.settings.adminUrl;
-        const tempApi = new ObsetyncApi(serverUrl, "", "");
-        const result = await tempApi.claimEnrollment(code, adminUrl);
-        assertCurrent();
-        if (this.settings.serverUrl !== serverUrl || this.settings.adminUrl !== adminUrl) {
-            throw new Error("Server address changed during enrollment; try again");
-        }
+        const before = { ...this.settings };
+        const assertEnrollmentCurrent = (expected: SyncSettings): void => {
+            assertCurrent();
+            for (const field of ["serverUrl", "adminUrl", "deviceId", "bearerToken", "serverBoxPub", "enrolled"] as const) {
+                if (this.settings[field] !== expected[field]) {
+                    throw new Error("Settings changed during enrollment; try again");
+                }
+            }
+        };
+        const tempApi = new ObsetyncApi(before.serverUrl, "", "");
+        const result = await tempApi.claimEnrollment(code, before.adminUrl);
+        assertEnrollmentCurrent(before);
 
         this.settings.deviceId     = result.device_id;
         this.settings.bearerToken  = result.bearer_token;
@@ -1565,11 +1575,12 @@ export default class ObsetyncPlugin extends Plugin {
         this.settings.esPubValidUntil = result.Es_pub_valid_until;
         this.settings.lastOutgoingSeq = 0;
         this.settings.enrolled     = true;
+        const published = { ...this.settings };
         await this.saveSettings();
-        assertCurrent();
+        assertEnrollmentCurrent(published);
 
         await this.initSync();
-        assertCurrent();
+        assertEnrollmentCurrent(published);
     }
 
     async syncNow(): Promise<void> {

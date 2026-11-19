@@ -4,6 +4,15 @@ use e2e_tests::*;
 use reqwest::StatusCode;
 
 #[tokio::test]
+async fn code_shaped_device_name_does_not_replace_enrollment_code() {
+    let env = harness().await;
+    let creds = env.enroll_device("ABCD-1234 EFGH-5678").await.unwrap();
+    assert_eq!(creds.device_name, "ABCD-1234 EFGH-5678");
+    let client = WireClient::new(&env, creds);
+    assert!(client.chunks_check(&[]).await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn enroll_two_devices_yields_distinct_credentials() {
     let env = harness().await;
     let a = env.enroll_device("phone-A").await.unwrap();

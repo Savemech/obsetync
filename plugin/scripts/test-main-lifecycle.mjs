@@ -649,6 +649,50 @@ test("failed or stale enrollment never replaces the existing credentials", async
     }
 });
 
+test("duplicate enrollment cannot consume a second code while the first request is pending", async () => {
+    const f = fixture(), plugin = await f.loaded(), gate = f.block("api1:enroll");
+    const first = observe(plugin.enroll("ABCD-1234"));
+    await f.waitFor("api1:enroll");
+    const second = observe(plugin.enroll("EFGH-5678"));
+    await nextTurn();
+    try {
+        check(second.done && second.error, "Duplicate enrollment was not rejected");
+        equal(f.count("api2:new"), 0, "Duplicate enrollment created another API owner");
+    } finally {
+        gate.resolve();
+        const outcomes = await Promise.allSettled([first.promise, second.promise]);
+        await f.unload(plugin);
+        equal(outcomes[0].status, "fulfilled", "Duplicate submission disrupted the original enrollment");
+    }
+});
+
+test("changed credentials fence enrollment response and post-save activation", async () => {
+    for (const boundary of ["api1:enroll", "save:1"]) {
+        const f = fixture(), plugin = await f.loaded(), gate = f.block(boundary);
+        const pending = observe(plugin.enroll("ABCD-1234"));
+        await f.waitFor(boundary);
+        plugin.settings.enrolled = false;
+        plugin.settings.bearerToken = "reset-token";
+        gate.resolve();
+        try {
+            await assert.rejects(pending.promise, /enrollment/i);
+            equal(plugin.settings.bearerToken, "reset-token", "Late enrollment replaced reset credentials");
+            equal(f.engines.length, 0, "Late enrollment activated sync after credentials changed");
+        } finally { await f.unload(plugin); }
+    }
+});
+
+test("failed enrollment releases admission for a fresh code", async () => {
+    const f = fixture(), plugin = await f.loaded();
+    f.state.enrollmentFailure = true;
+    await assert.rejects(plugin.enroll("ABCD-1234"), /enrollment/i);
+    f.state.enrollmentFailure = false;
+    try {
+        await plugin.enroll("EFGH-5678");
+        equal(f.engines.length, 1, "Fresh enrollment did not activate after prior rejection");
+    } finally { await f.unload(plugin); }
+});
+
 test("startup waits 30 seconds; manual sync, pause and unload cancel its only timer", async () => {
     for (const action of ["timer", "manual", "pause", "unload"]) {
         const f = fixture({ enrolled: true, mobile: true });
