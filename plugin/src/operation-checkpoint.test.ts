@@ -124,6 +124,38 @@ async function basicRestartEvidence(): Promise<void> {
     assert.equal(cleanRestart.getLastInterruption()?.phase, "pull");
 }
 
+async function restartAfterInterruptedPromotion(): Promise<void> {
+    const io = new MemoryIO();
+    const original = new OperationCheckpoint(io, "test");
+    const id = await original.begin("pull");
+    const write = io.writeFile.bind(io);
+    io.writeFile = async () => { throw new Error("archive unavailable"); };
+    assert.equal((await new OperationCheckpoint(io, "test").initialize())?.operationId, id);
+    assert.equal(read(io)?.operationId, id, "archive write failure erased the only durable evidence");
+    io.writeFile = write;
+    const remove = io.deleteFile.bind(io);
+    io.deleteFile = async () => { throw new Error("cleanup unavailable"); };
+    await new OperationCheckpoint(io, "test").initialize();
+    io.deleteFile = remove;
+    const repeated = new OperationCheckpoint(io, "test");
+    assert.equal(await repeated.initialize(), null, "archived interruption counted twice after cleanup failure");
+    assert.equal(repeated.getLastInterruption()?.operationId, id);
+    assert.equal(read(io), undefined);
+
+    const failedId = await original.begin("push");
+    await original.fail(failedId, new Error("caught"));
+    const caught = new OperationCheckpoint(io, "test");
+    assert.equal(await caught.initialize(), null, "caught failure counted as renderer termination");
+    assert.equal(caught.getLastInterruption()?.failed, true);
+    const saved = read(io, OPERATION_CHECKPOINT_PATHS.lastInterruption)!;
+    for (const updatedAt of [1e30, "invalid"]) {
+        await write(OPERATION_CHECKPOINT_PATHS.active, new TextEncoder().encode(JSON.stringify({ ...saved, updatedAt })));
+        const invalid = new OperationCheckpoint(io, "test");
+        assert.equal(await invalid.initialize(), null);
+        assert.deepEqual(invalid.getLastInterruption(), saved, "invalid timestamp displaced useful evidence");
+    }
+}
+
 async function thousandsOfProgressUpdatesHaveOnePendingSnapshot(): Promise<void> {
     let clock = 1000;
     const io = new DeferredIO();
@@ -381,6 +413,7 @@ async function initializationCannotDeleteAConcurrentNewBegin(): Promise<void> {
 
 async function run(): Promise<void> {
     await basicRestartEvidence();
+    await restartAfterInterruptedPromotion();
     await thousandsOfProgressUpdatesHaveOnePendingSnapshot();
     await lifecycleBarriersSupersedeProgressAndSettleInOrder();
     await completeAndNewBeginDiscardTheirPredecessorsPendingProgress();

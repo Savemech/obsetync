@@ -269,8 +269,8 @@ reviewed	plugin/src/max-latency-coalescer.ts	production	Read timer, rerun, flush
 pending	plugin/src/mobile-ranged-source.ts	production	Not reviewed
 pending	plugin/src/object-confirmation-store.test.ts	tests	Not reviewed
 pending	plugin/src/object-confirmation-store.ts	production	Not reviewed
-pending	plugin/src/operation-checkpoint.test.ts	tests	Not reviewed
-pending	plugin/src/operation-checkpoint.ts	production	Not reviewed
+reviewed	plugin/src/operation-checkpoint.test.ts	tests	Reviewed progress coalescing, barrier ordering, cancellation by replacement and IO errors; injected promotion/cleanup failures and invalid persisted timestamps across restarts
+reviewed	plugin/src/operation-checkpoint.ts	production	Traced serialized marker lifecycle, startup hold and governor use; preserve sole copy on failed archive, deduplicate successful promotion after failed cleanup, distinguish caught failures and validate renderable timestamps
 pending	plugin/src/paged-pull.test.ts	tests	Not reviewed
 pending	plugin/src/perf-governor.test.ts	tests	Not reviewed
 pending	plugin/src/perf-overhead.bench.ts	tooling	Not reviewed

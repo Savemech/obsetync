@@ -52,16 +52,19 @@ export class OperationCheckpoint {
         let orphan: OperationRecord | null = null;
         await this.enqueue(async () => {
             const active = await this.readRecord(ACTIVE_PATH);
-            if (active) {
-                this.lastInterruption = active;
-                await this.writeRecord(LAST_INTERRUPTION_PATH, active);
+            const archived = await this.readRecord(LAST_INTERRUPTION_PATH);
+            this.lastInterruption = active ?? archived;
+            if (!active) return;
+            if (archived?.operationId === active.operationId && archived.updatedAt === active.updatedAt &&
+                archived.phase === active.phase && archived.detail === active.detail && archived.failed === active.failed &&
+                archived.pluginVersion === active.pluginVersion && archived.startedAt === active.startedAt) {
                 await this.deleteRecord(ACTIVE_PATH);
-                console.warn(
-                    `[obsetync] previous renderer stopped during ${active.phase}: ${active.detail}`,
-                );
+                return;
+            }
+            if (await this.writeRecord(LAST_INTERRUPTION_PATH, active)) await this.deleteRecord(ACTIVE_PATH);
+            if (!active.failed) {
+                console.warn(`[obsetync] previous renderer stopped during ${active.phase}: ${active.detail}`);
                 orphan = { ...active };
-            } else {
-                this.lastInterruption = await this.readRecord(LAST_INTERRUPTION_PATH);
             }
         });
         return orphan;
@@ -132,8 +135,9 @@ export class OperationCheckpoint {
                 value?.schema !== 1 ||
                 typeof value.operationId !== "string" ||
                 typeof value.phase !== "string" ||
-                typeof value.startedAt !== "number" ||
-                typeof value.updatedAt !== "number" ||
+                typeof value.pluginVersion !== "string" ||
+                !validTimestamp(value.startedAt) || !validTimestamp(value.updatedAt) ||
+                (value.failed !== undefined && typeof value.failed !== "boolean") ||
                 typeof value.detail !== "string"
             ) {
                 return null;
@@ -148,7 +152,7 @@ export class OperationCheckpoint {
         // current is mutable, whereas a queued begin/fail must preserve the
         // exact barrier snapshot even if another operation starts meanwhile.
         const snapshot = { ...record };
-        return this.enqueue(() => this.writeRecord(path, snapshot));
+        return this.enqueue(async () => { await this.writeRecord(path, snapshot); });
     }
 
     private safeDelete(path: string): Promise<void> {
@@ -170,12 +174,13 @@ export class OperationCheckpoint {
         return result;
     }
 
-    private async writeRecord(path: string, record: OperationRecord): Promise<void> {
+    private async writeRecord(path: string, record: OperationRecord): Promise<boolean> {
         try {
             const bytes = new TextEncoder().encode(JSON.stringify(record));
             await this.io.writeFile(path, bytes);
+            return true;
         } catch {
-            // Diagnostics must never make sync fail.
+            return false;
         }
     }
 
@@ -221,6 +226,10 @@ export class OperationCheckpoint {
             this.draining = false;
         }
     }
+}
+
+function validTimestamp(value: unknown): boolean {
+    return typeof value === "number" && Number.isSafeInteger(value) && Number.isFinite(new Date(value).getTime());
 }
 
 function clean(value: string): string {

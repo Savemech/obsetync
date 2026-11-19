@@ -1266,10 +1266,9 @@ export default class ObsetyncPlugin extends Plugin {
             push(`Started:           ${fmt(interruption.startedAt)}`);
             push(`Plugin version:    ${interruption.pluginVersion}`);
             push(`Progress:          ${interruption.detail || "(none)"}`);
-            push(
-                "Meaning:           renderer stopped before this phase returned " +
-                "(on iOS, usually memory-pressure/Jetsam)",
-            );
+            push(interruption.failed
+                ? "Meaning:           sync caught an error during this phase"
+                : "Meaning:           renderer stopped before this phase returned; cause unknown");
         } else {
             push("No orphaned operation checkpoint found.");
         }
