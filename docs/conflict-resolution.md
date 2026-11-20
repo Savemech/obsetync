@@ -128,8 +128,8 @@ For every prefix that appears in any of the three roots:
 | prefix new in both                | recurse into entries with empty base | both added; per-file diff required |
 | A deleted, B unchanged            | honour deletion                   | one-sided delete                |
 | B deleted, A unchanged            | honour deletion                   | one-sided delete                |
-| A deleted, B changed              | keep B (B wins over A's delete)   | **change beats delete**         |
-| B deleted, A changed              | keep A                            | **change beats delete**         |
+| A deleted, B changed              | resolve each file against base   | **change beats delete**         |
+| B deleted, A changed              | resolve each file against base    | **change beats delete**         |
 | both deleted                      | stay deleted                      | no-op                           |
 
 This decision is made on **directory prefixes** (`notes/`, `photos/`, root-

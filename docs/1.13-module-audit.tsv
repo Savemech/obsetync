@@ -32,7 +32,7 @@ reviewed	benchmarks/baseline-1.10.2/client-instrumentation-overhead.json	histori
 reviewed	crates/e2e-tests/Cargo.toml	configuration/schema	All network test files explicitly require e2e; verified the declared targets exhaust tests/*.rs; corrected workspace-default comment
 read	crates/e2e-tests/src/lib.rs	production	Environment/enrollment/wire and snapshot helpers traced; exact code-element parser replaces arbitrary HTML scan; snapshot setup stops on the first failed content PUT; four unit tests pass; complete harness audit remains
 reviewed	crates/e2e-tests/tests/concurrency.rs	tests	Read test and traced snapshot helpers; eight native same-parent push races preserved both edits on independent observer readback
-pending	crates/e2e-tests/tests/conflicts.rs	tests	Not reviewed
+reviewed	crates/e2e-tests/tests/conflicts.rs	tests	Traced divergent-root fixture and add/modify/delete cases; reproduced unintended sibling restoration via native server and tested both push orders
 reviewed	crates/e2e-tests/tests/enrollment.rs	tests	All seven scenarios read and passed against isolated native server; code-shaped device name enrolls and authenticates; concurrent claim gets one 200 and one 400; auth/revocation and reused-code paths verified
 pending	crates/e2e-tests/tests/history_export.rs	tests	Not reviewed
 reviewed	crates/e2e-tests/tests/realtime_ws.rs	tests	All six scenarios read and passed against isolated fixed binary; reconnect regression failed against previous binary; CRDT assertions correctly labeled live readback, not crash durability
@@ -57,7 +57,7 @@ pending	crates/sync-core/src/diff_page.rs	production	Not reviewed
 pending	crates/sync-core/src/fastcdc_chunker.rs	production	Not reviewed
 reviewed	crates/sync-core/src/hash.rs	production	Traced hash conversions through WASM, HTTP, storage and E2E callers; fixed-array hex decode preserves results and exact errors on 24,897 inputs; zero allocations for 10,000 valid hashes
 read	crates/sync-core/src/lib.rs	production	Entry-point/build inventory; behavior/callers still under review
-pending	crates/sync-core/src/merge.rs	production	Not reviewed
+read	crates/sync-core/src/merge.rs	production	Traced prefix and path decisions to server bridge; fixed whole-prefix deletion versus concurrent edits, removed path-vector/maps and per-merge target scan; text-merge IO fallback review pending
 pending	crates/sync-core/src/replacement_rebuild.rs	production	Not reviewed
 pending	crates/sync-core/src/replacement_rebuild_v1.rs	production	Not reviewed
 pending	crates/sync-core/src/replacement_rebuild_v2.rs	production	Not reviewed

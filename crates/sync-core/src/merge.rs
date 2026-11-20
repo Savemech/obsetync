@@ -38,7 +38,7 @@ pub struct VersionedMergeResult {
 /// provisionally in the merged list; the post-pass either replaces it with a
 /// line-merged version or records a `FileConflict`.
 struct TextMergeTodo {
-    path: String,
+    merged_index: usize,
     base_hash: FileHash,
     a: FileEntry,
     b: FileEntry,
@@ -92,117 +92,32 @@ pub async fn merge_trees<S: ChunkStore, C: ContentStore>(
         let a_hash = a_map.get(prefix).copied();
         let b_hash = b_map.get(prefix).copied();
 
-        match (base_hash, a_hash, b_hash) {
-            // Both same as base — no change.
-            (Some(bh), Some(ah), Some(bh2)) if ah == bh && bh2 == bh => {
-                let entries = load_all_entries(store, bh).await?;
-                for e in entries {
-                    merged_entries.push(e);
-                }
-            }
-            // Only A changed — take A.
-            (Some(bh), Some(ah), Some(bh2)) if bh2 == bh && ah != bh => {
-                auto_resolved += 1;
-                let entries = load_all_entries(store, ah).await?;
-                for e in entries {
-                    merged_entries.push(e);
-                }
-            }
-            // Only B changed — take B.
-            (Some(bh), Some(ah), Some(bh2)) if ah == bh && bh2 != bh => {
-                auto_resolved += 1;
-                let entries = load_all_entries(store, bh2).await?;
-                for e in entries {
-                    merged_entries.push(e);
-                }
-            }
-            // Both changed — recurse into entries for file-level merge.
-            (Some(bh), Some(ah), Some(bh2)) if ah != bh && bh2 != bh => {
-                let base_entries = load_all_entries(store, bh).await?;
-                let a_entries = load_all_entries(store, ah).await?;
-                let b_entries = load_all_entries(store, bh2).await?;
-
-                merge_entry_lists(
-                    &base_entries,
-                    &a_entries,
-                    &b_entries,
-                    &mut merged_entries,
-                    &mut file_conflicts,
-                    &mut auto_resolved,
-                    &mut text_todo,
-                );
-            }
-            // New in A only.
-            (None, Some(ah), None) => {
-                auto_resolved += 1;
-                let entries = load_all_entries(store, ah).await?;
-                for e in entries {
-                    merged_entries.push(e);
-                }
-            }
-            // New in B only.
-            (None, None, Some(bh)) => {
-                auto_resolved += 1;
-                let entries = load_all_entries(store, bh).await?;
-                for e in entries {
-                    merged_entries.push(e);
-                }
-            }
-            // New in both A and B — merge entries.
-            (None, Some(ah), Some(bh)) => {
-                let a_entries = load_all_entries(store, ah).await?;
-                let b_entries = load_all_entries(store, bh).await?;
-                merge_entry_lists(
-                    &[],
-                    &a_entries,
-                    &b_entries,
-                    &mut merged_entries,
-                    &mut file_conflicts,
-                    &mut auto_resolved,
-                    // base = [] here, so the modify-modify arm (which requires a
-                    // base entry) never fires — no text todos from this call.
-                    &mut text_todo,
-                );
-            }
-            // Deleted by A only (B has it, base has it, A doesn't).
-            (Some(_bh), None, Some(bh2)) => {
-                // A deleted this prefix. If B didn't change it from base, honor deletion.
-                // If B changed it, keep B's version (B wins over deletion).
-                if let Some(base_h) = base_hash {
-                    if bh2 == base_h {
-                        // B unchanged, A deleted — honor deletion.
-                    } else {
-                        // B changed, A deleted — keep B.
-                        auto_resolved += 1;
-                        let entries = load_all_entries(store, bh2).await?;
-                        for e in entries {
-                            merged_entries.push(e);
-                        }
-                    }
-                }
-            }
-            // Deleted by B only.
-            (Some(_bh), Some(ah), None) => {
-                if let Some(base_h) = base_hash {
-                    if ah == base_h {
-                        // A unchanged, B deleted — honor deletion.
-                    } else {
-                        // A changed, B deleted — keep A.
-                        auto_resolved += 1;
-                        let entries = load_all_entries(store, ah).await?;
-                        for e in entries {
-                            merged_entries.push(e);
-                        }
-                    }
-                }
-            }
-            // Both deleted — stay deleted.
-            (Some(_), None, None) => {}
-            // Nothing exists anywhere.
-            (None, None, None) => {}
-            // Catch remaining cases.
-            _ => {}
+        if a_hash.is_none() && b_hash.is_none() {
+            continue;
         }
+        if a_hash == base_hash || b_hash == base_hash {
+            let selected = if a_hash == base_hash { b_hash } else { a_hash };
+            if let Some(hash) = selected {
+                auto_resolved += usize::from(selected != base_hash);
+                merged_entries.extend(load_all_entries(store, hash).await?);
+            }
+            continue;
+        }
+
+        // A deleted prefix is an empty side of a divergent merge. Resolve
+        // its files individually so an edit cannot resurrect untouched siblings.
+        let base_entries = load_prefix(store, base_hash).await?;
+        let a_entries = load_prefix(store, a_hash).await?;
+        let b_entries = load_prefix(store, b_hash).await?;
+        merge_entry_lists(
+            &base_entries,
+            &a_entries,
+            &b_entries,
+            &mut merged_entries,
+            &mut file_conflicts,
+            &mut auto_resolved,
+            &mut text_todo,
+        );
     }
 
     // --- Content-level text-merge post-pass -------------------------------
@@ -217,7 +132,7 @@ pub async fn merge_trees<S: ChunkStore, C: ContentStore>(
             text_merged += 1;
         } else {
             file_conflicts.push(FileConflict {
-                path: todo.path.clone(),
+                path: todo.a.path.clone(),
                 base_hash: todo.base_hash,
                 side_a_hash: todo.a.hash,
                 side_b_hash: todo.b.hash,
@@ -243,6 +158,16 @@ pub async fn merge_trees<S: ChunkStore, C: ContentStore>(
         auto_resolved_count: auto_resolved,
         text_merged_count: text_merged,
     })
+}
+
+async fn load_prefix<S: ChunkStore>(
+    store: &S,
+    hash: Option<&FileHash>,
+) -> Result<Vec<FileEntry>, ChunkError> {
+    match hash {
+        Some(hash) => load_all_entries(store, hash).await,
+        None => Ok(Vec::new()),
+    }
 }
 
 /// Three-way merge across the Tree v1/v2 migration boundary. Pure v1 keeps
@@ -293,7 +218,7 @@ pub async fn merge_versioned_trees<S: ChunkStore, C: ContentStore>(
             text_merged += 1;
         } else {
             file_conflicts.push(FileConflict {
-                path: todo.path.clone(),
+                path: todo.a.path.clone(),
                 base_hash: todo.base_hash,
                 side_a_hash: todo.a.hash,
                 side_b_hash: todo.b.hash,
@@ -332,7 +257,7 @@ async fn try_text_merge<C: ContentStore>(
 ) -> Result<bool, ChunkError> {
     // v1 gates: text extensions only, small-blob storage only (files at or
     // above FILE_CHUNK_THRESHOLD live as FastCDC manifests, not blobs).
-    if !is_text_file(&todo.path)
+    if !is_text_file(&todo.a.path)
         || todo.a.size_bytes >= FILE_CHUNK_THRESHOLD
         || todo.b.size_bytes >= FILE_CHUNK_THRESHOLD
     {
@@ -366,14 +291,13 @@ async fn try_text_merge<C: ContentStore>(
         content.put(merged_hash, merged).await?;
     }
 
-    if let Some(entry) = merged_entries.iter_mut().find(|e| e.path == todo.path) {
-        entry.hash = merged_hash;
-        entry.size_bytes = merged_len;
-        // max(a, b): deterministic (the root hash covers mtime, so a retried
-        // merge must reproduce the same root) and never behind side A (the
-        // guard's mtime-regression tripwire must not see merges as reverts).
-        entry.mtime_ms = todo.a.mtime_ms.max(todo.b.mtime_ms);
-    }
+    let entry = &mut merged_entries[todo.merged_index];
+    entry.hash = merged_hash;
+    entry.size_bytes = merged_len;
+    // max(a, b): deterministic (the root hash covers mtime, so a retried
+    // merge must reproduce the same root) and never behind side A (the
+    // guard's mtime-regression tripwire must not see merges as reverts).
+    entry.mtime_ms = todo.a.mtime_ms.max(todo.b.mtime_ms);
     Ok(true)
 }
 
@@ -391,147 +315,58 @@ fn merge_entry_lists(
     auto_resolved: &mut usize,
     text_todo: &mut Vec<TextMergeTodo>,
 ) {
-    // All three slices are sorted by path. Three-pointer merge: O(n+m+k), zero map allocations.
-
-    // Collect all unique paths in sorted order using a merge of three sorted iterators.
-    let mut paths: Vec<&str> =
-        Vec::with_capacity(base_entries.len().max(a_entries.len()).max(b_entries.len()));
-
-    // Merge three sorted slices into a deduplicated sorted path list.
+    let mut base = base_entries.iter().peekable();
+    let mut a = a_entries.iter().peekable();
+    let mut b = b_entries.iter().peekable();
+    while let Some(path) = [base.peek().copied(), a.peek().copied(), b.peek().copied()]
+        .into_iter()
+        .flatten()
+        .map(|entry| entry.path.as_str())
+        .min()
     {
-        let mut ii = 0usize;
-        let mut ji = 0usize;
-        let mut ki = 0usize;
-        loop {
-            let a_path = a_entries.get(ii).map(|e| e.path.as_str());
-            let b_path = b_entries.get(ji).map(|e| e.path.as_str());
-            let c_path = base_entries.get(ki).map(|e| e.path.as_str());
-
-            let min = match (a_path, b_path, c_path) {
-                (None, None, None) => break,
-                (Some(a), None, None) => {
-                    ii += 1;
-                    a
-                }
-                (None, Some(b), None) => {
-                    ji += 1;
-                    b
-                }
-                (None, None, Some(c)) => {
-                    ki += 1;
-                    c
-                }
-                (Some(a), Some(b), None) => match a.cmp(b) {
-                    std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {
-                        if a == b {
-                            ji += 1;
-                        }
-                        ii += 1;
-                        a
-                    }
-                    std::cmp::Ordering::Greater => {
-                        ji += 1;
-                        b
-                    }
-                },
-                (Some(a), None, Some(c)) => match a.cmp(c) {
-                    std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {
-                        if a == c {
-                            ki += 1;
-                        }
-                        ii += 1;
-                        a
-                    }
-                    std::cmp::Ordering::Greater => {
-                        ki += 1;
-                        c
-                    }
-                },
-                (None, Some(b), Some(c)) => match b.cmp(c) {
-                    std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {
-                        if b == c {
-                            ki += 1;
-                        }
-                        ji += 1;
-                        b
-                    }
-                    std::cmp::Ordering::Greater => {
-                        ki += 1;
-                        c
-                    }
-                },
-                (Some(a), Some(b), Some(c)) => {
-                    let min3 = a.min(b).min(c);
-                    if a == min3 {
-                        ii += 1;
-                    }
-                    if b == min3 {
-                        ji += 1;
-                    }
-                    if c == min3 {
-                        ki += 1;
-                    }
-                    min3
-                }
-            };
-
-            if paths.last().copied() != Some(min) {
-                paths.push(min);
-            }
-        }
-    }
-
-    // Build lookup maps — only for path membership checks, reusing sorted positions.
-    // Use sorted binary search instead of HashMap.
-    let base_map: HashMap<&str, &FileEntry> =
-        base_entries.iter().map(|e| (e.path.as_str(), e)).collect();
-    let a_map: HashMap<&str, &FileEntry> = a_entries.iter().map(|e| (e.path.as_str(), e)).collect();
-    let b_map: HashMap<&str, &FileEntry> = b_entries.iter().map(|e| (e.path.as_str(), e)).collect();
-
-    for path in paths {
-        let base_entry = base_map.get(path);
-        let a_entry = a_map.get(path);
-        let b_entry = b_map.get(path);
+        let base_entry = base.next_if(|entry| entry.path == path);
+        let a_entry = a.next_if(|entry| entry.path == path);
+        let b_entry = b.next_if(|entry| entry.path == path);
 
         match (base_entry, a_entry, b_entry) {
             (Some(base), Some(a), Some(b)) if a.hash == base.hash && b.hash == base.hash => {
-                merged.push((*base).clone());
+                merged.push(base.clone());
             }
             (Some(base), Some(a), Some(b)) if b.hash == base.hash && a.hash != base.hash => {
                 *auto_resolved += 1;
-                merged.push((*a).clone());
+                merged.push(a.clone());
             }
             (Some(base), Some(a), Some(b)) if a.hash == base.hash && b.hash != base.hash => {
                 *auto_resolved += 1;
-                merged.push((*b).clone());
+                merged.push(b.clone());
             }
             (Some(base), Some(a), Some(b)) if a.hash != base.hash && b.hash != base.hash => {
                 // Side A goes in provisionally; the text-merge post-pass in
                 // merge_trees either replaces it with a line-merged version
                 // or records the conflict.
-                merged.push((*a).clone());
+                merged.push(a.clone());
                 if a.hash == b.hash {
                     // Both sides made the identical edit — not a conflict.
                     *auto_resolved += 1;
                 } else {
                     text_todo.push(TextMergeTodo {
-                        path: path.to_string(),
+                        merged_index: merged.len() - 1,
                         base_hash: base.hash,
-                        a: (*a).clone(),
-                        b: (*b).clone(),
+                        a: a.clone(),
+                        b: b.clone(),
                     });
                 }
             }
             (None, Some(a), None) => {
                 *auto_resolved += 1;
-                merged.push((*a).clone());
+                merged.push(a.clone());
             }
             (None, None, Some(b)) => {
                 *auto_resolved += 1;
-                merged.push((*b).clone());
+                merged.push(b.clone());
             }
             (None, Some(a), Some(b)) => {
-                merged.push((*a).clone());
+                merged.push(a.clone());
                 if a.hash != b.hash {
                     conflicts.push(FileConflict {
                         path: path.to_string(),
@@ -544,12 +379,12 @@ fn merge_entry_lists(
             (Some(base), None, Some(b)) if b.hash == base.hash => {}
             (Some(_base), None, Some(b)) => {
                 *auto_resolved += 1;
-                merged.push((*b).clone());
+                merged.push(b.clone());
             }
             (Some(base), Some(a), None) if a.hash == base.hash => {}
             (Some(_base), Some(a), None) => {
                 *auto_resolved += 1;
-                merged.push((*a).clone());
+                merged.push(a.clone());
             }
             (Some(_), None, None) | (None, None, None) => {}
             _ => {}
@@ -998,17 +833,25 @@ mod tests {
     async fn every_mixed_version_merge_preserves_semantics_and_current_format() {
         let store = MemoryChunkStore::new();
         let content = MemoryContentStore::new();
-        let base_entries = vec![make_entry("a.md", "a0"), make_entry("b.md", "b0")];
+        let base_entries = vec![
+            make_entry("a.md", "a0"),
+            make_entry("b.md", "b0"),
+            make_entry("dir/edit", "old"),
+            make_entry("dir/drop", "unchanged"),
+        ];
         let a_entries = vec![make_entry("a.md", "a1"), make_entry("b.md", "b0")];
         let b_entries = vec![
             make_entry("a.md", "a0"),
             make_entry("b.md", "b0"),
             make_entry("c.md", "c1"),
+            make_entry("dir/edit", "new"),
+            make_entry("dir/drop", "unchanged"),
         ];
         let expected = vec![
             make_entry("a.md", "a1"),
             make_entry("b.md", "b0"),
             make_entry("c.md", "c1"),
+            make_entry("dir/edit", "new"),
         ];
         let mut bases = Vec::new();
         let mut sides_a = Vec::new();

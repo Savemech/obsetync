@@ -240,6 +240,39 @@ async fn modify_beats_delete() {
 }
 
 #[tokio::test]
+async fn deleted_folder_retains_only_concurrent_additions_and_edits() {
+    let env = harness().await;
+    for delete_first in [false, true] {
+        let (a, b, vault) = pair(&env, "folder-delete-edit").await;
+        let outside = ("outside.md".into(), b"outside".to_vec());
+        let unchanged = ("notes/unchanged.md".into(), b"unchanged".to_vec());
+        let edited: (String, Vec<u8>) = ("notes/edited.md".into(), b"edited".to_vec());
+        let added = ("notes/new.md".into(), b"new".to_vec());
+        let base = vec![
+            outside.clone(),
+            unchanged.clone(),
+            (edited.0.clone(), b"base".to_vec()),
+        ];
+        let deleted = vec![outside.clone()];
+        let changed = vec![outside.clone(), unchanged, edited.clone(), added.clone()];
+        let (first, second) = if delete_first {
+            (deleted, changed)
+        } else {
+            (changed, deleted)
+        };
+
+        let response = diverge(&a, &b, &vault, base, first, second).await;
+        assert!(response.merged && response.conflicts.is_empty());
+        let pulled: std::collections::BTreeMap<_, _> = pull_vault_snapshot(&b, &vault)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(pulled, [outside, edited, added].into_iter().collect());
+    }
+}
+
+#[tokio::test]
 async fn delete_beats_unchanged() {
     // A makes a *different* edit (so server.current diverges from base).
     // B doesn't see A's edit and deletes x.md against parent=base. The
