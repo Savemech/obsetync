@@ -165,7 +165,7 @@ reviewed	plugin/src/adaptive-batches.ts	production	Traced use in push, reconcile
 pending	plugin/src/adaptive-transport-chaos.test.ts	tests	Not reviewed
 reviewed	plugin/src/api-enrollment.test.ts	tests	New actual-API regressions cover HTTPS/prefix/admin routing, valid and malformed bundles, rejected URLs/codes and no-dispatch validation; full test chain passes
 read	plugin/src/api-memory.test.ts	tests	Traced fake encrypted transport and ran suite; added legacy item, response and repeated-hash checks; remaining scenarios pending individual review
-pending	plugin/src/api-root-outcome.test.ts	tests	Not reviewed
+read	plugin/src/api-root-outcome.test.ts	tests	Added out-of-order sealed response regression covering forced refresh, channel rotation and authenticated root observation; full fixture audit pending.
 read	plugin/src/api.ts	production	HTTPS retained; enrollment URL/code/bundle validated with default/proxy/explicit-admin routes; native HTTPS proxy enroll and sealed negotiation pass; all four legacy check routes matched to server limits and tested at 1001 items; full transport/queue/lifetime audit remains
 reviewed	plugin/src/binary.ts	production	Traced adapter, append, HTTP and WS consumers; whole ordinary buffers retain identity, shared views copy to an exact ordinary ArrayBuffer. Covered by platform tests.
 pending	plugin/src/bounded-append.test.ts	tests	Not reviewed

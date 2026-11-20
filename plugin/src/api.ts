@@ -465,7 +465,7 @@ export class ObsetyncApi {
         string,
         { generation: number; result: TreeNegotiation }
     >();
-    private readonly treeNegotiationPromises = new Map<string, Promise<TreeNegotiation>>();
+    private readonly treeNegotiationPromises = new Map<string, { generation: number; promise: Promise<TreeNegotiation> }>();
     private rootOutcomeOffer: { generation: number; result: RootOutcomeCapabilities | null } | null = null;
     private rootOutcomePromise: { generation: number; promise: Promise<RootOutcomeCapabilities | null> } | null = null;
     private readonly sequences: DurableSequenceAllocator;
@@ -572,12 +572,13 @@ export class ObsetyncApi {
     ): Promise<TreeNegotiation> {
         await this.getChannel(perf);
         const generation = this.channelGeneration;
-        const cached = this.treeNegotiations.get(vaultId);
-        if (!force && cached?.generation === generation) return cached.result;
+        if (force) this.treeNegotiations.delete(vaultId);
         const pending = this.treeNegotiationPromises.get(vaultId);
-        if (!force && pending) return pending;
+        if (!force && pending?.generation === generation) return pending.promise;
+        const cached = this.getTreeNegotiation(vaultId);
+        if (!force && cached) return cached;
 
-        const promise = (async (): Promise<TreeNegotiation> => {
+        const negotiate = async (): Promise<TreeNegotiation> => {
             const report = new TextEncoder().encode(JSON.stringify({
                 protocol_version: 1,
                 vault_id: vaultId,
@@ -592,6 +593,7 @@ export class ObsetyncApi {
                 REPLAY_SAFE_SEALED_OPTIONS,
             );
             let result: TreeNegotiation;
+            let bundle;
             if (response.status === 404 || response.status === 405) {
                 result = {
                     currentVersion: 1,
@@ -604,22 +606,28 @@ export class ObsetyncApi {
                 if (!response.ok) {
                     throw new Error(`tree capability negotiation failed: ${response.status}`);
                 }
-                const bundle = await response.json();
+                bundle = await response.json();
                 result = decodeTreeNegotiation(bundle);
-                if (this.channelGeneration === generation) this.applyCapabilityBundle(bundle);
             }
-            // `sealed` used the current channel synchronously; still fail
-            // closed if a future refactor swaps it while the request awaits.
+            const latest = this.treeNegotiationPromises.get(vaultId);
+            if (latest?.promise !== promise) {
+                if (latest?.generation === this.channelGeneration) return latest.promise;
+                const observed = this.getTreeNegotiation(vaultId);
+                if (observed) return observed;
+                throw new Error("Tree capability negotiation superseded");
+            }
             if (this.channelGeneration === generation) {
+                if (bundle !== undefined) this.applyCapabilityBundle(bundle);
                 this.treeNegotiations.set(vaultId, { generation, result });
             }
             return result;
-        })();
-        this.treeNegotiationPromises.set(vaultId, promise);
+        };
+        const promise = negotiate();
+        this.treeNegotiationPromises.set(vaultId, { generation, promise });
         try {
             return await promise;
         } finally {
-            if (this.treeNegotiationPromises.get(vaultId) === promise) {
+            if (this.treeNegotiationPromises.get(vaultId)?.promise === promise) {
                 this.treeNegotiationPromises.delete(vaultId);
             }
         }
@@ -641,7 +649,9 @@ export class ObsetyncApi {
             enrolledDevices: 0,
             activation: "blocked" as const,
         };
-        if (cached.currentVersion === currentVersion) return;
+        const pending = this.treeNegotiationPromises.get(vaultId);
+        if (pending?.generation === this.channelGeneration) this.treeNegotiationPromises.delete(vaultId);
+        else if (cached.currentVersion === currentVersion) return;
         this.treeNegotiations.set(vaultId, {
             generation: this.channelGeneration,
             result: {

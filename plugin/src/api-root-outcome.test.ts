@@ -329,6 +329,36 @@ async function actualWireAndJSONBoundsPrecedeDecryptAndAcceptance(): Promise<voi
     } finally { f.close(); }
 }
 
+async function treeRefreshOwnsItsChannelAndCache(): Promise<void> {
+    for (const action of ["refresh", "channel", "observation"] as const) {
+        const f = fixture(), older = gate<Reply>(), entered = gate<void>();
+        try {
+            let reports = 0;
+            f.reply(() => {
+                if (++reports === 1) { entered.resolve(); return older.promise; }
+                return { body: bytes({ capabilities: ["tree-v2"], tree: {
+                    current_version: 2, ready_devices: 1, enrolled_devices: 1,
+                    fleet_ready: true, activation: "active",
+                } }) };
+            });
+            const first = f.api.negotiateTreeVersion("vault");
+            await entered.promise;
+            if (action === "observation") f.api.observeTreeVersion("vault", 2);
+            else {
+                if (action === "channel") f.internal.channelGeneration++;
+                const latest = f.api.negotiateTreeVersion("vault", undefined, action === "refresh");
+                await hostTurn();
+                assert.equal(reports, 2, "new channel joined an old report");
+                assert.equal((await latest).currentVersion, 2);
+            }
+            older.resolve({ body: bytes({ capabilities: [] }) });
+            assert.equal((await first).currentVersion, 2);
+            assert.equal(f.api.getTreeNegotiation("vault")?.currentVersion, 2,
+                "older report replaced the current tree format");
+        } finally { older.resolve({ status: 404 }); f.close(); }
+    }
+}
+
 void (async () => {
     await completeAdmissionPrecedesCommitTransportAndLivesThroughNativeCompletion();
     await queryAndCancelCaptureBeforeAdmissionAndRetainTheirLease();
@@ -338,5 +368,6 @@ void (async () => {
     await staleSessionStillUsesOriginalIncarnationAndCancellationIdentity();
     await queryAndFailuresNeverBecomeLegacyAcceptance();
     await actualWireAndJSONBoundsPrecedeDecryptAndAcceptance();
-    console.log("api-root-outcome.test: 8 admitted sealed HTTP/capability/retry regression scenarios passed");
+    await treeRefreshOwnsItsChannelAndCache();
+    console.log("api-root-outcome.test: 9 admitted sealed HTTP/capability/retry regression scenarios passed");
 })().catch(error => { setTimeout(() => { throw error; }, 0); });
