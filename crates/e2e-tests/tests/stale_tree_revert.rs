@@ -1,40 +1,6 @@
-//! Regression: stale-tree revert / fleet-wide data loss via a trusted client
-//! parent on `PUT /api/v1/root/{vault}`.
-//!
-//! ## The bug (protocol level)
-//!
-//! The server's `put_root` (crates/sync-server/src/api.rs) decides how to
-//! integrate an incoming root purely from the *client-claimed* parent hash
-//! carried in the 64-byte body prefix — it never checks that the incoming
-//! Merkle tree actually descends from that parent:
-//!
-//!   * `current == claimed_parent`  → "fast-forward accepted": the server
-//!     `set_current_root(incoming)` — wholesale replacing the good tree.
-//!   * `current != claimed_parent`  → three-way merge that uses the
-//!     *claimed* parent as the merge BASE ("use the parent hash as the base").
-//!
-//! A device whose in-memory tree is days stale but which keeps polling the
-//! server every ~30s can therefore fabricate a fresh-looking parent and either
-//! clobber or "merge-revert" the vault. Every file created on other devices
-//! since the stale tree's epoch is silently deleted/reverted for the whole
-//! fleet.
-//!
-//! Production incident-log evidence:
-//!   put_root: fast-forward accepted vault=example-vault root=226b4fb0 parent=27cd3dfd
-//!   put_root: merged divergent roots parent=c9c0647d current=89da5b31 auto_resolved=441 conflicts=3
-//!
-//! ## What these tests encode
-//!
-//! Both tests drive the exact production shape through the real HTTP + AEAD
-//! stack and assert the CORRECT post-fix invariant: a stale device pushing an
-//! old tree must NOT be able to make the fleet lose files A legitimately
-//! created. The push may be rejected, or merged in a way that preserves the
-//! newer files — either is acceptable — but the authoritative tree any other
-//! device pulls afterwards must still contain f1..f5.
-//!
-//! On today's (buggy) server BOTH tests FAIL: the fleet observer sees only a
-//! subset of the files. Each failing `assert_eq!` prints the observed-vs-
-//! expected file set. When the parent-trust bug is fixed these turn green.
+//! Historical stale-tree regression. A separate observer checks the published
+//! vault after a device submits an outdated snapshot. Both test cases require
+//! every newer file to retain its exact bytes, regardless of the push response.
 
 use e2e_tests::*;
 use std::collections::BTreeMap;
@@ -169,15 +135,7 @@ fn assert_no_data_loss(seen: &BTreeMap<String, Vec<u8>>, files: &[(String, Vec<u
     }
 }
 
-/// T1 — stale-tree fast-forward clobber.
-///
-/// B polls the *current* root (its 30s heartbeat) and pushes its stale {f1}
-/// tree claiming `parent == current`. The server takes the "fast-forward
-/// accepted" branch and replaces the good {f1..f5} tree with {f1}.
-///
-/// OBSERVED (buggy) result: `put_root` returns `{accepted:true, merged:false}`
-/// and a subsequent fleet pull sees only f1 → f2..f5 gone.
-/// CORRECT (asserted) result: f1..f5 all still present fleet-wide.
+/// Check the observer after the stale device polls the current root.
 #[tokio::test]
 async fn stale_parent_fast_forward_clobbers() {
     let env = harness().await;
@@ -197,44 +155,16 @@ async fn stale_parent_fast_forward_clobbers() {
 
     // B pushes its STALE {f1} tree claiming parent = the freshly-polled current.
     let push_res = push_vault_snapshot(&b, &vault, &b_stale, &polled_hex).await;
-    match &push_res {
-        Ok((_r, resp)) => {
-            // OBSERVED TODAY (bug): current == claimed_parent → the server takes
-            // the `put_root: fast-forward accepted` branch and set_current_root()
-            // to B's stale {f1}, discarding f2..f5. resp == {accepted:true,
-            // merged:false}. Mirrors the incident line:
-            //   "put_root: fast-forward accepted ... root=226b4fb0 parent=27cd3dfd"
-            eprintln!(
-                "[T1] put_root accepted a stale-tree fast-forward (buggy): {:?}",
-                resp
-            );
-        }
-        Err(e) => {
-            // Post-fix ACCEPTABLE: server refuses a fast-forward whose incoming
-            // tree does not descend from the claimed parent.
-            eprintln!(
-                "[T1] put_root rejected the stale fast-forward (post-fix ok): {}",
-                e
-            );
-        }
-    }
+    eprintln!(
+        "[T1] stale snapshot response: {:?}",
+        push_res.map(|(_, response)| response)
+    );
 
-    // CORRECT BEHAVIOUR — regardless of accept/reject, no file A created may
-    // vanish. On the buggy server this fails: the observer sees only {f1}.
     let seen = fleet_view(&env, &vault, "stale-ff-observer").await;
     assert_no_data_loss(&seen, &files, "stale-parent fast-forward clobber");
 }
 
-/// T2 — poisoned merge base.
-///
-/// Same stale device, but it claims `parent == R4` (one step behind current
-/// R5), forcing the three-way merge. The server uses the *claimed* parent as
-/// the merge base, so f2..f4 — present in base and current, merely absent from
-/// B's stale tree — are treated as B-deletions and reverted (auto_resolved).
-///
-/// OBSERVED (buggy) result: `put_root` returns `{merged:true, auto_resolved>0}`
-/// and a fleet pull sees only {f1, f5} → f2..f4 reverted.
-/// CORRECT (asserted) result: f1..f5 all still present fleet-wide.
+/// Check the observer when the reported parent is one generation behind.
 #[tokio::test]
 async fn poisoned_merge_base_reverts() {
     let env = harness().await;
@@ -258,26 +188,11 @@ async fn poisoned_merge_base_reverts() {
     // → f2/f3/f4 look like B-deletes against an unchanged current → reverted;
     //   only f5 (new in current, absent from base) survives.
     let push_res = push_vault_snapshot(&b, &vault, &b_stale, &parent_hex).await;
-    match &push_res {
-        Ok((_r, resp)) => {
-            // OBSERVED TODAY (bug): merged=true, auto_resolved>0 — a silent mass
-            // revert. Mirrors the incident line:
-            //   "put_root: merged divergent roots parent=c9c0647d current=89da5b31 auto_resolved=441 conflicts=3"
-            eprintln!(
-                "[T2] put_root merged against a poisoned base (buggy): {:?}",
-                resp
-            );
-        }
-        Err(e) => {
-            eprintln!(
-                "[T2] put_root rejected the poisoned merge (post-fix ok): {}",
-                e
-            );
-        }
-    }
+    eprintln!(
+        "[T2] stale snapshot response: {:?}",
+        push_res.map(|(_, response)| response)
+    );
 
-    // CORRECT BEHAVIOUR — A's newer files must survive the merge with A's exact
-    // content. On the buggy server this fails: the observer sees only {f1, f5}.
     let seen = fleet_view(&env, &vault, "poison-merge-observer").await;
     assert_no_data_loss(&seen, &files, "poisoned merge base");
 }

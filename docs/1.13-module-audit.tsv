@@ -38,7 +38,7 @@ reviewed	crates/e2e-tests/tests/history_export.rs	tests	Traced three-root histor
 reviewed	crates/e2e-tests/tests/realtime_ws.rs	tests	All six scenarios read and passed against isolated fixed binary; reconnect regression failed against previous binary; CRDT assertions correctly labeled live readback, not crash durability
 reviewed	crates/e2e-tests/tests/single_device.rs	tests	All six native-server cases pass; zero-root inventory now checks every path, content hash and size
 reviewed	crates/e2e-tests/tests/smoke.rs	tests	Checked public health, redirect, dashboard and enrollment. Parse the actual health JSON and use the enrolled credentials for an authenticated read-only request.
-pending	crates/e2e-tests/tests/stale_tree_revert.rs	tests	Not reviewed
+read	crates/e2e-tests/tests/stale_tree_revert.rs	tests	Compared observer assertions with stale commentary; removed claims about current server outcome; runtime confirmation pending
 reviewed	crates/e2e-tests/tests/text_merge.rs	tests	Read both two-device tests and helpers; mixed insert and EOF edit pulled byte-for-byte on both clients; invalid UTF-8 retained as conflict on native server
 pending	crates/e2e-tests/tests/transport_security.rs	tests	Not reviewed
 reviewed	crates/e2e-tests/tests/two_device_sync.rs	tests	All four native-server cases pass: cross-device readback, fast-forward, divergent merge and vault isolation
@@ -159,7 +159,7 @@ reviewed	plugin/scripts/test-native-root-crash-recovery.mjs	tooling	Validated ex
 pending	plugin/scripts/test-native-root-mutation-complexity.mjs	tooling	Not reviewed
 pending	plugin/scripts/test-native-root-server.mjs	tooling	Not reviewed
 pending	plugin/scripts/test-native-ws-data.mjs	tooling	Not reviewed
-pending	plugin/scripts/test-wasm-memory.mjs	tooling	Not reviewed
+read	plugin/scripts/test-wasm-memory.mjs	tooling	Checked allocator snapshot against native counter semantics, including contradictory live allocation counts; tree component review pending
 reviewed	plugin/src/adaptive-batches.test.ts	tests	Checked eager grouping parity, refreshed limits, singleton boundaries, timed batches, cancellation by early exit and invalid inputs. Untimed batches also skip clock reads.
 reviewed	plugin/src/adaptive-batches.ts	production	Traced use in push, reconcile and pull. Each requested batch snapshots its limits and stops at the first boundary without retaining a plan for the remaining tail.
 pending	plugin/src/adaptive-transport-chaos.test.ts	tests	Not reviewed
@@ -398,7 +398,7 @@ pending	plugin/src/tree-root-export-job.ts	production	Not reviewed
 reviewed	plugin/src/utf8-bytes.ts	production	Shared existing tree repair UTF-8 count with storage size checks; compared to TextEncoder including unpaired surrogates.
 pending	plugin/src/verified-conflict-content.test.ts	tests	Not reviewed
 pending	plugin/src/verified-conflict-content.ts	production	Not reviewed
-pending	plugin/src/wasm-memory.ts	production	Not reviewed
+read	plugin/src/wasm-memory.ts	production	Checked allocator snapshot against native counter semantics, including contradictory live allocation counts; tree component review pending
 reviewed	plugin/src/wasm-runtime.test.ts	tests	Covered SIMD selection, both scalar fallbacks, invalid modules and concurrent callers sharing a failed attempt and a successful retry; assertion count measured at runtime.
 reviewed	plugin/src/wasm-runtime.ts	production	Traced the session loader through main.loadWasm and startup publication. Cache only in-flight and successful selections; a failed load can be retried without reloading the plugin.
 pending	plugin/src/work-scheduler.test.ts	tests	Not reviewed

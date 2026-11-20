@@ -178,6 +178,9 @@ export function formatWasmMemoryDebug(module?: WasmMemoryModule): string[] {
         if (!values.every(safeCount)) return invalid("missing counter values", linear);
         const [live, peak, allocations, successful, reallocations, allocationFailures, reallocationFailures] = values;
         if (peak < live) return invalid("inconsistent live/peak counters", linear);
+        if (allocations > successful || (allocations === 0 && live > 0)) {
+            return invalid("inconsistent live allocation count", linear);
+        }
         return [
             `WASM memory:       requested live ${bytes(live)} · peak ${bytes(peak)}`,
             `WASM allocations:  ${allocations} live · ${successful} alloc/zeroed successes · ${reallocations} realloc successes`,

@@ -219,6 +219,11 @@ test("safe integer endpoints and real zero samples remain exact; a contradictory
     assert.match(lines[1], /9007199254740991 live/);
     assert.match(lines[3], /9007199254740991 B/);
     invalid(format(snapshot({ peak_requested_bytes: 1023 })));
+    for (const live_allocations of [0, 10]) {
+        const lines = format(snapshot({ live_allocations }));
+        invalid(lines);
+        assert(lines.some(line => line.includes("4194304 B")));
+    }
 });
 
 test("missing linear observation is explicit and never derived from requested bytes", () => {
