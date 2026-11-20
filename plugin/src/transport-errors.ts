@@ -6,17 +6,6 @@ export class ObsetyncReenrollmentRequiredError extends Error {
     }
 }
 
-/**
- * Keep the classifier tolerant of errors crossing bundle/realm boundaries and
- * of older helpers that still surface the same terminal condition as a plain
- * Error. Transient network and server failures must not match this.
- */
-export function isReenrollmentRequiredError(error: unknown): boolean {
-    if (error instanceof ObsetyncReenrollmentRequiredError) return true;
-    const message = error instanceof Error ? error.message : String(error ?? "");
-    return /re-?enroll(?:ment)?(?: (?:this|the))? device/i.test(message);
-}
-
 export function reenrollmentRequired(message: string): ObsetyncReenrollmentRequiredError {
     return new ObsetyncReenrollmentRequiredError(message);
 }
@@ -30,10 +19,30 @@ export class ObsetyncUpgradeRequiredError extends Error {
     }
 }
 
+/** A typed server refusal takes precedence over advice in its message.
+ * Bundles and realms may have separate copies of the error constructors. */
+function transportRequirement(error: unknown): "upgrade" | "reenroll" | null {
+    if (error instanceof ObsetyncUpgradeRequiredError) return "upgrade";
+    if (error instanceof ObsetyncReenrollmentRequiredError) return "reenroll";
+    let message: unknown = error;
+    if (typeof error === "object" && error !== null) {
+        const name = "name" in error ? error.name : undefined;
+        if (name === "ObsetyncUpgradeRequiredError") return "upgrade";
+        if (name === "ObsetyncReenrollmentRequiredError") return "reenroll";
+        message = "message" in error ? error.message : undefined;
+    }
+    if (typeof message !== "string") return null;
+    if (/upgrade required|update\/reload the Obsetync plugin/i.test(message)) return "upgrade";
+    if (/re-?enroll(?:ment)?(?: (?:this|the))? device/i.test(message)) return "reenroll";
+    return null;
+}
+
+export function isReenrollmentRequiredError(error: unknown): boolean {
+    return transportRequirement(error) === "reenroll";
+}
+
 export function isUpgradeRequiredError(error: unknown): boolean {
-    if (error instanceof ObsetyncUpgradeRequiredError) return true;
-    const message = error instanceof Error ? error.message : String(error ?? "");
-    return /upgrade required|update\/reload the Obsetync plugin/i.test(message);
+    return transportRequirement(error) === "upgrade";
 }
 
 export function upgradeRequired(message: string): ObsetyncUpgradeRequiredError {

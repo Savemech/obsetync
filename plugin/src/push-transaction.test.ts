@@ -1,3 +1,4 @@
+import { runInNewContext } from "node:vm";
 import { push } from "./push";
 import {
     isReenrollmentRequiredError,
@@ -181,6 +182,16 @@ async function terminalPreflightDoesNotMutate(): Promise<void> {
         !isReenrollmentRequiredError(upgrade),
         "HTTP 426 upgrade was incorrectly classified as re-enrollment",
     );
+    const foreignUpgrade = runInNewContext(
+        'Object.assign(new Error("keep credentials; do not re-enroll device"), { name: "ObsetyncUpgradeRequiredError" })',
+    );
+    check(isUpgradeRequiredError(foreignUpgrade) && !isReenrollmentRequiredError(foreignUpgrade),
+        "cross-realm upgrade advice overrode the typed refusal");
+    const foreignEnrollment = runInNewContext(
+        'Object.assign(new Error("outdated credentials"), { name: "ObsetyncReenrollmentRequiredError" })',
+    );
+    check(isReenrollmentRequiredError(foreignEnrollment) && !isUpgradeRequiredError(foreignEnrollment),
+        "cross-realm enrollment refusal relied on message wording");
     check(f.deleteCalls() === 0, "terminal preflight mutated the tree");
     check(f.beginCalls() === 0, "terminal preflight opened a candidate");
     check(f.entries.has("gone.md"), "terminal preflight mutated sync-base");
