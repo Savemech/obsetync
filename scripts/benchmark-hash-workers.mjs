@@ -7,13 +7,13 @@ import { performance } from "node:perf_hooks";
 import { Worker } from "node:worker_threads";
 
 const workerBundle = resolve(process.argv[2] ?? "/tmp/obsetync-hash-worker.cjs");
-const fileCount = Number.parseInt(process.argv[3] ?? "8", 10);
-const fileMiB = Number.parseInt(process.argv[4] ?? "16", 10);
-const workerCount = Number.parseInt(process.argv[5] ?? "4", 10);
+const fileCount = Number(process.argv[3] ?? 8);
+const fileMiB = Number(process.argv[4] ?? 16);
+const workerCount = Number(process.argv[5] ?? 4);
 if (
-    !Number.isInteger(fileCount) || fileCount < 2 ||
-    !Number.isInteger(fileMiB) || fileMiB < 1 ||
-    !Number.isInteger(workerCount) || workerCount < 1 || workerCount > 4
+    !Number.isSafeInteger(fileCount) || fileCount < 2 ||
+    !Number.isSafeInteger(fileMiB) || fileMiB < 1 ||
+    !Number.isSafeInteger(workerCount) || workerCount < 1 || workerCount > 4
 ) {
     throw new RangeError("usage: benchmark-hash-workers.mjs bundle [files>=2] [MiB>=1] [workers=1..4]");
 }
@@ -36,6 +36,12 @@ class WorkerClient {
             this.resolveReady = resolveReady;
             this.rejectReady = rejectReady;
         });
+        const fail = (error) => {
+            this.failure = error;
+            this.rejectReady(error);
+            for (const waiter of this.pending.values()) waiter.reject(error);
+            this.pending.clear();
+        };
         this.worker.on("message", (message) => {
             this.metadataOnly &&= !hasBinary(message);
             if (message?.type === "ready") {
@@ -47,7 +53,7 @@ class WorkerClient {
                 return;
             }
             if (message?.type === "fatal") {
-                this.rejectReady(new Error(message.message));
+                fail(new Error(message.message));
                 return;
             }
             const waiter = this.pending.get(message?.job_id);
@@ -60,14 +66,12 @@ class WorkerClient {
                 waiter.reject(error);
             }
         });
-        this.worker.on("error", (error) => {
-            this.rejectReady(error);
-            for (const waiter of this.pending.values()) waiter.reject(error);
-            this.pending.clear();
-        });
+        this.worker.on("error", fail);
+        this.worker.on("exit", code => fail(new Error(`hash worker exited with code ${code}`)));
     }
 
     start(input) {
+        if (this.failure) throw this.failure;
         const jobId = `bench-${this.nextId++}`;
         const request = {
             type: "job",
@@ -100,7 +104,7 @@ class WorkerClient {
 }
 
 function percentile(samples, quantile) {
-    if (samples.length === 0) return 0;
+    if (samples.length === 0) return null;
     const ordered = [...samples].sort((left, right) => left - right);
     return ordered[Math.min(ordered.length - 1, Math.ceil(ordered.length * quantile) - 1)];
 }
@@ -108,6 +112,7 @@ function percentile(samples, quantile) {
 const source = await readFile(workerBundle, "utf8");
 const directory = await mkdtemp(join(tmpdir(), "obsetync-workers-"));
 const clients = [];
+let timer;
 try {
     const block = Buffer.allocUnsafe(1024 * 1024);
     let state = 0x6d2b79f5;
@@ -123,7 +128,7 @@ try {
         const handle = await open(path, "w");
         try {
             block[0] = fileIndex;
-            for (let mib = 0; mib < fileMiB; mib++) await handle.write(block);
+            for (let mib = 0; mib < fileMiB; mib++) await handle.writeFile(block);
         } finally {
             await handle.close();
         }
@@ -139,23 +144,22 @@ try {
     const lagSamples = [];
     const intervalMs = 5;
     let expectedTick = performance.now() + intervalMs;
-    const timer = setInterval(() => {
+    timer = setInterval(() => {
         const observed = performance.now();
         lagSamples.push(Math.max(0, observed - expectedTick));
         expectedTick = observed + intervalMs;
     }, intervalMs);
 
     let nextFile = 0;
-    const results = [];
     const started = performance.now();
     await Promise.all(clients.map(async (client) => {
         while (nextFile < files.length) {
             const file = files[nextFile++];
-            results.push(await client.run({
+            await client.run({
                 ...file,
                 mode: "hash",
                 feedBytes: 512 * 1024,
-            }));
+            });
         }
     }));
     const elapsedMs = performance.now() - started;
@@ -236,10 +240,9 @@ try {
             p95_ms: p95LagMs,
             p99_ms: percentile(lagSamples, 0.99),
             target_p95_ms: 16,
-            target_met: p95LagMs < 16,
+            target_met: p95LagMs === null ? null : p95LagMs < 16,
         },
         invariants: {
-            scalar_simd_hash_parity_inherited_from_slice3: true,
             hash_manifest_parity: true,
             pathname_fingerprint_stable: fingerprintStable,
             protocol_metadata_only: clients.every((client) => client.metadataOnly),
@@ -248,6 +251,7 @@ try {
         },
     }, null, 2));
 } finally {
+    clearInterval(timer);
     await Promise.allSettled(clients.map((client) => client.close()));
     await rm(directory, { recursive: true, force: true });
 }

@@ -413,8 +413,8 @@ read	plugin/src/ws.ts	production	Read complete connection-generation, foreground
 reviewed	plugin/styles.css	production	Matched all selectors to settings and debug modal callers.
 reviewed	plugin/tsconfig.json	configuration/schema	Enabled noUnusedLocals/noUnusedParameters; tsc and actual Nix plugin compilation pass
 reviewed	rust-toolchain.toml	configuration/schema	Local rustc 1.95.0 and wasm32 target verified; CI and release Rust setup version pins match
-pending	scripts/benchmark-hash-workers.mjs	tooling	Not reviewed
-pending	scripts/benchmark-wasm-hash.mjs	tooling	Not reviewed
+reviewed	scripts/benchmark-hash-workers.mjs	tooling	Traced fixture IO, worker lifecycle, measured timing and report; exercised real bundle, clean exit during job and fatal message after ready; no retained job results
+reviewed	scripts/benchmark-wasm-hash.mjs	tooling	Traced deterministic scalar/SIMD timing, individual digest checks and report; verified even-sample medians independently and rejected malformed CLI counts
 reviewed	scripts/build-wasm.sh	tooling	Read complete scalar/SIMD build and output isolation with Docker/CI/Nix callers; fixed unquoted optimizer path; version/whitespace refusal and accepted-path contract tests pass
 reviewed	scripts/check-release-version.mjs	tooling	Read structured JSON/Cargo/Nix checks and release callers; centralized manifest parity and corrected quoted Nix delimiters; release regression suite passes
 reviewed	scripts/install-wasm-tools.sh	tooling	Shared Linux installer; architecture allowlist, pinned hashes, both checks before install, cleanup and quoted paths reviewed; mock refusal/selection tests and real x86 dev image install pass
@@ -428,5 +428,5 @@ reviewed	scripts/release-artifact-manifest.test.mjs	tests	Read and executed dete
 reviewed	scripts/release-provenance.mjs	tooling	Traced executable and JSON server identity, CLI inputs, canonical Docker/Nix digest manifest and exclusive creation into the release workflow.
 reviewed	scripts/release-provenance.test.mjs	tests	Removed simulated subprocess output. Four suites exercise real CLI creation/rejection, server identity, immutable container references and workflow invocation.
 read	scripts/verify-wasm-memory.mjs	tooling	Reviewed qualification entrypoint and completed packaged scalar/SIMD allocator lifecycle run, both prefix corpora and tree formats, three cycles each. Individual qualification helper review pending.
-pending	scripts/verify-wasm-parity.mjs	tooling	Not reviewed
+read	scripts/verify-wasm-parity.mjs	tooling	Reviewed hash, streaming, batch and chunk comparisons; batch results now verified against individual slice hashes; tree ABI sections pending
 reviewed	versions.json	configuration/schema	Current compatibility entry passed shared release checker; verified minimums against 21 available tagged root manifests

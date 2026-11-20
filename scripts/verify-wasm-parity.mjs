@@ -90,11 +90,11 @@ for (const feedBytes of chunkFeedSizes) {
 const batchData = deterministicPayload(3000);
 const offsets = new Uint32Array([0, 1000, 2000]);
 const sizes = new Uint32Array([1000, 1000, 1000]);
-if (
-    JSON.stringify(scalar.wasm_hash_batch(batchData, offsets, sizes)) !==
-    JSON.stringify(simd.wasm_hash_batch(batchData, offsets, sizes))
-) {
-    throw new Error("scalar/SIMD batch hash mismatch");
+const expectedBatch = Array.from(offsets, (offset, i) =>
+    scalar.wasm_hash(batchData.subarray(offset, offset + sizes[i])));
+for (const module of [scalar, simd]) {
+    assert.deepEqual(module.wasm_hash_batch(batchData, offsets, sizes), expectedBatch,
+        "batch hashes differ from individual slice hashes");
 }
 
 function deterministicTreeEntries(count) {

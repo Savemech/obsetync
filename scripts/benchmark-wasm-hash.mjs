@@ -6,12 +6,12 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const outputDir = resolve(process.argv[2] ?? "plugin/wasm");
-const payloadMiB = Number.parseInt(process.argv[3] ?? "32", 10);
-const measuredIterations = Number.parseInt(process.argv[4] ?? "7", 10);
-if (!Number.isInteger(payloadMiB) || payloadMiB <= 0) {
+const payloadMiB = Number(process.argv[3] ?? 32);
+const measuredIterations = Number(process.argv[4] ?? 7);
+if (!Number.isSafeInteger(payloadMiB) || payloadMiB <= 0) {
     throw new RangeError("payload MiB must be a positive integer");
 }
-if (!Number.isInteger(measuredIterations) || measuredIterations < 3) {
+if (!Number.isSafeInteger(measuredIterations) || measuredIterations < 3) {
     throw new RangeError("measured iterations must be an integer >= 3");
 }
 
@@ -53,7 +53,8 @@ function timeHash(module, feedBytes) {
 
 function median(values) {
     const ordered = [...values].sort((a, b) => a - b);
-    return ordered[Math.floor(ordered.length / 2)];
+    const middle = Math.floor(ordered.length / 2);
+    return ordered.length % 2 ? ordered[middle] : (ordered[middle - 1] + ordered[middle]) / 2;
 }
 
 const expected = scalar.wasm_hash(payload);
