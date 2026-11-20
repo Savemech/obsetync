@@ -120,7 +120,7 @@ async function fixtureWorker() {
                     base.setEntry(syntheticPath(index), hash(index), 1_800_000_000_000 + index, index % 4096,
                         1_799_999_999_000 + index);
                 }
-                await immediate();
+                if (end < ENTRIES) await base.checkpoint();
             }
             base.setTreeBaseRoot("1".repeat(64));
             base.setLastSyncTimestamp(1_800_000_000_000);
@@ -140,6 +140,7 @@ async function fixtureWorker() {
 
     // Verification is intentionally outside the phase timings and sampler.
     workerPhase = "verification";
+    await base.drainMaintenance();
     assert.equal(base.entryCount(), ENTRIES);
     for (let index = 0; index < ENTRIES; index++) {
         assert.equal(base.getHash(syntheticPath(index)), index === changedIndex ? changedHash : hash(index));
@@ -283,11 +284,12 @@ async function main() {
             }];
         }));
         report = {
-            benchmark: "sync-base-native-filesystem-sanity", schema: 1,
+            benchmark: "sync-base-native-filesystem-sanity", schema: 2,
             platform: process.platform, arch: process.arch, node: process.version,
             corpus: { entries: ENTRIES, seedBatch: SEED_BATCH, syntheticMetadataOnly: true,
                 vaultContentBytes: 0, hashes: "deterministic synthetic identifiers, no content hashing" },
-            measurement: { runs: RUNS, eventLoopResolutionMs: DELAY_RESOLUTION_MS,
+            measurement: { runs: RUNS, seed: "includes intermediate durable checkpoints",
+                checkpoint: "final seed batch plus root, timestamp and cursor", eventLoopResolutionMs: DELAY_RESOLUTION_MS,
                 eventLoopDelay: "raw Node sampler delay, includes sampling interval; not renderer UI lag",
                 coldLoad: "fresh Node process, filesystem cache not evicted; module startup excluded",
                 writes: "native filesystem completion and production readback, no fsync guarantee",
