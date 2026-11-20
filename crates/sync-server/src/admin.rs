@@ -562,10 +562,7 @@ async fn vault_detail(
             let Ok(h) = sync_core::hash::hex_to_hash(hash) else {
                 continue;
             };
-            let Some(bytes) = state.vaults.get_root(&vault_id, &h) else {
-                continue;
-            };
-            let Ok(r) = sync_core::versioned_root::VersionedRoot::deserialize(&bytes) else {
+            let Ok(r) = admin_history_root(&state, &vault_id, &h) else {
                 continue;
             };
             metas.push(RootMeta {
@@ -613,18 +610,7 @@ async fn vault_detail(
     // Reuse the checked head identity rather than issuing a second lossy
     // current-root read while constructing the tree controls.
     let current_version = match current {
-        Some(hash) => {
-            let bytes = state
-                .vaults
-                .get_root(&vault_id, &hash)
-                .ok_or_else(|| ServerErrorHtml("current root data missing".into()))?;
-            let root = sync_core::versioned_root::VersionedRoot::deserialize(&bytes)
-                .map_err(|error| ServerErrorHtml(format!("corrupt current root: {error}")))?;
-            if root.vault_id() != vault_id || root.hash() != hash {
-                return Err(ServerErrorHtml("current root identity mismatch".into()));
-            }
-            Some(root.version())
-        }
+        Some(hash) => Some(admin_history_root(&state, &vault_id, &hash)?.version()),
         None => None,
     };
     let fleet = state.devices.fleet_capability("tree-v2");
@@ -697,16 +683,7 @@ async fn rollback_vault(
     let hash = sync_core::hash::hex_to_hash(&form.root_hash)
         .map_err(|_| ServerErrorHtml("invalid hash".into()))?;
 
-    // Verify the root exists.
-    let root_bytes = state
-        .vaults
-        .get_root(&vault_id, &hash)
-        .ok_or_else(|| ServerErrorHtml("root not found in history".into()))?;
-    let root = sync_core::versioned_root::VersionedRoot::deserialize(&root_bytes)
-        .map_err(|error| ServerErrorHtml(format!("corrupt rollback root: {error}")))?;
-    if root.vault_id() != vault_id || root.hash() != hash {
-        return Err(ServerErrorHtml("rollback root identity mismatch".into()));
-    }
+    let root = admin_history_root(&state, &vault_id, &hash)?;
     // Same per-vault write lock as put_root — a rollback racing an in-flight
     // push is the same lost-update bug in admin clothing.
     let vault_lock = state.vault_lock(&vault_id);
@@ -773,15 +750,7 @@ async fn project_tree_version(
 
     let current_hash = admin_current_root(&state, &vault_id)?
         .ok_or_else(|| ServerErrorHtml("vault has no current root".into()))?;
-    let current_bytes = state
-        .vaults
-        .get_root(&vault_id, &current_hash)
-        .ok_or_else(|| ServerErrorHtml("current root data missing".into()))?;
-    let current_root = sync_core::versioned_root::VersionedRoot::deserialize(&current_bytes)
-        .map_err(|error| ServerErrorHtml(format!("corrupt current root: {error}")))?;
-    if current_root.vault_id() != vault_id || current_root.hash() != current_hash {
-        return Err(ServerErrorHtml("current root identity mismatch".into()));
-    }
+    let current_root = admin_history_root(&state, &vault_id, &current_hash)?;
     if current_root.version() == target_version {
         return Ok(Redirect::to(&format!("/admin/vaults/{vault_id}")));
     }
@@ -866,16 +835,7 @@ async fn purge_vault(
 
     let current_hash = admin_current_root(&state, &vault_id)?
         .ok_or_else(|| ServerErrorHtml("vault has no current root".into()))?;
-    let current_bytes = state
-        .vaults
-        .get_root(&vault_id, &current_hash)
-        .ok_or_else(|| ServerErrorHtml("current root data missing".into()))?;
-    let current_root = sync_core::versioned_root::VersionedRoot::deserialize(&current_bytes)
-        .map_err(|e| ServerErrorHtml(format!("corrupt current root: {}", e)))?;
-    if current_root.vault_id() != vault_id || current_root.hash() != current_hash {
-        return Err(ServerErrorHtml("current root identity mismatch".into()));
-    }
-
+    let current_root = admin_history_root(&state, &vault_id, &current_hash)?;
     let (mut new_root, removed, kept) =
         crate::bridge::run_versioned_purge(state.storage_writer.clone(), current_root, patterns)
             .await
@@ -996,12 +956,7 @@ async fn export_vault(
 ) -> Result<axum::response::Response, ServerErrorHtml> {
     let hash = sync_core::hash::hex_to_hash(&root_hash)
         .map_err(|_| ServerErrorHtml("invalid root hash".into()))?;
-    let root_bytes = state
-        .vaults
-        .get_root(&vault_id, &hash)
-        .ok_or_else(|| ServerErrorHtml("root not found in history".into()))?;
-    let root = sync_core::versioned_root::VersionedRoot::deserialize(&root_bytes)
-        .map_err(|e| ServerErrorHtml(format!("corrupt root: {}", e)))?;
+    let root = admin_history_root(&state, &vault_id, &hash)?;
 
     let entries = crate::bridge::run_versioned_list_entries(state.storage_writer.clone(), root)
         .await
@@ -1286,6 +1241,23 @@ fn dir_stats(path: &std::path::Path) -> (u64, u64) {
         }
     }
     (bytes, count)
+}
+
+fn admin_history_root(
+    state: &SharedState,
+    vault_id: &str,
+    hash: &sync_core::hash::FileHash,
+) -> Result<sync_core::versioned_root::VersionedRoot, ServerErrorHtml> {
+    let bytes = state
+        .vaults
+        .get_root(vault_id, hash)
+        .ok_or_else(|| ServerErrorHtml("root not found in history".into()))?;
+    let root = sync_core::versioned_root::VersionedRoot::deserialize(&bytes)
+        .map_err(|error| ServerErrorHtml(format!("corrupt history root: {error}")))?;
+    if root.vault_id() != vault_id || root.hash() != *hash {
+        return Err(ServerErrorHtml("history root identity mismatch".into()));
+    }
+    Ok(root)
 }
 
 fn admin_current_root(
@@ -1641,6 +1613,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn export_and_diff_reject_misfiled_history() {
+        let (_dir, state, hash) = current_root_fixture();
+        let vault = "read-error";
+        let bytes = state.vaults.get_root(vault, &hash).unwrap();
+        for (directory, address) in [("other-vault", hash), (vault, [7; 32])] {
+            state
+                .vaults
+                .store_root(directory, &address, &bytes)
+                .unwrap();
+            let hex = hash_to_hex(&address);
+            let export =
+                export_vault(State(state.clone()), Path((directory.into(), hex.clone()))).await;
+            assert!(
+                matches!(export, Err(ServerErrorHtml(message)) if message.contains("identity mismatch"))
+            );
+            let diff = api_diff(
+                State(state.clone()),
+                Path((directory.into(), hex.clone(), hex)),
+            )
+            .await;
+            assert!(
+                matches!(diff, Err(ServerErrorHtml(message)) if message.contains("identity mismatch"))
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn absent_current_remains_empty_but_missing_root_statistics_are_unknown() {
         let (_dir, state, hash) = current_root_fixture();
         let vault = "actually-empty";
@@ -1756,12 +1755,7 @@ async fn api_diff(
     let load = |hex: &str| -> Result<sync_core::versioned_root::VersionedRoot, ServerErrorHtml> {
         let hash = sync_core::hash::hex_to_hash(hex)
             .map_err(|_| ServerErrorHtml("invalid root hash".into()))?;
-        let bytes = state
-            .vaults
-            .get_root(&vault_id, &hash)
-            .ok_or_else(|| ServerErrorHtml("root not found in history".into()))?;
-        sync_core::versioned_root::VersionedRoot::deserialize(&bytes)
-            .map_err(|e| ServerErrorHtml(format!("corrupt root: {}", e)))
+        admin_history_root(&state, &vault_id, &hash)
     };
     let from_root = load(&from_hex)?;
     let to_root = load(&to_hex)?;
@@ -1930,10 +1924,7 @@ async fn api_stats(
             let Ok(h) = sync_core::hash::hex_to_hash(hash) else {
                 continue;
             };
-            let Some(bytes) = state.vaults.get_root(&vault_id, &h) else {
-                continue;
-            };
-            let Ok(r) = sync_core::versioned_root::VersionedRoot::deserialize(&bytes) else {
+            let Ok(r) = admin_history_root(&state, &vault_id, &h) else {
                 continue;
             };
             if let Some(p) = r.parent_hash() {
@@ -1953,15 +1944,9 @@ async fn api_stats(
         ) else {
             continue;
         };
-        let (Some(rb), Some(pb)) = (
-            state.vaults.get_root(&vault_id, &h),
-            state.vaults.get_root(&vault_id, &p),
-        ) else {
-            continue;
-        };
         let (Ok(root), Ok(parent)) = (
-            sync_core::versioned_root::VersionedRoot::deserialize(&rb),
-            sync_core::versioned_root::VersionedRoot::deserialize(&pb),
+            admin_history_root(&state, &vault_id, &h),
+            admin_history_root(&state, &vault_id, &p),
         ) else {
             continue;
         };
@@ -2015,10 +2000,7 @@ async fn explorer(
             let Ok(h) = sync_core::hash::hex_to_hash(hash) else {
                 continue;
             };
-            let Some(bytes) = state.vaults.get_root(&vault_id, &h) else {
-                continue;
-            };
-            let Ok(r) = sync_core::versioned_root::VersionedRoot::deserialize(&bytes) else {
+            let Ok(r) = admin_history_root(&state, &vault_id, &h) else {
                 continue;
             };
             metas.push(Meta {
