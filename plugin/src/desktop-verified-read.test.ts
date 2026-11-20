@@ -40,7 +40,7 @@ function fixture(options: {
     afterStat?: () => Promise<ReturnType<typeof file>>;
     pathLstat?: () => Promise<ReturnType<typeof file>>;
     openError?: Error;
-    closeError?: Error;
+    close?: () => Promise<void>;
 } = {}) {
     const events: string[] = [];
     let stats = 0;
@@ -59,7 +59,7 @@ function fixture(options: {
             buffer.set(bytes.subarray(position, position + count), offset);
             return { bytesRead: count };
         },
-        async close() { events.push("close"); if (options.closeError) throw options.closeError; },
+        async close() { events.push("close"); await options.close?.(); },
     };
     const host: DesktopVerifiedReadHost = {
         isAbsolute: path => path.startsWith("/"),
@@ -204,6 +204,21 @@ async function nativeFailuresStayTypedAndClose(): Promise<void> {
     await assert.rejects(readDesktopFileIdentityVerified(source(), undefined, failed.host), error => error === ioError);
     assertions++;
     check(failed.events.at(-1) === "close", "source IO failure leaked its handle");
+
+    const controller = new AbortController();
+    const cancelled = fixture({ close: async () => { controller.abort(); } });
+    await assert.rejects(readDesktopFileIdentityVerified(source(), controller.signal, cancelled.host),
+        { name: "AbortError" });
+    assertions++;
+    const closeFailure = fixture({ close: async () => { throw ioError; } });
+    await assert.rejects(readDesktopFileIdentityVerified(source(), undefined, closeFailure.host),
+        error => error === ioError);
+    assertions++;
+    const bothFailed = fixture({ read: () => Promise.reject(), close: async () => { throw ioError; } });
+    await readDesktopFileIdentityVerified(source(), undefined, bothFailed.host).then(
+        () => assert.fail("failed native read returned a result"),
+        reason => check(reason === undefined, "close failure masked the original read rejection"),
+    );
 
     const missing = fixture({ openError: Object.assign(new Error("missing"), { code: "ENOENT" }) });
     await assert.rejects(readDesktopFileIdentityVerified(source(), undefined, missing.host), HashWorkerFileDriftError);

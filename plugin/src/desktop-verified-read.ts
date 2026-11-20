@@ -164,8 +164,7 @@ export async function readDesktopFileIdentityVerified(
         throw error;
     }
 
-    let result: Uint8Array | undefined;
-    let failure: unknown;
+    let result: Uint8Array;
     try {
         throwIfWorkAborted(signal);
         const beforeStats = await handle.stat();
@@ -219,17 +218,12 @@ export async function readDesktopFileIdentityVerified(
         throwIfWorkAborted(signal);
         result = output;
     } catch (error) {
-        failure = isVanished(error)
+        try { await handle.close(); } catch { /* preserve the read failure */ }
+        throw isVanished(error)
             ? new HashWorkerFileDriftError("desktop source disappeared, moved or became linked during read")
             : error;
     }
-    try {
-        await handle.close();
-    } catch (error) {
-        // Preserve a typed drift/directory/cancellation error when close also
-        // rejects; a close-only failure remains authoritative.
-        if (failure === undefined) failure = error;
-    }
-    if (failure !== undefined) throw failure;
-    return result!;
+    await handle.close();
+    throwIfWorkAborted(signal);
+    return result;
 }
