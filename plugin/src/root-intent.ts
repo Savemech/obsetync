@@ -5,7 +5,7 @@ import { SegmentedStore, STORE_LIMITS, StoreRecoveryError, createMigrationProof,
 import { detachRootBasePublication, type RootBasePublication,
     type RootPublicationIdentity } from "./sync-base";
 import { detachRootCommitIntent, computeRootRequestHash, validateRootTerminalOutcome,
-    type RootCommitIntent, type RootCommitRequest, type RootTerminalOutcome } from "./root-outcome";
+    type RootCommitIntent, type RootCommitRequest, type RootConflict, type RootTerminalOutcome } from "./root-outcome";
 import { legacyDowngradeRootSequenceFloor } from "./legacy-downgrade";
 
 export const ROOT_INTENT_PATH = ".obsidian/plugins/obsetync/root-intent.store-v1";
@@ -101,11 +101,17 @@ function addConflictReceipt(pending: PendingRootIntent, receipt: RootConflictCop
     return { ...pending, conflictCopies: [...pending.conflictCopies, receipt]
         .sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0) };
 }
+export function hasRecordedConflictCopies(conflicts: readonly RootConflict[], copies: readonly RootConflictCopyReceipt[]): boolean {
+    if (conflicts.length === 0) return true;
+    if (copies.length < conflicts.length) return false;
+    const hashes = new Map<string, string>();
+    for (const copy of copies) hashes.set(copy.path, copy.hash);
+    return conflicts.every(conflict => hashes.get(conflict.path) === conflict.side_b_hash);
+}
 function assertRetirable(pending: PendingRootIntent): void {
     const terminal = pending.terminal;
     if (!terminal) fail("IDENTITY", "cannot retire an unresolved root intent");
-    if (terminal.status === "accepted" && "merged" in terminal.result && terminal.result.conflicts.some(conflict =>
-        !pending.conflictCopies.some(receipt => receipt.path === conflict.path && receipt.hash === conflict.side_b_hash))) {
+    if (terminal.status === "accepted" && "merged" in terminal.result && !hasRecordedConflictCopies(terminal.result.conflicts, pending.conflictCopies)) {
         fail("IDENTITY", "cannot retire before every root conflict copy is recorded");
     }
 }

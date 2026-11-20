@@ -1,6 +1,6 @@
 import type { ObsetyncJournal } from "./journal";
 import type { ObsetyncSyncBase } from "./sync-base";
-import type { RootIntentStore } from "./root-intent";
+import { hasRecordedConflictCopies, type RootIntentStore } from "./root-intent";
 import type { RootConflictPreserver } from "./root-conflicts";
 
 export type RootSettlement = { status: "idle" | "unresolved" | "cancelled" | "conflicts-pending" } |
@@ -41,18 +41,18 @@ export class RootSettlementCoordinator {
             throw new Error("Root settlement requires its original validated journal epoch");
         }
         const expectedCopies = "merged" in terminal.result ? terminal.result.conflicts : [];
-        const hasCopies = (copies: typeof pending.conflictCopies) => expectedCopies.every(conflict =>
-            copies.some(copy => copy.path === conflict.path && copy.hash === conflict.side_b_hash));
-        if (!hasCopies(pending.conflictCopies) && !this.conflicts) {
+        const needsPreservation = !hasRecordedConflictCopies(expectedCopies, pending.conflictCopies);
+        if (needsPreservation && !this.conflicts) {
             return { status: "conflicts-pending" };
         }
         await this.base.commitRootPublication(intent.publication);
-        if (!hasCopies(pending.conflictCopies)) await this.conflicts!.preserve();
+        if (needsPreservation) await this.conflicts!.preserve();
         const current = this.intents.pending();
         if (!current || current.intent.request.sequence !== intent.request.sequence ||
             current.intent.request.mutation_id !== intent.request.mutation_id ||
             current.intent.publication.identity.scopeHash !== intent.publication.identity.scopeHash ||
-            current.intent.request.request_hash !== intent.request.request_hash || !hasCopies(current.conflictCopies)) {
+            current.intent.request.request_hash !== intent.request.request_hash ||
+            !hasRecordedConflictCopies(expectedCopies, current.conflictCopies)) {
             throw new Error("Root settlement lacks its exact recorded conflict preservation");
         }
         await this.journal.acknowledgeOwned(intent.journalEpoch, intent.journalCuts);

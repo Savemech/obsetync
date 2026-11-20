@@ -2,7 +2,7 @@ import { strict as assert } from "node:assert";
 import { createHash } from "node:crypto";
 import { ObsetyncJournal } from "./journal";
 import { ObsetyncSyncBase, SYNC_BASE_STORE_PATH } from "./sync-base";
-import { RootIntentStore, type StoredRootIntent } from "./root-intent";
+import { hasRecordedConflictCopies, RootIntentStore, type StoredRootIntent } from "./root-intent";
 import { createRootCommitIntent, type RootTerminalOutcome } from "./root-outcome";
 import { RootSettlementCoordinator } from "./root-settlement";
 import { MemorySegmentedIO } from "./segmented-store-test-io";
@@ -111,6 +111,14 @@ async function sharedOwnerAndLateAppend() {
     check(f.journal.unsynced()[0]?.id === late, "accepted tail consumed mutation captured during native base write");
 }
 async function run() {
+    const conflicts = Array.from({ length: 256 }, (_, i) => ({
+        path: `note-${i}.md`, base_hash: h(1), side_a_hash: h(2), side_b_hash: h(i),
+    }));
+    const copies = conflicts.map(row => ({ path: row.path, copyPath: row.path + ".copy",
+        hash: row.side_b_hash, size: 0 })).reverse();
+    check(hasRecordedConflictCopies(conflicts, copies), "exact receipts in reverse order were rejected");
+    copies[0].hash = copies[1].hash;
+    check(!hasRecordedConflictCopies(conflicts, copies), "a peer's hash satisfied another conflict");
     await restartCuts(); await terminalBoundaries(); await sharedOwnerAndLateAppend();
     console.log(`root-settlement: ${assertions} assertions passed`);
 }

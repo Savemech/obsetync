@@ -322,7 +322,7 @@ reviewed	plugin/src/root-batch.ts	production	Traced shared graph validation, gen
 read	plugin/src/root-conflicts.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
 reviewed	plugin/src/root-conflicts.ts	production	Traced accepted-intent ownership, bounded staging, exclusive copy, receipt and drain; use original staging digest and one bounded UTF-8 stem pass
 pending	plugin/src/root-intent.test.ts	tests	Not reviewed
-pending	plugin/src/root-intent.ts	production	Not reviewed
+read	plugin/src/root-intent.ts	production	Traced conflict receipt validation and durable retirement/replay; shared exact-copy check with settlement; other loading and persistence paths pending
 removed	plugin/src/root-local-omissions.test.ts	tests	Tests of retired selector; moved backlog-limit and distant shared-ID coverage to the live queue alongside its classification and provenance cases
 removed	plugin/src/root-local-omissions.ts	production	Selector was called only by its own tests; live local omission selection is RootReviewedQueue.takeLocal; carried the shared type to file-safety
 reviewed	plugin/src/root-outcome.test.ts	tests	Checked Rust digest vectors, post-capture mutation, encoding boundaries, receipt identity, conflict paths, JSON decoding, capabilities and cancellation
@@ -333,8 +333,8 @@ pending	plugin/src/root-recovery.test.ts	tests	Not reviewed
 pending	plugin/src/root-recovery.ts	production	Not reviewed
 read	plugin/src/root-reviewed-queue.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
 reviewed	plugin/src/root-reviewed-queue.ts	production	Traced creation, review, overlay, dependency checks, claim, settlement and dispose; takeLocal uses the actual retirement limit; distant linked omissions tested through next()
-pending	plugin/src/root-settlement.test.ts	tests	Not reviewed
-pending	plugin/src/root-settlement.ts	production	Not reviewed
+reviewed	plugin/src/root-settlement.test.ts	tests	Restart cuts, cancellation, shared owner and full 256-copy permutation/hash mismatch covered; 44 assertions passed
+reviewed	plugin/src/root-settlement.ts	production	Traced runtime, recovery and conflict preservation; check receipts by path and exact content hash before journal ACK and recheck after writes
 reviewed	plugin/src/root-stream-scope.test.ts	tests	Full six ownership/endpoint/bounds/secret-free suites read and run; stable legacy HTTP digest retained; HTTP and HTTPS partition scope, case aliases remain equivalent
 reviewed	plugin/src/root-stream-scope.ts	production	Read full canonicalization/fingerprint/fences and main callers; explicit HTTPS policy matches API; one-time enrolled-settings migration retains old HTTP scope and existing intents fail closed on genuine scope change
 pending	plugin/src/root-sync-runtime.test.ts	tests	Not reviewed
