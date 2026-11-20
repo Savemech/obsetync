@@ -10665,13 +10665,13 @@ impl WasmChunker {
 /// This avoids sending all chunk data over the WASM bridge at once.
 #[wasm_bindgen]
 pub fn wasm_get_file_chunk(data: &[u8], offset: u32, size: u32) -> Vec<u8> {
-    let start = offset as usize;
-    let end = start + size as usize;
-    if end <= data.len() {
-        data[start..end].to_vec()
-    } else {
-        vec![]
-    }
+    file_chunk_slice(data, offset, size).to_vec()
+}
+
+fn file_chunk_slice(data: &[u8], offset: u32, size: u32) -> &[u8] {
+    data.get(offset as usize..)
+        .and_then(|tail| tail.get(..size as usize))
+        .unwrap_or_default()
 }
 
 /// Check if a file should use sub-file chunking based on size.
@@ -10695,12 +10695,7 @@ pub fn wasm_hash_batch(data: &[u8], offsets: &[u32], sizes: &[u32]) -> Vec<Strin
     offsets
         .iter()
         .zip(sizes.iter())
-        .map(|(&off, &sz)| {
-            let start = off as usize;
-            let end = start + sz as usize;
-            let slice = data.get(start..end).unwrap_or(&[]);
-            hash_to_hex(&hash_bytes(slice))
-        })
+        .map(|(&offset, &size)| hash_to_hex(&hash_bytes(file_chunk_slice(data, offset, size))))
         .collect()
 }
 

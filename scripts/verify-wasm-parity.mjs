@@ -95,6 +95,14 @@ const expectedBatch = Array.from(offsets, (offset, i) =>
 for (const module of [scalar, simd]) {
     assert.deepEqual(module.wasm_hash_batch(batchData, offsets, sizes), expectedBatch,
         "batch hashes differ from individual slice hashes");
+    const endOffsets = new Uint32Array([2999, 2999, 0xffffffff]);
+    const endSizes = new Uint32Array([1, 2, 2]);
+    const expectedSlices = [batchData.subarray(2999), new Uint8Array(), new Uint8Array()];
+    assert.deepEqual(module.wasm_hash_batch(batchData, endOffsets, endSizes),
+        expectedSlices.map(slice => module.wasm_hash(slice)));
+    for (const [index, expected] of expectedSlices.entries()) {
+        assert.deepEqual(module.wasm_get_file_chunk(batchData, endOffsets[index], endSizes[index]), expected);
+    }
 }
 
 function deterministicTreeEntries(count) {
