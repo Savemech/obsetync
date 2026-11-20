@@ -825,6 +825,22 @@ test("persistence replacement drains old maintenance owners before opening new s
     await f.unload(plugin);
 });
 
+test("failed persistence retirement waits for sibling storage work", async () => {
+    const f = fixture(), plugin = await f.loaded();
+    const base = f.block("base:maintenance-drained");
+    const journal = f.block("journal:maintenance-drained");
+    const failure = new Error("base retirement failed");
+    const replacing = observe(plugin.loadCurrentPersistence("desktop", true));
+    await f.waitFor("journal:maintenance-drained");
+    base.reject(failure);
+    await nextTurn();
+    equal(replacing.done, false, "Replacement returned while journal maintenance was still running");
+    journal.resolve();
+    await assert.rejects(replacing.promise, error => error === failure);
+    equal(f.count("base:new"), 1, "Failed retirement allowed replacement storage to open");
+    await f.unload(plugin);
+});
+
 test("interrupted and legacy-active startup fence current stores and every network dispatch", async () => {
     for (const legacyState of ["interrupted", "legacy-active"]) {
         const f = fixture({ legacyState, enrolled: true }), plugin = await f.loaded();

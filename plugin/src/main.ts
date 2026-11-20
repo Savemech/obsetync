@@ -565,12 +565,12 @@ export default class ObsetyncPlugin extends Plugin {
     }
 
     private closePersistenceOwners(owners: readonly unknown[]): Promise<void> {
-        return Promise.all(owners.map(async owner => {
+        return settleRuntimeOwners(owners.map(async owner => {
             if (!owner || typeof owner !== "object") return;
             const lifecycle = owner as { closeAndDrain?: () => Promise<void>; close?: () => void };
             if (typeof lifecycle.closeAndDrain === "function") await lifecycle.closeAndDrain.call(owner);
             else lifecycle.close?.call(owner);
-        })).then(() => undefined);
+        }));
     }
 
     private installCurrentRuntimeUi(scheduleAutomaticSync = true): void {
