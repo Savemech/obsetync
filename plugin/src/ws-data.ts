@@ -357,6 +357,8 @@ export class ObsetyncWsDataLane {
         }
         const socket = this.socket;
         const session = this.session;
+        // Disconnect resets the old credit counters. A replacement socket owns its own.
+        if (this.limits !== limits) throw new WsDataUnavailableError("WS data session changed before send");
         if (!socket || !session || socket.readyState !== SOCKET_OPEN || this.state !== "ready") {
             this.releaseCredit(payload.byteLength);
             throw new WsDataUnavailableError("WS data lane disconnected before send");
@@ -1065,6 +1067,7 @@ export class ObsetyncWsDataLane {
         for (;;) {
             const configuredLimit = this.options.localRequestLimit?.() ??
                 limits.maxInflightRequests;
+            if (this.limits !== limits) throw new WsDataUnavailableError("WS data session changed before credit");
             const requestLimit = Number.isFinite(configuredLimit)
                 ? Math.max(1, Math.min(limits.maxInflightRequests, Math.trunc(configuredLimit)))
                 : 1;

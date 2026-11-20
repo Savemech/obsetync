@@ -589,6 +589,38 @@ async function socketLossRejectsUnknownResultAndReconnectsFresh(): Promise<void>
     lane.close();
 }
 
+async function waitingForMemoryCannotMoveARequestToANewSession(): Promise<void> {
+    const budget = new ResourceBudget({ capacityBytes: 8192 });
+    const hold = await budget.reserve(8192);
+    const sockets: FakeSocket[] = [];
+    const lane = new ObsetyncWsDataLane({
+        baseUrl: "http://server:27182", runtime: "desktop", advertisedPayloadBytes: 1024,
+        openSession, backoffStartMs: 1, memoryBudget: budget,
+        socketFactory: () => {
+            const socket = new FakeSocket("echo", { maxInflightRequests: 1, maxPayloadBytes: 1024, maxInflightBytes: 4096 });
+            sockets.push(socket);
+            return socket;
+        },
+    });
+    const request = (value: number) => lane.request(
+        WsDataFrameType.CheckObjects, new Uint8Array([value]), WsDataFrameType.CheckResult);
+    try {
+        const old = request(1).then(() => false, error => error instanceof WsDataUnavailableError);
+        await eventually(() => budget.snapshot().queuedRequests === 1, "first session did not reach memory wait");
+        sockets[0].onclose?.();
+        await new Promise(resolve => setTimeout(resolve, 3));
+        const fresh = request(2);
+        await eventually(() => budget.snapshot().queuedRequests === 2, "replacement session did not reach memory wait");
+        hold.release();
+        ok(await old, "old memory waiter sent under a replacement session");
+        ok((await fresh)[0] === 2 && sockets[1].rpcFrames.length === 1, "replacement session sent unexpected work");
+        ok(budget.snapshot().usedBytes === 0, "reconnected requests leaked queue memory");
+    } finally {
+        hold.release();
+        lane.close();
+    }
+}
+
 async function liveTelemetryTracksCreditAckAndSessionReuse(): Promise<void> {
     let now = 0;
     const trace = new PerfTrace({ monotonicNow: () => now, monitorEventLoop: false });
@@ -1893,6 +1925,7 @@ void (async () => {
     await byteCreditsAndSocketWatermarksApplyBackpressure();
     await malformedErrorRejectsPendingWithoutHanging();
     await socketLossRejectsUnknownResultAndReconnectsFresh();
+    await waitingForMemoryCannotMoveARequestToANewSession();
     await liveTelemetryTracksCreditAckAndSessionReuse();
     await closeUnderBufferPressureClearsLiveWaitImmediately();
     await oldHandshakeDecryptCannotReplaceNewSession();
