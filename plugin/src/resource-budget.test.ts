@@ -210,6 +210,23 @@ async function resizing(): Promise<void> {
     assertEmpty(shrinking, "shrink leaked accounting");
     shrinking.close();
 
+    const mixed = new ResourceBudget({ capacityBytes: 12 });
+    const all = await mixed.reserve(12);
+    const order: number[] = [];
+    const results = [8, 3, 9, 2].map((bytes, index) => mixed.reserve(bytes).then(lease => {
+        order.push(index);
+        lease.release();
+    }, error => check(error instanceof ResourceBudgetOversizedError && bytes > 5,
+        "resize rejected a fitting waiter or lost its refusal reason")));
+    mixed.setCapacity(5);
+    mixed.setCapacity(5);
+    check(mixed.snapshot().queuedRequests === 2 && mixed.snapshot().queuedBytes === 5,
+        "mixed resize lost the fitting FIFO prefix or retained oversized waiters");
+    all.release();
+    await Promise.all(results);
+    check(order.join(",") === "1,3", "mixed resize reordered the surviving waiters");
+    assertEmpty(mixed, "mixed resize leaked accounting");
+
     const growing = new ResourceBudget({ capacityBytes: 10 });
     const initial = await growing.reserve(10);
     const six = growing.reserve(6);
@@ -271,6 +288,10 @@ async function closePreservesOwnedReservations(): Promise<void> {
     check(budget.snapshot().peakUsedBytes === 10, "close lost historical peak");
 }
 
+let completed = false;
+process.once("beforeExit", () => {
+    if (!completed) { console.error("resource-budget.test: queue checks did not settle"); process.exitCode = 1; }
+});
 void validationAndOversizedAdmission()
     .then(synchronousAccountingAndFifo)
     .then(cancellationAndOwnership)
@@ -278,8 +299,9 @@ void validationAndOversizedAdmission()
     .then(resizing)
     .then(reservationShrinking)
     .then(closePreservesOwnedReservations)
-    .then(() => console.log(`resource-budget.test: ${assertions} assertions passed`))
+    .then(() => { completed = true; console.log(`resource-budget.test: ${assertions} assertions passed`); })
     .catch((error) => {
+        completed = true;
         console.error(error);
         process.exitCode = 1;
     });

@@ -308,8 +308,8 @@ pending	plugin/src/reconcile-upload.test.ts	tests	Not reviewed
 pending	plugin/src/reconcile-upload.ts	production	Not reviewed
 pending	plugin/src/resident-memory.test.ts	tests	Not reviewed
 pending	plugin/src/resident-memory.ts	production	Not reviewed
-pending	plugin/src/resource-budget.test.ts	tests	Not reviewed
-pending	plugin/src/resource-budget.ts	production	Not reviewed
+reviewed	plugin/src/resource-budget.test.ts	tests	Ran 91 assertions including mixed oversized and fitting waiters on resize, grant order, accounting, abort, closure and repeated release. Added unfinished-suite guard.
+reviewed	plugin/src/resource-budget.ts	production	Traced FIFO grants, shrink/release, abort listeners, queue bounds and live profile updates. Skip unchanged capacity and compact surviving waiters in one pass on shrink.
 pending	plugin/src/resource-governor.bench.ts	tooling	Not reviewed
 pending	plugin/src/resource-governor.test.ts	tests	Not reviewed
 pending	plugin/src/resource-governor.ts	production	Not reviewed

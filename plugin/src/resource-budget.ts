@@ -165,16 +165,20 @@ export class ResourceBudget {
     setCapacity(capacityBytes: number): void {
         positiveBytes(capacityBytes, "capacityBytes");
         if (this.closed) throw new ResourceBudgetClosedError();
+        const previous = this.capacityBytes;
+        if (capacityBytes === previous) return;
         this.capacityBytes = capacityBytes;
-        for (let index = 0; index < this.queue.length;) {
-            const waiter = this.queue[index];
-            if (waiter.bytes <= capacityBytes) {
-                index++;
-                continue;
+        if (capacityBytes < previous) {
+            let kept = 0;
+            for (const waiter of this.queue) {
+                if (waiter.bytes <= capacityBytes) {
+                    this.queue[kept++] = waiter;
+                } else {
+                    this.detach(waiter);
+                    waiter.reject(new ResourceBudgetOversizedError(waiter.bytes, capacityBytes));
+                }
             }
-            this.queue.splice(index, 1);
-            this.detach(waiter);
-            waiter.reject(new ResourceBudgetOversizedError(waiter.bytes, capacityBytes));
+            this.queue.length = kept;
         }
         this.drain();
     }
