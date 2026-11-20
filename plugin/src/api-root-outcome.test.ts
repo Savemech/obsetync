@@ -6,9 +6,6 @@ import { ROOT_CAPABILITY_MAX_BYTES, ROOT_RESPONSE_MAX_BYTES, rootCommitIntentEnc
     type RootCommitIntent } from "./root-outcome";
 import { ResourceBudget } from "./resource-budget";
 import { estimateRootOutcomeWorkset } from "./transient-memory";
-// Run alongside the pre-existing global fake: per-origin routing must remain
-// isolated even when both suites are imported concurrently by the aggregator.
-import "./api-memory.test";
 
 const bytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));
 const identity = { sequence: 1, mutation_id: "b".repeat(32),
@@ -371,6 +368,8 @@ async function treeRefreshOwnsItsChannelAndCache(): Promise<void> {
     }
 }
 
+const unfinished = () => { throw new Error("root outcome API tests stopped before completion"); };
+process.once("beforeExit", unfinished);
 void (async () => {
     await completeAdmissionPrecedesCommitTransportAndLivesThroughNativeCompletion();
     await queryAndCancelCaptureBeforeAdmissionAndRetainTheirLease();
@@ -383,4 +382,5 @@ void (async () => {
     await actualWireAndJSONBoundsPrecedeDecryptAndAcceptance();
     await treeRefreshOwnsItsChannelAndCache();
     console.log("api-root-outcome.test: admitted sealed HTTP/capability/retry regression scenarios passed");
-})().catch(error => { setTimeout(() => { throw error; }, 0); });
+})().catch(error => { console.error(error); process.exitCode = 1; })
+    .finally(() => process.off("beforeExit", unfinished));
