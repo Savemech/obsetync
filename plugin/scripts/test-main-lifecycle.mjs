@@ -39,7 +39,7 @@ const fixtures = new Map([
         "inspectLegacyDowngradeState",
         "resumeLegacyDowngrade",
     ]],
-    ["./settings", ["DEFAULT_SETTINGS", "ObsetyncSettingTab"]],
+    ["./settings", ["DEFAULT_SETTINGS", "MAX_SYNC_INTERVAL_MS", "ObsetyncSettingTab"]],
     ["./conflict-ui", ["ObsetyncConflictModal", "findConflicts"]],
     ["./debug-log", ["debugLog", "crashLog", "perfSpan"]],
     ["./operation-checkpoint", ["OperationCheckpoint"]],
@@ -495,7 +495,7 @@ function fixture({ workers = false, mobile = false, legacyState = "none", enroll
                     for (const key of Object.keys(captured)) assert.equal(current[key], captured[key]);
                 } };
         },
-        ObsetyncSyncEngine: Engine, DEFAULT_SETTINGS: settings, ObsetyncSettingTab: class {},
+        ObsetyncSyncEngine: Engine, DEFAULT_SETTINGS: settings, MAX_SYNC_INTERVAL_MS: 2147483647, ObsetyncSettingTab: class {},
         RootIntentStore: class {
             constructor() { record("legacy-root:new"); }
             async load() { await step("legacy-root:load"); }
@@ -615,6 +615,17 @@ function fixture({ workers = false, mobile = false, legacyState = "none", enroll
 
 const tests = [];
 function test(name, run) { tests.push({ name, run }); }
+
+test("stored poll delays stay inside the host timer range", async () => {
+    for (const value of [0, null, "5000", 4999, 5000, 2147483647, 2147483648]) {
+        const f = fixture({ storedSettings: { syncIntervalMs: value, serverUrlPolicy: 1 } });
+        const plugin = f.newPlugin();
+        await plugin.loadSettings();
+        const valid = value === 5000 || value === 2147483647;
+        equal(plugin.settings.syncIntervalMs, valid ? value : 30000, "Unsafe poll delay");
+        equal(plugin.settingsMigrationPending, !valid, "Poll delay migration flag");
+    }
+});
 
 test("URL upgrade preserves old enrolled dispatch and then honors explicit HTTPS", async () => {
     for (const enrolled of [false, true]) {

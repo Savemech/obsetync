@@ -158,6 +158,19 @@ test("upload priority reaches the running engine from the dropdown", async () =>
     assert.equal(f.effects.saves, 1);
 });
 
+test("poll interval rejects malformed and overflowing timer delays", async () => {
+    const f = fixture(true);
+    f.setBlocked(false);
+    for (const value of ["", "30abc", "5.5", "4", "2147484", "Infinity"]) {
+        await invoke("Sync Interval:text", value);
+    }
+    assert.equal(f.effects.saves, 0);
+    for (const value of ["5", "2147483"]) {
+        await invoke("Sync Interval:text", value);
+        assert.equal(f.plugin.settings.syncIntervalMs, Number(value) * 1000);
+    }
+});
+
 test("startup delay defaults to 30 seconds and accepts only bounded whole seconds", async () => {
     const f = fixture(true);
     f.setBlocked(false);

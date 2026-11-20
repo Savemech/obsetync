@@ -153,8 +153,8 @@ pending	plugin/scripts/native-root-qualification.test.mjs	tests	Not reviewed
 reviewed	plugin/scripts/run-resource-governor-bench.mjs	tooling	Traced worker bundling, child exit, result recording and cleanup; live x86 record run passes and leaves historical reports intact
 read	plugin/scripts/run-tests.mjs	tooling	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
 read	plugin/scripts/run-tests.test.mjs	tests	Updated build/installer contracts and verified 26 targeted cases; full runner fixture semantics still under review
-reviewed	plugin/scripts/settings-fence.test.mjs	tests	Read bundled settings controls and fixture; five cases pass, including all 13 settings mutation controls and recovery UI after a failed credential save
-read	plugin/scripts/test-main-lifecycle.mjs	tooling	Read bundle fixture/owner/IO ports and enrollment regressions; actual main has 38 passing scenarios / 395 assertions; entire runner and all scenario bodies still require review
+reviewed	plugin/scripts/settings-fence.test.mjs	tests	Read bundled settings controls and fixture; seven cases pass, including all 13 settings mutation controls and recovery UI after a failed credential save
+read	plugin/scripts/test-main-lifecycle.mjs	tooling	Read bundle fixture/owner/IO ports and enrollment regressions; actual main has 40 passing scenarios / 411 assertions; entire runner and all scenario bodies still require review
 read	plugin/scripts/test-native-root-crash-recovery.mjs	tooling	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
 pending	plugin/scripts/test-native-root-mutation-complexity.mjs	tooling	Not reviewed
 pending	plugin/scripts/test-native-root-server.mjs	tooling	Not reviewed

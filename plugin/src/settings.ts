@@ -4,6 +4,9 @@ import { ObsetyncDebugModal } from "./debug-modal";
 import { DEFAULT_IGNORE_PATTERNS } from "./ignore";
 import type { ResourceRecoveryHint } from "./resource-governor";
 
+// Browser interval delays are signed 32-bit milliseconds.
+export const MAX_SYNC_INTERVAL_MS = 2_147_483_647;
+
 export type SyncPriority =
     | "sequential"   // as found (default)
     | "oldest"       // mtime ascending
@@ -260,13 +263,13 @@ export class ObsetyncSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName("Sync Interval")
-            .setDesc("How often to check for remote changes (seconds).")
+            .setDesc("How often to check for remote changes (whole seconds, minimum 5). Takes effect after reloading the plugin.")
             .addText((text) =>
                 text
                     .setValue(String(this.plugin.settings.syncIntervalMs / 1000))
                     .onChange(async (value) => {
-                        const secs = parseInt(value);
-                        if (!isNaN(secs) && secs >= 5) {
+                        const secs = Number(value);
+                        if (Number.isInteger(secs) && secs >= 5 && secs * 1000 <= MAX_SYNC_INTERVAL_MS) {
                             this.plugin.authorizeSettingsMutation();
                             this.plugin.settings.syncIntervalMs = secs * 1000;
                             await this.plugin.saveSettings();

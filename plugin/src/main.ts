@@ -36,7 +36,7 @@ import {
 import { activatePreparedSync, publishStartupResult } from "./startup-activation";
 import { awaitRuntimeRetirement, registerRuntimeRetirement, settleRuntimeOwners, startRuntimeOwner } from "./runtime-retirement";
 import { SerialSettingsWriter } from "./settings-persistence";
-import { SyncSettings, DEFAULT_SETTINGS, ObsetyncSettingTab } from "./settings";
+import { SyncSettings, DEFAULT_SETTINGS, MAX_SYNC_INTERVAL_MS, ObsetyncSettingTab } from "./settings";
 import { ObsetyncConflictModal, findConflicts } from "./conflict-ui";
 import { debugLog, crashLog, perfSpan } from "./debug-log";
 import { OperationCheckpoint } from "./operation-checkpoint";
@@ -1498,6 +1498,11 @@ export default class ObsetyncPlugin extends Plugin {
         );
         this.lastSavedSettings = cloneSyncSettings(this.settings);
         let settingsChanged = false;
+        if (!Number.isInteger(this.settings.syncIntervalMs) ||
+            this.settings.syncIntervalMs < 5000 || this.settings.syncIntervalMs > MAX_SYNC_INTERVAL_MS) {
+            this.settings.syncIntervalMs = DEFAULT_SETTINGS.syncIntervalMs;
+            settingsChanged = true;
+        }
         if (!Number.isInteger(this.settings.startupDelayMs) ||
             this.settings.startupDelayMs < 0 || this.settings.startupDelayMs > 300_000) {
             this.settings.startupDelayMs = DEFAULT_SETTINGS.startupDelayMs;
