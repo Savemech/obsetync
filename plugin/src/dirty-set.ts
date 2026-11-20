@@ -110,10 +110,6 @@ export class DirtyPathSet {
             ownJournalId: durableId(journalId) ? journalId : undefined });
     }
 
-    addMany(changes: FileChange[]): void {
-        for (const change of changes) this.add(change);
-    }
-
     has(path: string): boolean {
         return this.changes.get(path) !== undefined;
     }
@@ -302,16 +298,20 @@ export class DirtyPathSet {
      * external hints. Live callbacks/scans use add/ordinary restore instead.
      * Existing newer hints retain their state and provenance, including none. */
     restoreJournal(snapshot: readonly DirtyFileChange[]): void {
-        if (!Array.isArray(snapshot) || snapshot.length > DIRTY_RETIREMENT_LIMIT) {
+        const length = Array.isArray(snapshot) ? snapshot.length : -1;
+        if (!Number.isSafeInteger(length) || length < 0 || length > DIRTY_RETIREMENT_LIMIT) {
             throw new RangeError("journal hint restore exceeds its bounded replay batch");
         }
         // Validate/detach the entire bounded batch before changing the map.
-        const entries = snapshot.map(raw => {
-            if (!isSafeVaultPath(raw?.path) || !durableId(raw?.journalId)) {
+        const entries: DirtyEntry[] = [];
+        for (let index = 0; index < length; index++) {
+            const raw = snapshot[index];
+            const change = raw && compact(raw, raw.journalId);
+            if (!change || !isSafeVaultPath(change.path) || !durableId(change.journalId)) {
                 throw new RangeError("journal hint restore requires a safe path and durable generation");
             }
-            return { change: compact(raw, raw.journalId), ownJournalId: raw.journalId };
-        });
+            entries.push({ change, ownJournalId: change.journalId });
+        }
         for (const entry of entries) this.restoreEntry(entry);
     }
 
@@ -321,12 +321,14 @@ export class DirtyPathSet {
      * One outstanding token retains at most 256 selected entries, not the
      * complete dirty backlog. A new capture invalidates the previous token. */
     captureRetirement(cuts: readonly DirtyJournalCut[]): DirtyRetirementToken {
-        if (!Array.isArray(cuts) || cuts.length > DIRTY_RETIREMENT_LIMIT) {
+        const length = Array.isArray(cuts) ? cuts.length : -1;
+        if (!Number.isSafeInteger(length) || length < 0 || length > DIRTY_RETIREMENT_LIMIT) {
             throw new RangeError("dirty retirement exceeds its bounded journal cut");
         }
         const entries: Array<{ path: string; entry: DirtyEntry }> = [];
         let previous: string | undefined;
-        for (const cut of cuts) {
+        for (let index = 0; index < length; index++) {
+            const cut = cuts[index];
             const path = cut?.path, throughId = cut?.throughId;
             if (!isSafeVaultPath(path) || !durableId(throughId) ||
                 (previous !== undefined && path <= previous)) {

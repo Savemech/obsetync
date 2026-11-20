@@ -54,7 +54,7 @@ import { sortByPriority, sortByPriorityCooperatively, type PrioritySortOptions }
 import { compileIgnore, type CompiledIgnore } from "./ignore";
 import { PullEchoTracker } from "./pull-echo";
 import { EditorPullGuard } from "./editor-pull-guard";
-import { DIRTY_CLAIM_LIMIT, DirtyPathSet, type DirtyFileChange, type DirtyPathCapture } from "./dirty-set";
+import { DIRTY_CLAIM_LIMIT, DIRTY_RETIREMENT_LIMIT, DirtyPathSet, type DirtyFileChange, type DirtyPathCapture } from "./dirty-set";
 import { LocalEventGuards } from "./local-event-guards";
 import { DeferredChangeTracker, type DeferredChangeSummary } from "./deferred-changes";
 import { type RootLocalOmission, materializeFileChanges } from "./file-safety";
@@ -3982,9 +3982,9 @@ export class ObsetyncSyncEngine {
         // during the yields; preserve those newer hints and carry only the
         // older WAL watermark into their eventual successful publication.
         const hints = recovered.take();
-        for (let offset = 0; offset < hints.length; offset += 256) {
+        for (let offset = 0; offset < hints.length; offset += DIRTY_RETIREMENT_LIMIT) {
             throwIfWorkAborted(this.hashWorkerAbort.signal);
-            this.pendingChanges.restoreJournal(hints.slice(offset, offset + 256));
+            this.pendingChanges.restoreJournal(hints.slice(offset, offset + DIRTY_RETIREMENT_LIMIT));
             await yieldToUI({ signal: this.hashWorkerAbort.signal, lane: "maintenance" });
         }
     }

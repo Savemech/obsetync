@@ -170,6 +170,14 @@ function boundsAndAtomicValidation() {
     rejects(() => set.restoreJournal([{ ...hint("first.md"), journalId: 8 }, { ...hint("bad.md") }]), "unproven replay hint was admitted");
     check(!set.has("first.md") && set.size === 1, "invalid replay partially mutated the dirty map");
     rejects(() => set.restoreJournal(Array.from({ length: 257 }, () => ({ ...hint(), journalId: 7 }))), "replay batch exceeded bounded admission");
+    const sparse = [{ ...hint("first.md"), journalId: 8 }];
+    sparse.length = 2;
+    rejects(() => set.restoreJournal(sparse), "sparse journal batch was accepted");
+    check(!set.has("first.md"), "sparse journal batch installed its valid prefix");
+    const indexedCuts = [cut()];
+    indexedCuts[Symbol.iterator] = () => [cut("unselected.md")].values();
+    check(set.commitRetirement(set.captureRetirement(indexedCuts)) === 1 && !set.has("note.md"),
+        "caller iterator replaced the selected retirement paths");
     const full = new DirtyPathSet(), cuts = Array.from({ length: 256 }, (_, index) => cut(`n${index.toString().padStart(3, "0")}`));
     full.restoreJournal(cuts.map(({ path, throughId }) => ({ ...hint(path), journalId: throughId })));
     check(full.commitRetirement(full.captureRetirement(cuts)) === 256 && full.size === 0, "maximum bounded retirement failed");
