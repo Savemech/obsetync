@@ -100,6 +100,21 @@ async function nonCanonicalAndSelfEntriesAreRejected() {
     } finally { await rm(directory, { recursive: true, force: true }); }
 }
 
+async function concurrentGeneratorsPreserveWinningManifest() {
+    const directory = await fixture();
+    try {
+        const attempts = await Promise.allSettled([
+            generateReleaseArtifactManifest(directory, ZIP),
+            generateReleaseArtifactManifest(directory, ZIP),
+        ]);
+        assert.ok(attempts.some(attempt => attempt.status === "fulfilled"));
+        await verifyReleaseArtifactManifest(directory, ZIP);
+    } finally {
+        await rm(directory, { recursive: true, force: true });
+    }
+}
+
+await concurrentGeneratorsPreserveWinningManifest();
 await deterministicAndSelfExcluding();
 await exactFlatSetIsRequired();
 await tamperAndWrongZipFailClosed();

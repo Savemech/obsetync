@@ -2,7 +2,7 @@
 
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { open, readdir, readFile, rename, rm } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { isCliEntry } from "./is-cli-entry.mjs";
 
@@ -150,11 +150,17 @@ export async function generateReleaseArtifactManifest(directory, zipName) {
     const output = canonicalManifest(artifacts);
     const manifestPath = join(releaseDirectory, RELEASE_ARTIFACT_MANIFEST);
     const temporaryPath = join(releaseDirectory, `.${RELEASE_ARTIFACT_MANIFEST}.${process.pid}.tmp`);
+    const temporary = await open(temporaryPath, "wx", 0o644);
     try {
-        await writeFile(temporaryPath, output, { encoding: "utf8", flag: "wx", mode: 0o644 });
+        try {
+            await temporary.writeFile(output, "utf8");
+        } finally {
+            await temporary.close();
+        }
         await rename(temporaryPath, manifestPath);
-    } finally {
+    } catch (error) {
         await rm(temporaryPath, { force: true });
+        throw error;
     }
     await verifyReleaseArtifactManifest(releaseDirectory, zipName);
     return output;
