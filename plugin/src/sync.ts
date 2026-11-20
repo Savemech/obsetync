@@ -427,6 +427,7 @@ export class ObsetyncSyncEngine {
      * choosing its bootstrap version. Cache only unchanged push admission. */
     private pushBootstrapAdmissionRefusal: RootTreeAdmissionRefusal | null = null;
     private pushBootstrapReportedRefusal: RootTreeOutputAdmissionDeniedError | null = null;
+    private eventPushBackoffUntil = 0;
     private candidateMutationAdmissionRefusal: CandidateMutationAdmissionRefusal | null = null;
     /** Manual recovery requests invalidate even a marker installed by an
      * older attempt whose catch runs after the click. */
@@ -2632,6 +2633,9 @@ export class ObsetyncSyncEngine {
     private recordSyncFailure(origin: string, error: unknown): void {
         const message = error instanceof Error ? error.message : String(error);
         this.lastError = { ts: Date.now(), origin, message };
+        if (origin === "push" && error instanceof CandidateMutationOutputAdmissionDeniedError) {
+            this.eventPushBackoffUntil = performance.now() + Math.min(this.syncInterval, 30_000);
+        }
         this.state = "error";
 
         if (isReenrollmentRequiredError(error)) {
@@ -3842,6 +3846,7 @@ export class ObsetyncSyncEngine {
                 if (lifecycleQuiesced && !this.stopped) this.state = "idle";
             }
             if (!pushFailed && !this.stopped) {
+                this.eventPushBackoffUntil = 0;
                 this.state = "idle";
                 this.onStatusUpdate(
                     this.pendingIdleStatus(),
@@ -4463,6 +4468,8 @@ export class ObsetyncSyncEngine {
 
     private attachVaultListeners(): void {
         const runAutomaticPush = async () => {
+            // Vault events keep journaling during pressure. Polls and manual sync can still retry.
+            if (performance.now() < this.eventPushBackoffUntil) return;
             if (this.autoSync) {
                 try { await this.pushPending(); }
                 catch (error) {

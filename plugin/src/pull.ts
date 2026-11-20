@@ -1514,6 +1514,7 @@ async function applyDeltas(
                     await checkpointAndReport(batch.length);
                     return;
                 }
+                const afterEchoes: Array<{ delta: FileDelta; publish: () => boolean }> = [];
                 const countedHashes = new Set<string>();
                 for (let offset = 0; offset < pending.length;) {
                     // Re-read between windows so lag reductions and healthy
@@ -1545,6 +1546,7 @@ async function applyDeltas(
                                 downloaded,
                                 largeTransferScope,
                                 () => registerUpsert(delta),
+                                publish => afterEchoes.push({ delta, publish }),
                             );
                         },
                     );
@@ -1560,6 +1562,10 @@ async function applyDeltas(
                 // journal append + ACK and prevented their existing batching.
                 perf?.setDemand({ apply: 0 });
                 if (afterApplyWindow) await beforeHeavyBatch?.();
+                for (const { delta, publish } of afterEchoes) {
+                    try { if (!publish()) deferLocal(delta); }
+                    catch { failed.push(delta); }
+                }
             }
             await checkpointAndReport(batch.length);
         } finally {
@@ -1852,6 +1858,7 @@ async function finishContentDownload(
     prefetchedObjects?: PullObjects,
     largeTransferScope?: PullLargeTransferScope,
     beforeWrite?: () => void,
+    publishAfterEchoes?: (publish: () => boolean) => void,
 ): Promise<boolean> {
     if (!delta.hash) return true;
     const { size, preserveExisting } = preparation;
@@ -1929,19 +1936,33 @@ async function finishContentDownload(
         if (!applied) return false;
     }
     const postStat = await io.stat(delta.path);
-    if (!postStat || shouldDefer?.() || (delta.size != null && postStat.size !== delta.size)) return false;
-    syncBase.setEntry(
-        delta.path,
-        delta.hash,
-        postStat.mtime,
-        postStat.size,
-        delta.mtime_ms,
-    );
-    stats.downloaded++;
-    if (countTransferredBytes) stats.bytesDownloaded += size;
-    perf?.increment({ filesCompleted: 1,
-        bytesTransferred: size < CHUNK_THRESHOLD && countTransferredBytes ? size : 0 });
-    return true;
+    if (!postStat || (delta.size != null && postStat.size !== delta.size)) return false;
+    const hash = delta.hash;
+    const publish = (): boolean => {
+        if (shouldDefer?.()) return false;
+        syncBase.setEntry(
+            delta.path,
+            hash,
+            postStat.mtime,
+            postStat.size,
+            delta.mtime_ms,
+        );
+        stats.downloaded++;
+        if (countTransferredBytes) stats.bytesDownloaded += size;
+        perf?.increment({ filesCompleted: 1,
+            bytesTransferred: size < CHUNK_THRESHOLD && countTransferredBytes ? size : 0 });
+        return true;
+    };
+    // A create/modify callback can still be authenticating our own write.
+    // Keep the metadata pending until the batch's echo fence classifies it.
+    if (shouldDefer?.() && beforeHeavyBatch) {
+        if (publishAfterEchoes) {
+            publishAfterEchoes(publish);
+            return true;
+        }
+        await beforeHeavyBatch();
+    }
+    return publish();
 }
 
 async function applyContentDelta(

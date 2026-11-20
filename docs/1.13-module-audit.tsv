@@ -263,7 +263,7 @@ reviewed	plugin/src/legacy-downgrade.ts	production	Traced projection, archive an
 reviewed	plugin/src/legacy-source.test.ts	tests	Compared digests to independent Node crypto implementation across Unicode boundaries; exercised absent roles, host yields and rename ACK parsing.
 reviewed	plugin/src/legacy-source.ts	production	Traced bounded SHA-256 fingerprinting from journal, sync base and transfer scope; captures immutable role/value pairs before yielding.
 reviewed	plugin/src/local-event-guards.ts	production	Traced reference counts, generation ordering, idempotent release and bounded overflow through create/modify/delete/rename listeners and pull protection
-reviewed	plugin/src/local-events.test.ts	tests	Reviewed callback and mobile journal fixtures; exercise newer-first release and let the watchdog run during echo classification waits
+reviewed	plugin/src/local-events.test.ts	tests	Reviewed callback and mobile journal fixtures; exercise newer-first release and let the watchdog run during echo classification waits; event retry backoff and 63 accepted writes plus one local edit verified with 9008 pending
 read	plugin/src/main.ts	production	Legacy endpoint migration and enrollment owner traced; duplicate requests rejected before dispatch; credential/address changes fence response and saved continuation; 38 bundled-main scenarios pass, including two failed credential writes followed by successful retry without a second claim; full host audit remains
 reviewed	plugin/src/max-latency-coalescer.test.ts	tests	Read quiet/max-latency, failure and closure coverage; npm test passes
 reviewed	plugin/src/max-latency-coalescer.ts	production	Read timer, rerun, flush and close paths with production sync.ts callers and dedicated tests; npm test passes
@@ -300,7 +300,7 @@ reviewed	plugin/src/push-memory.ts	production	Traced grouping, normal and ranged
 pending	plugin/src/push-prepared.test.ts	tests	Not reviewed
 pending	plugin/src/push-root-transaction.test.ts	tests	Not reviewed
 pending	plugin/src/push-transaction.test.ts	tests	Not reviewed
-pending	plugin/src/push.ts	production	Not reviewed
+read	plugin/src/push.ts	production	Traced candidate mutation refusal provenance and abort through engine restore and event retry; remaining push stages pending
 reviewed	plugin/src/reconcile-content.test.ts	tests	Single-pass iterator covers ignored first copy, mixed-case hashes, physical totals, threshold and duplicate missing ranges
 reviewed	plugin/src/reconcile-content.ts	production	Read index, byte totals and range selection; traced sync and both upload paths; one-pass snapshot input and ordered unique ranges
 reviewed	plugin/src/reconcile-status.test.ts	tests	Traced force sync, reconcile summary, pending status, cancellation and recovery; reproduced returned-result alias changing idle warning; 27 status assertions and engine/root plus startup replay suites passed

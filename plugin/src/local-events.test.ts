@@ -1,4 +1,5 @@
 import { TFile, TAbstractFile } from "obsidian";
+import { CandidateMutationOutputAdmissionDeniedError } from "./candidate-mutation-output-admission";
 import { ObsetyncSyncEngine } from "./sync";
 import { DirtyPathSet } from "./dirty-set";
 import { DeferredChangeTracker } from "./deferred-changes";
@@ -105,6 +106,17 @@ async function toggleControlsAlreadyQueuedLocalEvents(): Promise<void> {
     f.engine.setAutoSync(true);
     await drain();
     check(pushes === 1, "enabling auto-sync left an existing edit waiting for another event");
+    f.engine.syncInterval = 30_000;
+    f.engine.onStatusUpdate = () => {};
+    f.engine.recordSyncFailure("push", new CandidateMutationOutputAdmissionDeniedError(13_333_405, 11_463_466, 0));
+    await f.callbacks.get("create")!(fileAt("during-pressure.md"));
+    await drain();
+    check(pushes === 1 && f.engine.pendingChanges.has("during-pressure.md"),
+        "vault event retried a memory refusal immediately or lost the edit");
+    f.engine.eventPushBackoffUntil = performance.now() - 1;
+    await f.callbacks.get("create")!(fileAt("after-pressure.md"));
+    await drain();
+    check(pushes === 2, "vault event could not retry after admission backoff expired");
     f.engine.autoPushCoalescer.close();
 }
 
@@ -384,7 +396,7 @@ async function pullBatchesDurableEchoesWithoutLosingEdits(): Promise<void> {
             const elapsed = performance.now() - began;
             const heads = storage.events.slice(start).filter(event => event.method === "write" &&
                 event.phase === "after" && event.path === `${JOURNAL_STORE_PATH}/head.json.next`).length;
-            check(result.downloaded === 64 && peakWrites === 1, "echo batching changed serial apply or lost files");
+            check(result.downloaded === 63 && result.localDeferredCount === 1 && peakWrites === 1, "echo batching changed serial apply or lost files");
             check(peakEchoes <= 33 && peakBytes <= tuning.transientBudgetBytes,
                 "echo batching exceeded the 32-file batch (plus one local edit) or admitted memory cap");
             check(peakBytes <= 5 * 1024 * 1024 + estimateHashSourceWorkset(32 * 1024, tuning.maxFeedBytes),
