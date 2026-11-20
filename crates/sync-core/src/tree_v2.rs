@@ -409,7 +409,7 @@ pub async fn build_tree<S: ChunkStore>(
     store: &S,
     mut entries: Vec<FileEntry>,
 ) -> Result<TreeV2Root, ChunkError> {
-    entries.sort();
+    entries.sort_by(FileEntry::cmp_path);
     validate_entries(&entries)?;
     if entries.is_empty() {
         return Ok(empty_root());

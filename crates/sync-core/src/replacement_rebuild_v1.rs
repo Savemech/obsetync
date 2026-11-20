@@ -525,7 +525,7 @@ impl ReplacementRebuildV1 {
                 }
             }
             Phase::SortRows => {
-                if !self.row_sort.as_mut().unwrap().tick() {
+                if !self.row_sort.as_mut().unwrap().tick_by(FileEntry::cmp_path) {
                     let rows = self.row_sort.take().unwrap().finish();
                     self.entry_memory.sort_to_rows(&rows);
                     self.rows = Some(rows.into_iter());

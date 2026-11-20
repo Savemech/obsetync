@@ -207,7 +207,7 @@ pub async fn load_all_entries<S: ChunkStore>(
                 }
                 entries.extend(child);
             }
-            entries.sort();
+            entries.sort_by(FileEntry::cmp_path);
             entries
         }
         VersionedRoot::V2(root) => crate::tree_v2::load_all_entries(store, &root.tree).await?,

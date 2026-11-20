@@ -978,7 +978,7 @@ impl ReplacementRebuildV2 {
                     .sorter
                     .as_mut()
                     .expect("sort phase must own its stable sorter");
-                if sorter.tick() {
+                if sorter.tick_by(FileEntry::cmp_path) {
                     return Ok(true);
                 }
                 self.entries = self.sorter.take().unwrap().finish();

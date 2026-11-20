@@ -57,7 +57,7 @@ pub async fn build_tree<S: ChunkStore>(
 
     // 2. For each directory group: build leaf chunks and internal node.
     for (prefix, mut group_entries) in groups {
-        group_entries.sort();
+        group_entries.sort_by(FileEntry::cmp_path);
         total_files += group_entries.len() as u64;
 
         // Split into leaf chunks of TARGET_CHUNK_ENTRIES.
@@ -365,7 +365,7 @@ pub async fn load_all_entries<S: ChunkStore>(
     // lexical order is `0, 1, 10, 11, 2, ...`, which is not necessarily
     // FileEntry path order once a directory spans more than ten leaves.
     // diff/merge both use a two-pointer walk and require this invariant.
-    all_entries.sort();
+    all_entries.sort_by(FileEntry::cmp_path);
     Ok(all_entries)
 }
 

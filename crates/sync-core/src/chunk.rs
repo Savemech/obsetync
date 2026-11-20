@@ -9,7 +9,7 @@ fn decode_hash(bytes: &[u8], field: &str) -> Result<FileHash, ChunkError> {
 }
 
 /// A single file entry inside a leaf chunk.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FileEntry {
     /// Vault-relative path, e.g. "notes/2024/jan.md"
     pub path: String,
@@ -22,6 +22,10 @@ pub struct FileEntry {
 }
 
 impl FileEntry {
+    pub(crate) fn cmp_path(&self, other: &Self) -> std::cmp::Ordering {
+        self.path.cmp(&other.path)
+    }
+
     pub fn new(path: String, hash: FileHash, mtime_ms: u64, size_bytes: u64) -> Self {
         Self {
             path,
@@ -29,18 +33,6 @@ impl FileEntry {
             mtime_ms,
             size_bytes,
         }
-    }
-}
-
-impl PartialOrd for FileEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for FileEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.path.cmp(&other.path)
     }
 }
 
@@ -53,7 +45,7 @@ pub struct LeafChunk {
 
 impl LeafChunk {
     pub fn new(mut entries: Vec<FileEntry>) -> Self {
-        entries.sort();
+        entries.sort_by(FileEntry::cmp_path);
         Self { entries }
     }
 
@@ -555,6 +547,29 @@ mod tests {
         assert_eq!(v[1].path, "b.md");
         assert!(a < b);
         assert_eq!(a.partial_cmp(&b), Some(std::cmp::Ordering::Less));
+    }
+
+    #[test]
+    fn same_path_revisions_are_distinct_but_keep_leaf_order() {
+        let original = FileEntry::new("note.md".into(), [0; 32], 1, 1);
+        for revised in [
+            FileEntry {
+                hash: [1; 32],
+                ..original.clone()
+            },
+            FileEntry {
+                mtime_ms: 2,
+                ..original.clone()
+            },
+            FileEntry {
+                size_bytes: 2,
+                ..original.clone()
+            },
+        ] {
+            assert_ne!(original.cmp(&revised), std::cmp::Ordering::Equal);
+            let rows = vec![revised, original.clone()];
+            assert_eq!(LeafChunk::new(rows.clone()).entries, rows);
+        }
     }
 
     #[test]

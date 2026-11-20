@@ -133,6 +133,10 @@ impl<T: Ord> Sort<T> {
     /// one T comparison or one T swap occurs in a unit. Equal keys retain their
     /// original input order. No T is cloned, dropped, or reallocated by sorting.
     pub(crate) fn tick(&mut self) -> bool {
+        self.tick_by(Ord::cmp)
+    }
+
+    pub(crate) fn tick_by(&mut self, cmp: impl Fn(&T, &T) -> std::cmp::Ordering) -> bool {
         assert!(
             self.phase != SortPhase::Retiring,
             "retiring stable sort cannot resume"
@@ -143,7 +147,7 @@ impl<T: Ord> Sort<T> {
                 SortPhase::Indexing => {
                     if self.source.len() < len {
                         let index = self.source.len();
-                        if index > 0 && self.values[index - 1] > self.values[index] {
+                        if index > 0 && cmp(&self.values[index - 1], &self.values[index]).is_gt() {
                             self.input_sorted = false;
                         }
                         self.source.push(index);
@@ -186,8 +190,11 @@ impl<T: Ord> Sort<T> {
                     }
                     let from = if self.right == self.end
                         || (self.left < self.middle
-                            && self.values[self.source[self.left]]
-                                <= self.values[self.source[self.right]])
+                            && cmp(
+                                &self.values[self.source[self.left]],
+                                &self.values[self.source[self.right]],
+                            )
+                            .is_le())
                     {
                         let value = self.left;
                         self.left += 1;
@@ -1741,7 +1748,7 @@ impl PrefixMutation {
                     self.phase = PrefixPhase::SortExisting(Sort::new(load.entries));
                 }
                 PrefixPhase::SortExisting(mut sort) => {
-                    if sort.tick() {
+                    if sort.tick_by(FileEntry::cmp_path) {
                         self.phase = PrefixPhase::SortExisting(sort);
                         return Ok(true);
                     }
@@ -1749,7 +1756,7 @@ impl PrefixMutation {
                     self.phase = PrefixPhase::SortAdds(Sort::new(std::mem::take(&mut self.adds)));
                 }
                 PrefixPhase::SortAdds(mut sort) => {
-                    if sort.tick() {
+                    if sort.tick_by(FileEntry::cmp_path) {
                         self.phase = PrefixPhase::SortAdds(sort);
                         return Ok(true);
                     }

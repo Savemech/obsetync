@@ -235,7 +235,7 @@ pub(crate) fn diff_entries(
     to: &[crate::chunk::FileEntry],
     deltas: &mut Vec<FileDelta>,
 ) {
-    // Both slices are sorted by path (guaranteed by LeafChunk::new → entries.sort()).
+    // Both slices are sorted by path (guaranteed by LeafChunk::new).
     // Two-pointer merge: O(n+m), zero allocations.
     let mut i = 0;
     let mut j = 0;

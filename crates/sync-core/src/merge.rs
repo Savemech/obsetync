@@ -127,7 +127,7 @@ pub async fn merge_trees<S: ChunkStore, C: ContentStore>(
 
     // Build a new tree from merged entries.
     let mut all_entries = merged_entries;
-    all_entries.sort(); // FileEntry implements Ord by path
+    all_entries.sort_by(FileEntry::cmp_path);
     all_entries.dedup_by(|a, b| a.path == b.path); // remove any duplicates from same prefix appearing twice
     let new_root = crate::tree::build_tree(store, all_entries, &side_a.vault_id, "server").await?;
 
@@ -200,7 +200,7 @@ pub async fn merge_versioned_trees<S: ChunkStore, C: ContentStore>(
     let text_merged =
         resolve_text_merges(content, text_todo, &mut merged_entries, &mut file_conflicts).await?;
 
-    merged_entries.sort();
+    merged_entries.sort_by(FileEntry::cmp_path);
     merged_entries.dedup_by(|left, right| left.path == right.path);
     let mut new_root = crate::versioned_root::build_root(
         store,
