@@ -23,8 +23,10 @@ function positiveSafeInteger(value: number, name: string): number {
 export function estimateRootIntentPreparationWorkset(rootBytes: number): RootIntentPreparationWorkset {
     positiveSafeInteger(rootBytes, "rootBytes");
     const base64Chars = 4 * Math.ceil(rootBytes / 3);
+    // Budget two UTF-16 binary strings (btoa input and atob output) and one
+    // canonical hash buffer. The export owner separately holds the raw root.
     const ownerBytes = positiveSafeInteger(
-        6 * rootBytes + 2 * base64Chars + ROOT_INTENT_FIXED_PREPARATION_BYTES,
+        5 * rootBytes + 2 * base64Chars + ROOT_INTENT_FIXED_PREPARATION_BYTES,
         "root intent preparation ownerBytes",
     );
     const workBytes = estimateStreamingHashWorkset(ROOT_INTENT_HASH_FEED_BYTES);

@@ -18,7 +18,7 @@ const MAX_ARENA = 0xffff_ffff;
 
 function exactPreparation(rootBytes: number) {
     const root = BigInt(rootBytes), base64Chars = 4n * ((root + 2n) / 3n);
-    const ownerBytes = 6n * root + 2n * base64Chars + FIXED_BYTES;
+    const ownerBytes = 5n * root + 2n * base64Chars + FIXED_BYTES;
     return { ownerBytes, workBytes: HASH_WORK_BYTES, totalBytes: ownerBytes + HASH_WORK_BYTES };
 }
 
@@ -33,7 +33,7 @@ function preparationFormulaAndOverflow(): void {
         }, `preparation copy allowance differs for ${root} bytes`);
     }
     assert.deepEqual(estimateRootIntentPreparationWorkset(ROOT_MAX_BYTES), {
-        ownerBytes: 4_806_488, workBytes: 458_752, totalBytes: 5_265_240,
+        ownerBytes: 4_282_200, workBytes: 458_752, totalBytes: 4_740_952,
     });
     // The estimator is arithmetic, not permission to bypass the codec's root
     // cap. Its upper numeric boundary must reject total overflow too, even
@@ -117,8 +117,8 @@ function makeRequest(root: Uint8Array): RootCommitRequest {
         parent_root: "c".repeat(64), root: Buffer.from(root).toString("base64") };
 }
 
-/** Independent Node framing oracle: production uses DataView plus decoded
- * root buffers. No production framing helper constructs this expected input. */
+/** Independent Node framing oracle: production writes the decoded
+ * root directly into the DataView-framed hash input. No production framing helper constructs this expected input. */
 function expectedPreimage(vault: string, device: string, request: RootCommitRequest, root: Uint8Array): Buffer {
     const u64 = (value: number) => {
         const result = Buffer.alloc(8); result.writeBigUInt64LE(BigInt(value)); return result;

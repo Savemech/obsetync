@@ -327,7 +327,7 @@ removed	plugin/src/root-local-omissions.test.ts	tests	Tests of retired selector;
 removed	plugin/src/root-local-omissions.ts	production	Selector was called only by its own tests; live local omission selection is RootReviewedQueue.takeLocal; carried the shared type to file-safety
 reviewed	plugin/src/root-outcome.test.ts	tests	Checked Rust digest vectors, post-capture mutation, encoding boundaries, receipt identity, conflict paths, JSON decoding, capabilities and cancellation
 reviewed	plugin/src/root-outcome.ts	production	Reviewed canonical request capture/digest, strict receipt identity, status, capability and wire limits; decoded root directly into its final hash input
-pending	plugin/src/root-publication-memory.test.ts	tests	Not reviewed
+reviewed	plugin/src/root-publication-memory.test.ts	tests	Reviewed independent BigInt quota and arena bounds, exact maximum-root BLAKE3 framing, async source ownership, padding and refusal cases; aligned owner charge with direct decoding
 reviewed	plugin/src/root-publication-memory.ts	production	Traced owner and hash preparation estimates and arena bounds to push and root runtime. Four publication memory suites pass including maximum root and rejected admission.
 pending	plugin/src/root-recovery.test.ts	tests	Not reviewed
 pending	plugin/src/root-recovery.ts	production	Not reviewed
