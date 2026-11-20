@@ -328,11 +328,7 @@ impl RootBuildRetirement {
 
     fn clear_if_empty(&mut self) {
         if self.child.is_none() && self.vault_id.is_none() && self.device_id.is_none() {
-            let counters_valid = self.metadata.counters_valid;
-            let strings_valid = self.metadata.strings.counters_valid;
-            self.metadata = RootMetadataMemory::default();
-            self.metadata.counters_valid = counters_valid;
-            self.metadata.strings.counters_valid = strings_valid;
+            self.metadata.clear_retired();
         }
     }
 }

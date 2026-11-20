@@ -171,6 +171,14 @@ impl Default for RootMetadataMemory {
 }
 
 impl RootMetadataMemory {
+    pub(crate) fn clear_retired(&mut self) {
+        let valid = self.counters_valid;
+        let strings_valid = self.strings.counters_valid;
+        *self = Self::default();
+        self.counters_valid = valid;
+        self.strings.counters_valid = strings_valid;
+    }
+
     /// One root-metadata pass, not a graph traversal. Do not call this from an
     /// O(1) snapshot or a ready-only native finish.
     pub(crate) fn from_v1(root: &RootNode) -> Self {

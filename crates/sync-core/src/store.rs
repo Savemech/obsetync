@@ -408,6 +408,22 @@ impl MemoryChunkStore {
         Ok(())
     }
 
+    pub(crate) fn fresh_hashes<'a>(
+        &self,
+        hashes: impl Iterator<Item = &'a FileHash>,
+        baseline: Option<u64>,
+    ) -> Result<Vec<FileHash>, ChunkError> {
+        let baseline = baseline
+            .ok_or_else(|| ChunkError::Deserialize("candidate chunk baseline is missing".into()))?;
+        let mut fresh = Vec::new();
+        for hash in hashes {
+            if self.is_fresh_since(hash, baseline)? {
+                fresh.push(*hash);
+            }
+        }
+        Ok(fresh)
+    }
+
     pub(crate) fn is_fresh_since(
         &self,
         hash: &FileHash,

@@ -1121,7 +1121,10 @@ impl TransactionalTree {
             .committed_root
             .as_ref()
             .ok_or_else(|| state_error("no committed root"))?;
-        sorted_hashes(mark_reachable_chunks(&self.store, [root.value()])?)
+        Ok(sorted_hashes(mark_reachable_chunks(
+            &self.store,
+            [root.value()],
+        )?))
     }
 
     pub fn candidate_chunk_hashes(&self) -> Result<Vec<FileHash>, ChunkError> {
@@ -1129,7 +1132,10 @@ impl TransactionalTree {
             .candidate_root
             .as_ref()
             .ok_or_else(|| state_error("no active candidate"))?;
-        sorted_hashes(mark_reachable_chunks(&self.store, [root.value()])?)
+        Ok(sorted_hashes(mark_reachable_chunks(
+            &self.store,
+            [root.value()],
+        )?))
     }
 
     pub fn new_candidate_chunk_hashes(&self) -> Result<Vec<FileHash>, ChunkError> {
@@ -1137,11 +1143,12 @@ impl TransactionalTree {
             .candidate_root
             .as_ref()
             .ok_or_else(|| state_error("no active candidate"))?;
-        self.candidate_chunk_plan_from_reachable(mark_reachable_chunks(
-            &self.store,
-            [root.value()],
-        )?)
-        .map(|(_, fresh)| fresh)
+        let reachable = mark_reachable_chunks(&self.store, [root.value()])?;
+        let mut fresh = self
+            .store
+            .fresh_hashes(reachable.iter(), self.candidate_start_chunks)?;
+        fresh.sort_unstable();
+        Ok(fresh)
     }
 
     pub(crate) fn candidate_chunk_plan_from_reachable(
@@ -1151,17 +1158,10 @@ impl TransactionalTree {
         if self.candidate_root.is_none() {
             return Err(state_error("no active candidate"));
         }
-        let baseline = self
-            .candidate_start_chunks
-            .as_ref()
-            .ok_or_else(|| state_error("candidate chunk baseline is missing"))?;
-        let all = sorted_hashes(reachable)?;
-        let mut fresh = Vec::new();
-        for hash in &all {
-            if self.store.is_fresh_since(hash, *baseline)? {
-                fresh.push(*hash);
-            }
-        }
+        let all = sorted_hashes(reachable);
+        let fresh = self
+            .store
+            .fresh_hashes(all.iter(), self.candidate_start_chunks)?;
         Ok((all, fresh))
     }
 
@@ -1241,10 +1241,10 @@ impl TransactionalTree {
     }
 }
 
-pub(crate) fn sorted_hashes(hashes: HashSet<FileHash>) -> Result<Vec<FileHash>, ChunkError> {
+pub(crate) fn sorted_hashes(hashes: HashSet<FileHash>) -> Vec<FileHash> {
     let mut hashes: Vec<_> = hashes.into_iter().collect();
-    hashes.sort();
-    Ok(hashes)
+    hashes.sort_unstable();
+    hashes
 }
 
 fn state_error(message: &str) -> ChunkError {

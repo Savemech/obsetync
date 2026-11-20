@@ -88,7 +88,7 @@ impl RootRetirementV2 {
 
     fn clear_if_empty(&mut self) {
         if self.child.is_none() && self.vault_id.is_none() && self.device_id.is_none() {
-            self.metadata = RootMetadataMemory::default();
+            self.metadata.clear_retired();
         }
     }
 }
@@ -144,7 +144,6 @@ impl TreeRetirementV2 {
             self.candidate = None;
         }
         if self.candidate_start_chunks.take().is_some() {
-            self.candidate_start_chunks = None;
             self.candidate_start_chunks_metadata = CandidateBaselineMemory::default();
         }
         if self.chunks.next().is_some() {
@@ -391,31 +390,19 @@ impl TransactionalTreeV2 {
         changed: &[FileEntry],
         deleted: &[String],
     ) -> Result<(), ChunkError> {
-        if self.candidate_root.is_none() {
-            return Err(state_error("no active candidate"));
-        }
-        if changed.is_empty() && deleted.is_empty() {
-            return Ok(());
-        }
-        let (previous, next) = {
-            let root = self
-                .candidate_root
-                .as_ref()
-                .ok_or_else(|| state_error("no active candidate"))?;
-            let previous = root.hash();
-            let next = crate::tree_v2::update_tree(&self.store, &root.tree, changed, deleted)
-                .await?
-                .0;
-            (previous, next)
-        };
         let root = self
             .candidate_root
             .as_mut()
-            .expect("candidate checked before update");
+            .ok_or_else(|| state_error("no active candidate"))?;
+        if changed.is_empty() && deleted.is_empty() {
+            return Ok(());
+        }
+        let previous = root.hash();
+        let (next, _) =
+            crate::tree_v2::update_tree(&self.store, &root.tree, changed, deleted).await?;
         root.tree = next;
         root.parent_hash = Some(previous);
-        let candidate_metadata = RootMetadataMemory::from_v2(root);
-        self.candidate_metadata = candidate_metadata;
+        self.candidate_metadata = RootMetadataMemory::from_v2(root);
         Ok(())
     }
 
@@ -449,23 +436,15 @@ impl TransactionalTreeV2 {
         &mut self,
         cursor: &mut V2CandidateMutation,
     ) -> Result<(), ChunkError> {
-        let (previous, next) = {
-            let root = self
-                .candidate_root
-                .as_ref()
-                .ok_or_else(|| state_error("no active candidate"))?;
-            let previous = root.hash();
-            let (next, _) = cursor.finish(&self.store, &root.tree)?;
-            (previous, next)
-        };
         let root = self
             .candidate_root
             .as_mut()
-            .expect("candidate checked before mutation finish");
+            .ok_or_else(|| state_error("no active candidate"))?;
+        let previous = root.hash();
+        let (next, _) = cursor.finish(&self.store, &root.tree)?;
         root.tree = next;
         root.parent_hash = Some(previous);
-        let candidate_metadata = RootMetadataMemory::from_v2(root);
-        self.candidate_metadata = candidate_metadata;
+        self.candidate_metadata = RootMetadataMemory::from_v2(root);
         Ok(())
     }
 
@@ -647,7 +626,9 @@ impl TransactionalTreeV2 {
             .committed_root
             .as_ref()
             .ok_or_else(|| state_error("no committed root"))?;
-        sorted_hashes(crate::tree_v2::reachable_hashes(&self.store, &root.tree).await?)
+        Ok(sorted_hashes(
+            crate::tree_v2::reachable_hashes(&self.store, &root.tree).await?,
+        ))
     }
 
     pub async fn candidate_chunk_hashes(&self) -> Result<Vec<FileHash>, ChunkError> {
@@ -655,7 +636,9 @@ impl TransactionalTreeV2 {
             .candidate_root
             .as_ref()
             .ok_or_else(|| state_error("no active candidate"))?;
-        sorted_hashes(crate::tree_v2::reachable_hashes(&self.store, &root.tree).await?)
+        Ok(sorted_hashes(
+            crate::tree_v2::reachable_hashes(&self.store, &root.tree).await?,
+        ))
     }
 
     pub async fn new_candidate_chunk_hashes(&self) -> Result<Vec<FileHash>, ChunkError> {
@@ -663,10 +646,12 @@ impl TransactionalTreeV2 {
             .candidate_root
             .as_ref()
             .ok_or_else(|| state_error("no active candidate"))?;
-        self.candidate_chunk_plan_from_reachable(
-            crate::tree_v2::reachable_hashes(&self.store, &root.tree).await?,
-        )
-        .map(|(_, fresh)| fresh)
+        let reachable = crate::tree_v2::reachable_hashes(&self.store, &root.tree).await?;
+        let mut fresh = self
+            .store
+            .fresh_hashes(reachable.iter(), self.candidate_start_chunks)?;
+        fresh.sort_unstable();
+        Ok(fresh)
     }
 
     pub(crate) fn candidate_chunk_plan_from_reachable(
@@ -676,17 +661,10 @@ impl TransactionalTreeV2 {
         if self.candidate_root.is_none() {
             return Err(state_error("no active candidate"));
         }
-        let baseline = self
-            .candidate_start_chunks
-            .as_ref()
-            .ok_or_else(|| state_error("candidate chunk baseline is missing"))?;
-        let all = sorted_hashes(reachable)?;
-        let mut fresh = Vec::new();
-        for hash in &all {
-            if self.store.is_fresh_since(hash, *baseline)? {
-                fresh.push(*hash);
-            }
-        }
+        let all = sorted_hashes(reachable);
+        let fresh = self
+            .store
+            .fresh_hashes(all.iter(), self.candidate_start_chunks)?;
         Ok((all, fresh))
     }
 
@@ -1036,6 +1014,22 @@ mod tests {
 
         let mut no_candidate = TransactionalTreeV2::new("vault", "device");
         assert!(no_candidate.apply_candidate(&[], &[]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn retired_root_keeps_invalid_string_counters_until_owner_is_dropped() {
+        let mut tree = TransactionalTreeV2::new("vault", "device");
+        tree.rebuild(vec![entry("a.md", 1)]).await.unwrap();
+        let mut retirement = tree.into_retirement();
+        let root = retirement.committed.as_mut().unwrap();
+        root.metadata.strings.counters_valid = false;
+        while root.retire_one() {
+            assert!(!root.metadata_memory().counters_valid);
+        }
+        let memory = root.metadata_memory();
+        assert_eq!(memory.roots, 0);
+        assert_eq!(memory.strings.strings, 0);
+        assert!(!memory.counters_valid && !memory.strings.counters_valid);
     }
 
     #[tokio::test]
