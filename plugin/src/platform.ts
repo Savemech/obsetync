@@ -163,21 +163,24 @@ export class ObsetyncDesktopIO implements PlatformIO {
         // staging area until the new file is in place, then remove it.
         const backupPath = `${stagingPath}.previous`;
         const adapter = this.app.vault.adapter;
-        let backedUp = false;
+        let hasBackup = await adapter.exists(backupPath);
         try {
-            if (await adapter.exists(backupPath)) await adapter.remove(backupPath);
             if (await adapter.exists(targetPath)) {
+                if (hasBackup) await adapter.remove(backupPath);
                 await adapter.rename(targetPath, backupPath);
-                backedUp = true;
+                hasBackup = true;
             }
             await adapter.rename(stagingPath, targetPath);
-            if (backedUp) await adapter.remove(backupPath);
         } catch (error) {
-            if (!(await adapter.exists(targetPath)) && backedUp && await adapter.exists(backupPath)) {
-                try { await adapter.rename(backupPath, targetPath); } catch { /* preserve original error */ }
-            }
+            // A previous renderer may already have moved the target aside.
+            try {
+                if (!(await adapter.exists(targetPath)) && await adapter.exists(backupPath)) {
+                    await adapter.rename(backupPath, targetPath);
+                }
+            } catch { /* Leave the backup for a retry and preserve the promotion error. */ }
             throw error;
         }
+        if (hasBackup) await adapter.remove(backupPath);
     }
 
     async copyFileExclusive(stagingPath: string, targetPath: string): Promise<void> {

@@ -278,6 +278,33 @@ async function writesAvoidExistingFolderMutations(): Promise<void> {
     }
 }
 
+async function interruptedMobileReplacementKeepsItsBackup(): Promise<void> {
+    const files = new Map([["stage.previous", "original"], ["stage", "replacement"]]);
+    let failPromotion = true;
+    const adapter = {
+        exists: async (path: string) => files.has(path),
+        remove: async (path: string) => { files.delete(path); },
+        rename: async (from: string, to: string) => {
+            if (failPromotion && from === "stage") throw new Error("promotion failed");
+            assert(files.has(from) && !files.has(to));
+            files.set(to, files.get(from)!);
+            files.delete(from);
+        },
+    };
+    const io = new ObsetyncMobileIO({ vault: { adapter } } as unknown as App);
+    await assert.rejects(io.replaceFile("stage", "target"), /promotion failed/);
+    assert.equal(files.get("target"), "original");
+    assert.equal(files.get("stage"), "replacement");
+    failPromotion = false;
+    await io.replaceFile("stage", "target");
+    assert.deepEqual([...files], [["target", "replacement"]]);
+    files.clear();
+    files.set("stage.previous", "original");
+    files.set("stage", "replacement");
+    await io.replaceFile("stage", "target");
+    assert.deepEqual([...files], [["target", "replacement"]]);
+}
+
 async function run(): Promise<void> {
     const backing = new Uint8Array([9, 1, 2, 3, 8]);
     const exact = new Uint8Array(exactArrayBuffer(backing.subarray(1, 4)));
@@ -288,6 +315,7 @@ async function run(): Promise<void> {
     await capabilityAndSourceDriftStayDistinct();
     await boundsAbortAndDesktopIsolation();
     await writesAvoidExistingFolderMutations();
+    await interruptedMobileReplacementKeepsItsBackup();
     console.log(`platform.test: ${assertions} assertions passed`);
 }
 
