@@ -106,6 +106,18 @@ async function catchesEditWhileBaselineReadIsPending(): Promise<void> {
     guard.close();
 }
 
+async function editorReplacementDuringReadProtectsPath(): Promise<void> {
+    const f = fixture([{ path: "open.md", disk: "saved", editor: "saved" }]);
+    f.app.vault.adapter.read = async () => {
+        f.views[0].leaf.view.editor = { lineCount: () => 1, getLine: () => "unsaved replacement" };
+        return "saved";
+    };
+    const guard = await EditorPullGuard.open(f.app as any);
+    try {
+        check(guard.has("open.md"), "detached editor certified its replacement as clean");
+    } finally { guard.close(); }
+}
+
 async function failsClosedOnUnboundedOrUnreadableState(): Promise<void> {
     const oversized = fixture([{ path: "huge.md", disk: "x", editor: "x", size: 1024 * 1024 + 1 }]);
     const first = await EditorPullGuard.open(oversized.app as any);
@@ -131,6 +143,7 @@ async function failsClosedOnUnboundedOrUnreadableState(): Promise<void> {
 async function main(): Promise<void> {
     await detectsExistingUnsavedBuffers();
     await catchesEditsAfterBaseline();
+    await editorReplacementDuringReadProtectsPath();
     await catchesEditWhileBaselineReadIsPending();
     await failsClosedOnUnboundedOrUnreadableState();
     console.log(`editor pull guard tests passed (${assertions} assertions)`);

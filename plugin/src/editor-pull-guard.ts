@@ -134,10 +134,6 @@ export class EditorPullGuard {
             if (existing) existing.push(opened);
             else byPath.set(path, [opened]);
         }
-        if (byPath.size > MAX_OPEN_EDITOR_PATHS) {
-            this.protectAll = true;
-            return;
-        }
 
         for (const [path, editors] of byPath) {
             this.assertOpenAndCurrent();
@@ -159,7 +155,7 @@ export class EditorPullGuard {
             if (this.protectedPaths.has(path)) continue;
             try {
                 const stable = editors.every(({ info, editor }) =>
-                    info.file?.path === path && editorMatchesDisk(editor, disk));
+                    info.file?.path === path && info.editor === editor && editorMatchesDisk(editor, disk));
                 if (!stable) {
                     this.protectedPaths.add(path);
                 }
