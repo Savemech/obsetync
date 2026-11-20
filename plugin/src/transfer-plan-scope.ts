@@ -49,7 +49,10 @@ export function preparedScopeForTree(identity: PreparedScopeIdentity): (version:
         let digest = pending.get(version);
         if (!digest) {
             digest = fingerprintLegacyCopies([{ role: "prepared-identity-v1", raw: encoded },
-                { role: "tree-version", raw: String(version) }]);
+                { role: "tree-version", raw: String(version) }]).catch(error => {
+                    pending.delete(version);
+                    throw error;
+                });
             pending.set(version, digest);
         }
         return digest;

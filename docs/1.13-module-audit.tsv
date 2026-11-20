@@ -72,7 +72,7 @@ pending	crates/sync-core/src/tree_v2.rs	production	Not reviewed
 pending	crates/sync-core/src/tree_work_memory.rs	production	Not reviewed
 reviewed	crates/sync-core/src/versioned_root.rs	production	Traced format dispatch, history fields, canonical rebuild and complete-inventory checks; v1 totals now checked per loaded subtree without speculatively reserving the entire declared count; dual-format and overrun tests pass
 pending	crates/sync-core/src/wasm.rs	production	Not reviewed
-pending	crates/sync-core/src/wasm_memory.rs	production	Not reviewed
+reviewed	crates/sync-core/src/wasm_memory.rs	production	Traced global allocator delegation, failed realloc ownership, saturation, instance isolation and disabled native snapshot through wasm.rs. Six allocator tests pass.
 reviewed	crates/sync-schema/Cargo.toml	configuration/schema	Single workspace FlatBuffers dependency; schema unit suite and wasm32 downstream check passed
 reviewed	crates/sync-schema/schema/chunk.fbs	configuration/schema	Checked six table declarations against generated slots and required-field checks; enum and round-trip tests passed
 read	crates/sync-schema/src/chunk_generated.rs	generated/lock	Compared all 20 vtable slots and required-field builder checks to schema, exercised generated readers/writers; compiler output regeneration not verified
@@ -260,8 +260,8 @@ pending	plugin/src/legacy-downgrade-modal.test.ts	tests	Not reviewed
 pending	plugin/src/legacy-downgrade-modal.ts	production	Not reviewed
 pending	plugin/src/legacy-downgrade.test.ts	tests	Not reviewed
 pending	plugin/src/legacy-downgrade.ts	production	Not reviewed
-pending	plugin/src/legacy-source.test.ts	tests	Not reviewed
-pending	plugin/src/legacy-source.ts	production	Not reviewed
+reviewed	plugin/src/legacy-source.test.ts	tests	Compared digests to independent Node crypto implementation across Unicode boundaries; exercised absent roles, host yields and rename ACK parsing.
+reviewed	plugin/src/legacy-source.ts	production	Traced bounded SHA-256 fingerprinting from journal, sync base and transfer scope; captures immutable role/value pairs before yielding.
 reviewed	plugin/src/local-event-guards.ts	production	Traced reference counts, generation ordering, idempotent release and bounded overflow through create/modify/delete/rename listeners and pull protection
 reviewed	plugin/src/local-events.test.ts	tests	Reviewed callback and mobile journal fixtures; exercise newer-first release and let the watchdog run during echo classification waits
 read	plugin/src/main.ts	production	Legacy endpoint migration and enrollment owner traced; duplicate requests rejected before dispatch; credential/address changes fence response and saved continuation; 38 bundled-main scenarios pass, including two failed credential writes followed by successful retry without a second claim; full host audit remains
@@ -287,15 +287,15 @@ pending	plugin/src/prepared-desktop-manifest.test.ts	tests	Not reviewed
 pending	plugin/src/prepared-desktop-manifest.ts	production	Not reviewed
 pending	plugin/src/prepared-mobile-manifest.test.ts	tests	Not reviewed
 pending	plugin/src/prepared-mobile-manifest.ts	production	Not reviewed
-pending	plugin/src/prepared-retirement.test.ts	tests	Not reviewed
-pending	plugin/src/prepared-retirement.ts	production	Not reviewed
+reviewed	plugin/src/prepared-retirement.test.ts	tests	Executed covered cut, stale ACK, retained rename peer, scan-only path, empty selection and detached output tests.
+reviewed	plugin/src/prepared-retirement.ts	production	Both push settlement paths call after journal ACK. Retained paths override acknowledged cuts; result carries detached mutation tokens.
 reviewed	plugin/src/priority-sort.test.ts	tests	Checked direction for all five deterministic modes, stable ties, random draws, admission, cancellation and cooperative yields
 reviewed	plugin/src/priority-sort.ts	production	Traced synchronous and reviewed upload paths, shared deterministic comparator, preserved legacy random and sequential behavior
 reviewed	plugin/src/pull-echo.test.ts	tests	Checked matching and mismatching bytes, renames, expiration, renewal and backward wall-clock movement. All 14 assertions pass.
 reviewed	plugin/src/pull-echo.ts	production	Traced registration through pull and local event consumption. Prune expired prefixes during registration and move renewals to the tail. Live checks still validate each requested path.
 read	plugin/src/pull.test.ts	tests	Checked crash-resumed rename and same-size target fixtures. Added two live edits during adapter lookups and ran the pull suite. Other scenarios remain under review.
 read	plugin/src/pull.ts	production	Traced paged snapshot ordering, deferred checkpoints and final root verification. Checked live rename guards across target lookup and post-move stat. Expired snapshots and remaining apply paths need review.
-pending	plugin/src/push-memory.test.ts	tests	Not reviewed
+reviewed	plugin/src/push-memory.test.ts	tests	Executed mobile/desktop budget tests covering whole and ranged reads, backing allocations, per-worker feed costs, WS floor and grouping capacity.
 pending	plugin/src/push-memory.ts	production	Not reviewed
 pending	plugin/src/push-prepared.test.ts	tests	Not reviewed
 pending	plugin/src/push-root-transaction.test.ts	tests	Not reviewed
@@ -328,7 +328,7 @@ removed	plugin/src/root-local-omissions.ts	production	Selector was called only b
 pending	plugin/src/root-outcome.test.ts	tests	Not reviewed
 pending	plugin/src/root-outcome.ts	production	Not reviewed
 pending	plugin/src/root-publication-memory.test.ts	tests	Not reviewed
-pending	plugin/src/root-publication-memory.ts	production	Not reviewed
+reviewed	plugin/src/root-publication-memory.ts	production	Traced owner and hash preparation estimates and arena bounds to push and root runtime. Four publication memory suites pass including maximum root and rejected admission.
 pending	plugin/src/root-recovery.test.ts	tests	Not reviewed
 pending	plugin/src/root-recovery.ts	production	Not reviewed
 read	plugin/src/root-reviewed-queue.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
@@ -370,8 +370,8 @@ pending	plugin/src/sync-memory-arbiter.ts	production	Not reviewed
 pending	plugin/src/sync-status.test.ts	tests	Not reviewed
 pending	plugin/src/sync-status.ts	production	Not reviewed
 read	plugin/src/sync.ts	production	Automatic push and lifecycle paths traced; removed unused debounce seam; actual coalescer regression and engine suites pass; remaining engine paths pending
-pending	plugin/src/transfer-plan-scope.test.ts	tests	Not reviewed
-pending	plugin/src/transfer-plan-scope.ts	production	Not reviewed
+reviewed	plugin/src/transfer-plan-scope.test.ts	tests	Validated enrollment, policy, version separation, concurrent callers sharing a failure and successful retry on the same runtime.
+reviewed	plugin/src/transfer-plan-scope.ts	production	Traced capture and per-tree promise cache through engine construction; failed digests now release their cache slot for retry.
 pending	plugin/src/transfer-plan.test.ts	tests	Not reviewed
 pending	plugin/src/transfer-plan.ts	production	Not reviewed
 pending	plugin/src/transient-memory.test.ts	tests	Not reviewed

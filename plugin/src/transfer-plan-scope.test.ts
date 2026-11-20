@@ -1,3 +1,4 @@
+import { mock } from "node:test";
 import { strict as assert } from "node:assert";
 import { preparedScopeForTree, type PreparedScopeIdentity } from "./transfer-plan-scope";
 
@@ -19,6 +20,15 @@ async function run(): Promise<void> {
     }
     assert.notEqual(first, await preparedScopeForTree({ ...original, syncObsidianConfig: true })(1));
     assert.notEqual(first, await preparedScopeForTree({ ...original, ignorePatterns: [] })(1));
+    const retryScope = preparedScopeForTree(original);
+    const failure = new Error("temporary digest failure");
+    const digest = mock.method(globalThis.crypto.subtle, "digest", async () => { throw failure; });
+    try {
+        const failed = retryScope(1);
+        assert.equal(retryScope(1), failed);
+        await assert.rejects(failed, error => error === failure);
+    } finally { digest.mock.restore(); }
+    assert.equal(await retryScope(1), first);
     await assert.rejects(scoped(3));
     assert.throws(() => preparedScopeForTree({ ...original, ignorePatterns: ["x".repeat(8193)] }));
     assert.throws(() => preparedScopeForTree({ ...original, ignorePatterns: Array(20).fill("x".repeat(8192)) }));
