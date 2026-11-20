@@ -622,11 +622,12 @@ function chunkJobApi(tree: CandidateJobTree): CandidateChunkTraversalApi | null 
     return claimed ? { begin: begin!, step: step!, finish: finish!, cancel: cancel! } : null;
 }
 
-function chunkHashes(value: unknown): string[] {
-    if (!Array.isArray(value) || value.length > 1_000_000) {
+function chunkHashes(value: unknown, maximum = 1_000_000): string[] {
+    if (!Array.isArray(value)) throw new TypeError("WASM tree chunk job returned an invalid plan");
+    const length = value.length;
+    if (!Number.isSafeInteger(length) || length < 0 || length > maximum) {
         throw new TypeError("WASM tree chunk job returned an invalid plan");
     }
-    const length = value.length;
     const output = new Array<string>(length);
     for (let index = 0; index < length; index++) {
         const hash = value[index];
@@ -776,13 +777,16 @@ function candidateChunkPage(value: unknown, expectedOffset: number, allCount: nu
     const row = candidateChunkRecord(value, fields, "plan page");
     const offset = candidateChunkCount(row.offset, "page offset");
     const nextOffset = candidateChunkCount(row.nextOffset, "page next offset");
-    const all = chunkHashes(row.all), fresh = chunkHashes(row.fresh);
+    const pageLength = nextOffset - offset;
     if (row.schema !== 1 || row.scope !== "candidate-chunk-plan-page" ||
         typeof row.done !== "boolean" || offset !== expectedOffset || nextOffset > allCount ||
-        nextOffset - offset !== all.length || all.length > TREE_CANDIDATE_CHUNK_PAGE_HASHES ||
-        (row.done !== (nextOffset === allCount)) || (!row.done && all.length === 0)) {
+        pageLength < 0 || pageLength > TREE_CANDIDATE_CHUNK_PAGE_HASHES ||
+        (row.done !== (nextOffset === allCount)) || (!row.done && pageLength === 0)) {
         throw new TypeError("WASM tree returned inconsistent candidate chunk plan page");
     }
+    const all = chunkHashes(row.all, pageLength);
+    if (all.length !== pageLength) throw new TypeError("WASM tree returned inconsistent candidate chunk plan page");
+    const fresh = chunkHashes(row.fresh, pageLength);
     let cursor = 0;
     for (const hash of fresh) {
         while (cursor < all.length && all[cursor] < hash) cursor++;

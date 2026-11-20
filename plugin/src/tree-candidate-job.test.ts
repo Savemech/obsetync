@@ -1044,6 +1044,24 @@ async function pagedCandidateChunksBoundCallbacksAndCleanup(): Promise<void> {
 }
 
 async function pagedCandidateChunksCapabilitiesAndLegacyFailClosed(): Promise<void> {
+    for (const field of ["all", "fresh"] as const) {
+        const tree = new PagedChunkTreeFixture();
+        const read = tree.read_candidate_chunks_page_v1_job.bind(tree);
+        tree.read_candidate_chunks_page_v1_job = (token, offset, maxHashes) => {
+            const oversized = new Array(maxHashes + 1);
+            Object.defineProperty(oversized, 0, { get() { throw new Error("oversized page was traversed"); } });
+            return { ...read(token, offset, maxHashes) as object, [field]: oversized };
+        };
+        let releases = 0;
+        await assert.rejects(collectTreeCandidateChunkPages(tree, {
+            cooperate: async () => {}, cooperateRetirement: async () => {}, legacy: () => ({}),
+            onSortMemoryPlan: () => ({ release: () => { releases++; } }),
+            onPage: async () => { throw new Error("oversized page was delivered"); },
+        }), /invalid plan|inconsistent candidate chunk plan page/);
+        assert.equal(releases, 1);
+        assert.equal(tree.retirement, false);
+        assert.equal(tree.pageFinishes, 0);
+    }
     const partial = new PagedChunkTreeFixture() as CandidateJobTree;
     partial.read_candidate_chunks_page_v1_job = undefined;
     await assert.rejects(collectTreeCandidateChunkPages(partial, {
