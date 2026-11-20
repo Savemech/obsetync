@@ -257,24 +257,31 @@ async function brokenCapabilitiesFallBackWithoutLeaking(): Promise<void> {
 async function lanesDeadlinesAndAgingAreFair(): Promise<void> {
     const host = new FakeHost(true);
     const scheduler = new WorkScheduler({ runtime: host, maxPendingJobs: 16 });
+    const lanes = ["interactive", "urgent-file", "bulk", "maintenance"] as const;
     const order: string[] = [];
     const pending: Promise<void>[] = [];
-    const add = (lane: "interactive" | "urgent-file" | "bulk" | "maintenance", label: string) => {
-        pending.push(scheduler.yield({ lane }).then(() => { order.push(label); }));
+    let refill = true;
+    const add = (lane: typeof lanes[number]) => {
+        pending.push(scheduler.yield({ lane }).then(() => {
+            order.push(lane);
+            if (refill) add(lane);
+        }));
     };
-    for (let index = 0; index < 6; index++) add("interactive", `i${index}`);
-    for (let index = 0; index < 3; index++) add("urgent-file", `u${index}`);
-    for (let index = 0; index < 2; index++) add("bulk", `b${index}`);
-    add("maintenance", "m0");
-    assert.deepEqual(scheduler.snapshot().pendingByLane,
-        { interactive: 6, "urgent-file": 3, bulk: 2, maintenance: 1 });
-    assert.equal(host.tasks.size, 1, "lane admission posted more than one host callback");
-    for (let index = 0; index < 12; index++) host.tick();
+    for (const lane of lanes) add(lane);
+    for (let turn = 0; turn < 24; turn++) {
+        assert.equal(host.tasks.size, 1);
+        host.tick();
+        await Promise.resolve();
+        assert.deepEqual(scheduler.snapshot().pendingByLane,
+            { interactive: 1, "urgent-file": 1, bulk: 1, maintenance: 1 });
+    }
+    const cycle = ["interactive", "interactive", "interactive", "interactive",
+        "urgent-file", "interactive", "urgent-file", "bulk",
+        "interactive", "urgent-file", "bulk", "maintenance"];
+    assert.deepEqual(order, [...cycle, ...cycle], "continuous input starved a lane or changed its weight");
+    refill = false;
+    for (const _lane of lanes) host.tick();
     await Promise.all(pending);
-    assert.deepEqual(order, [
-        "i0", "i1", "i2", "i3", "u0", "i4", "u1", "b0",
-        "i5", "u2", "b1", "m0",
-    ], "weighted lane service lost priority or starved a background lane");
 
     const deadlineOrder: string[] = [];
     const interactive = scheduler.yield({ lane: "interactive" })

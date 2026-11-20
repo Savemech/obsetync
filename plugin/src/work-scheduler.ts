@@ -35,7 +35,7 @@ export interface WorkYieldOptions {
     perf?: PerfOperation;
     lane?: WorkLane;
     /** Maximum queue wait from admission, in milliseconds. Once expired the
-     * oldest deadline wins regardless of lane. This is not a task timeout. */
+     * oldest expired deadline among lane heads wins. FIFO holds within each lane. This is not a task timeout. */
     deadlineMs?: number;
 }
 
@@ -377,14 +377,11 @@ export class WorkScheduler {
 
     private oldestWait(now: number): number {
         let oldest = now;
-        let found = false;
         for (const lane of LANES) {
             const entry = this.queues[lane][0];
-            if (!entry) continue;
-            found = true;
-            oldest = Math.min(oldest, entry.enqueuedAt);
+            if (entry) oldest = Math.min(oldest, entry.enqueuedAt);
         }
-        return found ? Math.max(0, now - oldest) : 0;
+        return now - oldest;
     }
 
     private admissionError(lane: WorkLane, signal?: AbortSignal): unknown {
