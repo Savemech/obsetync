@@ -92,6 +92,63 @@ FAKE_MV
     echo "ok - plugin activation failure restores every previous artifact"
 }
 
+test_locked_destination() {
+    local root
+    root=$(new_case)
+    if flock "$root/dest" bash "$deploy_script" "$root/source" "$root/dest" "$commit"; then
+        fail "concurrent installation accepted"
+    fi
+    assert_contents "$root" old
+    echo "ok - concurrent installation leaves the active destination alone"
+}
+
+test_interrupted_activation() {
+    local root status
+    root=$(new_case)
+    rm "$root/dest/styles.css"
+    mv "$root/dest/sync_core.js" "$root/old-js"
+    ln -s "$root/old-js" "$root/dest/sync_core.js"
+    mkdir "$root/bin"
+    cat > "$root/bin/mv" <<'FAKE_MV'
+#!/usr/bin/env bash
+if [[ $1 == -fT && $3 == */new/sync_core_bg.wasm ]]; then
+    kill -TERM "$PPID"
+    exit 1
+fi
+exec "${REAL_MV:?}" "$@"
+FAKE_MV
+    chmod +x "$root/bin/mv"
+    status=0
+    REAL_MV=$(command -v mv) PATH="$root/bin:$PATH" bash "$deploy_script" "$root/source" "$root/dest" "$commit" || status=$?
+    [[ $status -eq 143 && ! -e $root/dest/styles.css && -L $root/dest/sync_core.js ]] || fail "interrupted deployment lost the original layout"
+    [[ $(cat "$root/dest/sync_core.js") == 'old sync_core.js' ]] || fail "old link content changed"
+    echo "ok - TERM restores a symlink and removes a newly installed artifact"
+}
+
+test_incomplete_rollback() {
+    local root status=0
+    root=$(new_case)
+    mkdir "$root/bin"
+    cat > "$root/bin/mv" <<'FAKE_MV'
+#!/usr/bin/env bash
+case "$3" in
+    */new/sync_core_bg.wasm) exit 71 ;;
+    */old/styles.css) exit 72 ;;
+esac
+exec "${REAL_MV:?}" "$@"
+FAKE_MV
+    chmod +x "$root/bin/mv"
+    REAL_MV=$(command -v mv) PATH="$root/bin:$PATH" bash "$deploy_script" "$root/source" "$root/dest" "$commit" 2>"$root/stderr" || status=$?
+    [[ $status -eq 71 ]] || fail "incomplete rollback masked the original error"
+    local backups=( "$root/dest"/.obsetync-deploy-*/old/styles.css )
+    [[ ${#backups[@]} -eq 1 && $(cat "${backups[0]}") == 'old styles.css' ]] || fail "rollback discarded the unrestored backup"
+    grep -Fq 'recovery files retained' "$root/stderr" || fail "missing recovery location"
+    echo "ok - failed restoration retains the backup and reports its location"
+}
+
 test_success
 test_preflight_failure
 test_activation_failure
+test_locked_destination
+test_interrupted_activation
+test_incomplete_rollback

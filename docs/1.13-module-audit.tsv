@@ -418,8 +418,8 @@ reviewed	scripts/build-wasm.sh	tooling	Read complete scalar/SIMD build and outpu
 reviewed	scripts/check-release-version.mjs	tooling	Read structured JSON/Cargo/Nix checks and release callers; centralized manifest parity and corrected quoted Nix delimiters; release regression suite passes
 reviewed	scripts/install-wasm-tools.sh	tooling	Shared Linux installer; architecture allowlist, pinned hashes, both checks before install, cleanup and quoted paths reviewed; mock refusal/selection tests and real x86 dev image install pass
 reviewed	scripts/check-release-version.test.mjs	tests	Read release/tag/schema/compatibility cases; added exact-byte and quoted delimiter regressions, reproduced both failures before fixes
-pending	scripts/deploy-plugin.sh	tooling	Not reviewed
-pending	scripts/deploy-plugin.test.sh	tests	Not reviewed
+reviewed	scripts/deploy-plugin.sh	tooling	Traced just ship-plugin staging, activation and rollback. Serialized competing installs and retained backups when restoration fails.
+reviewed	scripts/deploy-plugin.test.sh	tests	Executed six temporary-directory cases covering success, preflight, failed activation, lock contention, TERM and failed rollback.
 pending	scripts/deploy-server.sh	tooling	Not reviewed
 pending	scripts/deploy-server.test.sh	tests	Not reviewed
 pending	scripts/release-artifact-manifest.mjs	tooling	Not reviewed
