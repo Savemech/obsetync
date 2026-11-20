@@ -1,3 +1,4 @@
+import { CandidateOpenRootAdmissionDeniedError } from "./candidate-open-root-admission";
 import { settleRuntimeOwners } from "./runtime-retirement";
 import { App, TAbstractFile, TFile, Notice } from "obsidian";
 
@@ -2633,7 +2634,8 @@ export class ObsetyncSyncEngine {
     private recordSyncFailure(origin: string, error: unknown): void {
         const message = error instanceof Error ? error.message : String(error);
         this.lastError = { ts: Date.now(), origin, message };
-        if (origin === "push" && error instanceof CandidateMutationOutputAdmissionDeniedError) {
+        if (origin === "push" && (error instanceof CandidateMutationOutputAdmissionDeniedError ||
+            error instanceof CandidateOpenRootAdmissionDeniedError || error instanceof RootTreeOutputAdmissionDeniedError)) {
             this.eventPushBackoffUntil = performance.now() + Math.min(this.syncInterval, 30_000);
         }
         this.state = "error";

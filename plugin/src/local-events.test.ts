@@ -1,4 +1,6 @@
 import { TFile, TAbstractFile } from "obsidian";
+import { CandidateOpenRootAdmissionDeniedError } from "./candidate-open-root-admission";
+import { RootTreeOutputAdmissionDeniedError } from "./root-tree-repair";
 import { CandidateMutationOutputAdmissionDeniedError } from "./candidate-mutation-output-admission";
 import { ObsetyncSyncEngine } from "./sync";
 import { DirtyPathSet } from "./dirty-set";
@@ -108,11 +110,19 @@ async function toggleControlsAlreadyQueuedLocalEvents(): Promise<void> {
     check(pushes === 1, "enabling auto-sync left an existing edit waiting for another event");
     f.engine.syncInterval = 30_000;
     f.engine.onStatusUpdate = () => {};
-    f.engine.recordSyncFailure("push", new CandidateMutationOutputAdmissionDeniedError(13_333_405, 11_463_466, 0));
-    await f.callbacks.get("create")!(fileAt("during-pressure.md"));
-    await drain();
-    check(pushes === 1 && f.engine.pendingChanges.has("during-pressure.md"),
-        "vault event retried a memory refusal immediately or lost the edit");
+    for (const error of [
+        new CandidateMutationOutputAdmissionDeniedError(13_333_405, 11_463_466, 0),
+        new CandidateOpenRootAdmissionDeniedError(128, 1024, 960),
+        new RootTreeOutputAdmissionDeniedError(128, 1024, 960, 1),
+    ]) {
+        f.engine.eventPushBackoffUntil = 0;
+        f.engine.recordSyncFailure("push", error);
+        const path = `${error.name}.md`;
+        await f.callbacks.get("create")!(fileAt(path));
+        await drain();
+        check(pushes === 1 && f.engine.pendingChanges.has(path),
+            `${error.name}: vault event retried immediately or lost the edit`);
+    }
     f.engine.eventPushBackoffUntil = performance.now() - 1;
     await f.callbacks.get("create")!(fileAt("after-pressure.md"));
     await drain();
