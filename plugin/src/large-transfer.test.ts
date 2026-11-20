@@ -1,3 +1,4 @@
+import { strict as assert } from "node:assert";
 import {
     applyLargeFile,
     LARGE_TRANSFER_STAGING_LIMITS,
@@ -29,13 +30,13 @@ const manifest = {
 };
 
 check(validateManifest(manifest, fileHash, 5).chunks.length === 2, "valid manifest rejected");
-let malformedRejected = false;
-try {
-    validateManifest({ ...manifest, chunks: [{ ...manifest.chunks[0], offset: 1 }] }, fileHash, 5);
-} catch {
-    malformedRejected = true;
-}
-check(malformedRejected, "manifest hole/offset mismatch accepted");
+assert.throws(() => validateManifest({
+    ...manifest, chunks: [{ ...manifest.chunks[0], offset: 1 }],
+}, fileHash, 5), /invalid large-file chunk layout/);
+
+assert.throws(() => validateManifest({ ...manifest, chunks: [] }, fileHash, 5),
+    /chunk layout does not cover the file/);
+assert.equal(validateManifest({ ...manifest, chunks: [], total_size: 0 }, fileHash, 0).total_size, 0);
 
 async function resumeInterruptedDownload(): Promise<void> {
     const files = new Map<string, Uint8Array>();
@@ -182,14 +183,12 @@ async function freshDownloadRejectsWrongWholeFileHash(): Promise<void> {
         },
     } as any;
 
-    let rejected = false;
-    try {
-        await applyLargeFile(api, io, "media/wrong.bin", fileHash, 5, wasm);
-    } catch {
-        rejected = true;
-    }
-    check(rejected, "wrong whole-file hash was accepted from valid individual chunks");
-    check(!files.has("media/wrong.bin"), "wrong assembled file replaced the target");
+    const target = "media/wrong.bin";
+    const original = new Uint8Array([9, 8, 7]);
+    files.set(target, original.slice());
+    await assert.rejects(applyLargeFile(api, io, target, fileHash, 5, wasm),
+        /large-file assembled content hash mismatch/);
+    assert.deepEqual(files.get(target), original);
     check(
         ![...files.keys()].some((path) => path.includes(".part") || path.includes(".checkpoint")),
         "failed whole-file verification left a resumable corrupt staging set",

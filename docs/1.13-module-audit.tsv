@@ -253,7 +253,7 @@ read	plugin/src/journal-rename.test.ts	tests	Removed obsolete debounce mocks or 
 read	plugin/src/journal-semantics.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
 reviewed	plugin/src/journal.test.ts	tests	Reviewed and ran segmented batch and restart scenarios, migration proof, corruption and failed writes. Added sparse input beside a valid edit and checked persisted generation after restart; 373 assertions passed.
 reviewed	plugin/src/journal.ts	production	Traced event/scan submissions, bounded group commit, durable ACK ownership, startup import, close and failed writes. Fixed sparse input reaching the shared writer and poisoning unrelated queued appends.
-pending	plugin/src/large-transfer.test.ts	tests	Not reviewed
+reviewed	plugin/src/large-transfer.test.ts	tests	Traced resume, scope, staging quota and promotion cases; required exact whole-file integrity error, preserved preexisting target bytes and checked empty manifest coverage; focused suite passed
 pending	plugin/src/legacy-downgrade-host.test.ts	tests	Not reviewed
 pending	plugin/src/legacy-downgrade-host.ts	production	Not reviewed
 reviewed	plugin/src/legacy-downgrade-modal.test.ts	tests	Exercised typed target, explicit consent, cancellation and text for all nine host states; focused suite passed

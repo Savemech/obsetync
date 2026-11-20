@@ -2200,9 +2200,6 @@ export function validateManifest(
     if (expectedOffset !== manifest.total_size) {
         throw new Error("large-file chunk layout does not cover the file");
     }
-    if (manifest.total_size > 0 && manifest.chunks.length === 0) {
-        throw new Error("non-empty large file has no chunks");
-    }
     return manifest as FileManifest;
 }
 
