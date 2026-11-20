@@ -39,9 +39,10 @@ async fn subscribed_session_receives_root_frame_on_push() {
 
     // Baseline so the push below is a plain fast-forward.
     let base = vec![("doc.md".to_string(), b"base\n".to_vec())];
-    let (base_root, _) = push_vault_snapshot(&pusher, &vault, &base, ZERO_HASH_HEX)
-        .await
-        .unwrap();
+    let (base_root, _, _) =
+        push_vault_snapshot_with_receive_memory_retry(&pusher, &vault, &base, ZERO_HASH_HEX)
+            .await
+            .unwrap();
     let parent = hash_to_hex(&base_root.hash());
 
     // Watcher opens the notify channel and subscribes.
@@ -61,9 +62,10 @@ async fn subscribed_session_receives_root_frame_on_push() {
 
     // Pusher advances the vault.
     let v2 = vec![("doc.md".to_string(), b"edited\n".to_vec())];
-    let (new_root, resp) = push_vault_snapshot(&pusher, &vault, &v2, &parent)
-        .await
-        .unwrap();
+    let (new_root, resp, _) =
+        push_vault_snapshot_with_receive_memory_retry(&pusher, &vault, &v2, &parent)
+            .await
+            .unwrap();
     assert!(resp.accepted || resp.merged, "push failed: {resp:?}");
     let new_root_hex = hash_to_hex(&new_root.hash());
 
@@ -312,17 +314,19 @@ async fn v2_sealed_session_delivers_root_frames() {
     let pusher = WireClient::new(&env, env.enroll_device("v2-pusher").await.unwrap());
 
     let base = vec![("doc.md".to_string(), b"base\n".to_vec())];
-    let (base_root, _) = push_vault_snapshot(&pusher, &vault, &base, ZERO_HASH_HEX)
-        .await
-        .unwrap();
+    let (base_root, _, _) =
+        push_vault_snapshot_with_receive_memory_retry(&pusher, &vault, &base, ZERO_HASH_HEX)
+            .await
+            .unwrap();
     let parent = hash_to_hex(&base_root.hash());
 
     let (mut ws, mut crypto) = v2::open_v2_session(&env, &watcher, &vault).await;
 
     let v2_files = vec![("doc.md".to_string(), b"edited\n".to_vec())];
-    let (new_root, _) = push_vault_snapshot(&pusher, &vault, &v2_files, &parent)
-        .await
-        .unwrap();
+    let (new_root, _, _) =
+        push_vault_snapshot_with_receive_memory_retry(&pusher, &vault, &v2_files, &parent)
+            .await
+            .unwrap();
     let new_root_hex = hash_to_hex(&new_root.hash());
 
     let frame = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -352,7 +356,7 @@ async fn v2_presence_roundtrip_between_sessions() {
     let bob = WireClient::new(&env, env.enroll_device("presence-bob").await.unwrap());
 
     // Vault must exist for enrollment-independent flows; push a baseline.
-    push_vault_snapshot(
+    push_vault_snapshot_with_receive_memory_retry(
         &alice,
         &vault,
         &[("a.md".to_string(), b"x\n".to_vec())],
@@ -487,7 +491,7 @@ async fn crdt_ops_relay_log_readback_and_compaction() {
     let a = WireClient::new(&env, env.enroll_device("crdt-a").await.unwrap());
     let b = WireClient::new(&env, env.enroll_device("crdt-b").await.unwrap());
     // Vault must exist.
-    push_vault_snapshot(
+    push_vault_snapshot_with_receive_memory_retry(
         &a,
         &vault,
         &[("seed.md".to_string(), b"x\n".to_vec())],
