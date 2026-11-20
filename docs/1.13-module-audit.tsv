@@ -377,8 +377,8 @@ pending	plugin/src/transfer-plan.ts	production	Not reviewed
 pending	plugin/src/transient-memory.test.ts	tests	Not reviewed
 pending	plugin/src/transient-memory.ts	production	Not reviewed
 reviewed	plugin/src/transport-errors.ts	production	Traced enrollment and format upgrade refusals through API and sync callers. Typed refusals across realms take precedence over incidental advice; legacy text fallback retained.
-read	plugin/src/transport-router.test.ts	tests	Traced WebSocket backoff, overlapping completions and replay-safe HTTP fallback; regression covers stale normal and half-open successes; performance sample review pending
-read	plugin/src/transport-router.ts	production	Traced WebSocket backoff, overlapping completions and replay-safe HTTP fallback; regression covers stale normal and half-open successes; performance sample review pending
+read	plugin/src/transport-router.test.ts	tests	Traced WebSocket backoff, overlapping completions, reset generations, scoring and replay-safe HTTP fallback; verified ACK budgets for asymmetric bulk transfers; additional sample validation review pending
+read	plugin/src/transport-router.ts	production	Traced WebSocket backoff, overlapping completions, reset generations, scoring and replay-safe HTTP fallback; verified ACK budgets for asymmetric bulk transfers; additional sample validation review pending
 reviewed	plugin/src/transport-sequence.test.ts	tests	Verified 5k concurrent allocations, restart gap, server recovery and queued allocation following a failed recovery save.
 reviewed	plugin/src/transport-sequence.ts	production	Traced API persistence and recovery. Retire stale range before a fallible reservation so queued requests remain above the observed server floor.
 pending	plugin/src/tree-candidate-job.test.ts	tests	Not reviewed

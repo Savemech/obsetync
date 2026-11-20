@@ -398,11 +398,12 @@ export class TransportRouter {
         );
     }
 
-    timeoutsFor(payloadBytes: number): TransportPhaseTimeouts {
-        if (!Number.isSafeInteger(payloadBytes) || payloadBytes < 0) {
+    timeoutsFor(payloadBytes: number, expectedUsefulBytes = payloadBytes): TransportPhaseTimeouts {
+        if (!Number.isSafeInteger(payloadBytes) || payloadBytes < 0 ||
+            !Number.isSafeInteger(expectedUsefulBytes) || expectedUsefulBytes < 0) {
             throw new RangeError("transport payload byte count is invalid");
         }
-        const transferMs = Math.ceil(payloadBytes * 1_000 / this.ackMinimumBytesPerSecond);
+        const transferMs = Math.ceil(Math.max(payloadBytes, expectedUsefulBytes) * 1_000 / this.ackMinimumBytesPerSecond);
         return {
             creditTimeoutMs: this.creditTimeoutMs,
             sendTimeoutMs: this.sendTimeoutMs,
@@ -414,12 +415,12 @@ export class TransportRouter {
         if (request.replay !== "content-addressed") {
             throw new Error("transport fallback requires an explicit replay-safe operation");
         }
-        const normalTimeouts = this.timeoutsFor(request.payloadBytes);
         const expectedUsefulBytes = request.expectedUsefulBytes ?? request.payloadBytes;
         if (!Number.isSafeInteger(expectedUsefulBytes) || expectedUsefulBytes < 0 ||
             expectedUsefulBytes > this.performanceMaxUsefulBytes) {
             throw new RangeError("transport expected useful byte count is invalid");
         }
+        const normalTimeouts = this.timeoutsFor(request.payloadBytes, expectedUsefulBytes);
         const policyNow = this.readPerformanceClock();
         const selection: BulkCarrierSelection = request.lane === "bulk"
             ? this.selectBulkCarrier(expectedUsefulBytes, policyNow)
@@ -441,7 +442,7 @@ export class TransportRouter {
                 ? this.probeTimeoutsFor(normalTimeouts)
                 : normalTimeouts;
             const recoveryEpoch = this.recoveryEpoch;
-            const started = this.readPerformanceClock();
+            const started = this.readPerformanceClock(NaN);
             const clockGeneration = this.performanceClockGeneration;
             const sampleInitiallyValid = this.performanceSampleValid(request);
             const measurements = new AttemptMeasurements(
@@ -478,14 +479,14 @@ export class TransportRouter {
             }
         }
 
-        const started = this.readPerformanceClock();
+        const started = this.readPerformanceClock(NaN);
         const httpReason = retryableWsFailure
             ? "ws-retryable-fallback"
             : request.ws === undefined
             ? request.wsUnavailableReason ?? "ws-unavailable"
             : selection.carrier === "http"
                 ? selection.reason
-                : this.httpReasonAfterUnavailableWs(request, started);
+                : this.httpReasonAfterUnavailableWs(request, this.performanceClock);
         this.recordSelection(
             "http",
             httpReason,
@@ -573,11 +574,11 @@ export class TransportRouter {
         this.lastSelectionAtMs = null;
     }
 
-    private readPerformanceClock(): number {
+    private readPerformanceClock(invalidFallback = this.performanceClock): number {
         const value = this.now();
         if (!Number.isFinite(value) || value < 0) {
             this.invalidatePerformanceSample();
-            return this.performanceClock;
+            return invalidFallback;
         }
         if (value < this.performanceClock) {
             // A monotonic source should never move backwards. Discard the
@@ -605,7 +606,7 @@ export class TransportRouter {
         externallyValid: boolean,
         measurements: AttemptMeasurements,
     ): void {
-        const finished = this.readPerformanceClock();
+        const finished = this.readPerformanceClock(NaN);
         const durationMs = finished - started;
         if (!externallyValid || !measurements.valid ||
             clockGeneration !== this.performanceClockGeneration ||

@@ -178,6 +178,12 @@ async function timeoutPolicyIsBoundedAndSizeAware(): Promise<void> {
     ok(router.timeoutsFor(0).ackTimeoutMs === 1_000, "zero payload ACK base changed");
     ok(router.timeoutsFor(2_000).ackTimeoutMs === 3_000, "ACK timeout is not size-aware");
     ok(router.timeoutsFor(100_000).ackTimeoutMs === 5_000, "ACK timeout cap was bypassed");
+    for (const [payloadBytes, expectedUsefulBytes] of [[10, 2_000], [2_000, 10]]) {
+        const ack = await router.execute({ payloadBytes, expectedUsefulBytes, lane: "bulk",
+            replay: "content-addressed", classifyWsFailure: retryable,
+            ws: async timeouts => timeouts.ackTimeoutMs, http: async () => 0 });
+        ok(ack === 3_000, "bulk ACK deadline overlooked the larger direction of transfer");
+    }
     let rejected = false;
     try { router.timeoutsFor(-1); } catch { rejected = true; }
     ok(rejected, "negative payload acquired a routing policy");
@@ -440,6 +446,11 @@ async function invalidAndSuspendedSamplesAreBoundedAndIgnored(): Promise<void> {
     const excluded = router.snapshot();
     ok(excluded.wsBulkSamples === 1 && excluded.invalidPerformanceSamples === 4,
         "hidden, clock-gap, NaN, or over-cap evidence entered carrier scoring");
+
+    now = NaN;
+    await request(() => { now = 2_000; });
+    ok(router.snapshot().wsBulkSamples === 1,
+        "missing dispatch timestamp reused an earlier request's clock observation");
 
     router.resetMeasurements();
     for (let index = 0; index < 70; index++) {
