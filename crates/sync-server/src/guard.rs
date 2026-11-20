@@ -117,8 +117,9 @@ impl GuardScan {
         if self.mtime_regressions > cfg.mtime_regression_max {
             return Some("mtime_regression");
         }
-        let blast = (self.deletions + self.content_changes) as u64;
-        let ceiling = std::cmp::max(cfg.blast_min, self.current_total * cfg.blast_pct / 100);
+        let blast = self.deletions as u128 + self.content_changes as u128;
+        let percentage_limit = u128::from(self.current_total) * u128::from(cfg.blast_pct) / 100;
+        let ceiling = u128::from(cfg.blast_min).max(percentage_limit);
         if blast > ceiling {
             return Some("blast_radius");
         }
@@ -146,37 +147,11 @@ impl GuardScan {
 ///
 /// Runs on a blocking thread with a LocalSet because sync-core's store
 /// futures are `!Send` — same pattern as `bridge::run_merge`.
-pub async fn scan(
-    store: StorageWriter,
-    current: RootNode,
-    candidate: RootNode,
-) -> Result<GuardScan, String> {
-    store
-        .run_blocking(move |store| {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| e.to_string())?;
-            let skew_ms = config().mtime_skew_ms;
-            let local = tokio::task::LocalSet::new();
-            local.block_on(&rt, async {
-                scan_inner(&store, &current, &candidate, skew_ms)
-                    .await
-                    .map_err(|e| e.to_string())
-            })
-        })
-        .await
-        .map_err(|e| e.to_string())?
-}
-
 pub async fn scan_versioned(
     store: StorageWriter,
     current: VersionedRoot,
     candidate: VersionedRoot,
 ) -> Result<GuardScan, String> {
-    if let (VersionedRoot::V1(current), VersionedRoot::V1(candidate)) = (&current, &candidate) {
-        return scan(store, current.clone(), candidate.clone()).await;
-    }
     store
         .run_blocking(move |store| {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -185,6 +160,13 @@ pub async fn scan_versioned(
                 .map_err(|e| e.to_string())?;
             let local = tokio::task::LocalSet::new();
             local.block_on(&rt, async {
+                if let (VersionedRoot::V1(current), VersionedRoot::V1(candidate)) =
+                    (&current, &candidate)
+                {
+                    return scan_inner(&store, current, candidate, config().mtime_skew_ms)
+                        .await
+                        .map_err(|e| e.to_string());
+                }
                 let current_entries = sync_core::versioned_root::load_all_entries(&store, &current)
                     .await
                     .map_err(|e| e.to_string())?;
@@ -330,6 +312,27 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn blast_threshold_handles_large_percentages_and_exact_boundary() {
+        let mut cfg = GuardConfig {
+            mode: GuardMode::Enforce,
+            mtime_regression_max: 25,
+            mtime_skew_ms: 12 * HOUR,
+            blast_pct: u64::MAX,
+            blast_min: 0,
+        };
+        let mut scan = GuardScan {
+            current_total: 100,
+            deletions: 25,
+            ..Default::default()
+        };
+        assert_eq!(scan.triggered(&cfg), None);
+        cfg.blast_pct = 25;
+        assert_eq!(scan.triggered(&cfg), None);
+        scan.content_changes = 1;
+        assert_eq!(scan.triggered(&cfg), Some("blast_radius"));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn stale_tree_shows_regressions_and_deletions() {
         let dir = tempdir().unwrap();
@@ -355,7 +358,13 @@ mod tests {
         )
         .await;
 
-        let scan = scan(store, current, candidate).await.unwrap();
+        let scan = scan_versioned(
+            store,
+            VersionedRoot::V1(current),
+            VersionedRoot::V1(candidate),
+        )
+        .await
+        .unwrap();
         assert_eq!(scan.content_changes, 2);
         assert_eq!(scan.mtime_regressions, 2);
         assert_eq!(scan.deletions, 1);
@@ -390,7 +399,13 @@ mod tests {
         )
         .await;
 
-        let scan = scan(store, current, candidate).await.unwrap();
+        let scan = scan_versioned(
+            store,
+            VersionedRoot::V1(current),
+            VersionedRoot::V1(candidate),
+        )
+        .await
+        .unwrap();
         assert_eq!(scan.mtime_regressions, 0);
         assert_eq!(scan.deletions, 0);
         assert_eq!(scan.content_changes, 1);
@@ -431,7 +446,13 @@ mod tests {
         )
         .await;
 
-        let scan = scan(store, current, candidate).await.unwrap();
+        let scan = scan_versioned(
+            store,
+            VersionedRoot::V1(current),
+            VersionedRoot::V1(candidate),
+        )
+        .await
+        .unwrap();
         assert_eq!(scan.content_changes, 2);
         assert_eq!(
             scan.mtime_regressions, 0,
@@ -452,7 +473,13 @@ mod tests {
         let current = build_on_store(store.clone(), cur).await;
         let candidate = build_on_store(store.clone(), cand).await;
 
-        let scan = scan(store, current, candidate).await.unwrap();
+        let scan = scan_versioned(
+            store,
+            VersionedRoot::V1(current),
+            VersionedRoot::V1(candidate),
+        )
+        .await
+        .unwrap();
         assert_eq!(scan.content_changes, 1);
         assert_eq!(scan.mtime_regressions, 1);
     }
