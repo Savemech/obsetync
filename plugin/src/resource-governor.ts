@@ -473,10 +473,11 @@ export class AdaptiveResourceGovernor {
 
     setVisible(visible: boolean): void {
         if (this.visible !== visible) {
+            const remainingCooldown = this.windowCooldownMs;
             this.rollbackWindowProbe("visibility transition");
             this.windowHealthy = 0;
             this.windowHealthyKey = null;
-            this.windowCooldownMs = WINDOW_PROBE_COOLDOWN_MS;
+            this.windowCooldownMs = Math.max(remainingCooldown, WINDOW_PROBE_COOLDOWN_MS);
         }
         this.visible = visible;
         if (!visible && this.environment.runtime === "mobile") {
@@ -813,7 +814,7 @@ export class AdaptiveResourceGovernor {
         this.windowProbe = null;
         this.windowHealthy = 0;
         this.windowHealthyKey = null;
-        this.windowCooldownMs = cooldownMs;
+        this.windowCooldownMs = Math.max(this.windowCooldownMs, cooldownMs);
         this.healthyHintWindows = 0;
     }
 

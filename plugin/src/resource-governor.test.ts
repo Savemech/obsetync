@@ -483,7 +483,7 @@ function recoveryOneAutomaticallyProbesAfterCleanActiveWindows(): void {
         "clean active windows did not retire the temporary recovery hint");
 }
 
-function pressureCooldownPreventsWindowByWindowOscillation(): void {
+function pressureCooldownPreventsWindowByWindowOscillation(interrupted: boolean): void {
     const governor = new AdaptiveResourceGovernor({ ...SNAPDRAGON });
     for (let sequence = 1; sequence <= 3; sequence++) {
         governor.observeWindow(windowMeasurement(sequence, { demand: { network: 8 } }));
@@ -496,15 +496,21 @@ function pressureCooldownPreventsWindowByWindowOscillation(): void {
     assert.equal(governor.current().tuning.networkConcurrency, 1);
     assert.equal(governor.snapshot().probeAxis, null);
 
-    for (let sequence = 5; sequence <= 9; sequence++) {
+    if (interrupted) {
+        governor.setVisible(false);
+        governor.observeWindow(windowMeasurement(5, { continuousVisible: false, activeDurationMs: 0 }));
+        governor.setVisible(true);
+    }
+    const first = interrupted ? 25 : 5;
+    for (let sequence = first; sequence < first + 5; sequence++) {
         governor.observeWindow(windowMeasurement(sequence, { demand: { network: 8 } }));
         assert.equal(governor.current().tuning.networkConcurrency, 1,
-            `post-pressure control regrew after only ${sequence - 4} clean windows`);
+            `post-pressure control regrew after only ${sequence - first + 1} clean windows`);
         assert.equal(governor.snapshot().probeAxis, null);
     }
     assert.equal((governor as any).windowHealthy, RESOURCE_GOVERNOR_CONSTANTS.windowHealthyToProbe,
         "healthy hysteresis counter grew without bound during cooldown");
-    governor.observeWindow(windowMeasurement(10, { demand: { network: 8 } }));
+    governor.observeWindow(windowMeasurement(first + 5, { demand: { network: 8 } }));
     assert.equal(governor.current().tuning.networkConcurrency, 2);
     assert.equal(governor.snapshot().probeAxis, "network");
 }
@@ -638,7 +644,8 @@ async function run(): Promise<void> {
     partialByteBudgetCannotAuthorizeOtherStages();
     capabilityChangesAndUnobservedGapsInvalidateProbes();
     recoveryOneAutomaticallyProbesAfterCleanActiveWindows();
-    pressureCooldownPreventsWindowByWindowOscillation();
+    pressureCooldownPreventsWindowByWindowOscillation(false);
+    pressureCooldownPreventsWindowByWindowOscillation(true);
     windowKindsNumericValidationAndApplicationFailureAreIsolated();
     await visibilityGateStopsOnlyNewMobileWork();
     await visibilityCancellationIsPerWaiter();
