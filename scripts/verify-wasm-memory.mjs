@@ -3933,6 +3933,8 @@ async function qualifyCorpus(variant, kind, version) {
     const started = performance.now(), input = corpus(kind);
     const expected = await oracleFor(variant, kind, version, input);
     const context = await fresh(variant, `${variant.name}/${kind}/v${version}`), cycles = [];
+    const cancellationStages = ["empty-input", "partial-input", "input", "sorting", "partial", "ready",
+        ...(version === 2 ? ["parent", "closure", "failed-duplicate"] : [])];
     for (let cycle = 0; cycle < 3; cycle++) {
         const tree = requiredTree(context.module);
         let activeToken, cleanupRows, retiring = false;
@@ -3968,8 +3970,7 @@ async function qualifyCorpus(variant, kind, version) {
             sameLive(observe(context, tree, "seeded-component-verified").memory, baseline,
                 `${context.label}: resident length queries/reporting retained native scratch`);
             const cancelled = [];
-            for (const stage of ["empty-input", "partial-input", "input", "sorting", "partial", "ready",
-                ...(version === 2 ? ["parent", "closure", "failed-duplicate"] : [])]) {
+            for (const stage of cancellationStages) {
                 const rows = stage === "failed-duplicate" ? [...input.rows, { ...input.rows[0] }] : input.rows;
                 const expectedRows = stage === "empty-input" ? [] : rows;
                 const acceptedRows = stage === "partial-input" ? rows.slice(0, 17) : expectedRows;
@@ -4298,6 +4299,8 @@ async function qualifyCorpus(variant, kind, version) {
             assert(retained.live_requested_bytes < published.live_requested_bytes, "old populated graph did not retire");
             assert.deepEqual(canonical(context.module, tree), expected, `${context.label}: rebuilt root/chunks differ from legacy`);
             sameLive(observe(context, tree, "publish/verified").memory, retained, `${context.label}: canonical export retains native scratch`);
+            assert.deepEqual(cancelled.map(result => result.stage), cancellationStages,
+                `${context.label}: cycle ${cycle + 1} did not complete its cancellation stages`);
             cycles.push({ cycle, cancelled, published: { built, retired,
                 retained_requested_bytes: retained.live_requested_bytes, retained_live_allocations: retained.live_allocations,
                 before_swap: prepared, after_swap: transferred,
@@ -4394,11 +4397,6 @@ function compactV2Reachability(result) {
 }
 
 function compactCorpus(result) {
-    const cancelledStages = result.cycles[0]?.cancelled.map(stage => stage.stage) ?? [];
-    for (const cycle of result.cycles) {
-        assert.deepEqual(cycle.cancelled.map(stage => stage.stage), cancelledStages,
-            `${result.variant}/${result.corpus}/v${result.version}: lifecycle stages differ by cycle`);
-    }
     return {
         variant: result.variant,
         corpus: result.corpus,
@@ -4410,7 +4408,7 @@ function compactCorpus(result) {
         baseline_live_allocations: result.baseline_live_allocations,
         phases: compactPhases(result.phases),
         cycle_count: result.cycles.length,
-        cancelled_stages: cancelledStages,
+        cancelled_stages: result.cycles[0].cancelled.map(result => result.stage),
         published_range_checkpoints: result.cycles.map(cycle => cycle.published.built.ranges),
         published_retained_requested_bytes: result.cycles.map(cycle =>
             cycle.published.retained_requested_bytes),
