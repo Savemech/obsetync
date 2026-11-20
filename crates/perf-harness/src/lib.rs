@@ -797,7 +797,7 @@ pub async fn benchmark(
         let oracle_store = sync_core::store::MemoryChunkStore::new();
         let oracle_root = sync_core::tree::build_tree(
             &oracle_store,
-            entry_map.values().cloned().collect(),
+            entry_map.into_values().collect(),
             "benchmark-vault",
             "perf-harness",
         )
@@ -900,10 +900,11 @@ pub async fn benchmark_prefix_merge(
     for entry in &changed {
         expected.insert(entry.path.clone(), entry.clone());
     }
+    let final_files = expected.len() as u64;
     let oracle_store = sync_core::store::MemoryChunkStore::new();
     let oracle_root = sync_core::tree::build_tree(
         &oracle_store,
-        expected.values().cloned().collect(),
+        expected.into_values().collect(),
         "prefix-benchmark",
         "perf-harness",
     )
@@ -959,8 +960,8 @@ pub async fn benchmark_prefix_merge(
 
         let roots_match = legacy_root.hash() == oracle_root.hash()
             && linear_root.hash() == oracle_root.hash()
-            && legacy_root.total_files == expected.len() as u64
-            && linear_root.total_files == expected.len() as u64;
+            && legacy_root.total_files == final_files
+            && linear_root.total_files == final_files;
         if !roots_match {
             return Err(HarnessError::ManifestMismatch(format!(
                 "prefix benchmark semantic mismatch in iteration {iteration}"
@@ -970,7 +971,7 @@ pub async fn benchmark_prefix_merge(
             legacy_update_ns,
             linear_update_ns,
             speedup: legacy_update_ns as f64 / linear_update_ns.max(1) as f64,
-            final_files: expected.len() as u64,
+            final_files,
             roots_match,
         });
     }
@@ -1317,13 +1318,12 @@ pub async fn benchmark_tree_v2(
             let v2_entries = sync_core::tree_v2::load_all_entries(&v2_store, &v2_after)
                 .await
                 .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+            let entries_match = v1_entries == expected_entries && v2_entries == expected_entries;
             let oracle_store = sync_core::store::MemoryChunkStore::new();
-            let oracle = sync_core::tree_v2::build_tree(&oracle_store, expected_entries.clone())
+            let oracle = sync_core::tree_v2::build_tree(&oracle_store, expected_entries)
                 .await
                 .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
-            let semantic_state_matches = v1_entries == expected_entries
-                && v2_entries == expected_entries
-                && v2_after.hash() == oracle.hash();
+            let semantic_state_matches = entries_match && v2_after.hash() == oracle.hash();
             let deltas_match = v1_diff.deltas == v2_diff.deltas;
             let churn_limit = v2_stats
                 .replacement_leaves
