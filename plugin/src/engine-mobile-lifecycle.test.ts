@@ -139,6 +139,18 @@ async function run(): Promise<void> {
             assert(deletions.journal.unsyncedCount() > 0 && deletions.journal.unsyncedCount() <= 256,
                 "hidden deletion scan appended beyond its one in-flight durable batch");
             assert.equal(deletionVisibility.snapshot().activeWork, 0);
+            assert.equal(deletions.server.requests.length, 0, "hidden scan published deletions");
+            deletions.source.set(pathAt(0), 1);
+            deletions.source.set(pathAt(1), 2);
+            assert.equal(deletionVisibility.setVisible(true), true);
+            await deletionEngine.engine.lifecycleResume;
+            assert.equal(deletions.server.entries.size, 2);
+            assert.equal(deletions.journal.unsyncedCount(), 0, "foreground left deletion hints unacknowledged");
+            assert.equal(deletions.base.entryCount(), 2);
+            for (const [path, version] of deletions.source) {
+                assert.equal(deletions.server.entries.get(path)?.hash, hashFor(version));
+                assert.equal(deletions.base.getHash(path), hashFor(version));
+            }
         } finally {
             deletionVisibility.dispose();
             await deletions.close();
@@ -152,4 +164,7 @@ async function run(): Promise<void> {
     }
 }
 
-void run().catch(error => { setTimeout(() => { throw error; }, 0); });
+const stalled = () => { throw new Error("mobile lifecycle suite exited before its operations settled"); };
+process.once("beforeExit", stalled);
+void run().finally(() => process.off("beforeExit", stalled))
+    .catch(error => { setTimeout(() => { throw error; }, 0); });
