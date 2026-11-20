@@ -224,14 +224,17 @@ impl ClosureValidation {
             return Ok(false);
         };
         range_memory.remove_vector(V2RangeVector::ClosurePending, &range);
-        if let Some(previous) = self.descriptors.get(&range.hash) {
-            if previous != &range {
-                return Err(invalid(
-                    "Tree v2 repeated hash has a different child descriptor",
-                ));
+        let slot = match self.descriptors.entry(range.hash) {
+            hash_map::Entry::Occupied(previous) => {
+                if previous.get() != &range {
+                    return Err(invalid(
+                        "Tree v2 repeated hash has a different child descriptor",
+                    ));
+                }
+                return Ok(true);
             }
-            return Ok(true);
-        }
+            hash_map::Entry::Vacant(slot) => slot,
+        };
 
         self.visited_nodes = self.visited_nodes.saturating_add(1);
         if range.height > MAX_TREE_DEPTH || self.visited_nodes > MAX_VISITED_NODES {
@@ -260,9 +263,7 @@ impl ClosureValidation {
             }
         }
         self.reachable.insert(range.hash);
-        let hash = range.hash;
-        self.descriptors.insert(hash, range);
-        range_memory.add_descriptor(self.descriptors.get(&hash).unwrap());
+        range_memory.add_descriptor(slot.insert(range));
         Ok(true)
     }
 }

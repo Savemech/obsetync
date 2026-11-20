@@ -878,18 +878,6 @@ impl ReplacementV2RangesMemory {
         self.check();
     }
 
-    /// Only for a real replacement of an existing map value. Counts remain
-    /// unchanged; the previous and replacement endpoint allocations may differ.
-    #[cfg(test)]
-    pub(crate) fn replace_descriptor(&mut self, previous: &RangeRef, replacement: &RangeRef) {
-        self.counters_valid &= self.descriptor_ranges > 0;
-        self.descriptor_paths
-            .subtract_memory(Self::endpoints(previous));
-        self.descriptor_paths
-            .add_memory(Self::endpoints(replacement));
-        self.check();
-    }
-
     /// Numerical emptiness, independent of sticky validity, for diagnostics.
     /// This is not proof that a caller actually released its native allocations.
     #[cfg(test)]
@@ -1079,14 +1067,8 @@ mod v2_ranges_memory_tests {
         assert_eq!(memory.descriptor_paths, clone_paths);
         assert_eq!(memory.descriptor_ranges, 1);
 
-        let replacement = range(9);
-        let replacement_paths = ReplacementV2RangesMemory::endpoints(&replacement);
-        memory.replace_descriptor(&descriptor, &replacement);
+        memory.remove_descriptor(&descriptor);
         drop(descriptor);
-        assert_eq!(memory.descriptor_paths, replacement_paths);
-        assert_eq!(memory.descriptor_ranges, 1);
-        memory.remove_descriptor(&replacement);
-        drop(replacement);
         drop(pending);
         memory.release_vector(V2RangeVector::ClosurePending);
         let value = ranges.pop().unwrap();
