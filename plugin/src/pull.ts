@@ -644,7 +644,11 @@ async function pullPagedIfSupported(
         );
         recordsSeen += page.deltas.length;
         bytesTotal += pageBytesTotal;
-        perf?.setWorkload({ filesTotal: recordsSeen, bytesTotal });
+        // Progress events belong to this operation; checkpoints also count earlier runs.
+        perf?.setWorkload({
+            filesTotal: recordsSeen - (checkpoint?.recordsSeen ?? 0),
+            bytesTotal: bytesTotal - (checkpoint?.bytesTotal ?? 0),
+        });
         if (localRootHash !== null && page.deltas.length > 0) {
             onProgress?.(`${recordsSeen} changes to apply (paged)`);
         }
@@ -741,10 +745,10 @@ async function pullPagedIfSupported(
 
     syncBase.setLastSyncTimestamp(Date.now());
     perf?.setWorkload({
-        filesTotal: recordsSeen,
-        bytesTotal,
-        filesNeeded: downloaded,
-        bytesNeeded: bytesDownloaded,
+        filesTotal: recordsSeen - (checkpoint?.recordsSeen ?? 0),
+        bytesTotal: bytesTotal - (checkpoint?.bytesTotal ?? 0),
+        filesNeeded: downloaded - (checkpoint?.downloaded ?? 0),
+        bytesNeeded: bytesDownloaded - (checkpoint?.bytesDownloaded ?? 0),
     });
     if (deferredCount > 0 || remoteOmissionCount > 0) {
         // Do not strand a completed cursor past files that were never applied

@@ -1,4 +1,5 @@
 import { strict as assert } from "node:assert";
+import { PerfTrace } from "./perf-trace";
 import { pull } from "./pull";
 import { ObsetyncSyncBase, SYNC_BASE_STORE_PATH } from "./sync-base";
 import type { DiffPage, FileDelta } from "./api";
@@ -231,6 +232,8 @@ async function rendererKillResumesAfterDurablePage(): Promise<void> {
             return new Uint8Array([hash === hashA ? 1 : 2]);
         },
     } as any;
+    const trace = new PerfTrace({ monitorEventLoop: false });
+    const resumedPerf = trace.begin("pull");
     const result = await pull(
         resumedApi,
         io as any,
@@ -239,7 +242,13 @@ async function rendererKillResumesAfterDurablePage(): Promise<void> {
         sourceRoot,
         wasm,
         makeTree(targetRoot),
+        undefined, undefined, undefined, undefined, resumedPerf,
     );
+    resumedPerf.finish();
+    const [resumedRecord] = trace.recent();
+    assert.deepEqual([resumedRecord.filesCompleted, resumedRecord.filesTotal, resumedRecord.filesNeeded,
+        resumedRecord.bytesTotal, resumedRecord.bytesNeeded], [1, 1, 1, 1, 1]);
+    assert.equal(result.applied, 2);
     check(resumedRequest, "restart did not continue from persisted snapshot cursor");
     check(result.requiresTreeRebuild === true,
         "partial checkpoint did not require a base-derived tree replacement");
@@ -280,6 +289,7 @@ async function rendererKillResumesAfterDurablePage(): Promise<void> {
         check(completedBase.diffPageCheckpoint?.toRoot === targetRoot,
             "failed verification discarded the pinned target");
     }
+    const completedPerf = trace.begin("pull");
     const completedResult = await pull(
         completedApi,
         io as any,
@@ -288,7 +298,13 @@ async function rendererKillResumesAfterDurablePage(): Promise<void> {
         sourceRoot,
         wasm,
         staleCompletedTree,
+        undefined, undefined, undefined, undefined, completedPerf,
     );
+    completedPerf.finish();
+    const completedRecord = trace.recent().at(-1)!;
+    assert.deepEqual([completedRecord.filesCompleted, completedRecord.filesTotal, completedRecord.filesNeeded,
+        completedRecord.bytesTotal, completedRecord.bytesNeeded], [0, 0, 0, 0, 0]);
+    assert.equal(completedResult.applied, 2);
     check(!unexpectedPageRequest, "completed checkpoint fetched a duplicate page");
     check(completedResult.requiresTreeRebuild === true,
         "completed checkpoint did not require a base-derived tree replacement");
