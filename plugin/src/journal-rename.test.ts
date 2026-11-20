@@ -100,16 +100,21 @@ async function ignoredHalvesRemainIndependentAndPartialGroupsKeepBothHints(): Pr
         "rename leaving scope persisted its ignored new path");
 
     const failed = await fixture();
+    const prior = await failed.journal.append({ action: "modified", path: "prior.md", ts: 1, synced: false });
+    const successfulWrites = failed.appends();
     failed.failAppend();
     await failed.callbacks.get("rename")!(fileAt("new.md"), "old.md");
     const queued = failed.engine.pendingChanges.take();
     check(queued.length === 2 && queued.every((hint: any) => hint.journalId === undefined),
         "partial append lost one session hint or invented a durable watermark");
-    check(failed.journal.unsynced().length === 0, "partial append published a half-rename in memory");
-    const attempted = failed.walWrites.flatMap(write => segmentRows(write.raw));
-    check(failed.appends() === 1 && attempted.length === 1 && attempted[0].op === "append" &&
-        attempted[0].entry?.action === "renamed" && failed.files.get(failed.walWrites[0].path)?.length === 15,
+    check(failed.journal.unsyncedCount() === 1, "partial append changed the committed journal count");
+    const attempted = failed.walWrites.slice(successfulWrites).flatMap(write => segmentRows(write.raw));
+    check(failed.appends() === successfulWrites + 1 && attempted.length === 1 && attempted[0].op === "append" &&
+        attempted[0].entry?.action === "renamed" && failed.files.get(failed.walWrites[successfulWrites].path)?.length === 15,
         "actual callback persisted the old-path deletion separately instead of a single torn linked segment");
+    const restarted = await recover(failed);
+    check(restarted.queued.length === 1 && restarted.queued[0].path === "prior.md" &&
+        restarted.queued[0].journalId === prior, "torn rename corrupted the last committed journal prefix");
 }
 
 const oversizedMove: DeferredPushChange[] = [
