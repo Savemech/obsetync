@@ -2,7 +2,6 @@
 export interface PreparedSyncEngine {
     prepareLocal(): Promise<void>;
     start(): Promise<void>;
-    stop(): void;
     quiesceAndDrain(): Promise<void>;
     isStopped(): boolean;
 }
@@ -45,20 +44,20 @@ export async function activatePreparedSync<T>(options: {
     // A superseding initialization needs these listeners until its capture
     // handoff. Terminal stop belongs to plugin unload, not a stale activation
     // continuation that may finish during the replacement's drain.
-    const quiesce = () => { void engine.quiesceAndDrain(); };
-    if (!current()) { quiesce(); return false; }
+    const quiesce = async () => { await engine.quiesceAndDrain(); return false; };
+    if (!current()) return quiesce();
     try {
         await engine.prepareLocal();
-        if (!current()) { quiesce(); return false; }
+        if (!current()) return quiesce();
         const negotiated = await negotiation;
-        if (!current()) { quiesce(); return false; }
+        if (!current()) return quiesce();
         if ("error" in negotiated) throw negotiated.error;
         options.selectTree(negotiated.value);
-        if (!current()) { quiesce(); return false; }
+        if (!current()) return quiesce();
         await engine.start();
-        return current();
+        return current() || quiesce();
     } catch (error) {
-        if (!current()) { quiesce(); return false; }
+        if (!current()) return quiesce();
         throw error;
     }
 }

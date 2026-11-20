@@ -1,4 +1,4 @@
-import { publishStartupResult } from "./startup-activation";
+import { activatePreparedSync, publishStartupResult } from "./startup-activation";
 import { createWasmLoader, type WasmSelection } from "./wasm-runtime";
 
 let assertions = 0;
@@ -85,10 +85,28 @@ async function sharedLoaderPublishesOnlyTheCurrentGeneration(): Promise<void> {
         "concurrent initializations duplicated compilation or governor/profile publication");
 }
 
+async function staleActivationWaitsForCleanup(): Promise<void> {
+    const drain = deferred<void>();
+    const failure = new Error("native retirement failed");
+    let settled = false;
+    const unexpected = () => { throw new Error("obsolete activation started work"); };
+    const activation = activatePreparedSync({
+        engine: { prepareLocal: unexpected, start: unexpected, isStopped: () => false,
+            quiesceAndDrain: () => drain.promise },
+        negotiation: Promise.resolve(), selectTree: unexpected, isCurrent: () => false,
+    }).finally(() => { settled = true; });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    check(!settled, "stale activation returned before engine retirement finished");
+    drain.reject(failure);
+    const error = await activation.then(() => null, reason => reason);
+    check(error === failure, "engine retirement failure was lost");
+}
+
 const watchdog = setTimeout(() => { throw new Error("startup publication test did not settle"); }, 10_000);
 void lateCompilationCannotReplaceCurrentModuleOrProfile()
     .then(staleFailuresAreIgnoredButCurrentFailuresPropagate)
     .then(sharedLoaderPublishesOnlyTheCurrentGeneration)
+    .then(staleActivationWaitsForCleanup)
     .then(() => console.log(`startup-activation.test: ${assertions} assertions passed`))
     .catch(error => { console.error(error); process.exitCode = 1; })
     .finally(() => clearTimeout(watchdog));
