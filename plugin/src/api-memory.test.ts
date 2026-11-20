@@ -393,22 +393,15 @@ async function ownedDownloadRetainsAdmissionThroughApplyAndRejectsOversizeBefore
 }
 
 async function oversizedWsPayloadHasAnExplicitRouteReason(): Promise<void> {
-    const previousWebSocket = (globalThis as any).WebSocket;
-    (globalThis as any).WebSocket = class {};
-    try {
-        const budget = new ResourceBudget({ capacityBytes: 4 * MIB });
-        const fake = fakeApi(budget);
-        fake.internal.wsDataFrameBytes = 64;
-        fake.reply(() => ({ body: ack(1) }));
-        await fake.api.putObjects([record(1, 128)]);
-        const diagnostics = await fake.api.getBulkDiagnostics();
-        assert.equal(diagnostics.lastCarrier, "http");
-        assert.equal(diagnostics.lastCarrierReason, "ws-payload-too-large");
-        assert.equal(fake.counts.request, 1);
-    } finally {
-        if (previousWebSocket === undefined) delete (globalThis as any).WebSocket;
-        else (globalThis as any).WebSocket = previousWebSocket;
-    }
+    const budget = new ResourceBudget({ capacityBytes: 4 * MIB });
+    const fake = fakeApi(budget);
+    fake.internal.wsDataFrameBytes = 64;
+    fake.reply(() => ({ body: ack(1) }));
+    await fake.api.putObjects([record(1, 128)]);
+    const diagnostics = await fake.api.getBulkDiagnostics();
+    assert.equal(diagnostics.lastCarrier, "http");
+    assert.equal(diagnostics.lastCarrierReason, "ws-payload-too-large");
+    assert.equal(fake.counts.request, 1);
 }
 
 async function legacyLargeObjectFitsMobileAndCumulativeRetentionIsBounded(): Promise<void> {
@@ -699,7 +692,8 @@ async function urgentFilePriorityIsBoundedExplicitAndReplaySafe(): Promise<void>
         undefined, undefined, undefined, { priority: "urgent-file" }), /one bounded content object/);
     assert.equal(priorities.length, beforeCalls, "invalid urgent pack reached transport");
 
-    const replay = fakeApi(new ResourceBudget({ capacityBytes: 4 * MIB }));
+    assert.equal(budget.snapshot().usedBytes, 0);
+    const replay = fakeApi(budget);
     replay.internal.wsDataFrameBytes = 2 * MIB;
     const effects = new Set<string>();
     let wsAttempts = 0;
@@ -711,6 +705,7 @@ async function urgentFilePriorityIsBoundedExplicitAndReplaySafe(): Promise<void>
         },
     });
     replay.reply((_path, body) => {
+        assert.ok(budget.snapshot().usedBytes > 0, "HTTP fallback lost its upload reservation");
         const decoded = decodeBulkUploadPack(body, limits);
         for (const item of decoded) effects.add(item.hash);
         return { body: ack(decoded.length) };
@@ -798,9 +793,9 @@ void (async () => {
         await rejectedPacksReleaseWorkspaceBeforeOrderedRetries();
         await legacyFallbackAndMalformedAckReleaseAdmission();
         await ownedDownloadRetainsAdmissionThroughApplyAndRejectsOversizeBeforeDecrypt();
-        await oversizedWsPayloadHasAnExplicitRouteReason();
         await legacyLargeObjectFitsMobileAndCumulativeRetentionIsBounded();
         await withAvailableWebSocket(async () => {
+            await oversizedWsPayloadHasAnExplicitRouteReason();
             await ownedUploadStillUsesTheAutomaticWsLane();
             await productionRouterOwnsFallbackAndStopsWsPingPong();
             await oversizedWsGetFallsBackWithoutMaskingInvalidWrites();
