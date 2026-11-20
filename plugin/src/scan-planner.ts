@@ -4,6 +4,8 @@ export interface MetadataStat {
 }
 
 export interface MetadataScanPlan {
+    visibleFiles: number;
+    visibleBytes: number;
     toHash: Array<{ path: string; stat: MetadataStat }>;
     deleted: string[];
 }
@@ -25,20 +27,7 @@ export function automaticChangeNeedsReview(
     );
 }
 
-/**
- * A startup audit is recovery, not user intent. Refuse to automatically
- * publish a vault-sized expansion or a suspicious mass deletion; Full Rescan
- * remains the explicit confirmation path after the user reviews ignores.
- */
-export function metadataScanNeedsReview(
-    plan: MetadataScanPlan,
-    baseCount: number,
-): boolean {
-    const total = plan.toHash.length + plan.deleted.length;
-    return automaticChangeNeedsReview(total, plan.deleted.length, baseCount);
-}
-
-/** Pure metadata phase shared by startup scans and tests. */
+/** Pure metadata phase shared by automatic and manual scans. */
 export function planMetadataScan(
     stats: Map<string, MetadataStat>,
     basePaths: string[],
@@ -46,8 +35,11 @@ export function planMetadataScan(
     isExcluded: (path: string) => boolean,
 ): MetadataScanPlan {
     const toHash: Array<{ path: string; stat: MetadataStat }> = [];
+    let visibleFiles = 0, visibleBytes = 0;
     for (const [path, stat] of stats) {
         if (isExcluded(path)) continue;
+        visibleFiles++;
+        visibleBytes += stat.size;
         const base = getBase(path);
         if (base && base.mtime === stat.mtime && base.size === stat.size) continue;
         // Do not gate on `mtime > lastSync`: copied-in files can be older than
@@ -56,6 +48,6 @@ export function planMetadataScan(
         toHash.push({ path, stat });
     }
 
-    const deleted = basePaths.filter((path) => !isExcluded(path) && !stats.has(path));
-    return { toHash, deleted };
+    const deleted = basePaths.filter((path) => !stats.has(path) && !isExcluded(path));
+    return { toHash, deleted, visibleFiles, visibleBytes };
 }

@@ -75,7 +75,6 @@ import { repairSmallContent, repairLargeContent, validatedReconcileMissing,
 import { uploadIndexChunks } from "./index-upload";
 import {
     automaticChangeNeedsReview,
-    metadataScanNeedsReview,
     planMetadataScan,
 } from "./scan-planner";
 import { isSafeVaultPath } from "./delta-validation";
@@ -1742,19 +1741,8 @@ export class ObsetyncSyncEngine {
 
             // Phase 1: fast mtime+size filter (synchronous, no I/O).
             const endEnumerate = perf.phase("enumerate");
-            const toHash: Array<{ path: string; stat: { mtime: number; size: number } }> = [];
-            let visibleFiles = 0;
-            let visibleBytes = 0;
-            for (const [path, stat] of statMap) {
-                if (this.isExcluded(path)) continue;
-                visibleFiles++;
-                visibleBytes += stat.size;
-                const base = this.syncBase.getEntry(path);
-                if (base && stat.mtime === base.mtime && stat.size === base.size) continue;
-                toHash.push({ path, stat });
-            }
-            const deletedPaths = this.syncBase.allPaths().filter(
-                (path) => !statMap.has(path) && !this.isExcluded(path),
+            const { toHash, deleted: deletedPaths, visibleFiles, visibleBytes } = planMetadataScan(
+                statMap, this.syncBase.allPaths(), path => this.syncBase.getEntry(path), path => this.isExcluded(path),
             );
             endEnumerate();
             perf.setWorkload({ filesTotal: visibleFiles + deletedPaths.length, bytesTotal: visibleBytes });
@@ -4035,14 +4023,6 @@ export class ObsetyncSyncEngine {
             }
             endStat();
 
-            let visibleFiles = 0;
-            let visibleBytes = 0;
-            for (const [path, stat] of allStats) {
-                if (this.isExcluded(path)) continue;
-                visibleFiles++;
-                visibleBytes += stat.size;
-            }
-
             const endEnumerate = perf.phase("enumerate");
             const plan = planMetadataScan(
                 allStats,
@@ -4050,12 +4030,13 @@ export class ObsetyncSyncEngine {
                 (path) => this.syncBase.getEntry(path),
                 (path) => this.isExcluded(path),
             );
+            const { visibleFiles, visibleBytes } = plan;
             endEnumerate();
             perf.setWorkload({ filesTotal: visibleFiles, bytesTotal: visibleBytes });
 
             const total = plan.toHash.length + plan.deleted.length;
-            const needsBulkReview = metadataScanNeedsReview(
-                plan,
+            const needsBulkReview = automaticChangeNeedsReview(
+                total, plan.deleted.length,
                 this.syncBase.entryCount(),
             );
             const approvalResumed = this.syncBase.bulkChangeApproval

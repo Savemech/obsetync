@@ -1,6 +1,5 @@
 import {
     automaticChangeNeedsReview,
-    metadataScanNeedsReview,
     planMetadataScan,
 } from "./scan-planner";
 
@@ -36,21 +35,15 @@ check(!candidates.has("ignored.tmp"), "ignored local file entered the scan");
 check(result.deleted.length === 1 && result.deleted[0] === "gone.md", "offline deletion was missed");
 
 check(
-    !metadataScanNeedsReview(result, bases.size),
+    !automaticChangeNeedsReview(result.toHash.length + result.deleted.length, result.deleted.length, bases.size),
     "small metadata audit was incorrectly blocked",
 );
 check(
-    metadataScanNeedsReview(
-        { toHash: Array.from({ length: 10_000 }, (_, i) => ({ path: `${i}.md`, stat: { mtime: i, size: 1 } })), deleted: [] },
-        20_000,
-    ),
+    automaticChangeNeedsReview(10_000, 0, 20_000),
     "vault-sized automatic audit was not blocked",
 );
 check(
-    metadataScanNeedsReview(
-        { toHash: [], deleted: Array.from({ length: 100 }, (_, i) => `${i}.md`) },
-        400,
-    ),
+    automaticChangeNeedsReview(100, 100, 400),
     "mass deletion was not blocked",
 );
 check(
@@ -62,4 +55,6 @@ check(
     "ordinary journal recovery was incorrectly blocked",
 );
 
-console.log("scan-planner.test: 10 assertions passed");
+check(result.visibleFiles === 3 && result.visibleBytes === 14, "workload must include unchanged visible files and exclude ignored files");
+
+console.log("scan-planner.test: 11 assertions passed");

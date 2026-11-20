@@ -345,8 +345,8 @@ pending	plugin/src/root-tree-resident-admission.test.ts	tests	Not reviewed
 pending	plugin/src/root-tree-resident-admission.ts	production	Not reviewed
 pending	plugin/src/runtime-retirement.test.ts	tests	Not reviewed
 pending	plugin/src/runtime-retirement.ts	production	Not reviewed
-pending	plugin/src/scan-planner.test.ts	tests	Not reviewed
-pending	plugin/src/scan-planner.ts	production	Not reviewed
+reviewed	plugin/src/scan-planner.test.ts	tests	Checked inclusion, unchanged and regressed metadata, missing tracked files, workload totals and bulk review cutoffs.
+reviewed	plugin/src/scan-planner.ts	production	Traced startup and full rescan. Both use one metadata planner; workload totals collected alongside size/mtime comparisons. Shared review thresholds retained.
 pending	plugin/src/secure.test.ts	tests	Not reviewed
 pending	plugin/src/secure.ts	production	Not reviewed
 pending	plugin/src/segmented-store-gc.test.ts	tests	Not reviewed
