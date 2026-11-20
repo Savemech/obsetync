@@ -113,7 +113,8 @@ function treeSummary(value: unknown): TreeChunkSummary | null {
     const countersValid = ownData(value, "counters_valid");
     if (!safeCount(chunks) || !safeCount(mapCapacity) || !safeCount(payloadBytes)
         || !safeCount(bufferCapacityBytes) || typeof countersValid !== "boolean"
-        || mapCapacity < chunks || bufferCapacityBytes < payloadBytes) return null;
+        || mapCapacity < chunks || bufferCapacityBytes < payloadBytes
+        || (chunks === 0 && bufferCapacityBytes !== 0)) return null;
     return {
         chunks, map_capacity: mapCapacity, payload_bytes: payloadBytes,
         buffer_capacity_bytes: bufferCapacityBytes, counters_valid: countersValid,
@@ -463,20 +464,8 @@ interface ReplacementV1GraphMemory {
 }
 
 function vecBackingMemory(value: unknown): VecBackingMemory | null {
-    const row = metadataRecord(value, VEC_MEMORY_FIELDS);
-    if (!row || !safeCount(row.owners) || row.owners > 1 || !safeCount(row.length_slots)
-        || !safeCount(row.capacity_slots) || !safeCount(row.slot_size_bytes)
-        || !safeCount(row.backing_capacity_bytes) || typeof row.counters_valid !== "boolean"
-        || row.length_slots > row.capacity_slots) return null;
-    if (row.owners === 0) {
-        if (row.length_slots !== 0 || row.capacity_slots !== 0 || row.slot_size_bytes !== 0
-            || row.backing_capacity_bytes !== 0) return null;
-    } else {
-        if (row.slot_size_bytes === 0
-            || row.capacity_slots > Math.floor(Number.MAX_SAFE_INTEGER / row.slot_size_bytes)
-            || row.backing_capacity_bytes !== row.capacity_slots * row.slot_size_bytes) return null;
-    }
-    return row as unknown as VecBackingMemory;
+    const row = vecBackingAggregateMemory(value);
+    return row && row.owners <= 1 ? row : null;
 }
 
 function vecBackingAggregateMemory(value: unknown): VecBackingAggregateMemory | null {

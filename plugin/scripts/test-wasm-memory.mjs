@@ -327,6 +327,7 @@ test("tree chunk invariants and invalid native counters fail closed without losi
     for (const section of ["resident", "replacement", "retiring"]) {
         for (const summary of [
             chunkSummary({ chunks: 8, map_capacity: 7 }),
+            chunkSummary({ chunks: 0, payload_bytes: 0, buffer_capacity_bytes: 1 }),
             chunkSummary({ payload_bytes: 2049, buffer_capacity_bytes: 2048 }),
         ]) invalidTree(formatTree(treeSnapshot({ [section]: summary })));
         const lines = formatTree(treeSnapshot({ [section]: chunkSummary({ counters_valid: false }) }));
@@ -342,6 +343,8 @@ test("tree chunk zero and maximum safe counters remain exact and private-job unc
     assert.match(zeroLines[0], /0 chunks.*map cap 0 slots.*payload 0 B.*buffer cap 0 B/);
     assert(zeroLines.some(line => /other private jobs unmeasured: no/.test(line)));
     treeLimitations(zeroLines);
+    assert.match(formatTree(treeSnapshot({ resident: { ...zero, map_capacity: 7 } }))[0],
+        /0 chunks.*map cap 7 slots.*payload 0 B.*buffer cap 0 B/);
     const maximum = chunkSummary({ chunks: Number.MAX_SAFE_INTEGER, map_capacity: Number.MAX_SAFE_INTEGER,
         payload_bytes: Number.MAX_SAFE_INTEGER, buffer_capacity_bytes: Number.MAX_SAFE_INTEGER });
     const maxLines = formatTree(treeSnapshot({ resident: maximum }));
