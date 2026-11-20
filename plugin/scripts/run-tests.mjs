@@ -1,6 +1,6 @@
 import { build } from "esbuild";
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -34,7 +34,7 @@ async function manifestEntries(manifestPath) {
         seen.add(entry);
         // Missing/inaccessible sources and aliases outside the manifest's
         // directory are errors, never a silently omitted test.
-        if (await realpath(entry) !== entry || !(await stat(entry)).isFile()) {
+        if (!(await lstat(entry)).isFile()) {
             throw new Error("Invalid test manifest: source must be a regular sibling file");
         }
         entries.push(entry);

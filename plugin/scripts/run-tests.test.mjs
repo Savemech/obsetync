@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { lstat, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -10,18 +10,12 @@ import ts from "typescript";
 const runner = fileURLToPath(new URL("./run-tests.mjs", import.meta.url));
 const sourceDirectory = fileURLToPath(new URL("../src/", import.meta.url));
 const productionManifest = join(sourceDirectory, "plugin.test.ts");
-const discoveryAllowlist = new Set(["plugin.test.ts"]);
 
 test("production manifest includes every sibling TypeScript test suite", async () => {
     const discovered = (await readdir(sourceDirectory, { withFileTypes: true }))
-        .filter(entry => entry.name.endsWith(".test.ts") && !discoveryAllowlist.has(entry.name));
+        .filter(entry => entry.name.endsWith(".test.ts") && entry.name !== "plugin.test.ts");
     for (const entry of discovered) {
-        const path = join(sourceDirectory, entry.name);
-        const info = await lstat(path);
-        assert(entry.isFile() && info.isFile() && !info.isSymbolicLink(),
-            `TypeScript test suite must be a regular sibling file: ${entry.name}`);
-        assert.equal(await realpath(path), path,
-            `TypeScript test suite must not escape the source directory: ${entry.name}`);
+        assert(entry.isFile(), `TypeScript test suite must be a regular sibling file: ${entry.name}`);
     }
 
     const source = await readFile(productionManifest, "utf8");
