@@ -97,15 +97,6 @@ function base64Root(value: unknown): string {
     if ((padding === 2 && (last & 15)) || (padding === 1 && (last & 3))) fail();
     return value;
 }
-function rootBytes(encoded: string): Uint8Array {
-    const binary = atob(base64Root(encoded));
-    // TypedArray.from(iterable) first materializes an unbounded element list.
-    // Allocate the exact bounded target instead so byte-workset accounting can
-    // conservatively cover this decoder without per-character JS objects.
-    const bytes = new Uint8Array(binary.length);
-    for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
-    return bytes;
-}
 export function rootCommitRootByteLength(value: RootCommitRequest): number {
     const encoded = detachRootCommitRequest(value).root;
     const padding = encoded.endsWith("==") ? 2 : encoded.endsWith("=") ? 1 : 0;
@@ -139,12 +130,17 @@ export function detachRootCommitIntent(value: unknown): RootCommitIntent {
 export async function computeRootRequestHash(
     vaultId: string, deviceId: string, request: RootCommitRequest, hashBytes: RootHashBytes,
 ): Promise<string> {
-    const captured = detachRootCommitRequest(request);
+    return hashCapturedRootRequest(vaultId, deviceId, detachRootCommitRequest(request), hashBytes);
+}
+async function hashCapturedRootRequest(
+    vaultId: string, deviceId: string, captured: RootCommitRequest, hashBytes: RootHashBytes,
+): Promise<string> {
     const fields = [utf8.encode(validateRootScopeId(vaultId)), utf8.encode(validateRootScopeId(deviceId)),
         utf8.encode(captured.server_incarnation), utf8.encode(captured.mutation_id),
-        utf8.encode(captured.parent_root), rootBytes(captured.root)];
+        utf8.encode(captured.parent_root)];
+    const binaryRoot = atob(captured.root);
     const domain = utf8.encode("obsetync.root-commit.v1\0");
-    const bytes = new Uint8Array(domain.length + 8 + fields.reduce((sum, field) => sum + 8 + field.length, 0));
+    const bytes = new Uint8Array(domain.length + 8 + 8 + binaryRoot.length + fields.reduce((sum, field) => sum + 8 + field.length, 0));
     bytes.set(domain);
     const view = new DataView(bytes.buffer);
     let position = domain.length;
@@ -155,13 +151,15 @@ export async function computeRootRequestHash(
     };
     u64(captured.sequence);
     for (const field of fields) { u64(field.length); bytes.set(field, position); position += field.length; }
+    u64(binaryRoot.length);
+    for (let i = 0; i < binaryRoot.length; i++) bytes[position + i] = binaryRoot.charCodeAt(i);
     return hex(await hashBytes(bytes));
 }
 export async function createRootCommitIntent(
     vaultId: string, deviceId: string, request: RootCommitRequest, hashBytes: RootHashBytes,
 ): Promise<RootCommitIntent> {
     const captured = detachRootCommitRequest(request);
-    return { ...captured, request_hash: await computeRootRequestHash(vaultId, deviceId, captured, hashBytes) };
+    return { ...captured, request_hash: await hashCapturedRootRequest(vaultId, deviceId, captured, hashBytes) };
 }
 export function encodeRootCommitIntent(value: RootCommitIntent): Uint8Array {
     const { request_hash: _, ...request } = detachRootCommitIntent(value);
