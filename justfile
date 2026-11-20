@@ -212,22 +212,16 @@ ship-plugin: ship-plugin-preflight build-release-plugin
 # intact across deploys. Only the compose restarts to pick up the new image.
 ship-server: ship-server-preflight build-release-nix-image
     @set -eu; \
-     image_tar="/tmp/obsetync-server-{{release_commit}}.tar"; \
-     staged_compose="{{dest}}/.docker-compose-{{release_commit}}.yml"; \
-     remote_script="/tmp/obsetync-deploy-server-{{release_commit}}.sh"; \
-     remote_script_uploaded=0; \
+     stage="$(ssh "{{server}}" mktemp -d /tmp/obsetync-ship-{{release_commit}}.XXXXXXXXXX)"; \
+     case "$stage" in /tmp/obsetync-ship-{{release_commit}}.??????????) ;; *) exit 2 ;; esac; \
+     case "${stage#/tmp/obsetync-ship-{{release_commit}}.}" in *[!a-zA-Z0-9]*|'') exit 2 ;; esac; \
      cleanup() { \
-        if [ "$remote_script_uploaded" -eq 1 ]; then \
-            ssh "{{server}}" rm -f "$remote_script" >/dev/null 2>&1 || true; \
-        fi; \
+        ssh "{{server}}" "rm -f -- '$stage/result' '$stage/docker-compose.yml' '$stage/deploy-server.sh' && rmdir -- '$stage'" || true; \
      }; \
      trap cleanup EXIT; \
-     scp result "{{server}}:$image_tar"; \
-     scp docker-compose.yml "{{server}}:$staged_compose"; \
-     scp scripts/deploy-server.sh "{{server}}:$remote_script"; \
-     remote_script_uploaded=1; \
-     ssh "{{server}}" bash "$remote_script" "{{dest}}" "$image_tar" \
-        "$staged_compose" "{{release_version}}" "{{release_commit}}"
+     trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; \
+     scp result docker-compose.yml scripts/deploy-server.sh "{{server}}:$stage/"; \
+     ssh "{{server}}" "bash '$stage/deploy-server.sh' '{{dest}}' '$stage/result' '$stage/docker-compose.yml' '{{release_version}}' '{{release_commit}}'"
 
 # --- maintenance ----------------------------------------------------------
 

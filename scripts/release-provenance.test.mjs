@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile as execFileCallback } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -82,7 +82,9 @@ test("CLI creates once, verifies exact inputs, and rejects unsafe output", async
         const output = join(directory, "container-images.json");
         const args = [output, VERSION, SHA, containers.dockerRepository, containers.dockerDigest,
             containers.nixRepository, containers.nixDigest];
-        const created = await cli(["create-containers", ...args]);
+        const alias = join(directory, "release-tool.mjs");
+        await symlink(SCRIPT, alias);
+        const created = await execFile(process.execPath, [alias, "create-containers", ...args]);
         assert.match(created.stdout, /created/);
         assert.equal(await readFile(output, "utf8"), canonicalContainerManifest(containers));
         const verified = await cli(["verify-containers", ...args]);

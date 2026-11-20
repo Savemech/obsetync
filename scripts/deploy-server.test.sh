@@ -55,8 +55,8 @@ set -Eeuo pipefail
 printf '%s\n' "$*" >> "$FAKE_DOCKER_LOG"
 
 if [[ $1 == compose ]]; then
-    if [[ ${2:-} == -f ]]; then
-        [[ ${4:-} == config && ${5:-} == --quiet ]] || exit 91
+    if [[ ${2:-} == --project-directory ]]; then
+        [[ $3 == "$PWD" && $4 == -f && -f $5 && $6 == config && $7 == --quiet ]] || exit 91
         exit 0
     fi
 

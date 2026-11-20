@@ -31,7 +31,7 @@ fi
 exec 9>"$lock_file"
 flock 9
 
-docker compose -f "$staged_compose" config --quiet
+docker compose --project-directory "$dest" -f "$staged_compose" config --quiet
 current_image=$(docker inspect --format '{{.Image}}' obsetync-server)
 timestamp=$(date -u +%Y-%m-%dT%H-%M-%SZ)
 mkdir -p -- "$backup_root"

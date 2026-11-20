@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { isCliEntry } from "./is-cli-entry.mjs";
 
 export const RELEASE_ARTIFACT_MANIFEST = "artifact-manifest.json";
 export const RELEASE_ARTIFACT_SCHEMA = "obsetync-release-artifact-manifest-v1";
@@ -176,7 +176,7 @@ async function main(argv) {
     process.stdout.write(`release artifact manifest ${command}: ok\n`);
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (isCliEntry(import.meta.url)) {
     main(process.argv.slice(2)).catch(error => {
         process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
         process.exitCode = 1;

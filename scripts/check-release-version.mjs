@@ -2,6 +2,7 @@
 
 import { readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { isCliEntry } from "./is-cli-entry.mjs";
 import { fileURLToPath } from "node:url";
 
 const SEMVER = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/;
@@ -392,7 +393,7 @@ async function main() {
     process.stdout.write(`release version check passed: ${result.version} (${result.declarations} declarations, tag ${result.tag})\n`);
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (isCliEntry(import.meta.url)) {
     main().catch(error => {
         process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
         process.exitCode = 1;

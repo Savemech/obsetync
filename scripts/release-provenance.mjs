@@ -4,7 +4,7 @@ import { execFile as execFileCallback } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import { promisify } from "node:util";
-import { fileURLToPath } from "node:url";
+import { isCliEntry } from "./is-cli-entry.mjs";
 
 const execFile = promisify(execFileCallback);
 export const SERVER_IDENTITY_SCHEMA = "obsetync-server-build-identity-v1";
@@ -134,7 +134,7 @@ export async function runReleaseProvenanceCli(args, write = value => process.std
         "<docker-repository> <docker-digest> <nix-repository> <nix-digest>");
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (isCliEntry(import.meta.url)) {
     runReleaseProvenanceCli(process.argv.slice(2)).catch(error => {
         process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
         process.exitCode = 1;
