@@ -29,7 +29,6 @@ use rand::TryRngCore;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use sync_core::chunk::{FileEntry, InternalNode, LeafChunk, RootNode};
@@ -753,58 +752,31 @@ fn decrypt_response(
 
 // --- High-level vault helpers ------------------------------------------------
 
-/// Build a Merkle root locally for a given set of files. Mirrors what
-/// `sync_core::tree::build_tree` would produce, but stays synchronous and
-/// returns the index chunks the caller will need to upload alongside the root.
-///
-/// Assumes <1000 entries per top-level prefix (single leaf per directory).
-/// Tests don't push thousand-file vaults — sync-core unit tests already cover
-/// the multi-leaf-chunk + InternalNode path.
-pub fn build_root_for_files(
+/// Build a production V1 tree and collect the index chunks needed for upload.
+pub async fn build_root_for_files(
     vault_id: &str,
     device_id: &str,
     files: &[(String, Vec<u8>)],
-) -> (RootNode, Vec<(FileHash, Vec<u8>)>) {
-    let entries: Vec<FileEntry> = files
+) -> Result<(RootNode, Vec<(FileHash, Vec<u8>)>)> {
+    let entries = files
         .iter()
         .map(|(path, content)| {
             FileEntry::new(path.clone(), hash_bytes(content), 0, content.len() as u64)
         })
         .collect();
-
-    let mut by_prefix: BTreeMap<String, Vec<FileEntry>> = BTreeMap::new();
-    for e in entries {
-        let prefix = match e.path.find('/') {
-            Some(i) => e.path[..=i].to_string(),
-            None => String::new(),
-        };
-        by_prefix.entry(prefix).or_default().push(e);
+    let store = sync_core::store::MemoryChunkStore::new();
+    let mut root = sync_core::tree::build_tree(&store, entries, vault_id, device_id).await?;
+    root.created_ms = 0; // Repeated fixture builds must serialize identically.
+    let mut hashes = store.all_chunk_hashes();
+    hashes.sort_unstable();
+    let mut chunks = Vec::with_capacity(hashes.len());
+    for hash in hashes {
+        chunks.push((
+            hash,
+            store.get_chunk(&hash).context("missing fixture chunk")?,
+        ));
     }
-
-    let mut chunks = Vec::new();
-    let mut root_children = Vec::new();
-    let mut total_files = 0u64;
-
-    for (prefix, group) in by_prefix {
-        total_files += group.len() as u64;
-        let leaf = LeafChunk::new(group);
-        let bytes = leaf.serialize();
-        let hash = hash_bytes(&bytes);
-        chunks.push((hash, bytes));
-        root_children.push((prefix, hash));
-    }
-
-    let root = RootNode {
-        vault_id: vault_id.to_string(),
-        created_ms: 0,
-        version: 1,
-        children: root_children,
-        total_files,
-        parent_hash: None,
-        device_id: device_id.to_string(),
-    };
-
-    (root, chunks)
+    Ok((root, chunks))
 }
 
 /// High-level: push a snapshot of `files` as the new root for `vault_id`.
@@ -848,7 +820,8 @@ async fn push_vault_snapshot_with_root_retries(
     parent_hex: &str,
     max_root_retries: usize,
 ) -> Result<(RootNode, PutRootResponse, usize)> {
-    let (mut root, chunks) = build_root_for_files(vault_id, &client.creds.device_name, files);
+    let (mut root, chunks) =
+        build_root_for_files(vault_id, &client.creds.device_name, files).await?;
     if parent_hex != ZERO_HASH_HEX {
         root.parent_hash = Some(hex_to_hash(parent_hex)?);
     }
@@ -885,9 +858,7 @@ pub async fn pull_vault_snapshot(
         let entries = if let Ok(leaf) = LeafChunk::deserialize(&bytes) {
             leaf.entries
         } else if let Ok(node) = InternalNode::deserialize(&bytes) {
-            // One level of internal-node recursion is enough for our test
-            // vaults (always <1000 entries per prefix) — sync-core tests cover
-            // deeper nesting.
+            // V1 groups with multiple leaves use one directory-level internal node.
             let mut all = Vec::new();
             for (_, sub_hash) in node.children {
                 let sub = client.get_chunk(&sub_hash).await?;
@@ -940,6 +911,29 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("did not become healthy"));
+    }
+
+    #[tokio::test]
+    async fn wide_snapshot_contains_the_internal_node_and_all_leaf_entries() {
+        let files: Vec<_> = (0..=sync_core::tree::TARGET_CHUNK_ENTRIES)
+            .map(|i| (format!("wide/{i:05}.md"), i.to_string().into_bytes()))
+            .collect();
+        let (root, chunks) = build_root_for_files("vault", "device", &files)
+            .await
+            .unwrap();
+        assert_eq!(root.total_files, files.len() as u64);
+        let chunks: std::collections::HashMap<_, _> = chunks.into_iter().collect();
+        assert_eq!(chunks.len(), 3);
+        let node = InternalNode::deserialize(&chunks[&root.children[0].1]).unwrap();
+        let mut entries = Vec::new();
+        for (_, hash) in node.children {
+            entries.extend(LeafChunk::deserialize(&chunks[&hash]).unwrap().entries);
+        }
+        assert_eq!(entries.len(), files.len());
+        for (entry, (path, content)) in entries.iter().zip(files) {
+            assert_eq!(entry.path, path);
+            assert_eq!(entry.hash, hash_bytes(&content));
+        }
     }
 
     #[tokio::test]

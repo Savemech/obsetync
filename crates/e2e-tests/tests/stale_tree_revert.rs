@@ -144,7 +144,9 @@ async fn assert_stale_root_refused(
     parent: &RootNode,
     deletions: u64,
 ) {
-    let (mut root, _) = build_root_for_files(vault, &client.creds().device_name, files);
+    let (mut root, _) = build_root_for_files(vault, &client.creds().device_name, files)
+        .await
+        .unwrap();
     root.parent_hash = Some(parent.hash());
     let mut body = hash_to_hex(&parent.hash()).into_bytes();
     body.extend(root.serialize());
