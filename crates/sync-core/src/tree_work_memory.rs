@@ -1436,14 +1436,9 @@ impl Default for ReplacementInputMemory {
 
 impl ReplacementInputMemory {
     pub(crate) fn new(entries: &Vec<FileEntry>) -> Self {
-        let mut paths = StringMemory::default();
-        for entry in entries {
-            paths.add(&entry.path);
-        }
-        let entries = VecBackingMemory::of(entries);
         let mut result = Self {
-            entries,
-            paths,
+            entries: VecBackingMemory::of(entries),
+            paths: Self::paths(entries),
             counters_valid: true,
         };
         result.check();

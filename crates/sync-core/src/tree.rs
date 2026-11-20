@@ -60,25 +60,8 @@ pub async fn build_tree<S: ChunkStore>(
         group_entries.sort_by(FileEntry::cmp_path);
         total_files += group_entries.len() as u64;
 
-        // Split into leaf chunks of TARGET_CHUNK_ENTRIES.
-        let leaf_hashes = build_leaf_chunks(store, &group_entries).await?;
-
-        if leaf_hashes.len() == 1 {
-            // Single leaf chunk — use its hash directly as the directory's hash.
-            root_children.push((prefix, leaf_hashes[0]));
-        } else {
-            // Multiple leaf chunks — create an internal node.
-            let children: Vec<_> = leaf_hashes
-                .into_iter()
-                .enumerate()
-                .map(|(i, hash)| (format!("{}{}", prefix, i), hash))
-                .collect();
-            let node = InternalNode::new(children);
-            let node_bytes = node.serialize();
-            let node_hash = crate::hash::hash_bytes(&node_bytes);
-            store.put(node_hash, node_bytes).await?;
-            root_children.push((prefix, node_hash));
-        }
+        let child_hash = build_prefix(store, &prefix, &group_entries).await?;
+        root_children.push((prefix, child_hash));
     }
 
     let now_ms = now_ms();
@@ -96,12 +79,12 @@ pub async fn build_tree<S: ChunkStore>(
     Ok(root)
 }
 
-/// Build leaf chunks from a sorted list of entries.
-/// Returns the hashes of all created leaf chunks.
-async fn build_leaf_chunks<S: ChunkStore>(
+/// Store one nonempty, path-sorted prefix and return its subtree hash.
+async fn build_prefix<S: ChunkStore>(
     store: &S,
+    prefix: &str,
     entries: &[FileEntry],
-) -> Result<Vec<FileHash>, ChunkError> {
+) -> Result<FileHash, ChunkError> {
     let mut hashes = Vec::new();
 
     for chunk_entries in entries.chunks(TARGET_CHUNK_ENTRIES) {
@@ -111,7 +94,18 @@ async fn build_leaf_chunks<S: ChunkStore>(
         hashes.push(hash);
     }
 
-    Ok(hashes)
+    if let [hash] = hashes.as_slice() {
+        return Ok(*hash);
+    }
+    let children = hashes
+        .into_iter()
+        .enumerate()
+        .map(|(index, hash)| (format!("{prefix}{index}"), hash))
+        .collect();
+    let bytes = InternalNode::new(children).serialize();
+    let hash = crate::hash::hash_bytes(&bytes);
+    store.put(hash, bytes).await?;
+    Ok(hash)
 }
 
 enum FinalPathState {
@@ -219,7 +213,7 @@ pub(crate) fn merge_prefix_entries(
 }
 
 /// Incremental update: apply changes to an existing tree.
-/// Only re-chunks leaf chunks containing changed files.
+/// Rebuilds the subtrees for top-level prefixes touched by the changes.
 /// Returns a new RootNode with updated hashes.
 pub async fn update_tree<S: ChunkStore>(
     store: &S,
@@ -269,7 +263,10 @@ pub async fn update_tree<S: ChunkStore>(
         let old_count = entries.len() as u64;
         let entries = merge_prefix_entries(entries, adds, dels);
         let new_count = entries.len() as u64;
-        total_files = total_files - old_count + new_count;
+        total_files = total_files
+            .checked_sub(old_count)
+            .and_then(|remaining| remaining.checked_add(new_count))
+            .ok_or_else(|| ChunkError::Deserialize("invalid Tree v1 file count".into()))?;
 
         if entries.is_empty() {
             // Directory is now empty — remove from root children.
@@ -277,23 +274,7 @@ pub async fn update_tree<S: ChunkStore>(
                 new_children.remove(index);
             }
         } else {
-            // Rebuild leaf chunks for this prefix.
-            let leaf_hashes = build_leaf_chunks(store, &entries).await?;
-
-            let new_hash = if leaf_hashes.len() == 1 {
-                leaf_hashes[0]
-            } else {
-                let children: Vec<_> = leaf_hashes
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, hash)| (format!("{}{}", prefix, i), hash))
-                    .collect();
-                let node = InternalNode::new(children);
-                let node_bytes = node.serialize();
-                let node_hash = crate::hash::hash_bytes(&node_bytes);
-                store.put(node_hash, node_bytes).await?;
-                node_hash
-            };
+            let new_hash = build_prefix(store, prefix, &entries).await?;
 
             // Update or insert the child in root.
             match child_position {
@@ -661,6 +642,19 @@ mod tests {
         let updated = update_tree(&store, &root, &[], &[]).await.unwrap();
         assert_eq!(updated.total_files, root.total_files);
         assert_eq!(updated.parent_hash, Some(root.hash()));
+    }
+
+    #[tokio::test]
+    async fn update_tree_rejects_inconsistent_file_count() {
+        let store = MemoryChunkStore::new();
+        let mut root = build_tree(&store, vec![make_entry("notes/a.md")], "v", "d")
+            .await
+            .unwrap();
+        for total in [0, u64::MAX] {
+            root.total_files = total;
+            let result = update_tree(&store, &root, &[make_entry("notes/b.md")], &[]).await;
+            assert!(matches!(result, Err(ChunkError::Deserialize(_))));
+        }
     }
 
     #[tokio::test]
