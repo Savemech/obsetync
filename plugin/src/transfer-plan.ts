@@ -342,7 +342,6 @@ export class PreparedTransferPlan {
                 value.manifest.chunks.push(copy); offset += copy.size;
             }
             if (offset !== value.manifest.total_size) failure("CORRUPT", "prepared manifest is incomplete");
-            immutable(value);
             return await this.enqueue(bytes, async () => {
                 this.assertReady();
                 const key = keyOf(value.scopeHash, value.path);
