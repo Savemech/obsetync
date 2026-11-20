@@ -286,6 +286,30 @@ async function transientReservationsUseTheInjectedLifetimeArbiter(): Promise<voi
         "combined local/shared transfer ownership leaked after settlement");
 }
 
+async function shutdownBetweenLocalAndSharedGrants(): Promise<void> {
+    const arbiter = new SyncMemoryArbiter({ capacityBytes: 100 });
+    const policy = new TransientMemoryBudget();
+    policy.configure({ runtime: "mobile", transientBudgetBytes: 100 }, arbiter);
+    const pending = rejected(policy.reserve(20));
+    check(policy.snapshot().usedBytes === 20 && arbiter.snapshot().usedBytes === 0,
+        "shutdown fixture missed the gap between local and shared admission");
+    policy.close();
+    arbiter.close();
+    const replacement = new SyncMemoryArbiter({ capacityBytes: 100 });
+    let reopenError: unknown;
+    try { policy.configure({ runtime: "mobile", transientBudgetBytes: 100 }, replacement); }
+    catch (error) { reopenError = error; }
+    check(reopenError instanceof ResourceBudgetClosedError, "reopen replaced a live local grant");
+    check(await pending instanceof ResourceBudgetClosedError,
+        "unfinished admission bypassed its closed arbiter");
+    check(policy.snapshot().usedBytes === 0 && replacement.snapshot().usedBytes === 0,
+        "refused shared grant leaked capacity into either session");
+    policy.configure({ runtime: "mobile", transientBudgetBytes: 100 }, replacement);
+    const fresh = await policy.reserve(20);
+    check(replacement.snapshot().usedBytes === 20, "reopened session missed its own arbiter");
+    fresh.release(); policy.close(); replacement.close();
+}
+
 estimatesAndAliases();
 void fullCapacitySubscopeDoesNotDeadlock()
     .then(queuedScopeKeepsItsOriginalQuotaAndSignal)
@@ -295,6 +319,7 @@ void fullCapacitySubscopeDoesNotDeadlock()
     .then(cancelledNativeWorkRetainsClosedParent)
     .then(hashSourcesAndTransfersShareAdmission)
     .then(transientReservationsUseTheInjectedLifetimeArbiter)
+    .then(shutdownBetweenLocalAndSharedGrants)
     .then(() => console.log(`transient-memory.test: ${assertions} assertions passed`))
     .catch((error) => {
         console.error(error);

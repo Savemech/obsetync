@@ -50,7 +50,6 @@ export class TransientMemoryBudget {
                 throw new Error("cannot replace sync memory arbiter while transient owners are live");
             }
         }
-        if (arbiter) this.arbiter = arbiter;
         const ceiling = tuning.runtime === "desktop"
             ? DESKTOP_TRANSIENT_CEILING : MOBILE_TRANSIENT_CEILING;
         const capacityBytes = Math.min(tuning.transientBudgetBytes, ceiling);
@@ -61,6 +60,7 @@ export class TransientMemoryBudget {
         } else {
             this.budget.setCapacity(capacityBytes);
         }
+        if (arbiter) this.arbiter = arbiter;
     }
 
     async reserve(bytes: number, options: { signal?: AbortSignal; wait?: boolean } = {}): Promise<ShrinkableResourceReservation> {
@@ -71,9 +71,11 @@ export class TransientMemoryBudget {
                 throw new SyncMemoryUnavailableError("transfer", bytes);
             }
         }
+        const requiresSharedGrant = this.arbiter !== undefined;
         const local = await this.budget.reserve(bytes, options);
         let shared: SyncMemoryLease | undefined;
         try {
+            if (requiresSharedGrant && !this.arbiter) throw new ResourceBudgetClosedError();
             shared = this.arbiter
                 ? await this.arbiter.reserve("transfer", bytes, options)
                 : undefined;
