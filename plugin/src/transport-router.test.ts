@@ -94,6 +94,31 @@ async function failuresOpenAndHalfOpenWithoutAProbeStampede(): Promise<void> {
     ok(router.snapshot().circuit === "closed", "successful probe did not close circuit");
 }
 
+async function lateSuccessCannotEndANewerRecoveryWindow(): Promise<void> {
+    let now = 0;
+    const router = new TransportRouter({ now: () => now, jitter: () => 0, failureThreshold: 1,
+        openBaseMs: 100, recoverySuccessThreshold: 1 });
+    const route = (ws: () => Promise<string>) => router.execute({ payloadBytes: 1,
+        replay: "content-addressed", ws, http: async () => "http", classifyWsFailure: retryable });
+    const slow = deferred<string>(), delayedFailure = deferred<string>();
+    const early = route(() => slow.promise), lateFailure = route(() => delayedFailure.promise);
+    await route(async () => { throw new Error("first disconnect"); });
+    slow.resolve("early success");
+    ok(await early === "early success" && router.snapshot().circuit === "open",
+        "a pre-disconnect success closed the recovery window");
+    now = 100;
+    const probe = deferred<string>();
+    const probing = route(() => probe.promise);
+    delayedFailure.reject(new Error("another disconnect"));
+    ok(await lateFailure === "http", "older failed request lost its fallback");
+    probe.resolve("probe success");
+    ok(await probing === "probe success" && router.snapshot().openForMs === 200,
+        "a probe started before the latest failure erased its backoff");
+    now += 200;
+    await route(async () => "healthy");
+    ok(router.snapshot().circuit === "closed", "fresh recovery probe could not restore WebSocket");
+}
+
 async function retryHintsAndPermanentErrorsAreFailClosed(): Promise<void> {
     let now = 0, http = 0;
     const router = new TransportRouter({
@@ -572,6 +597,7 @@ async function diagnosticsSeparateRequestAndExpectedResponseBytes(): Promise<voi
 void (async () => {
     await healthyWsOwnsTheAttempt();
     await failuresOpenAndHalfOpenWithoutAProbeStampede();
+    await lateSuccessCannotEndANewerRecoveryWindow();
     await retryHintsAndPermanentErrorsAreFailClosed();
     await timeoutPolicyIsBoundedAndSizeAware();
     await boundedRecoveryHysteresisKeepsBulkOnHttp();

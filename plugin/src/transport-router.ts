@@ -272,6 +272,7 @@ export class TransportRouter {
     private readonly performanceMaxThroughputBytesPerSecond: number;
     private consecutiveWsFailures = 0;
     private openUntil = 0;
+    private recoveryEpoch = Symbol();
     private halfOpenInFlight = false;
     private wsSuccesses = 0;
     private wsFailures = 0;
@@ -439,6 +440,7 @@ export class TransportRouter {
             const timeouts = wsMode === "half-open"
                 ? this.probeTimeoutsFor(normalTimeouts)
                 : normalTimeouts;
+            const recoveryEpoch = this.recoveryEpoch;
             const started = this.readPerformanceClock();
             const clockGeneration = this.performanceClockGeneration;
             const sampleInitiallyValid = this.performanceSampleValid(request);
@@ -458,8 +460,11 @@ export class TransportRouter {
                     sampleInitiallyValid && this.performanceSampleValid(request),
                     measurements,
                 );
-                if (wsMode === "half-open") this.recordProbeSuccess();
-                else this.closeCircuit();
+                // Another in-flight request may have opened a new recovery window.
+                if (recoveryEpoch === this.recoveryEpoch) {
+                    if (wsMode === "half-open") this.recordProbeSuccess();
+                    else this.closeCircuit();
+                }
                 return result;
             } catch (error) {
                 const disposition = request.classifyWsFailure(error);
@@ -497,22 +502,16 @@ export class TransportRouter {
             this.performanceMaxQueueWaitMs,
             this.performanceMaxUsefulBytes,
         );
-        try {
-            const result = await request.http(measurements);
-            this.recordPerformanceSample(
-                request.lane,
-                "http",
-                started,
-                clockGeneration,
-                sampleInitiallyValid && this.performanceSampleValid(request),
-                measurements,
-            );
-            return result;
-        } catch (error) {
-            // Failed HTTP outcomes are not evidence for carrier speed. Existing
-            // single-owner/fallback semantics intentionally propagate them.
-            throw error;
-        }
+        const result = await request.http(measurements);
+        this.recordPerformanceSample(
+            request.lane,
+            "http",
+            started,
+            clockGeneration,
+            sampleInitiallyValid && this.performanceSampleValid(request),
+            measurements,
+        );
+        return result;
     }
 
     snapshot(): TransportRouterSnapshot {
@@ -750,6 +749,7 @@ export class TransportRouter {
             this.consecutiveWsFailures + 1,
         );
         if (this.consecutiveWsFailures < this.failureThreshold) return;
+        this.recoveryEpoch = Symbol();
         const exponent = Math.min(16, this.consecutiveWsFailures - this.failureThreshold);
         const backoff = Math.min(this.openMaxMs, this.openBaseMs * (2 ** exponent));
         const sample = this.jitter();
