@@ -4,7 +4,7 @@ import { SegmentedStore, STORE_LIMITS, StoreRecoveryError, createMigrationProof,
     type SegmentedStoreIO } from "./segmented-store";
 import { detachRootBasePublication, type RootBasePublication,
     type RootPublicationIdentity } from "./sync-base";
-import { detachRootCommitIntent, computeRootRequestHash, validateRootTerminalOutcome,
+import { detachRootCommitIntent, computeRootRequestHash, validateRootTerminalOutcome, ROOT_MAX_BYTES,
     type RootCommitIntent, type RootCommitRequest, type RootConflict, type RootTerminalOutcome } from "./root-outcome";
 import { legacyDowngradeRootSequenceFloor } from "./legacy-downgrade";
 
@@ -119,7 +119,7 @@ function copyIntent(raw: unknown, scopeHash: string): StoredRootIntent {
     exact(raw, ["vaultId", "deviceId", "request", "publication", "journalEpoch", "journalCuts"]);
     for (const field of [raw.vaultId, raw.deviceId]) {
         if (typeof field !== "string" || !field.length || field.length > 128 ||
-            new TextEncoder().encode(field).length > 128) fail("CORRUPT", "invalid root-intent wire owner");
+            utf8Bytes(field) > 128) fail("CORRUPT", "invalid root-intent wire owner");
     }
     if (!epoch(raw.journalEpoch)) fail("CORRUPT", "invalid root-intent journal epoch");
     if (!Array.isArray(raw.journalCuts) || raw.journalCuts.length > ROOT_INTENT_LIMITS.journalCuts) {
@@ -144,10 +144,8 @@ function copyIntent(raw: unknown, scopeHash: string): StoredRootIntent {
         }
         previous = cut.path; journalCuts.push({ path: cut.path, throughId: cut.throughId });
     }
-    const result = { vaultId: raw.vaultId, deviceId: raw.deviceId, request, publication,
+    return { vaultId: raw.vaultId, deviceId: raw.deviceId, request, publication,
         journalEpoch: raw.journalEpoch, journalCuts };
-    encodedSize(result);
-    return result;
 }
 function intentHeader(intent: StoredRootIntent): Header {
     const { root, ...request } = intent.request;
@@ -423,7 +421,7 @@ export class RootIntentStore {
                 const h = row.header;
                 exact(h.request, ["protocol_version", "server_incarnation", "sequence", "mutation_id", "parent_root", "request_hash"]);
                 exact(h.publication, ["identity", "candidateRoot", "committedAt"]);
-                if (!uint(h.rootChars, 4) || h.rootChars > Math.ceil(512 * 1024 / 3) * 4 ||
+                if (!uint(h.rootChars, 4) || h.rootChars > Math.ceil(ROOT_MAX_BYTES / 3) * 4 ||
                     !uint(h.entryCount) || h.entryCount > ROOT_INTENT_LIMITS.entries ||
                     !uint(h.cutCount) || h.cutCount > ROOT_INTENT_LIMITS.journalCuts) fail("LIMIT", "root-intent header exceeds ceiling");
                 // The complete validators run at the seal before promotion.
@@ -459,6 +457,7 @@ export class RootIntentStore {
                 const intent = copyIntent({ vaultId: header.vaultId, deviceId: header.deviceId,
                     request: { ...header.request, root }, publication: { ...header.publication, entries },
                     journalEpoch: header.journalEpoch, journalCuts: cuts }, this.scopeHash);
+                encodedSize(intent);
                 if (!sameIdentity(identityCopy(row.identity), intent.publication.identity) ||
                     intent.request.sequence !== state.lastSequence + (snapshot ? 0 : 1)) fail("CORRUPT", "root-intent sealed sequence differs");
                 await this.verifyDigest(intent);

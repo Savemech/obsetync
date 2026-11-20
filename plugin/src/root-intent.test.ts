@@ -421,4 +421,8 @@ async function run() {
     await conflictCopyCorruption(); await conflictCopyLimitAndClose();
     console.log(`root-intent: ${assertions} assertions passed`);
 }
-void run().catch(error => { console.error(error); process.exitCode = 1; });
+let completed = false;
+process.once("beforeExit", () => {
+    if (!completed) { console.error("root-intent suite did not finish"); process.exitCode = 1; }
+});
+void run().then(() => { completed = true; }, error => { completed = true; console.error(error); process.exitCode = 1; });

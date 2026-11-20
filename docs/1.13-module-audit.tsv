@@ -321,8 +321,8 @@ reviewed	plugin/src/root-batch.test.ts	tests	Ran 167 assertions covering coverag
 reviewed	plugin/src/root-batch.ts	production	Traced shared graph validation, generations, rename edges, grouping and bounded selection through the reviewed queue. Removed redundant per-component queue arrays and the second ordering pass for fully ready graphs.
 reviewed	plugin/src/root-conflicts.test.ts	tests	Traced runtime preserver, settlement, restart, receipt boundaries and concurrent close. 142 assertions pass; an intentionally unresolvable copy gate exited 0 before the suite completion guard and exits 1 with it.
 reviewed	plugin/src/root-conflicts.ts	production	Traced accepted-intent ownership, bounded staging, exclusive copy, receipt and drain; use original staging digest and one bounded UTF-8 stem pass
-pending	plugin/src/root-intent.test.ts	tests	Not reviewed
-read	plugin/src/root-intent.ts	production	Traced conflict receipt validation and durable retirement/replay; shared exact-copy check with settlement; other loading and persistence paths pending
+reviewed	plugin/src/root-intent.test.ts	tests	Checked restart, detached caller ownership, head/receipt corruption, pruning and queued close scenarios. Added incomplete-run detection; 1041 assertions passed with the isolated runner.
+reviewed	plugin/src/root-intent.ts	production	Traced prepare, digest validation, terminal and conflict receipts, WAL replay, migration floor and retirement. Encoded size checked on admission and cold replay without a duplicate pass on prepare or pending reads.
 removed	plugin/src/root-local-omissions.test.ts	tests	Tests of retired selector; moved backlog-limit and distant shared-ID coverage to the live queue alongside its classification and provenance cases
 removed	plugin/src/root-local-omissions.ts	production	Selector was called only by its own tests; live local omission selection is RootReviewedQueue.takeLocal; carried the shared type to file-safety
 reviewed	plugin/src/root-outcome.test.ts	tests	Checked Rust digest vectors, post-capture mutation, encoding boundaries, receipt identity, conflict paths, JSON decoding, capabilities and cancellation
