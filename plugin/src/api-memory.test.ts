@@ -806,6 +806,23 @@ async function changedFrameLimitReplacesDataLane(): Promise<void> {
     internal.closeDataLane();
 }
 
+async function concurrentCallersShareChannelAfterRefresh(): Promise<void> {
+    const publicKey = Buffer.from([9, ...Array(31).fill(0)]).toString("base64");
+    const api = new ObsetyncApi("http://unused.invalid", publicKey, "11".repeat(32), {
+        get: () => ({ wireVersion: "0x02", esPub: publicKey,
+            esPubValidUntil: Math.floor(Date.now() / 1000) + 7200, lastOutgoingSeq: 0 }),
+        update: async () => {},
+    });
+    const internal = api as any;
+    const refresh = deferred<void>();
+    internal.refreshPromise = refresh.promise;
+    const first = api.ensureTransportReady();
+    const second = api.ensureTransportReady();
+    refresh.resolve();
+    await Promise.all([first, second]);
+    assert.equal(internal.channelGeneration, 1, "refresh waiters created separate channel generations");
+}
+
 async function desktopOwnedReceiveFitsARecoverySizedPool(): Promise<void> {
     const budget = new ResourceBudget({ capacityBytes: 32 * MIB });
     const fake = fakeApi(budget, "desktop");
@@ -849,8 +866,9 @@ void (async () => {
         await legacyHashChecksRespectBatchAndResponseLimits();
         await downloadHashesStopAtTheDistinctObjectLimit();
         await onlyOpenedResponsesCanReportMissingOrUnchangedTree();
+        await concurrentCallersShareChannelAfterRefresh();
         await desktopOwnedReceiveFitsARecoverySizedPool();
-        console.log("api-memory.test: 23 ownership/transport regression scenarios passed");
+        console.log("api-memory.test: 24 ownership/transport regression scenarios passed");
     } finally {
         delete (globalThis as any).__obsetyncTestRequestUrl;
     }

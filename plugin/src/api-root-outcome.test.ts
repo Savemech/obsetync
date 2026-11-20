@@ -328,6 +328,7 @@ async function actualWireAndJSONBoundsPrecedeDecryptAndAcceptance(): Promise<voi
         f.reply(call => call.path.endsWith("capabilities")
             ? { body: new Uint8Array(ROOT_CAPABILITY_MAX_BYTES + 1) }
             : { body: bytes(terminal()) });
+        await assert.rejects(f.api.supportsBulkHttp(), /admitted byte bound/);
         await assert.rejects(f.api.commitRootOutcome("vault", intent()), /admitted byte bound/);
         assert.equal(f.counts.decrypt, beforeCapabilityDecrypt,
             "oversized tree capability result reached decrypt/copies");

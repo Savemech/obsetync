@@ -527,8 +527,8 @@ export class ObsetyncApi {
      *  request; subsequent requests reuse the same shared secret. */
     private async getChannel(perf?: PerfOperation): Promise<ObsetyncSecureChannel> {
         if (this.channel && !this.channel.isStale()) return this.channel;
-        if (this.channelPromise) return this.channelPromise;
         if (this.refreshPromise) await this.refreshPromise;
+        if (this.channelPromise) return this.channelPromise;
         if (this.channel && !this.channel.isStale()) return this.channel;
         if (!this.serverBoxPubBase64) {
             throw reenrollmentRequired("ObsetyncApi: server box pubkey missing — re-enroll the device");
@@ -1663,7 +1663,7 @@ export class ObsetyncApi {
                     "/api/v1/capabilities",
                     new Uint8Array(),
                     perf,
-                    undefined,
+                    ROOT_CAPABILITY_MAX_BYTES,
                     REPLAY_SAFE_SEALED_OPTIONS,
                 );
                 if (response.status === 404 || response.status === 405) {
