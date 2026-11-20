@@ -896,19 +896,23 @@ struct WireChunk {
     size: u32,
 }
 
-/// Read a file's full content from the content store by hash — a single blob,
-/// or reassembled from its chunk manifest for large files. Blocking I/O; call
-/// inside StorageWriter's bounded read pool. Shared by export and file diff.
-fn read_file_content(
+/// Verify the full file, copying it only when it fits the caller's limit.
+fn copy_file_content(
     store: &crate::storage_writer::StorageWriter,
     hash: &sync_core::hash::FileHash,
-) -> Result<Vec<u8>, String> {
+    output: &mut impl std::io::Write,
+    limit: u64,
+) -> Result<u64, String> {
     use crate::storage_writer::StorageObjectKind;
     if let Some(data) = store
         .read(StorageObjectKind::Content, hash)
         .map_err(|error| error.to_string())?
     {
-        return Ok(data);
+        let size = data.len() as u64;
+        if size <= limit {
+            output.write_all(&data).map_err(|e| e.to_string())?;
+        }
+        return Ok(size);
     }
     let manifest_json = store
         .read(StorageObjectKind::Manifest, hash)
@@ -916,9 +920,7 @@ fn read_file_content(
         .ok_or_else(|| "manifest missing".to_string())?;
     let manifest: WireManifest =
         serde_json::from_slice(&manifest_json).map_err(|e| format!("corrupt manifest: {}", e))?;
-    let capacity = usize::try_from(manifest.total_size)
-        .map_err(|_| "manifest size exceeds platform range".to_string())?;
-    let mut data = Vec::with_capacity(capacity);
+    let mut hasher = blake3::Hasher::new();
     let mut expected_offset = 0u64;
     for chunk in &manifest.chunks {
         if chunk.offset != expected_offset {
@@ -933,23 +935,26 @@ fn read_file_content(
         if bytes.len() != chunk.size as usize {
             return Err("manifest chunk size mismatch".into());
         }
-        data.extend_from_slice(&bytes);
         expected_offset = expected_offset
             .checked_add(u64::from(chunk.size))
-            .ok_or_else(|| "manifest size overflow".to_string())?;
+            .filter(|end| *end <= manifest.total_size)
+            .ok_or_else(|| "manifest chunks exceed declared size".to_string())?;
+        hasher.update(&bytes);
+        if manifest.total_size <= limit {
+            output.write_all(&bytes).map_err(|e| e.to_string())?;
+        }
     }
-    if expected_offset != manifest.total_size || sync_core::hash::hash_bytes(&data) != *hash {
+    if expected_offset != manifest.total_size || hasher.finalize().as_bytes() != hash {
         return Err("manifest content does not match its file hash".into());
     }
-    Ok(data)
+    Ok(expected_offset)
 }
 
 /// GET /admin/vaults/{vault_id}/export/{root_hash} — download the vault as
 /// it looked at any root in history, as a tar archive. Small files come
 /// straight from the blob store; chunked large files are reassembled from
-/// their FastCDC manifests. The tar is assembled into an anonymous tempfile
-/// (blocking task) and streamed out, so memory stays bounded no matter how
-/// big the vault is.
+/// their FastCDC manifests one chunk at a time. The archive is streamed from
+/// a temporary file after every entry has passed content verification.
 async fn export_vault(
     State(state): State<SharedState>,
     Path((vault_id, root_hash)): Path<(String, String)>,
@@ -979,17 +984,17 @@ async fn export_vault(
             let mut builder = tar::Builder::new(&tmp);
 
             for entry in &entries {
-                let data = read_file_content(&object_store, &entry.hash)
-                    .map_err(|e| format!("{}: {}", entry.path, e))?;
-
                 let mut header = tar::Header::new_gnu();
-                header.set_size(data.len() as u64);
                 header.set_mode(0o644);
                 header.set_mtime(entry.mtime_ms / 1000);
-                header.set_cksum();
-                builder
-                    .append_data(&mut header, &entry.path, data.as_slice())
-                    .map_err(|e| format!("{}: tar append: {}", entry.path, e))?;
+                let mut member = builder
+                    .append_writer(&mut header, &entry.path)
+                    .map_err(|e| format!("{}: tar header: {e}", entry.path))?;
+                copy_file_content(&object_store, &entry.hash, &mut member, u64::MAX)
+                    .map_err(|e| format!("{}: {e}", entry.path))?;
+                member
+                    .finish()
+                    .map_err(|e| format!("{}: tar append: {e}", entry.path))?;
             }
 
             let mut inner = builder.into_inner().map_err(|e| e.to_string())?;
@@ -1342,6 +1347,40 @@ mod tests {
         assert_eq!(m.total_size, 4096);
         assert_eq!(m.chunks.len(), 1);
         assert!(sync_core::hash::hex_to_hash(&m.chunks[0].hash).is_ok());
+    }
+
+    #[tokio::test]
+    async fn chunked_file_copy_verifies_all_bytes_even_when_output_is_skipped() {
+        use crate::storage::write_blob;
+        use sync_core::hash::hash_bytes;
+        let (_dir, state, _) = current_root_fixture();
+        let hash = hash_bytes(b"abcdef");
+        let mut chunks = Vec::new();
+        for (offset, bytes) in [(0, b"abc"), (3, b"def")] {
+            let chunk_hash = hash_bytes(bytes);
+            write_blob(&state.layout.content_chunk_path(&chunk_hash), bytes).unwrap();
+            chunks.push(
+                serde_json::json!({"hash": hash_to_hex(&chunk_hash), "offset": offset, "size": 3}),
+            );
+        }
+        let path = state.layout.content_manifest_path(&hash);
+        let mut manifest =
+            serde_json::json!({"file_hash": hash_to_hex(&hash), "total_size": 6, "chunks": chunks});
+        write_blob(&path, &serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let mut output = Vec::new();
+        assert_eq!(
+            copy_file_content(&state.storage_writer, &hash, &mut output, 5).unwrap(),
+            6
+        );
+        assert!(output.is_empty());
+        assert_eq!(
+            copy_file_content(&state.storage_writer, &hash, &mut output, 6).unwrap(),
+            6
+        );
+        assert_eq!(output, b"abcdef");
+        manifest["total_size"] = u64::MAX.into();
+        write_blob(&path, &serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(copy_file_content(&state.storage_writer, &hash, &mut std::io::sink(), 5).is_err());
     }
 
     #[test]
@@ -1845,31 +1884,34 @@ async fn api_filediff(
     State(state): State<SharedState>,
     Path((_vault_id, old_hex, new_hex)): Path<(String, String, String)>,
 ) -> Result<axum::Json<serde_json::Value>, ServerErrorHtml> {
-    let object_store = state.storage_writer.clone();
-    let (old, new) = object_store
-        .run_blocking(move |object_store| -> Result<(Vec<u8>, Vec<u8>), String> {
-            let read = |hex: &str| -> Result<Vec<u8>, String> {
-                if hex == ZERO_HASH_HEX {
-                    return Ok(Vec::new());
-                }
-                let h =
-                    sync_core::hash::hex_to_hash(hex).map_err(|_| "invalid hash".to_string())?;
-                read_file_content(&object_store, &h)
+    const MAX_DIFF_BYTES: u64 = 2 * 1024 * 1024;
+    let ((old_size, old), (new_size, new)) = state
+        .storage_writer
+        .run_blocking(move |store| {
+            let read = |hex: &str| -> Result<(u64, Vec<u8>), String> {
+                let mut data = Vec::new();
+                let size = if hex == ZERO_HASH_HEX {
+                    0
+                } else {
+                    let hash = sync_core::hash::hex_to_hash(hex)
+                        .map_err(|_| "invalid hash".to_string())?;
+                    copy_file_content(&store, &hash, &mut data, MAX_DIFF_BYTES)?
+                };
+                Ok((size, data))
             };
-            Ok((read(&old_hex)?, read(&new_hex)?))
+            Ok::<_, String>((read(&old_hex)?, read(&new_hex)?))
         })
         .await
         .map_err(|e| ServerErrorHtml(format!("diff task failed: {e}")))?
         .map_err(ServerErrorHtml)?;
 
-    const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024; // 2 MiB per side
-    let val = if old.len() > MAX_DIFF_BYTES || new.len() > MAX_DIFF_BYTES {
+    let val = if old_size > MAX_DIFF_BYTES || new_size > MAX_DIFF_BYTES {
         serde_json::json!({
             "kind": "toolarge",
             "msg": format!(
                 "File too large to diff inline ({} → {}).",
-                format_bytes(old.len() as u64),
-                format_bytes(new.len() as u64)
+                format_bytes(old_size),
+                format_bytes(new_size)
             ),
         })
     } else {
@@ -1893,8 +1935,8 @@ async fn api_filediff(
                 "kind": "binary",
                 "msg": format!(
                     "Binary file — content not shown ({} → {}).",
-                    format_bytes(old.len() as u64),
-                    format_bytes(new.len() as u64)
+                    format_bytes(old_size),
+                    format_bytes(new_size)
                 ),
             }),
         }
