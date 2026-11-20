@@ -235,7 +235,7 @@ async function fixtureWorker() {
         baselineManifest = bootstrap.result.manifest;
         phases.bootstrapFreshPreparation.retainPublicationMs = round(retainMs);
         assert.deepEqual(plan.lookup(scopeHash, manifestPath).manifest, baselineManifest);
-        plan.close();
+        await plan.closeAndDrain();
         plan = null;
         assert.deepEqual(jobRecords.map(job => job.mode), ["manifest"]);
 
@@ -279,7 +279,7 @@ async function fixtureWorker() {
                     sample.reuse = { ...phases[prefix], planLoad: phases[prefix + "PlanLoad"],
                         lookupMs: round(lookupMs), validationReadMs: round(result.validationReadMs),
                         validationHashMs: round(result.validationHashMs), job: jobRecords[jobStart] };
-                    plan.close();
+                    await plan.closeAndDrain();
                     plan = null;
                 }
                 assert.equal(jobRecords.length, jobStart + 1);
@@ -303,8 +303,8 @@ async function fixtureWorker() {
         assert.equal(jobRecords.filter(job => job.mode === "manifest").length, PAIRS + 1);
         assert.equal(jobRecords.filter(job => job.mode === "hash").length, PAIRS);
     } finally {
-        plan?.close();
-        await pool?.close();
+        try { await plan?.closeAndDrain(); }
+        finally { await pool?.close(); }
     }
     const median = values => [...values].sort((left, right) => left - right)[Math.floor(values.length / 2)];
     const medians = {};

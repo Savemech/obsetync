@@ -123,7 +123,7 @@ reviewed	plugin/package-lock.json	generated/lock	Fresh offline npm ci and npm ls
 read	plugin/package.json	configuration/schema	Entry-point/build inventory; behavior/callers still under review
 reviewed	plugin/scripts/bench-journal.mjs	tooling	Traced documented native fixture, actual journal calls, returned IDs and restart checks. Fixed enumeration racing WAL cleanup and retired the writer before new-instance reload. Three cold-load pairs passed on 25k paths and 10k edits.
 read	plugin/scripts/bench-native-root.mjs	tooling	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
-pending	plugin/scripts/bench-prepared-manifest.mjs	tooling	Not reviewed
+reviewed	plugin/scripts/bench-prepared-manifest.mjs	tooling	Traced worker instrumentation and replay fixture. Join plan retirement before reopening. Three paired 64 MiB runs matched every chunk and read every source byte with one SIMD worker.
 reviewed	plugin/scripts/bench-sync-base.mjs	tooling	Ran three 25k-entry seed/cold-process pairs. Fixed producer exceeding the bounded queue and disk enumeration racing maintenance. Schema 2 identifies incremental checkpoints.
 reviewed	plugin/scripts/browser-hash-worker.test.mjs	tests	Read and ran minified browser entry with actual modules, transferred input ownership, successful SIMD/scalar and failed self-test outcomes
 pending	plugin/scripts/browser-probe.test.mjs	tests	Not reviewed
@@ -283,10 +283,10 @@ reviewed	plugin/src/platform-conflict-copy.test.ts	tests	Traced exclusive adapte
 read	plugin/src/platform.test.ts	tests	Added regression using the real mobile IO wrapper and a simulated interrupted adapter. Checked failure restores the original and successful retries finish with only the replacement. Existing range and write suites pass.
 read	plugin/src/platform.ts	production	Traced folder checks, adapter writes, staged large-file promotion and desktop rename fallback. Fixed loss of the prior target when promotion fails after an interrupted adapter replacement. Other platform operations remain under review.
 reviewed	plugin/src/plugin.test.ts	tests	Compared static sibling imports against all TypeScript test files, traced isolated suite runner and npm test entrypoint, ran production manifest discovery assertion.
-pending	plugin/src/prepared-desktop-manifest.test.ts	tests	Not reviewed
-pending	plugin/src/prepared-desktop-manifest.ts	production	Not reviewed
-pending	plugin/src/prepared-mobile-manifest.test.ts	tests	Not reviewed
-pending	plugin/src/prepared-mobile-manifest.ts	production	Not reviewed
+reviewed	plugin/src/prepared-desktop-manifest.test.ts	tests	Ran eight groups covering ten gated invalidation/cancellation boundaries, malformed metadata, ownership and fresh/reuse results. Compared to both desktop push paths.
+reviewed	plugin/src/prepared-desktop-manifest.ts	production	Traced worker and renderer-ranged push callers, manifest validation, mandatory full hash, discard/retain, clone admission and release. Ran isolated suite and native worker preparation fixture.
+reviewed	plugin/src/prepared-mobile-manifest.test.ts	tests	Ran isolated tests and traced mobile vs desktop store paths, confirmed full hash before reuse, scope/generation changes, error cleanup and restart behavior with synthetic storage.
+reviewed	plugin/src/prepared-mobile-manifest.ts	production	Traced ranged push through scope, generation, source, hash verification, CAS retention, detached lease transfer and cleanup. Focused restart and cancellation suite passed.
 reviewed	plugin/src/prepared-retirement.test.ts	tests	Executed covered cut, stale ACK, retained rename peer, scan-only path, empty selection and detached output tests.
 reviewed	plugin/src/prepared-retirement.ts	production	Both push settlement paths call after journal ACK. Retained paths override acknowledged cuts; result carries detached mutation tokens.
 reviewed	plugin/src/priority-sort.test.ts	tests	Checked direction for all five deterministic modes, stable ties, random draws, admission, cancellation and cooperative yields

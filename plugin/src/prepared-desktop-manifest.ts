@@ -38,7 +38,7 @@ export interface PreparedDesktopManifestOptions {
     /** Check the captured pending generation, not just size/mtime. */
     assertApplicable(): void;
     signal?: AbortSignal;
-    /** Phase-A injection seam. Omission preserves the legacy unwired caller. */
+    /** Admits detached chunk metadata when the caller shares a sync memory budget. */
     memoryArbiter?: SyncMemoryArbiter;
 }
 
