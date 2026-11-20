@@ -274,7 +274,7 @@ reviewed	plugin/src/operation-checkpoint.test.ts	tests	Reviewed progress coalesc
 reviewed	plugin/src/operation-checkpoint.ts	production	Traced serialized marker lifecycle, startup hold and governor use; preserve sole copy on failed archive, deduplicate successful promotion after failed cleanup, distinguish caught failures and validate renderable timestamps
 reviewed	plugin/src/paged-pull.test.ts	tests	Checked renderer restart, torn or unpublished WAL data, immutable root verification and retirement before cursor persistence. All 60 fixture assertions passed, including expired and mismatched final roots.
 pending	plugin/src/perf-governor.test.ts	tests	Not reviewed
-pending	plugin/src/perf-overhead.bench.ts	tooling	Not reviewed
+reviewed	plugin/src/perf-overhead.bench.ts	tooling	Checked paired arms, timing boundaries, phase samples, warmups and threshold. Now validates delivered governor windows and completed-file deltas. Dropping periodic sampling fails the workload. Local CPU overhead medians: sampled 0.46%, live batches 2.02%, active control 2.20%; latter two exceeded the 2% gate.
 pending	plugin/src/perf-trace.test.ts	tests	Not reviewed
 pending	plugin/src/perf-trace.ts	production	Not reviewed
 reviewed	plugin/src/persistent-path-index.test.ts	tests	Inspected balance/ordering invariants, sharing bounds, delete cascades and iterators across awaits. Ran suite with 5000 reference operations.
@@ -310,7 +310,7 @@ reviewed	plugin/src/resident-memory.test.ts	tests	Checked foreign and consumed l
 reviewed	plugin/src/resident-memory.ts	production	Traced positive reservation invariant through resize, split, transfer, absorb and release; removed redundant active flag; validated with root admission and settlement callers
 reviewed	plugin/src/resource-budget.test.ts	tests	Ran 91 assertions including mixed oversized and fitting waiters on resize, grant order, accounting, abort, closure and repeated release. Added unfinished-suite guard.
 reviewed	plugin/src/resource-budget.ts	production	Traced FIFO grants, shrink/release, abort listeners, queue bounds and live profile updates. Skip unchanged capacity and compact surviving waiters in one pass on shrink.
-pending	plugin/src/resource-governor.bench.ts	tooling	Not reviewed
+read	plugin/src/resource-governor.bench.ts	tooling	Traced fixed-profile worker comparison, hash consistency, timer sampling, throughput/UI gates and cleanup. Worker error and cleanup paths need verification.
 pending	plugin/src/resource-governor.test.ts	tests	Not reviewed
 pending	plugin/src/resource-governor.ts	production	Not reviewed
 reviewed	plugin/src/root-batch-drain.test.ts	tests	1068 assertions cover 257 sequential batches, progress gates, errors, held cleanup and closure

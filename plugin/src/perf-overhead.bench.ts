@@ -35,6 +35,8 @@ function pairedWorkload(sample: number, scenario: Scenario): PairedTiming {
         runtime: "desktop", architecture: "x64", os: "linux",
         hardwareConcurrency: 8, simdAvailable: true,
     }) : null;
+    let deliveredWindows = 0;
+    let observedFiles = 0;
     const unsubscribe = governor ? trace.subscribeWindows(window => {
         governor.observeWindow({
             ...window, operationKind: window.kind,
@@ -42,6 +44,8 @@ function pairedWorkload(sample: number, scenario: Scenario): PairedTiming {
             budget: { limitBytes: 128 * 1024 * 1024, reservedBytes: 0, coveredAxes: [] },
         });
         telemetrySink += governor.snapshot().controls.read;
+        deliveredWindows++;
+        observedFiles += window.filesCompleted;
     }) : undefined;
     const operation = trace.begin("scan");
     operation.setWorkload({
@@ -126,6 +130,10 @@ function pairedWorkload(sample: number, scenario: Scenario): PairedTiming {
     if (scenario === "sampled-phases") operation.increment({ filesCompleted: FILES });
     operation.finish("success");
     unsubscribe?.();
+    // PerfTrace isolates listener errors. A skipped controller would understate its CPU cost.
+    if (governor && (deliveredWindows !== Math.floor(FILES / WINDOW_EVERY_FILES) + 1 || observedFiles !== FILES)) {
+        throw new Error(`incomplete controller benchmark: ${deliveredWindows} windows, ${observedFiles}/${FILES} files`);
+    }
     return {
         baselineMs: Number(baselineNs) / 1_000_000,
         instrumentedMs: Number(instrumentedNs) / 1_000_000,
