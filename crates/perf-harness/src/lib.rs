@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Instant;
@@ -1569,7 +1569,7 @@ fn first_pull_files(seed: u64, count: usize) -> Vec<FileSpec> {
 }
 
 fn write_file(path: &Path, spec: &FileSpec) -> Result<blake3::Hash, HarnessError> {
-    let mut writer = BufWriter::with_capacity(IO_BUFFER_BYTES, File::create(path)?);
+    let mut writer = File::create(path)?;
     let hash = generate_content(&mut writer, spec)?;
     writer.flush()?;
     Ok(hash)
@@ -1588,7 +1588,7 @@ fn generate_content(writer: &mut dyn Write, spec: &FileSpec) -> Result<blake3::H
     let mut xof = source.finalize_xof();
     let mut remaining = spec.size;
     let mut offset = 0u64;
-    let mut buffer = vec![0u8; IO_BUFFER_BYTES];
+    let mut buffer = vec![0u8; remaining.min(IO_BUFFER_BYTES as u64) as usize];
     while remaining > 0 {
         let length = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
         let chunk = &mut buffer[..length];
@@ -1637,16 +1637,8 @@ fn overlay_format_markers(
 }
 
 fn hash_file(path: &Path) -> Result<blake3::Hash, HarnessError> {
-    let mut reader = BufReader::with_capacity(IO_BUFFER_BYTES, File::open(path)?);
     let mut hasher = blake3::Hasher::new();
-    let mut buffer = vec![0u8; IO_BUFFER_BYTES];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
+    hasher.update_reader(File::open(path)?)?;
     Ok(hasher.finalize())
 }
 
