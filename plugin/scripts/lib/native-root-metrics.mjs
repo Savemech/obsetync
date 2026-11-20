@@ -75,6 +75,14 @@ export function createNativeRootMetrics({ now = () => performance.now(), memoryU
         while (index < UPPER_MS.length && duration > UPPER_MS[index]) index++;
         record.histogram[index]++;
     }
+    function restoreEntry(entry) {
+        if (!installed.has(entry)) return;
+        if (Object.getOwnPropertyDescriptor(entry.target, entry.name)?.value === entry.wrapper) {
+            if (entry.own) Object.defineProperty(entry.target, entry.name, entry.own);
+            else delete entry.target[entry.name];
+        }
+        installed.delete(entry);
+    }
     function wrap(target, names, prefix, asynchronous) {
         if ((typeof target !== "object" && typeof target !== "function") || target === null ||
             !Array.isArray(names) || names.length > NATIVE_ROOT_METRIC_LIMITS.methods ||
@@ -108,13 +116,7 @@ export function createNativeRootMetrics({ now = () => performance.now(), memoryU
         const added = [], newLabels = [];
         const restore = () => {
             for (let index = added.length - 1; index >= 0; index--) {
-                const entry = added[index];
-                // Never overwrite a different wrapper installed by the caller.
-                if (Object.getOwnPropertyDescriptor(entry.target, entry.name)?.value === entry.wrapper) {
-                    if (entry.own) Object.defineProperty(entry.target, entry.name, entry.own);
-                    else delete entry.target[entry.name];
-                }
-                installed.delete(entry);
+                restoreEntry(added[index]);
             }
             added.length = 0;
         };
@@ -193,13 +195,7 @@ export function createNativeRootMetrics({ now = () => performance.now(), memoryU
                     "the explicit WASM sample is only the supplied instance, not worker instances or a separate server/Obsidian host"] };
         },
         restore() {
-            for (const entry of [...installed].reverse()) {
-                if (Object.getOwnPropertyDescriptor(entry.target, entry.name)?.value === entry.wrapper) {
-                    if (entry.own) Object.defineProperty(entry.target, entry.name, entry.own);
-                    else delete entry.target[entry.name];
-                }
-                installed.delete(entry);
-            }
+            for (const entry of [...installed].reverse()) restoreEntry(entry);
         },
     };
 }

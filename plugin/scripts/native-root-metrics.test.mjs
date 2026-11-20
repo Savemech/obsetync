@@ -114,6 +114,17 @@ test("method lists are indexed bounded arrays and restoration never overwrites n
     restore(); metrics.restore(); assert.equal(target.one, newer);
 });
 
+test("group cleanup loses ownership after global restoration", () => {
+    const target = { run() {} }, original = target.run, metrics = createNativeRootMetrics();
+    const restoreGroup = metrics.wrapSync(target, ["run"]);
+    const observed = target.run;
+    metrics.restore();
+    assert.equal(target.run, original);
+    target.run = observed;
+    restoreGroup();
+    assert.equal(target.run, observed);
+});
+
 test("observer failures do not replace native results or errors", () => {
     const marker = {}, failure = new Error("native"), target = { okay() { return marker; }, fail() { throw failure; } };
     const metrics = createNativeRootMetrics({ now() { throw new Error("observer"); } });

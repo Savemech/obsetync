@@ -139,7 +139,7 @@ pending	plugin/scripts/lib/native-root-crash-fixture.mjs	tooling	Not reviewed
 pending	plugin/scripts/lib/native-root-fixture.mjs	tooling	Not reviewed
 pending	plugin/scripts/lib/native-root-instrumentation.mjs	tooling	Not reviewed
 pending	plugin/scripts/lib/native-root-io.mjs	tooling	Not reviewed
-pending	plugin/scripts/lib/native-root-metrics.mjs	tooling	Not reviewed
+reviewed	plugin/scripts/lib/native-root-metrics.mjs	tooling	Reviewed bounded histograms, per-instance memory sampling, call settlement and wrapper ownership; consolidated group/global restore with live registration check
 pending	plugin/scripts/lib/native-root-publication.ts	tooling	Not reviewed
 reviewed	plugin/scripts/lib/native-root-qualification.mjs	tooling	Traced fixture ordinals through per-run nearest-rank p95 and cross-run qualification; reject zero and fractional counts before aggregation
 reviewed	plugin/scripts/lib/native-root-server.mjs	tooling	Read complete fixture ownership, explicit binary, random loopback ports, origin allowlist, request caps and teardown; reused for old/fixed realtime regression without production data
@@ -148,7 +148,7 @@ pending	plugin/scripts/native-root-auto-diagnostic.test.mjs	tests	Not reviewed
 pending	plugin/scripts/native-root-child.test.mjs	tests	Not reviewed
 pending	plugin/scripts/native-root-instrumentation.test.mjs	tests	Not reviewed
 pending	plugin/scripts/native-root-io.test.mjs	tests	Not reviewed
-pending	plugin/scripts/native-root-metrics.test.mjs	tests	Not reviewed
+reviewed	plugin/scripts/native-root-metrics.test.mjs	tests	Reproduced stale group cleanup overwriting caller assignment; metrics, qualification and instrumentation suites pass (28 tests)
 reviewed	plugin/scripts/native-root-qualification.test.mjs	tests	Confirmed regression failed before fix; qualification, metrics, auto and audit diagnostic suites passed (21 tests)
 reviewed	plugin/scripts/run-resource-governor-bench.mjs	tooling	Traced worker bundling, child exit, result recording and cleanup; live x86 record run passes and leaves historical reports intact
 read	plugin/scripts/run-tests.mjs	tooling	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
