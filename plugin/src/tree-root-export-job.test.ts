@@ -607,6 +607,11 @@ void (async () => {
         malformedWorksetsInfoAndPages, partialApiInvalidArgumentsAndNoSpeculativeCancel,
         nativeErrorsParserErrorsAndCleanupPreservePrimary, scopeOwnsActualConsumerAndBorrowedQuota,
         consumerQuotaUsesValidatedPlanAndCapturedCallback, guardsCaptureMethodsAndCatchReentrantStop, legacyOnceExplicitModeAndLateAdmission];
-    for (const test of tests) await test();
+    for (const test of tests) {
+        const stalled = () => { console.error(`Unfinished root export test: ${test.name}`); process.exitCode = 1; };
+        process.once("beforeExit", stalled);
+        try { await test(); }
+        finally { process.off("beforeExit", stalled); }
+    }
     console.log(`tree-root-export-job: ${tests.length} suites passed`);
 })().catch(error => { console.error(error); process.exitCode = 1; });
