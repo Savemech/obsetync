@@ -1882,13 +1882,14 @@ async fn api_diff(
             .map_err(|_| ServerErrorHtml("invalid root hash".into()))?;
         admin_history_root(&state, &vault_id, &hash)
     };
-    let from_root = load(&from_hex)?;
     let to_root = load(&to_hex)?;
-
-    let from_entries =
-        crate::bridge::run_versioned_list_entries(state.storage_writer.clone(), from_root)
+    let from_entries = if from_hex == ZERO_HASH_HEX {
+        Vec::new()
+    } else {
+        crate::bridge::run_versioned_list_entries(state.storage_writer.clone(), load(&from_hex)?)
             .await
-            .map_err(|e| ServerErrorHtml(format!("list from-root: {}", e)))?;
+            .map_err(|e| ServerErrorHtml(format!("list from-root: {e}")))?
+    };
     let to_entries =
         crate::bridge::run_versioned_list_entries(state.storage_writer.clone(), to_root)
             .await

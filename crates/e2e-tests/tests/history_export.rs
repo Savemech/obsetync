@@ -146,6 +146,33 @@ async fn admin_export_serves_tar_of_any_root() {
     let p1 = hash_to_hex(&r1.hash());
     push_vault_snapshot(&a, &vault, &v2, &p1).await.unwrap();
 
+    let first_diff = env
+        .http
+        .get(format!(
+            "{}/admin/vaults/{vault}/api/diff/{ZERO_HASH_HEX}/{p1}",
+            env.admin_url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let first_diff: serde_json::Value = serde_json::from_slice(&first_diff).unwrap();
+    let changes = first_diff["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), v1.len());
+    for (change, (path, bytes)) in changes.iter().zip(&v1) {
+        assert_eq!(change["path"], *path);
+        assert_eq!(change["s"], "A");
+        assert_eq!(change["old"], ZERO_HASH_HEX);
+        assert_eq!(
+            change["new"],
+            hash_to_hex(&sync_core::hash::hash_bytes(bytes))
+        );
+    }
+
     // Export the HISTORICAL root (v1), not current — the whole point of
     // keeping every root is being able to materialize any of them.
     let url = format!("{}/admin/vaults/{}/export/{}", env.admin_url, vault, p1);
