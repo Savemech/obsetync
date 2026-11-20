@@ -126,6 +126,17 @@ test("discovery only recognizes generated conflict filename formats", () => {
     const files = [legacy, digest, "Design (conflict resolution).md", "memo (conflict sync abc).md",
         "folder (conflict plan/note).md"];
     assert.deepEqual(findConflicts({ listFiles: () => files }), [
-        { original, preservedAs: legacy }, { original, preservedAs: digest },
+        { original, preservedAs: legacy }, { original: null, preservedAs: digest },
     ]);
+});
+
+test("digest copies are displayed without file mutation controls", () => {
+    buttons.clear();
+    const stem = "猫".repeat(26);
+    const copy = stem + " (conflict sync " + "a".repeat(64) + ").md";
+    const io = { listFiles: () => [stem + "猫.md", stem + ".md", copy] };
+    const conflicts = findConflicts(io);
+    assert.deepEqual(conflicts, [{ original: null, preservedAs: copy }]);
+    new ObsetyncConflictModal({}, io, conflicts, () => {}).open();
+    assert.equal(buttons.size, 0);
 });

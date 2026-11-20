@@ -3,7 +3,7 @@ import { PlatformIO } from "./platform";
 export { conflictCopyPath } from "./conflict-path";
 
 interface ConflictInfo {
-    original: string;
+    original: string | null;
     preservedAs: string;
     winnerDevice?: string;
     preservedDevice?: string;
@@ -45,7 +45,13 @@ export class ObsetyncConflictModal extends Modal {
 
         for (const conflict of this.conflicts) {
             const div = contentEl.createDiv({ cls: "obsetync-conflict" });
-            div.createEl("strong", { text: conflict.original });
+            if (conflict.original === null) {
+                div.createEl("strong", { text: conflict.preservedAs });
+                div.createEl("p", { text: "Compare this copy with the original in your vault. Its filename may contain a shortened original name." });
+                continue;
+            }
+            const original = conflict.original;
+            div.createEl("strong", { text: original });
 
             new Setting(div)
                 .setName("Resolution")
@@ -62,7 +68,7 @@ export class ObsetyncConflictModal extends Modal {
                     btn.setButtonText("Keep Local").onClick(() => this.runResolution(conflict, async () => {
                         // Replace winner with preserved copy.
                         const data = await this.io.readFile(conflict.preservedAs);
-                        await this.io.writeFile(conflict.original, data);
+                        await this.io.writeFile(original, data);
                         await this.io.deleteFile(conflict.preservedAs);
                     }))
                 )
@@ -138,7 +144,7 @@ export class ObsetyncConflictModal extends Modal {
     }
 }
 
-const CONFLICT_COPY_RE = /^(.*) \(conflict (?:[^()/]+ [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{4}|sync [a-f0-9]{64})\)(\.[^./]+)?$/;
+const CONFLICT_COPY_RE = /^(.*) \(conflict (?:[^()/]+ [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{4}|(sync [a-f0-9]{64}))\)(\.[^./]+)?$/;
 
 /** Scan the vault for conflict-copy files and return conflict info. */
 export function findConflicts(io: PlatformIO): ConflictInfo[] {
@@ -149,7 +155,7 @@ export function findConflicts(io: PlatformIO): ConflictInfo[] {
         const parts = path.match(CONFLICT_COPY_RE);
         if (parts) {
             conflicts.push({
-                original: parts[1] + (parts[2] ?? ""),
+                original: parts[2] ? null : parts[1] + (parts[3] ?? ""),
                 preservedAs: path,
             });
         }
