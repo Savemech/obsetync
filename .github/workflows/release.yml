@@ -388,6 +388,9 @@ jobs:
           node scripts/release-provenance.mjs verify-server-json nix-server-build-identity.json \
             '${{ needs.precheck.outputs.version }}' '${{ github.sha }}' clean
 
+      - name: Initialize a fresh data volume as the image user
+        run: docker run --rm --network none --read-only --cap-drop ALL obsetync-server:nix init --data-dir /data >/dev/null
+
       - name: Tag + push
         id: push
         env:

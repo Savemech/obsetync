@@ -270,6 +270,12 @@
             printf 'root:x:0:\nnogroup:x:65534:\n' > etc/group
           '';
 
+          # Docker copies this directory's ownership into fresh volumes.
+          fakeRootCommands = ''
+            mkdir -m 0700 data
+            chown 65534:65534 data
+          '';
+
           config = {
             Entrypoint   = [ "${sync-server}/bin/sync-server" ];
             Cmd          = [ "run" "--data-dir" "/data" ];
