@@ -841,7 +841,8 @@ export class PerfTrace {
                 if (this.records.length > this.maxRecords) {
                     this.records.splice(0, this.records.length - this.maxRecords);
                 }
-                for (const listener of this.listeners) {
+                for (const listener of [...this.listeners]) {
+                    if (!this.listeners.has(listener)) continue;
                     try {
                         listener(cloneRecord(record));
                     } catch (error) {
@@ -888,7 +889,8 @@ export class PerfTrace {
     private deliverWindow(operation: PerfOperationHandle, outcome: PerfOutcome): void {
         if (this.windowListeners.size === 0) return;
         const window = operation.takeWindow(++this.windowSequence, 5_000, outcome);
-        for (const listener of this.windowListeners) {
+        for (const listener of [...this.windowListeners]) {
+            if (!this.windowListeners.has(listener)) continue;
             try {
                 listener({ ...window, demand: { ...window.demand } });
             } catch (error) {

@@ -148,6 +148,31 @@ function run(): void {
     trace.begin("push").finish();
     assert.equal(delivered.length, 1);
 
+    // Changing subscriptions during delivery must neither replay this event
+    // nor deliver it to a listener that has already unsubscribed.
+    for (const subscribe of [trace.subscribe.bind(trace), trace.subscribeWindows.bind(trace)]) {
+        const calls: string[] = [];
+        let offFirst: () => void;
+        let offSecond: () => void;
+        let offNew: () => void;
+        const first = () => {
+            calls.push("first");
+            if (calls.length > 1) return;
+            offFirst();
+            offSecond();
+            offFirst = subscribe(first);
+            offNew = subscribe(() => calls.push("new"));
+        };
+        offFirst = subscribe(first);
+        offSecond = subscribe(() => calls.push("removed"));
+        trace.begin("pull").finish();
+        assert.deepEqual(calls, ["first"]);
+        trace.begin("pull").finish();
+        assert.deepEqual(calls, ["first", "first", "new"]);
+        offFirst();
+        offNew!();
+    }
+
     let blockedMono = 0;
     const blockedTrace = new PerfTrace({
         monotonicNow: () => blockedMono,
