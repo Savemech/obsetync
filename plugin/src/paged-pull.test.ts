@@ -1,3 +1,4 @@
+import { strict as assert } from "node:assert";
 import { pull } from "./pull";
 import { ObsetyncSyncBase, SYNC_BASE_STORE_PATH } from "./sync-base";
 import type { DiffPage, FileDelta } from "./api";
@@ -116,6 +117,24 @@ async function rendererKillResumesAfterDurablePage(): Promise<void> {
             return new Uint8Array([hash === hashA ? 1 : 2]);
         },
     } as any;
+    for (const unavailable of [null, undefined]) {
+        const fallbackApp = { vault: { adapter: new MemorySegmentedIO() } } as any;
+        const fallbackBase = new ObsetyncSyncBase(fallbackApp);
+        await fallbackBase.load();
+        let pages = 0;
+        const api = {
+            ...dyingApi,
+            getDiffPage: async () => ++pages === 1 ? firstPage : unavailable,
+            getContent: async () => new Uint8Array([1]),
+            getDiff: async () => { throw new Error("legacy fallback reached"); },
+        };
+        await assert.rejects(pull(api, new MemoryVaultIO() as any, fallbackBase, "vault", sourceRoot,
+            wasm, makeTree(targetRoot)), /legacy fallback reached/);
+        const reopened = new ObsetyncSyncBase(fallbackApp);
+        await reopened.load();
+        check(reopened.diffPageCheckpoint === null, "legacy fallback left a durable cursor from this pull");
+        check(reopened.getHash("a.md") === hashA, "clearing the abandoned cursor lost an applied file");
+    }
     let killed = false;
     try {
         await pull(dyingApi, io as any, firstBase, "vault", sourceRoot, wasm, makeTree(targetRoot));

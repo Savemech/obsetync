@@ -626,10 +626,7 @@ async function pullPagedIfSupported(
         // current root. Let the legacy empty-vault path preserve its existing
         // return semantics; undefined also covers a rolled-back server.
         if (page === null || page === undefined) {
-            if (checkpoint) {
-                syncBase.clearDiffPageCheckpoint();
-                await syncBase.checkpoint();
-            }
+            if (syncBase.clearDiffPageCheckpoint()) await syncBase.checkpoint();
             return undefined;
         }
         if (toRoot === null) toRoot = page.toRoot;
