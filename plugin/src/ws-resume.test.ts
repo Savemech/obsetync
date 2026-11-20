@@ -100,10 +100,9 @@ test("foreground resume invalidates an apparently-connected stale session exactl
         let seals = 0;
         (channel as any).session.seal = () => { seals++; return heldSeal; };
         channel.sendPresence("first.md", "active");
+        await eventually(() => seals === 1, "first presence did not start encryption");
         channel.sendPresence("second.md", "active");
         const sendsDone = (channel as any).txChain as Promise<void>;
-        await eventually(() => seals === 1, "first presence did not start encryption");
-
 
         documentEvents.visibilityState = "hidden";
         documentEvents.dispatch("visibilitychange");
@@ -127,6 +126,25 @@ test("foreground resume invalidates an apparently-connected stale session exactl
         await new Promise(resolve => setTimeout(resolve, 0));
         assert.equal(FakeSocket.sockets.length, 2);
         assert.deepEqual(observedConnected, [false]);
+
+        const live = FakeSocket.sockets[1];
+        live.readyState = FakeSocket.OPEN;
+        (channel as any).state = "connected";
+        const encrypted: string[] = [];
+        let releaseFirst!: () => void;
+        const holdFirst = new Promise<void>(resolve => { releaseFirst = resolve; });
+        (channel as any).session.seal = async (json: string) => {
+            encrypted.push(JSON.parse(json).file);
+            if (encrypted.length === 1) await holdFirst;
+            return new Uint8Array([1]);
+        };
+        channel.sendPresence("initial.md", "active");
+        await eventually(() => encrypted.length === 1, "presence did not start");
+        for (let i = 0; i < 100; i++) channel.sendPresence(`note-${i}.md`, "active");
+        releaseFirst();
+        await (channel as any).txChain;
+        assert.deepEqual(encrypted, ["initial.md", "note-99.md"]);
+        assert.equal(live.sends, 2);
 
         windowEvents.dispatch("pagehide");
         windowEvents.dispatch("pageshow");

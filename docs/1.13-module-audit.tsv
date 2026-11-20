@@ -409,7 +409,7 @@ pending	plugin/src/ws-data.bench.ts	tooling	Not reviewed
 pending	plugin/src/ws-data.test.ts	tests	Not reviewed
 pending	plugin/src/ws-data.ts	production	Not reviewed
 reviewed	plugin/src/ws-resume.test.ts	tests	Traced hidden/visible and page lifecycle epochs, stale-socket closure, data transport invalidation and listener teardown. Reproduced double-start listener leak; both foreground suites pass with one ticket and one listener per event.
-read	plugin/src/ws.ts	production	Read complete connection-generation, foreground, encryption-chain and event lifecycle; server protocol and engine callbacks traced; duplicate start is now inert and unused ensureConnected removed. Queued send checks socket ownership before encryption and after completion. Live-session queue bounds remain to review
+read	plugin/src/ws.ts	production	Read complete connection-generation, foreground, encryption-chain and event lifecycle; server protocol and engine callbacks traced; duplicate start is now inert and unused ensureConnected removed. Queued send checks socket ownership before encryption and after completion. Coalesced pending presence updates and verified 100 successive changes behind a held seal. Receive and control queue bounds remain to review
 reviewed	plugin/styles.css	production	Matched all selectors to settings and debug modal callers.
 reviewed	plugin/tsconfig.json	configuration/schema	Enabled noUnusedLocals/noUnusedParameters; tsc and actual Nix plugin compilation pass
 reviewed	rust-toolchain.toml	configuration/schema	Local rustc 1.95.0 and wasm32 target verified; CI and release Rust setup version pins match

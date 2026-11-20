@@ -46,6 +46,7 @@ export class ObsetyncWsChannel {
     private pageHideListener: (() => void) | null = null;
     private pageShowListener: (() => void) | null = null;
     private foregroundStale = false;
+    private queuedPresence?: { file: string | null; state: "active" | "idle" };
     private connectionGeneration = 0;
     /** Serialize decrypts/encrypts so sequence counters match wire order. */
     private rxChain: Promise<void> = Promise.resolve();
@@ -150,17 +151,20 @@ export class ObsetyncWsChannel {
 
     /** Share what this device is looking at (Ph3). No-op unless connected. */
     sendPresence(file: string | null, state: "active" | "idle"): void {
-        this.sendSealed({
-            v: 2,
-            t: "presence",
-            vault: this.vaultId,
-            file,
-            state,
-        });
+        if (!this.isConnected()) return;
+        if (this.queuedPresence) {
+            this.queuedPresence.file = file;
+            this.queuedPresence.state = state;
+            return;
+        }
+        const frame = { v: 2, t: "presence", vault: this.vaultId, file, state };
+        this.queuedPresence = frame;
+        this.sendSealed(frame);
     }
 
     private setState(s: WsState): void {
         this.state = s;
+        if (s !== "connected") this.queuedPresence = undefined;
     }
 
     private wsUrl(): string {
@@ -178,11 +182,11 @@ export class ObsetyncWsChannel {
         const generation = this.connectionGeneration;
         if (!ws || !session || this.state !== "connected") return;
         const current = () => generation === this.connectionGeneration && this.ws === ws && ws.readyState === WebSocket.OPEN;
-        const json = JSON.stringify(frame);
         this.txChain = this.txChain
             .then(async () => {
+                if (frame === this.queuedPresence) this.queuedPresence = undefined;
                 if (!current()) return;
-                const sealed = await session.seal(json);
+                const sealed = await session.seal(JSON.stringify(frame));
                 if (current()) {
                     ws.send(sealed.buffer as ArrayBuffer);
                 }
