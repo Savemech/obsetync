@@ -499,10 +499,12 @@ pub fn materialize(
             fs::create_dir_all(parent)?;
         }
         let content_hash = write_file(&path, file)?;
-        dataset_hasher.update(file.path.as_bytes());
-        dataset_hasher.update(&[0]);
-        dataset_hasher.update(&file.size.to_le_bytes());
-        dataset_hasher.update(content_hash.as_bytes());
+        hash_dataset_entry(
+            &mut dataset_hasher,
+            &file.path,
+            file.size,
+            content_hash.as_bytes(),
+        );
     }
 
     let operations_path = output.join("operations.ndjson");
@@ -587,10 +589,7 @@ fn verify_files(
         total_bytes = total_bytes.saturating_add(metadata.len());
         if let Some(hasher) = dataset_hasher.as_mut() {
             let content_hash = hash_file(&path)?;
-            hasher.update(file.path.as_bytes());
-            hasher.update(&[0]);
-            hasher.update(&file.size.to_le_bytes());
-            hasher.update(content_hash.as_bytes());
+            hash_dataset_entry(hasher, &file.path, file.size, content_hash.as_bytes());
         }
     }
 
@@ -691,6 +690,21 @@ pub async fn benchmark(
             ));
         }
         let enumerate_and_hash_ns = elapsed_ns(hash_started.elapsed());
+
+        let mut dataset_hasher = blake3::Hasher::new();
+        for entry in &entries {
+            hash_dataset_entry(
+                &mut dataset_hasher,
+                &entry.path,
+                entry.size_bytes,
+                &entry.hash,
+            );
+        }
+        if dataset_hasher.finalize().to_hex().as_str() != manifest.dataset_digest {
+            return Err(HarnessError::ManifestMismatch(
+                "dataset digest differs".into(),
+            ));
+        }
 
         let tree_started = Instant::now();
         let mut tree = sync_core::transactional_tree::TransactionalTree::new(
@@ -1636,6 +1650,13 @@ fn overlay_format_markers(
     }
 }
 
+fn hash_dataset_entry(hasher: &mut blake3::Hasher, path: &str, size: u64, hash: &[u8; 32]) {
+    hasher.update(path.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(&size.to_le_bytes());
+    hasher.update(hash);
+}
+
 fn hash_file(path: &Path) -> Result<blake3::Hash, HarnessError> {
     let mut hasher = blake3::Hasher::new();
     hasher.update_reader(File::open(path)?)?;
@@ -1850,6 +1871,24 @@ mod tests {
         assert_eq!(first_manifest, second_manifest);
         verify(&first, true).unwrap();
         verify(&second, true).unwrap();
+    }
+
+    #[tokio::test]
+    async fn benchmark_rejects_changed_content_with_matching_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("w1");
+        let plan = WorkloadPlan::build(WorkloadId::W1, 42, "0.00002".parse().unwrap()).unwrap();
+        materialize(&plan, &output, MaterializeOptions::default()).unwrap();
+        let file = &plan.files[0];
+        fs::write(
+            output.join("vault").join(&file.path),
+            vec![0; file.size as usize],
+        )
+        .unwrap();
+        assert!(matches!(
+            benchmark(&output, 1, None).await,
+            Err(HarnessError::ManifestMismatch(reason)) if reason == "dataset digest differs"
+        ));
     }
 
     #[tokio::test]
