@@ -278,7 +278,7 @@ export class ObsetyncSyncBase {
         let bytes = 0;
         let ownsSlot = false;
         try {
-            this.assertWritable();
+            this.assertAcceptingWork();
             if (this.queuedPublications >= ROOT_BASE_PUBLICATION_LIMITS.queuedRequests) {
                 throw new StoreRecoveryError("LIMIT", "root publication queue is full");
             }
@@ -293,6 +293,7 @@ export class ObsetyncSyncBase {
             if (bytes > ROOT_BASE_PUBLICATION_LIMITS.queuedEncodedBytes - this.queuedPublicationBytes) {
                 throw new StoreRecoveryError("LIMIT", "root publication queued metadata exceeds bound");
             }
+            this.assertAcceptingWork();
             this.queuedPublicationBytes += bytes;
         } catch (error) {
             if (ownsSlot) this.queuedPublications--;
@@ -566,7 +567,7 @@ export class ObsetyncSyncBase {
      * the witness stale. This is not a durable checkpoint or a paged index:
      * holding the capture retains its reachable AVL metadata until released. */
     captureTreeEntries(): CapturedBaseTreeEntries {
-        this.assertWritable();
+        this.assertAcceptingWork();
         if (this.queuedPublications !== 0 || this.publicationBarriers.length !== 0) {
             throw new StoreRecoveryError("RECOVERY_REQUIRED", "sync-base root publication is still pending");
         }
@@ -579,13 +580,13 @@ export class ObsetyncSyncBase {
                     yield { path, hash: entry.hash, mtime_ms: entry.treeMtime ?? entry.mtime, size: entry.size };
                 }
             },
-            isCurrent: () => this.writable && this.entries === entries && this.data === data &&
+            isCurrent: () => !this.closing && this.writable && this.entries === entries && this.data === data &&
                 this.mutationVersion === version && this.queuedPublications === 0 && this.publicationBarriers.length === 0,
         });
     }
 
     private record(operation: SyncBaseOperation): void {
-        this.assertWritable();
+        this.assertAcceptingWork();
         if (this.pendingOperationOwners >= this.maxPendingOperations) {
             throw new StoreRecoveryError("LIMIT", "sync-base pending operation queue is full");
         }
@@ -748,6 +749,11 @@ export class ObsetyncSyncBase {
         const result = this.writeChain.then(operation, operation);
         this.writeChain = result.then(() => undefined, () => undefined);
         return result;
+    }
+
+    private assertAcceptingWork(): void {
+        if (this.closing) throw new StoreRecoveryError("RECOVERY_REQUIRED", "sync-base is closing");
+        this.assertWritable();
     }
 
     private assertWritable(): void {

@@ -342,11 +342,37 @@ async function markerSurvivesCompactionAndFencesOlderReaders(): Promise<void> {
     }
 }
 
+async function retirementStopsSettersAndInvalidatesTreeCaptures(): Promise<void> {
+    const { base, io } = await fixture();
+    base.setEntry("pending.md", hash("5"), 1, 2);
+    const captured = base.captureTreeEntries();
+    const checkpoint = base.checkpoint();
+    const publicationWork = base.commitRootPublication(publication());
+    const drain = base.closeAndDrain();
+    assert.throws(() => base.setEntry("late.md", hash("6"), 3, 4), /closing/);
+    assert.throws(() => base.captureTreeEntries(), /closing/);
+    await assert.rejects(base.commitRootPublication(publication(2)), /closing/);
+    await checkpoint;
+    assert.equal(await publicationWork, "applied");
+    await drain;
+    assert.equal(captured.isCurrent(), false);
+    const disk = await restored(io.snapshot());
+    assertPublished(disk);
+    assert.equal(disk.getHash("pending.md"), hash("5"));
+    assert.equal(disk.getHash("late.md"), null);
+
+    const idle = await fixture();
+    const idleCapture = idle.base.captureTreeEntries();
+    const idleDrain = idle.base.closeAndDrain();
+    assert.equal(idleCapture.isCurrent(), false, "retiring base still authorized a repair");
+    await idleDrain;
+}
+
 const tests = [oneAtomicPublicationAndDetachedSubmission, duplicateDoesNotReplayOverNewerMutations,
     newerSettersStayBehindNativePublication, earlierSaveCannotPublishLaterSettersAheadOfBarrier,
     acceptedCutSurvivesLaterSetterFailureAndQueuedPublications, sameVisibleRootSetterAndBoundedPublicationQueue,
     strictInputBoundsNeverWrite, publicationFailuresNeverExposeMixedState,
-    markerSurvivesCompactionAndFencesOlderReaders];
+    markerSurvivesCompactionAndFencesOlderReaders, retirementStopsSettersAndInvalidatesTreeCaptures];
 let completed = false;
 const premature = () => { if (!completed) { console.error("sync-base-publication tests exited with unresolved work"); process.exitCode = 1; } };
 process.on("beforeExit", premature);
