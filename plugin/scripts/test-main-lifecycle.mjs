@@ -9,6 +9,8 @@ import { build } from "esbuild";
 // engine settlement itself is covered by src/engine-lifecycle.test.ts. This is
 // neither an Obsidian host simulation nor a device/native performance test.
 // No generated WASM, network, vault reads or temporary files are required.
+const checkOnly = process.argv.length === 3 && process.argv[2] === "--check";
+assert(process.argv.length === 2 || checkOnly, "Usage: test-main-lifecycle.mjs [--check]");
 const root = fileURLToPath(new URL("../", import.meta.url));
 const actualInputs = new Set([
     "src/main.ts", "src/startup-activation.ts", "src/runtime-retirement.ts",
@@ -113,12 +115,11 @@ for (const input of Object.keys(bundled.metafile.inputs)) {
 }
 for (const input of actualInputs) assert(input in bundled.metafile.inputs, `Actual source missing: ${input}`);
 const bundle = bundled.outputFiles[0].text;
-if (process.argv.includes("--check")) {
+if (checkOnly) {
     console.log(JSON.stringify({ suite: "main-lifecycle", mode: "bundle-only", testsExecuted: 0,
         actualSources: [...actualInputs], fixtureModules: fixtures.size }));
     process.exit(0);
 }
-assert.equal(process.argv.length, 2, "Only --check is supported");
 
 let assertions = 0;
 function check(value, message) { assertions++; assert(value, message); }
