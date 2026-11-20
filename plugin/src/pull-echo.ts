@@ -22,7 +22,7 @@ interface TrackedExpectation extends PullWriteExpectation {
  * resolves.
  */
 export class PullEchoTracker {
-    private expected = new Map<string, TrackedExpectation>();
+    private readonly expected = new Map<string, TrackedExpectation>();
 
     constructor(
         private readonly ttlMs = 60_000,
@@ -30,9 +30,16 @@ export class PullEchoTracker {
     ) {}
 
     register(writes: PullWriteExpectation[]): void {
-        this.sweep();
-        const expiresAt = this.now() + this.ttlMs;
+        const now = this.now();
+        const expiresAt = now + this.ttlMs;
+        // Registration order is expiry order while the clock advances.
+        // live() still checks each path directly if wall time moves backward.
+        for (const [path, entry] of this.expected) {
+            if (entry.expiresAt <= now) this.expected.delete(path);
+            else if (entry.expiresAt <= expiresAt) break;
+        }
         for (const write of writes) {
+            this.expected.delete(write.path);
             this.expected.set(write.path, { ...write, expiresAt });
         }
     }
@@ -85,7 +92,10 @@ export class PullEchoTracker {
     }
 
     get size(): number {
-        this.sweep();
+        const now = this.now();
+        for (const [path, entry] of this.expected) {
+            if (entry.expiresAt <= now) this.expected.delete(path);
+        }
         return this.expected.size;
     }
 
@@ -97,12 +107,5 @@ export class PullEchoTracker {
             return null;
         }
         return entry;
-    }
-
-    private sweep(): void {
-        const now = this.now();
-        for (const [path, entry] of this.expected) {
-            if (entry.expiresAt <= now) this.expected.delete(path);
-        }
     }
 }

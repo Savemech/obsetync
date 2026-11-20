@@ -36,4 +36,18 @@ now += 101;
 check(!tracker.consumeUpsert("late.md", "x"), "expired writes are not echoes");
 check(tracker.size === 0, "expired entries are swept");
 
+tracker.register([{ path: "renewed", action: "delete" }, { path: "expires", action: "delete" }]);
+now += 50;
+tracker.register([{ path: "renewed", action: "upsert", hash: "updated" }]);
+now += 50;
+tracker.register([{ path: "fresh", action: "delete" }]);
+check(!tracker.consumeDelete("expires"), "expired peer survived renewal of the oldest path");
+check(tracker.consumeUpsert("renewed", "updated"), "renewal lost its new action or deadline");
+
+now -= 200;
+tracker.register([{ path: "earlier", action: "upsert", hash: "x" }]);
+now += 100;
+check(!tracker.expectsUpsert("earlier"), "clock rollback authenticated an expired echo");
+check(tracker.size === 1 && tracker.consumeDelete("fresh"), "clock rollback lost a live expectation");
+
 console.log(`pull-echo.test: ${assertions} assertions passed`);
