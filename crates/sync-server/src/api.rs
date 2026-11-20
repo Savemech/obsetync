@@ -1316,7 +1316,7 @@ async fn get_root_at(
 
 /// How many history entries `get_history` returns at most. Every root file
 /// must be read to sort by creation time, so the read cost is the full
-/// history regardless — the cap only bounds the response size.
+/// history regardless. Only the newest entries are retained.
 const HISTORY_LIMIT: usize = 50;
 
 /// GET /api/v1/history/{vault_id} — the vault's recent root history, newest
@@ -1328,6 +1328,19 @@ async fn get_history(
     axum::Extension(device): axum::Extension<DeviceIdExt>,
     axum::Extension(session): axum::Extension<ClientSessionExt>,
 ) -> Result<impl IntoResponse, ServerError> {
+    let writer = state.storage_writer.clone();
+    writer
+        .run_blocking(move |_| read_history(state, vault_id, device, session))
+        .await
+        .map_err(|error| ServerError::ServiceUnavailable(error.to_string()))?
+}
+
+fn read_history(
+    state: SharedState,
+    vault_id: String,
+    device: DeviceIdExt,
+    session: ClientSessionExt,
+) -> Result<(StatusCode, String), ServerError> {
     if !state.vaults.vault_exists(&vault_id) {
         return Err(ServerError::NotFound(format!(
             "vault '{}' not found",
@@ -1350,10 +1363,9 @@ async fn get_history(
             current_root.version(),
         )?;
     }
-    let current_hex = current.map(|h| hash_to_hex(&h));
 
     let roots_dir = state.layout.vault_roots_dir(&vault_id);
-    let mut entries: Vec<serde_json::Value> = Vec::new();
+    let mut entries = std::collections::BTreeMap::new();
     if let Ok(dir) = std::fs::read_dir(&roots_dir) {
         for e in dir.filter_map(|e| e.ok()) {
             let name = e.file_name().to_string_lossy().to_string();
@@ -1375,26 +1387,32 @@ async fn get_history(
             {
                 continue;
             }
-            let hex = hash_to_hex(&root.hash());
-            entries.push(serde_json::json!({
-                "root": hex,
-                "parent": root.parent_hash().map(|h| hash_to_hex(&h)),
-                "created_ms": root.created_ms(),
-                "device_id": root.device_id(),
-                "total_files": root.total_files(),
-                "tree_version": root.version(),
-                "current": Some(&hex) == current_hex.as_ref(),
-            }));
+            let key = (std::cmp::Reverse(root.created_ms()), stored_hash);
+            if entries.len() == HISTORY_LIMIT
+                && entries
+                    .last_key_value()
+                    .is_some_and(|(last, _)| key >= *last)
+            {
+                continue;
+            }
+            entries.insert(
+                key,
+                serde_json::json!({
+                    "root": hash_to_hex(&stored_hash),
+                    "parent": root.parent_hash().map(|h| hash_to_hex(&h)),
+                    "created_ms": root.created_ms(),
+                    "device_id": root.device_id(),
+                    "total_files": root.total_files(),
+                    "tree_version": root.version(),
+                    "current": current == Some(stored_hash),
+                }),
+            );
+            if entries.len() > HISTORY_LIMIT {
+                entries.pop_last();
+            }
         }
     }
-    entries.sort_by(|a, b| {
-        b["created_ms"]
-            .as_u64()
-            .unwrap_or(0)
-            .cmp(&a["created_ms"].as_u64().unwrap_or(0))
-    });
-    entries.truncate(HISTORY_LIMIT);
-
+    let entries: Vec<_> = entries.into_values().collect();
     let body = serde_json::json!({ "roots": entries }).to_string();
     if body.len() > HTTP_HISTORY_RESPONSE_BYTES {
         return Err(ServerError::Internal(
@@ -4148,6 +4166,40 @@ mod integration_tests {
             .storage_writer
             .contains(StorageObjectKind::ContentChunk, &hash));
         assert!(!env.state.layout.content_chunk_path(&hash).exists());
+    }
+
+    #[tokio::test]
+    async fn recent_history_has_a_stable_cutoff_for_tied_timestamps() {
+        let env = setup();
+        let vault = "history-cutoff";
+        let mut expected = Vec::new();
+        for index in 0..70u8 {
+            let root = sync_core::chunk::RootNode {
+                vault_id: vault.into(),
+                created_ms: u64::from(index % 7 == 0),
+                version: 1,
+                children: vec![("notes".into(), hash_bytes(&[index]))],
+                total_files: 1,
+                parent_hash: None,
+                device_id: "device".into(),
+            };
+            let hash = root.hash();
+            env.state
+                .vaults
+                .store_root(vault, &hash, &root.serialize())
+                .unwrap();
+            expected.push((std::cmp::Reverse(root.created_ms), hash_to_hex(&hash)));
+        }
+        expected.sort();
+        let (status, body) =
+            send_semantic(&env, "GET", &format!("/api/v1/history/{vault}"), &[]).await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let roots = body["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), HISTORY_LIMIT);
+        for (entry, (_, expected_hash)) in roots.iter().zip(expected) {
+            assert_eq!(entry["root"], expected_hash);
+        }
     }
 
     #[tokio::test]
