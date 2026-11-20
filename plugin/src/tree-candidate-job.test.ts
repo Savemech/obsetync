@@ -1059,6 +1059,27 @@ async function pagedCandidateChunksBoundCallbacksAndCleanup(): Promise<void> {
     assert.equal(stoppedReleases, 1); assert.equal(stopped.retirement, false);
     assert.equal(stopped.candidate, true);
 
+    const interrupted = new PagedChunkTreeFixture();
+    const resumeError = new Error("sort resume acknowledgement lost");
+    const resume = interrupted.resume_candidate_chunks_sort_memory_v1_job.bind(interrupted);
+    interrupted.resume_candidate_chunks_sort_memory_v1_job = (...args) => {
+        resume(...args);
+        throw resumeError;
+    };
+    let releaseAttempts = 0;
+    await assert.rejects(collectTreeCandidateChunkPages(interrupted, {
+        cooperate: async () => {}, cooperateRetirement: async () => {}, legacy: () => ({}),
+        onSortMemoryPlan: () => ({ release() {
+            assert.equal(interrupted.retirement, false);
+            if (++releaseAttempts === 1) throw new Error("temporary release failure");
+        } }),
+        onPage: async () => { throw new Error("unexpected page"); },
+    }), error => error === resumeError);
+    assert.equal(hasPendingTreeReachabilityRetirement(interrupted), true);
+    await drainTreeReachabilityRetirement(interrupted);
+    assert.equal(releaseAttempts, 2);
+    assert.equal(hasPendingTreeReachabilityRetirement(interrupted), false);
+
     const failed = new PagedChunkTreeFixture(), sinkFailure = new Error("paged sink failed");
     let failedReleases = 0;
     await assert.rejects(collectTreeCandidateChunkPages(failed, {
@@ -1129,6 +1150,17 @@ async function pagedCandidateChunksCapabilitiesAndLegacyFailClosed(): Promise<vo
         legacy: () => { legacyReads++; return { all: [], fresh: [] }; },
     }), error => error === stopped);
     assert.equal(legacyReads, 0);
+    const emptyController = new AbortController();
+    const emptyAbort = new Error("cancelled after collecting an empty legacy plan");
+    await assert.rejects(collectTreeCandidateChunkPages(legacy, {
+        cooperate: async () => {}, cooperateRetirement: async () => {}, signal: emptyController.signal,
+        legacy: () => {
+            queueMicrotask(() => emptyController.abort(emptyAbort));
+            return { all: [], fresh: [] };
+        },
+        onSortMemoryPlan: () => { throw new Error("unexpected sort"); },
+        onPage: async () => { throw new Error("unexpected page"); },
+    }), error => error === emptyAbort);
     const all = Array.from({ length: 600 }, (_, index) => h(index + 1));
     const fresh = all.filter((_, index) => index % 7 === 0);
     const pages: string[][] = []; let admissions = 0;

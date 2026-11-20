@@ -1204,12 +1204,13 @@ export async function collectTreeCandidateChunkPages(
         if (requireIncremental) {
             throw new TypeError("incremental candidate chunk page API is required");
         }
-        const plan = await collectTreeCandidateChunks(tree, { ...options, requireIncremental, signal, assertCurrent: assertOwner });
         const check = () => {
             throwIfWorkAborted(signal);
             assertOwner?.();
             throwIfWorkAborted(signal);
         };
+        const plan = await collectTreeCandidateChunks(tree, { ...options, requireIncremental, signal, assertCurrent: assertOwner });
+        check();
         let freshOffset = 0;
         for (let offset = 0; offset < plan.all.length;) {
             const nextOffset = Math.min(plan.all.length, offset + TREE_CANDIDATE_CHUNK_PAGE_HASHES);
@@ -1270,7 +1271,7 @@ export async function collectTreeCandidateChunkPages(
     }
 
     let jobOpen = true, failed = false, primary: unknown;
-    let completed = 0, reachable = 0, sortOwnerAttached = false, sortResumed = false;
+    let completed = 0, reachable = 0, sortOwnerAttached = false;
     let sortOwner: CandidateOpenMemoryOwner | undefined;
     try {
         for (;;) {
@@ -1314,7 +1315,6 @@ export async function collectTreeCandidateChunkPages(
         assertCurrent();
         paged.resume.call(tree, token, memoryPlan.sourceHashesRequestedBytes,
             memoryPlan.scratchHashesRequestedBytes);
-        sortResumed = true;
 
         if (reachable > 0) {
             let sortCompleted = 0;
@@ -1371,9 +1371,9 @@ export async function collectTreeCandidateChunkPages(
         if (jobOpen) {
             try {
                 const retained = retainRetirement(tree, token, deferred, options.cooperateRetirement,
-                    true, sortResumed ? sortOwner : undefined);
-                if (sortResumed && sortOwner) retained.outputTransition = "detached";
-                sortOwnerAttached = sortResumed && !!sortOwner;
+                    true, sortOwner);
+                if (sortOwner) retained.outputTransition = "detached";
+                sortOwnerAttached = !!sortOwner;
                 jobOpen = false;
             } catch (cleanup) { cleanups.push(cleanup); }
         }
