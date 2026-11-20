@@ -235,8 +235,8 @@ reviewed	plugin/src/hash-source-budget.ts	production	Traced whole-file and strea
 read	plugin/src/hash-worker-entry.ts	production	Read request checks, cancellation chain, native IO, WASM cleanup and result path; real worker hashes empty file and rejects simulated quarter-millisecond ctime drift in both modes; cancellation lifecycle review pending
 reviewed	plugin/src/hash-worker-protocol.ts	production	Traced messages, actual worker producer and pool validator; exact native fingerprints shared by worker and both desktop readers; real SIMD hash and manifest checked
 reviewed	plugin/src/hash-worker-source.d.ts	production	All three virtual modules matched to esbuild entries and main imports; production bundle builds
-pending	plugin/src/host-runtime.test.ts	tests	Not reviewed
-pending	plugin/src/host-runtime.ts	production	Not reviewed
+reviewed	plugin/src/host-runtime.test.ts	tests	Both desktop and mobile hosts tested in either UI layout, including unknown and conflicting app flags.
+reviewed	plugin/src/host-runtime.ts	production	Traced host selection through startup, persistence, memory budgets, worker initialization and desktop/mobile adapter selection. Layout flag is diagnostic only.
 reviewed	plugin/src/ignore.test.ts	tests	Checked built-in and custom patterns, legacy settings migration, anchored file/directory matches and nested negative cases
 reviewed	plugin/src/ignore.ts	production	Traced matcher through event capture, scans, legacy and paged pulls; rooted single-segment patterns and directory-only anchored paths corrected
 pending	plugin/src/incremental-tree-test-abi.ts	production	Not reviewed
@@ -386,8 +386,8 @@ pending	plugin/src/tree-candidate-mutation-job.test.ts	tests	Not reviewed
 pending	plugin/src/tree-candidate-mutation-job.ts	production	Not reviewed
 pending	plugin/src/tree-chunk-export-job.test.ts	tests	Not reviewed
 pending	plugin/src/tree-chunk-export-job.ts	production	Not reviewed
-pending	plugin/src/tree-format.test.ts	tests	Not reviewed
-pending	plugin/src/tree-format.ts	production	Not reviewed
+removed	plugin/src/tree-format.test.ts	tests	Only exercised the retired synchronous helper. Active cross-format pull/recovery tests live in engine-root.test.ts.
+removed	plugin/src/tree-format.ts	production	Obsolete synchronous whole-vault JSON rebuild had only its own test as caller. Pull validates the observed version in sync.ts and calls rebuildRootTreeFromBase with owner and memory fences.
 pending	plugin/src/tree-negotiation.test.ts	tests	Not reviewed
 pending	plugin/src/tree-negotiation.ts	production	Not reviewed
 reviewed	plugin/src/tree-output-settlement.test.ts	tests	Verified commit/abort reports, malformed receipts, native failure, stale format, unobservable open state, final fence and legacy dispatch on synthetic wrappers.
