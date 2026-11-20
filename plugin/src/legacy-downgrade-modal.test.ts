@@ -7,9 +7,9 @@ import {
     legacyDowngradeStatus,
     type LegacyDowngradeConfirmationResult,
 } from "./legacy-downgrade-modal";
-import type { LegacyDowngradeHostState } from "./legacy-downgrade-host";
+import type { LegacyDowngradeHostState, LegacyDowngradeOperation } from "./legacy-downgrade-host";
 
-const complete = (action: "prepare" | "resume" | "import"): LegacyDowngradeConfirmationResult => ({
+const complete = (action: LegacyDowngradeOperation): LegacyDowngradeConfirmationResult => ({
     action, targetVersion: "1.11.3", typedTarget: "1.11.3", understandsSyncStops: true,
     understandsArchiveIsRetained: true, explicitlyConfirmed: true,
 });
@@ -41,11 +41,10 @@ async function run(): Promise<void> {
     const states: LegacyDowngradeHostState[] = ["none", "interrupted", "active-awaiting-import", "quiescing",
         "activating", "legacy-handoff", "import-authorized", "current-active", "retired"];
     for (const state of states) {
-        const status = legacyDowngradeStatus({ state, generation: 1, operation: null,
-            stopped: state !== "none" && state !== "current-active", unloaded: state === "retired" });
-        assert(status.text.length > 0 && status.text.length <= 180, `${state} status is unbounded`);
-        assert(!status.text.includes("/Users/") && !status.text.includes(".obsidian"), `${state} status leaked a path`);
-        if (state === "active-awaiting-import" || state === "legacy-handoff") assert.match(status.text, /stopped/i);
+        const status = legacyDowngradeStatus(state);
+        assert(status.length > 0 && status.length <= 180, `${state} status is unbounded`);
+        assert(!status.includes("/Users/") && !status.includes(".obsidian"), `${state} status leaked a path`);
+        if (state === "active-awaiting-import" || state === "legacy-handoff") assert.match(status, /stopped/i);
     }
     console.log("legacy-downgrade-modal.test: exact-target/confirmation/status assertions passed");
 }

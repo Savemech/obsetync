@@ -256,8 +256,8 @@ reviewed	plugin/src/journal.ts	production	Traced event/scan submissions, bounded
 pending	plugin/src/large-transfer.test.ts	tests	Not reviewed
 pending	plugin/src/legacy-downgrade-host.test.ts	tests	Not reviewed
 pending	plugin/src/legacy-downgrade-host.ts	production	Not reviewed
-pending	plugin/src/legacy-downgrade-modal.test.ts	tests	Not reviewed
-pending	plugin/src/legacy-downgrade-modal.ts	production	Not reviewed
+reviewed	plugin/src/legacy-downgrade-modal.test.ts	tests	Exercised typed target, explicit consent, cancellation and text for all nine host states; focused suite passed
+reviewed	plugin/src/legacy-downgrade-modal.ts	production	Traced confirmation and status bar in main; removed unused tone and duplicate action type; bundled lifecycle and type checks passed
 pending	plugin/src/legacy-downgrade.test.ts	tests	Not reviewed
 pending	plugin/src/legacy-downgrade.ts	production	Not reviewed
 reviewed	plugin/src/legacy-source.test.ts	tests	Compared digests to independent Node crypto implementation across Unicode boundaries; exercised absent roles, host yields and rename ACK parsing.

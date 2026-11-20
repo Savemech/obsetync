@@ -22,6 +22,7 @@ import {
 import {
     LegacyDowngradeHostCoordinator,
     type LegacyDowngradeHostAction,
+    type LegacyDowngradeOperation,
     type LegacyDowngradeGenerationToken,
     type LegacyDowngradeOperationContext,
     type LegacyDowngradeStoppedHost,
@@ -628,7 +629,7 @@ export default class ObsetyncPlugin extends Plugin {
         return this.legacyDowngradeHost;
     }
 
-    private async confirmLegacyDowngrade(action: "prepare" | "resume" | "import"): Promise<boolean> {
+    private async confirmLegacyDowngrade(action: LegacyDowngradeOperation): Promise<boolean> {
         if (this.legacyConfirmation) throw new Error("another compatibility confirmation is already open");
         const request = new LegacyDowngradeConfirmationModal({ confirm: view => new Promise(resolve => {
             if (this.unloaded) { resolve(null); return; }
@@ -2076,7 +2077,7 @@ export default class ObsetyncPlugin extends Plugin {
     private renderStatusBar(): void {
         const legacy = this.legacyDowngradeHost?.snapshot();
         if (legacy && legacy.state !== "none" && legacy.state !== "current-active") {
-            this.statusBarEl?.setText(legacyDowngradeStatus(legacy).text);
+            this.statusBarEl?.setText(legacyDowngradeStatus(legacy.state));
             return;
         }
         if (this.startupSyncTimer !== null) {
