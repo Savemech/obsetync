@@ -18,6 +18,7 @@ export const ROOT_TREE_REPAIR_LIMITS = {
     scratchBytes: 128 * 1024,
     feedEntries: 256,
     feedBytes: 256 * 1024,
+    v2PathBytes: 4096,
     buildUnits: 256,
     retirementUnits: 256,
 } as const;
@@ -39,7 +40,7 @@ export class RootTreeRetirementError extends Error {
     }
 }
 
-/** Fail-fast refusal of the scoped V2 replacement-output allowance. This is
+/** Fail-fast refusal of the scoped replacement-output allowance. This is
  * not an assertion about total native heap/RSS or currently unmeasured owners. */
 export class RootTreeOutputAdmissionDeniedError extends Error {
     readonly code = "ROOT_TREE_OUTPUT_ADMISSION_DENIED";
@@ -47,8 +48,9 @@ export class RootTreeOutputAdmissionDeniedError extends Error {
         readonly requestedBytes: number,
         readonly capacityBytes: number,
         readonly usedBytes: number,
+        treeVersion: 1 | 2,
     ) {
-        super(`V2 replacement output requires ${requestedBytes} requested bytes; ` +
+        super(`V${treeVersion} replacement output requires ${requestedBytes} requested bytes; ` +
             `${Math.max(0, capacityBytes - usedBytes)} are currently available`);
         this.name = "RootTreeOutputAdmissionDeniedError";
     }
@@ -512,6 +514,9 @@ export async function rebuildRootTreeFromBase(
         for (const row of captured.entries()) {
             if (++count > captured.entryCount) throw new RootTreeRepairError("INVALID_BASE", "captured tree entry count differs");
             const line = serializeEntry(row, previousPath);
+            if (preferredVersion === 2 && utf8Bytes(row.path) > ROOT_TREE_REPAIR_LIMITS.v2PathBytes) {
+                throw new RootTreeRepairError("LIMIT", "Tree v2 path exceeds the 4096-byte UTF-8 limit");
+            }
             previousPath = row.path;
             serializedBytes += utf8Bytes(line) + (count > 1 ? 1 : 0);
             if (serializedBytes > ROOT_TREE_REPAIR_LIMITS.serializedBytes) {
@@ -549,7 +554,7 @@ export async function rebuildRootTreeFromBase(
         const attempt = outputAdmission!.reserve(tree, { peakBytes, residentBytes });
         if (attempt) return attempt;
         const snapshot = outputAdmission!.snapshot().ledger;
-        throw new RootTreeOutputAdmissionDeniedError(peakBytes, snapshot.capacityBytes, snapshot.usedBytes);
+        throw new RootTreeOutputAdmissionDeniedError(peakBytes, snapshot.capacityBytes, snapshot.usedBytes, preferredVersion);
     };
     const prepareCleanup = (needsCancel: boolean): PendingRetirement => {
         if (preparedCleanup) {

@@ -339,9 +339,9 @@ reviewed	plugin/src/root-stream-scope.test.ts	tests	Full six ownership/endpoint/
 reviewed	plugin/src/root-stream-scope.ts	production	Read full canonicalization/fingerprint/fences and main callers; explicit HTTPS policy matches API; one-time enrolled-settings migration retains old HTTP scope and existing intents fail closed on genuine scope change
 pending	plugin/src/root-sync-runtime.test.ts	tests	Not reviewed
 read	plugin/src/root-sync-runtime.ts	production	Audited quiesce and dispose with recovery and conflict owners. Synchronous close failure still starts and joins siblings; 15 runtime integration suites pass. Remaining publication paths pending.
-pending	plugin/src/root-tree-repair-job.test.ts	tests	Not reviewed
-pending	plugin/src/root-tree-repair.test.ts	tests	Not reviewed
-pending	plugin/src/root-tree-repair.ts	production	Not reviewed
+read	plugin/src/root-tree-repair-job.test.ts	tests	Ran 33 host-driver suites; exercised 4096-byte paths and pre-admission rejection at 4097 UTF-8 bytes; both formats verified on output refusal. Remaining injected progress and quarantine cases under review.
+read	plugin/src/root-tree-repair.test.ts	tests	Checked base capture, atomic fallback and packaged scalar V1/V2 graph closure; 95 assertions passed including missing-child reconstruction and unsuccessful rebuild preserving the prior root.
+read	plugin/src/root-tree-repair.ts	production	Traced engine repair, two-pass input sizing and native V1/V2 admission. V2 checks UTF-8 path length before full workset reservation. Refusal reports negotiated format. Retirement and publication transitions still under review.
 read	plugin/src/root-tree-resident-admission.test.ts	tests	Traced reserve, terminal settlement and one-use proof ownership; foreign-ticket rejection now preserves the proof for its actual owner; full lifecycle review pending
 read	plugin/src/root-tree-resident-admission.ts	production	Traced reserve, terminal settlement and one-use proof ownership; foreign-ticket rejection now preserves the proof for its actual owner; full lifecycle review pending
 reviewed	plugin/src/runtime-retirement.test.ts	tests	Checked sibling failure, vault isolation, retained failure and reload-cycle cases. Bundled main regression confirms a rejected base retirement waits for the outstanding journal.

@@ -1289,13 +1289,18 @@ async function v2RequestedOutputAdmissionLifecycle(): Promise<void> {
         } finally { admission.close(); f.budget.close(); }
     }
 
-    {
-        const f = fixture(rows(1)); f.enableBuild(2); const plan = f.enableOutputPlan(); f.enableRetirement(1);
+    for (const version of [1, 2] as const) {
+        const f = fixture(rows(1)); f.enableBuild(2);
+        const plan = f.enableOutputPlan({ schema: 1, scope: `v${version}-replacement-output`,
+            nodePayloadBytes: 123_456, rangeEndpointPeakRequestedBytes: 1_000,
+            rangeEndpointResidentRequestedBytes: 200, peakAdmissionBytes: 124_456, residentAdmissionBytes: 123_656 });
+        f.enableRetirement(1);
         const admission = new RootTreeResidentAdmission({ capacityBytes: plan.peakAdmissionBytes - 1 });
         try {
-            const error = failure(await outcome(rebuildRootTreeFromBase(f.base, f.tree, 2, undefined,
+            const error = failure(await outcome(rebuildRootTreeFromBase(f.base, f.tree, version, undefined,
                 { budget: f.port, cooperate: async () => {}, residentAdmission: admission })));
             assert(error instanceof RootTreeOutputAdmissionDeniedError);
+            assert(error.message.startsWith(`V${version} replacement output requires`));
             assert.equal(error.requestedBytes, plan.peakAdmissionBytes);
             assert.equal(f.state.outputPlanReads, 1); assert.equal(f.state.outputPlanResumes, 0);
             assert.equal(f.state.deferredCancels, 1); assert.equal(f.state.root, OLD_ROOT);
@@ -1683,6 +1688,16 @@ async function sortWorkspaceStartFailureAndRetirementRetry(): Promise<void> {
 async function run() {
     inputEstimatorBoundaries();
     await countAndBytePagedSuccess();
+    const overlong = fixture([{ ...rows(1)[0], path: "é".repeat(2048) + "x" }]);
+    try {
+        const error = failure(await outcome(rebuildRootTreeFromBase(overlong.base, overlong.tree, 2, undefined,
+            { budget: overlong.port, cooperate: async () => {} })));
+        assert(error instanceof RootTreeRepairError && error.code === "LIMIT");
+        assert.equal(overlong.state.begin, 0);
+        assert.equal(overlong.base.iterations, 1);
+        assert.deepEqual(overlong.allocations, [ROOT_TREE_REPAIR_LIMITS.scratchBytes]);
+        assert.equal(overlong.budget.snapshot().usedBytes, 0);
+    } finally { overlong.budget.close(); }
     await actualHostTaskBetweenPages();
     await invalidatedAfterFeedCancels();
     await externalCheckCannotInvalidateThenPublish();
