@@ -3898,8 +3898,8 @@ export class ObsetyncSyncEngine {
         const now = new Date();
         for (const c of conflicts) {
             if (!c.path || !c.side_b_hash) continue;
-            const copyPath = conflictCopyPath(c.path, this.deviceName, now);
             try {
+                const copyPath = await conflictCopyPath(c.path, this.deviceName, now);
                 const matching = batch.filter(change => change.path === c.path && change.action !== "deleted" &&
                     change.hash?.toLowerCase() === c.side_b_hash.toLowerCase());
                 if (matching.length !== 1 || !Number.isSafeInteger(matching[0].size) || matching[0].size! < 0) {

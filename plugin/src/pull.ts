@@ -2824,7 +2824,7 @@ async function preserveLocalBeforePull(io: PlatformIO, path: string, shouldDefer
     if (!(await io.exists(path))) return true;
     const now = Date.now();
     for (let attempt = 0; attempt < 1_000; attempt++) {
-        const candidate = conflictCopyPath(
+        const candidate = await conflictCopyPath(
             path,
             "local-before-pull",
             new Date(now + attempt * 60_000),

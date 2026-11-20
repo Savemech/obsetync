@@ -221,7 +221,7 @@ async function pathsAndCapabilities() {
 async function legacyCopyUsesOnlyImmutableObjects() {
     const f = await fixture(2200000);
     f.files.data.set("note.md", new Uint8Array([99, 99, 99]));
-    const destination = conflictCopyPath("note.md", "Desktop", new Date(2026, 8, 10, 12, 30));
+    const destination = await conflictCopyPath("note.md", "Desktop", new Date(2026, 8, 10, 12, 30));
     const stagingKey = await legacyConflictStagingKey("note.md", f.digest);
     check(stagingKey !== await legacyConflictStagingKey("other.md", f.digest),
         "legacy staging owners merged unrelated paths with the same content");

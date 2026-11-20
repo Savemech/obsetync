@@ -1,3 +1,4 @@
+import { digestConflictCopyPath } from "./conflict-path";
 import type { ObsetyncApi } from "./api";
 import { isSafeVaultPath } from "./delta-validation";
 import type { PlatformIO } from "./platform";
@@ -32,13 +33,7 @@ export async function rootConflictCopyTarget(identity: RootPublicationIdentity, 
         sequence: identity.sequence, mutation: identity.mutationId, request: identity.requestHash, path, hash }));
     const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", source));
     const suffix = [...digest].map(byte => byte.toString(16).padStart(2, "0")).join("");
-    const slash = path.lastIndexOf("/"), parent = path.slice(0, slash + 1), name = path.slice(slash + 1);
-    const dot = name.lastIndexOf(".");
-    const extension = dot > 0 && /^\.[a-zA-Z0-9]{1,16}$/.test(name.slice(dot)) ? name.slice(dot) : "";
-    const sourceStem = extension ? name.slice(0, dot) : name;
-    const { read } = new TextEncoder().encodeInto(sourceStem, new Uint8Array(80));
-    const stem = sourceStem.slice(0, read).replace(/[. ]+$/, "") || "file";
-    const result = `${parent}${stem} (conflict sync ${suffix})${extension}`;
+    const result = digestConflictCopyPath(path, suffix);
     if (!isSafeVaultPath(result)) throw new RootConflictError("IDENTITY", "conflict destination exceeds safe path bound");
     return { copyPath: result, stagingKey: suffix };
 }

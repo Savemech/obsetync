@@ -119,9 +119,9 @@ test("handler failure releases ownership and normal completion preserves UI beha
 });
 
 
-test("discovery only recognizes generated conflict filename formats", () => {
+test("discovery only recognizes generated conflict filename formats", async () => {
     const original = "notes (archive)/черновик.v2.md";
-    const legacy = conflictCopyPath(original, "iPad (local)", new Date(2026, 9, 28, 12, 34));
+    const legacy = await conflictCopyPath(original, "iPad (local)", new Date(2026, 9, 28, 12, 34));
     const digest = "notes (archive)/черновик.v2 (conflict sync " + "a".repeat(64) + ").md";
     const files = [legacy, digest, "Design (conflict resolution).md", "memo (conflict sync abc).md",
         "folder (conflict plan/note).md"];
@@ -139,4 +139,14 @@ test("digest copies are displayed without file mutation controls", () => {
     assert.deepEqual(conflicts, [{ original: null, preservedAs: copy }]);
     new ObsetyncConflictModal({}, io, conflicts, () => {}).open();
     assert.equal(buttons.size, 0);
+});
+
+test("long legacy conflict names remain portable and never imply an original", async () => {
+    const stamp = new Date(2026, 9, 28, 12, 34);
+    const prefix = "notes/" + "猫".repeat(80);
+    const copy = await conflictCopyPath(prefix + "a.md", "iPad", stamp);
+    assert.ok(copy.startsWith("notes/") && copy.endsWith(".md") && Buffer.byteLength(copy.slice(6)) <= 255);
+    assert.notEqual(copy, await conflictCopyPath(prefix + "b.md", "iPad", stamp));
+    assert.notEqual(copy, await conflictCopyPath(prefix + "a.md", "iPad", new Date(+stamp + 60_000)));
+    assert.deepEqual(findConflicts({ listFiles: () => [copy] }), [{ original: null, preservedAs: copy }]);
 });
