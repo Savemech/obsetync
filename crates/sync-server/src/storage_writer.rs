@@ -176,12 +176,6 @@ struct QueueState {
     owners: HashMap<WriterOwner, OwnerUsage>,
 }
 
-struct FlatObject {
-    message_index: usize,
-    object_index: usize,
-    object: DurableObject,
-}
-
 struct CommitReport {
     results: Vec<StoreResult>,
     fatal: bool,
@@ -997,36 +991,17 @@ fn writer_loop(receiver: Receiver<WriterMessage>, mut active: ActiveSegment, sto
             }
         }
 
-        let result_lengths: Vec<usize> = messages
+        let objects: Vec<_> = messages
             .iter()
-            .map(|message| message.objects.len())
+            .flat_map(|message| &message.objects)
             .collect();
-        let mut flat = Vec::with_capacity(result_lengths.iter().sum());
-        for (message_index, message) in messages.iter_mut().enumerate() {
-            for (object_index, object) in
-                std::mem::take(&mut message.objects).into_iter().enumerate()
-            {
-                flat.push(FlatObject {
-                    message_index,
-                    object_index,
-                    object,
-                });
-            }
-        }
-        let report = commit_objects(&store, &mut active, &flat);
-        let mut separated: Vec<Vec<StoreResult>> = result_lengths
-            .into_iter()
-            .map(|length| vec![Err(StoreError::Closed); length])
-            .collect();
-        for (flat_object, result) in flat.iter().zip(report.results) {
-            separated[flat_object.message_index][flat_object.object_index] = result;
-        }
-        for (message, results) in messages.into_iter().zip(separated) {
-            let WriterMessage {
-                reply, reservation, ..
-            } = message;
-            drop(reservation);
-            let _ = reply.send(results);
+        let report = commit_objects(&store, &mut active, &objects);
+        let mut results = report.results.into_iter();
+        for message in messages {
+            let batch = results.by_ref().take(message.objects.len()).collect();
+            drop(message.objects);
+            drop(message.reservation);
+            let _ = message.reply.send(batch);
         }
         if report.fatal {
             break;
@@ -1074,28 +1049,27 @@ fn message_bytes(message: &WriterMessage) -> u64 {
 fn commit_objects(
     store: &PackStore,
     active: &mut ActiveSegment,
-    objects: &[FlatObject],
+    objects: &[&DurableObject],
 ) -> CommitReport {
     let mut results = vec![Err(StoreError::Closed); objects.len()];
-    let mut primary_by_key: HashMap<(StorageObjectKind, FileHash), usize> = HashMap::new();
+    let mut seen = HashSet::new();
     let mut pending = Vec::<usize>::new();
-    let mut aliases = Vec::<(usize, usize)>::new();
+    let mut aliases = Vec::new();
 
-    for (index, flat) in objects.iter().enumerate() {
-        if let Err(error) = validate_object(&flat.object) {
+    for (index, object) in objects.iter().enumerate() {
+        if let Err(error) = validate_object(object) {
             results[index] = Err(StoreError::InvalidObject(error));
             continue;
         }
-        if store.indexed(flat.object.kind, &flat.object.hash) {
+        if store.indexed(object.kind, &object.hash) {
             results[index] = Ok(StoreOutcome::AlreadyPresent);
             continue;
         }
-        let key = (flat.object.kind, flat.object.hash);
-        if let Some(primary) = primary_by_key.get(&key).copied() {
-            aliases.push((index, primary));
+        let key = (object.kind, object.hash);
+        if !seen.insert(key) {
+            aliases.push(index);
             continue;
         }
-        primary_by_key.insert(key, index);
         pending.push(index);
     }
 
@@ -1105,17 +1079,12 @@ fn commit_objects(
             fatal: false,
         };
     }
-    let pending_objects: Vec<&DurableObject> = pending
-        .iter()
-        .map(|index| &objects[*index].object)
-        .collect();
+    let pending_objects: Vec<&DurableObject> =
+        pending.iter().map(|index| objects[*index]).collect();
     if let Err(error) = store.append_group(active, &pending_objects, CommitFault::None) {
         let error = StoreError::Io(error.to_string());
-        for index in &pending {
-            results[*index] = Err(error.clone());
-        }
-        for (alias, _) in &aliases {
-            results[*alias] = Err(error.clone());
+        for index in pending.into_iter().chain(aliases) {
+            results[index] = Err(error.clone());
         }
         return CommitReport {
             results,
@@ -1126,11 +1095,8 @@ fn commit_objects(
     for index in pending {
         results[index] = Ok(StoreOutcome::Stored);
     }
-    for (alias, primary) in aliases {
-        results[alias] = match &results[primary] {
-            Ok(_) => Ok(StoreOutcome::AlreadyPresent),
-            Err(error) => Err(error.clone()),
-        };
+    for index in aliases {
+        results[index] = Ok(StoreOutcome::AlreadyPresent);
     }
     CommitReport {
         results,
@@ -1511,6 +1477,35 @@ mod tests {
         assert_eq!(perf.snapshot().storage.fdatasyncs, 1);
     }
 
+    #[tokio::test]
+    async fn grouped_messages_get_their_own_results_in_order() {
+        use futures_util::FutureExt;
+        let dir = tempdir().unwrap();
+        let perf = Arc::new(ServerPerfCounters::default());
+        let (writer, receiver, active, store) =
+            paused_writer(StorageLayout::new(dir.path()), Arc::clone(&perf));
+        let object = content(1, 128);
+        let mut invalid = content(2, 128);
+        invalid.bytes.clear();
+        let mut first = Box::pin(writer.store_batch(vec![object.clone()]));
+        let mut second = Box::pin(writer.store_batch(vec![invalid, object, content(3, 128)]));
+        assert!(first.as_mut().now_or_never().is_none());
+        assert!(second.as_mut().now_or_never().is_none());
+        let thread = std::thread::spawn(move || writer_loop(receiver, active, store));
+        assert_eq!(first.await.unwrap(), [Ok(StoreOutcome::Stored)]);
+        assert!(matches!(
+            second.await.unwrap().as_slice(),
+            [
+                Err(StoreError::InvalidObject(_)),
+                Ok(StoreOutcome::AlreadyPresent),
+                Ok(StoreOutcome::Stored)
+            ]
+        ));
+        drop(writer);
+        thread.join().unwrap();
+        assert_eq!(perf.snapshot().storage.fdatasyncs, 1);
+    }
+
     #[test]
     fn invalid_hash_is_rejected_before_segment_append() {
         let dir = tempdir().unwrap();
@@ -1524,15 +1519,7 @@ mod tests {
             hash: hash_bytes(b"different"),
             bytes: b"payload".to_vec(),
         };
-        let report = commit_objects(
-            &store,
-            &mut active,
-            &[FlatObject {
-                message_index: 0,
-                object_index: 0,
-                object,
-            }],
-        );
+        let report = commit_objects(&store, &mut active, &[&object]);
         assert!(matches!(
             report.results[0],
             Err(StoreError::InvalidObject(_))
