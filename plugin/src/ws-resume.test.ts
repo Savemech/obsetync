@@ -181,6 +181,32 @@ test("foreground resume invalidates an apparently-connected stale session exactl
         assert.deepEqual(observedConnected, [false, false]);
         assert.equal(channel.getState(), "connecting",
             "superseded socket close changed the fresh connection state");
+
+        // A burst of tiny frames and a burst of large frames hit independent bounds.
+        for (const [count, bytes] of [[256, 1], [8, 1024 * 1024]]) {
+            const socket = FakeSocket.sockets.at(-1)!;
+            let releaseOpen!: () => void;
+            const heldOpen = new Promise<void>(resolve => { releaseOpen = resolve; });
+            let opens = 0;
+            (channel as any).session.open = async () => {
+                opens++; await heldOpen; return JSON.stringify({ t: "ready" });
+            };
+            const event = { data: new ArrayBuffer(bytes) } as MessageEvent;
+            socket.onmessage!(event);
+            await eventually(() => opens === 1, "receive fixture did not start decrypting");
+            for (let n = 1; n < count; n++) socket.onmessage!(event);
+            assert.equal(socket.closes, 0, "socket closed before reaching its receive limit");
+            socket.onmessage!(event);
+            socket.onmessage!(event);
+            releaseOpen();
+            await (channel as any).rxChain;
+            assert.equal(socket.closes, 1, "receive overload must close the session once");
+            assert.equal(opens, 1, "retired receive queue continued decrypting");
+            assert.equal(channel.getState(), "backoff", "retired session published a late ready");
+            const previousCount = FakeSocket.sockets.length;
+            windowEvents.dispatch("pagehide"); windowEvents.dispatch("pageshow");
+            await eventually(() => FakeSocket.sockets.length > previousCount, "fresh session did not open");
+        }
     } finally {
         channel.stop();
         assert.equal(documentEvents.count("visibilitychange"), 0);

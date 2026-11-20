@@ -29,6 +29,9 @@ export interface PresenceUpdate {
     state: "active" | "idle" | "offline";
 }
 
+// Bound encrypted frames retained while ordered decrypts await WebCrypto.
+const MAX_PENDING_FRAMES = 256;
+const MAX_PENDING_BYTES = 8 * 1024 * 1024;
 const PING_INTERVAL_MS = 30_000;
 const BACKOFF_START_MS = 1_000;
 const BACKOFF_CAP_MS = 60_000;
@@ -241,6 +244,7 @@ export class ObsetyncWsChannel {
         this.txChain = Promise.resolve();
         let ready = false;
         let gone = false;
+        let pendingFrames = 0, pendingBytes = 0;
 
         ws.onopen = () => {
             if (this.stopped || generation !== this.connectionGeneration || this.ws !== ws) return;
@@ -256,6 +260,16 @@ export class ObsetyncWsChannel {
                 console.warn("[obsetync] ws: server said:", String(ev.data).slice(0, 200));
                 return;
             }
+            const length = ev.data.byteLength;
+            if (pendingFrames >= MAX_PENDING_FRAMES || length > MAX_PENDING_BYTES - pendingBytes) {
+                // Skipping one encrypted frame would desynchronize the receive counter.
+                console.warn("[obsetync] ws: receive queue full, reconnecting");
+                onGone();
+                ws.close();
+                return;
+            }
+            pendingFrames++;
+            pendingBytes += length;
             const data = new Uint8Array(ev.data);
             this.rxChain = this.rxChain
                 .then(async () => {
@@ -327,7 +341,8 @@ export class ObsetyncWsChannel {
                     } catch {
                         /* noop */
                     }
-                });
+                })
+                .finally(() => { pendingFrames--; pendingBytes -= length; });
         };
 
         const onGone = () => {
@@ -343,7 +358,7 @@ export class ObsetyncWsChannel {
                 this.session = null;
             }
             if (!ready) {
-                console.warn("[obsetync] ws: closed before ready (auth rejected?)");
+                console.warn("[obsetync] ws: closed before ready");
             }
             this.scheduleReconnect(generation);
         };
