@@ -669,7 +669,7 @@ export class AdaptiveResourceGovernor {
             measurement.budget?.limitBytes ?? Infinity,
         );
         const memoryPressure = measurement.memoryPressure === true ||
-            (measurement.budget !== undefined && measurement.budget.reservedBytes > measurement.budget.limitBytes) ||
+            (measurement.budget !== undefined && measurement.budget.reservedBytes > budgetLimit) ||
             measurement.peakBatchBytes > this.windowTuning.transientBudgetBytes;
         if (memoryPressure) {
             this.reduceWindowAxes(RESOURCE_AXES, "transient byte pressure", true);

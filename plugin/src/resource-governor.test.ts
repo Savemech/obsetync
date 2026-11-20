@@ -386,6 +386,18 @@ function memoryWindowsUseLeaseCeilingsWithoutGrowingThem(): void {
     assert.equal(after.maxBatchBytes, before.maxBatchBytes / 2);
     assert.equal(after.feedBytes, before.feedBytes / 2);
     assert.deepEqual(governor.snapshot().controls, { read: 2, hash: 2, network: 2, apply: 8 });
+
+    const mobile = new AdaptiveResourceGovernor(IOS);
+    const target = mobile.current().tuning.transientBudgetBytes;
+    const previousNetwork = mobile.snapshot().controls.network;
+    mobile.observeWindow(windowMeasurement(1, {
+        budget: { limitBytes: target * 2, reservedBytes: target + 1 },
+        filesCompleted: 0, bytesTransferred: 0,
+    }));
+    assert.equal(mobile.snapshot().bottleneck, "transient byte pressure",
+        "reservations over the mobile profile target escaped pressure detection");
+    assert.equal(mobile.snapshot().controls.network, Math.ceil(previousNetwork / 2));
+    assert.equal(mobile.current().tuning.transientBudgetBytes, target);
 }
 
 function overlappingWindowsNeverDoubleCountControlEvidence(): void {
