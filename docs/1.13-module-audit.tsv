@@ -37,7 +37,7 @@ reviewed	crates/e2e-tests/tests/enrollment.rs	tests	All seven scenarios read and
 reviewed	crates/e2e-tests/tests/history_export.rs	tests	Traced three-root history, rollback, observer pull and historical tar; added current-root check after rejected rollback and duplicate-entry check; native E2E
 reviewed	crates/e2e-tests/tests/realtime_ws.rs	tests	All six scenarios read and passed against isolated fixed binary; reconnect regression failed against previous binary; CRDT assertions correctly labeled live readback, not crash durability
 reviewed	crates/e2e-tests/tests/single_device.rs	tests	All six native-server cases pass; zero-root inventory now checks every path, content hash and size
-pending	crates/e2e-tests/tests/smoke.rs	tests	Not reviewed
+reviewed	crates/e2e-tests/tests/smoke.rs	tests	Checked public health, redirect, dashboard and enrollment. Parse the actual health JSON and use the enrolled credentials for an authenticated read-only request.
 pending	crates/e2e-tests/tests/stale_tree_revert.rs	tests	Not reviewed
 reviewed	crates/e2e-tests/tests/text_merge.rs	tests	Read both two-device tests and helpers; mixed insert and EOF edit pulled byte-for-byte on both clients; invalid UTF-8 retained as conflict on native server
 pending	crates/e2e-tests/tests/transport_security.rs	tests	Not reviewed
@@ -63,7 +63,7 @@ pending	crates/sync-core/src/replacement_rebuild_v1.rs	production	Not reviewed
 pending	crates/sync-core/src/replacement_rebuild_v2.rs	production	Not reviewed
 reviewed	crates/sync-core/src/root_export_v1.rs	production	Checked plan, build, page reads, cancellation and WASM callers. Account for fixed child costs in the first planning step. Tests cover exact budget, one byte short, 25k children and byte parity.
 pending	crates/sync-core/src/store.rs	production	Not reviewed
-pending	crates/sync-core/src/sync_rules.rs	production	Not reviewed
+reviewed	crates/sync-core/src/sync_rules.rs	production	Traced text eligibility to server merges and binary strategy selection to the public Rust helper. Fixed bare extension names, Unicode question marks and literal stars in filenames. Compared 116,281 pattern/name pairs to a reference matcher.
 pending	crates/sync-core/src/transactional_tree.rs	production	Not reviewed
 pending	crates/sync-core/src/transactional_tree_v2.rs	production	Not reviewed
 read	crates/sync-core/src/tree.rs	production	Initial group build, normalization and leaf rebuild call sites traced; borrowed sorted leaf encoding and prefix-key reuse verified by allocation comparison and legacy parity tests; remaining paths pending

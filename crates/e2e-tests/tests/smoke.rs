@@ -1,7 +1,6 @@
 //! Smoke tests — confirm the stack is reachable and basic admin endpoints
 //! return well-shaped responses.
 
-use base64::prelude::*;
 use e2e_tests::*;
 
 #[tokio::test]
@@ -14,12 +13,8 @@ async fn health_endpoint_is_public_plaintext() {
         .await
         .unwrap();
     assert!(resp.status().is_success(), "health must return 2xx");
-    let text = resp.text().await.unwrap();
-    assert!(
-        text.contains("\"ok\":true"),
-        "expected JSON {{\"ok\":true}}, got {}",
-        text
-    );
+    let body: serde_json::Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+    assert_eq!(body["ok"].as_bool(), Some(true));
 }
 
 #[tokio::test]
@@ -58,12 +53,11 @@ async fn admin_dashboard_renders() {
 }
 
 #[tokio::test]
-async fn enrollment_bundle_includes_valid_box_pubkey() {
+async fn enrollment_bundle_grants_sync_access() {
     let env = harness().await;
     let creds = env.enroll_device("smoke-pubkey").await.unwrap();
-    // server_box_pub round-trips through base64; PublicKey enforces 32 bytes.
-    let bytes = BASE64_STANDARD.encode(creds.server_box_pub.as_bytes());
-    assert_eq!(BASE64_STANDARD.decode(bytes).unwrap().len(), 32);
     assert_eq!(creds.bearer.len(), 64);
     assert!(creds.bearer.chars().all(|c| c.is_ascii_hexdigit()));
+    let client = WireClient::new(&env, creds);
+    assert!(client.chunks_check(&[]).await.unwrap().is_empty());
 }

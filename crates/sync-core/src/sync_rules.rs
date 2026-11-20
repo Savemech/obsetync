@@ -1,5 +1,4 @@
 /// Binary file strategy — determines how conflicts are handled per file type.
-/// Configured in sync-rules.toml. See D-003.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BinaryStrategy {
@@ -82,35 +81,31 @@ impl SyncRules {
 /// Simple glob matching — supports `*` (any chars) and `?` (single char).
 /// Not a full glob implementation, covers the patterns we need.
 fn glob_match(pattern: &str, text: &str) -> bool {
-    let pattern = pattern.as_bytes();
-    let text = text.as_bytes();
-    let mut pi = 0;
-    let mut ti = 0;
-    let mut star_pi = usize::MAX;
-    let mut star_ti = 0;
-
-    while ti < text.len() {
-        if pi < pattern.len() && (pattern[pi] == b'?' || pattern[pi] == text[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if pi < pattern.len() && pattern[pi] == b'*' {
-            star_pi = pi;
-            star_ti = ti;
-            pi += 1;
-        } else if star_pi != usize::MAX {
-            pi = star_pi + 1;
-            star_ti += 1;
-            ti = star_ti;
-        } else {
-            return false;
+    let mut pattern = pattern.chars();
+    let mut text = text.chars();
+    let mut star = None;
+    while !text.as_str().is_empty() {
+        match pattern.next() {
+            Some('*') => star = Some((pattern.clone(), text.clone())),
+            Some('?') => {
+                text.next();
+            }
+            Some(c) if text.as_str().starts_with(c) => {
+                text.next();
+            }
+            _ => {
+                let Some((suffix, consumed)) = &mut star else {
+                    return false;
+                };
+                if consumed.next().is_none() {
+                    return false;
+                }
+                pattern = suffix.clone();
+                text = consumed.clone();
+            }
         }
     }
-
-    while pi < pattern.len() && pattern[pi] == b'*' {
-        pi += 1;
-    }
-
-    pi == pattern.len()
+    pattern.all(|c| c == '*')
 }
 
 /// Known text file extensions that support three-way merge.
@@ -138,8 +133,11 @@ const TEXT_EXTENSIONS: &[&str] = &[
 
 /// Check if a file path is a text file (eligible for three-way merge).
 pub fn is_text_file(path: &str) -> bool {
-    let ext = path.rsplit('.').next().unwrap_or("");
-    TEXT_EXTENSIONS.contains(&ext.to_lowercase().as_str())
+    path.rsplit_once('.').is_some_and(|(_, ext)| {
+        TEXT_EXTENSIONS
+            .iter()
+            .any(|known| ext.eq_ignore_ascii_case(known))
+    })
 }
 
 #[cfg(test)]
@@ -148,6 +146,10 @@ mod tests {
 
     #[test]
     fn glob_basic() {
+        assert!(glob_match("?.md", "猫.md"));
+        assert!(!glob_match("??.md", "猫.md"));
+        assert!(glob_match("*.md", "*draft.md"));
+        assert!(glob_match("*?猫.md", "🙂稿猫.md"));
         assert!(glob_match("*.png", "photo.png"));
         assert!(glob_match("*.png", "dir/photo.png")); // matches filename only
         assert!(!glob_match("*.png", "photo.jpg"));
@@ -252,6 +254,10 @@ mod tests {
 
     #[test]
     fn is_text_file_handles_no_extension_and_unknown() {
+        assert!(!is_text_file("md"));
+        assert!(!is_text_file("js"));
+        assert!(!is_text_file("notes.md/report"));
+        assert!(is_text_file("notes/.md"));
         assert!(!is_text_file("Makefile"));
         assert!(!is_text_file("README"));
         assert!(!is_text_file("photo.tiff"));
