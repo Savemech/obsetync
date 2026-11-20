@@ -144,7 +144,6 @@ export class LegacyDowngradeHostCoordinator {
             this.bumpGeneration();
         }
         const operation = this.operation;
-        operation?.abort.abort(new LegacyDowngradeHostError("RETIRED", "legacy downgrade host unloaded"));
         const retirement = (async () => {
             await operation?.promise.catch(() => {});
             const stopped = this.stoppedHost;
@@ -152,6 +151,8 @@ export class LegacyDowngradeHostCoordinator {
             if (this.stoppedHost === stopped) this.stoppedHost = null;
         })();
         this.retirement = retirement;
+        // Abort listeners can call unload synchronously and must join this retirement.
+        operation?.abort.abort(new LegacyDowngradeHostError("RETIRED", "legacy downgrade host unloaded"));
         void retirement.catch(() => {
             if (this.retirement === retirement) this.retirement = null;
         });

@@ -105,13 +105,18 @@ async function failureResumeAndUnloadJoin(): Promise<void> {
     const joining = new LegacyDowngradeHostCoordinator("interrupted");
     const second = host(), activation = deferred();
     let handoffs = 0;
+    let listenerUnload: Promise<void> | undefined;
     const running = joining.resume({
         async quiesce() { return second.owner; },
-        async activate() { await activation.promise; },
+        async activate(context) {
+            context.signal.addEventListener("abort", () => { listenerUnload = joining.unload(); }, { once: true });
+            await activation.promise;
+        },
         async handoff() { handoffs++; },
     });
     await turns();
     const unloaded = joining.unload();
+    assert.equal(listenerUnload, unloaded, "abort listener started a second retirement");
     assert.equal(unloaded, joining.unload(), "repeated unload did not share its retirement tail");
     let joined = false; void unloaded.then(() => { joined = true; }); await turns();
     assert.equal(joined, false, "unload returned before the admitted activation tail");
