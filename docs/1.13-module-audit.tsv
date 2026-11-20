@@ -158,7 +158,7 @@ read	plugin/scripts/test-main-lifecycle.mjs	tooling	Read bundle fixture/owner/IO
 reviewed	plugin/scripts/test-native-root-crash-recovery.mjs	tooling	CLI, private fixture ownership, process signal and recovery result assertions traced; both live debug-server scenarios passed
 pending	plugin/scripts/test-native-root-mutation-complexity.mjs	tooling	Not reviewed
 reviewed	plugin/scripts/test-native-root-server.mjs	tooling	Live sealed HTTP smoke passed with 16 requests and zero active on close; injected failure before held response propagated through the bridge within 15s
-pending	plugin/scripts/test-native-ws-data.mjs	tooling	Not reviewed
+reviewed	plugin/scripts/test-native-ws-data.mjs	tooling	Checked scoped sockets, persistence, cancellation, fair interleaving, reconnect and fresh-session fallback; real client/debug server gate passed with 25 sent and 18 received binary frames
 read	plugin/scripts/test-wasm-memory.mjs	tooling	Checked allocator snapshot against native counter semantics, including contradictory live allocation counts; tree component review pending
 reviewed	plugin/src/adaptive-batches.test.ts	tests	Checked eager grouping parity, refreshed limits, singleton boundaries, timed batches, cancellation by early exit and invalid inputs. Untimed batches also skip clock reads.
 reviewed	plugin/src/adaptive-batches.ts	production	Traced use in push, reconcile and pull. Each requested batch snapshots its limits and stops at the first boundary without retaining a plan for the remaining tail.
@@ -403,8 +403,8 @@ reviewed	plugin/src/wasm-runtime.test.ts	tests	Covered SIMD selection, both scal
 reviewed	plugin/src/wasm-runtime.ts	production	Traced the session loader through main.loadWasm and startup publication. Cache only in-flight and successful selections; a failed load can be retried without reloading the plugin.
 reviewed	plugin/src/work-scheduler.test.ts	tests	Reproduced blocked queue on timing failure; checked successor scheduling and abort reason identity. Scheduler, perf-trace and lifecycle suites pass. Added abort, dispose and fill during timing-start regression. Checked host fallback cleanup and verified two full weighted service cycles under continuously replenished demand.
 reviewed	plugin/src/work-scheduler.ts	production	Traced host driver startup, lane selection, cancellation, disposal and per-job timing settlement. A throwing endWait now settles the current promise and allows the next host turn. Consolidated default clock selection. Verified reentrant admission at timing start: abort, dispose and full queue all reject before insertion; nested owner runs normally.
-pending	plugin/src/ws-data-codec.test.ts	tests	Not reviewed
-pending	plugin/src/ws-data-codec.ts	production	Not reviewed
+reviewed	plugin/src/ws-data-codec.test.ts	tests	Checked seeded round trips, malformed input rejection, byte parity and runtime negotiation limits; 5609 assertions passed
+reviewed	plugin/src/ws-data-codec.ts	production	Audited frame/fragment bounds, HELLO credits and error decoding; encode four-byte tags into output and compare ASCII in-place; OBW1/2 native interoperability passed
 reviewed	plugin/src/ws-data.bench.ts	tooling	Checked equal-body HTTP and WS encryption, timing boundaries and per-profile payload checks. Both profiles completed three samples. Benchmark scripts now propagate build failures through the shared runner.
 pending	plugin/src/ws-data.test.ts	tests	Not reviewed
 pending	plugin/src/ws-data.ts	production	Not reviewed

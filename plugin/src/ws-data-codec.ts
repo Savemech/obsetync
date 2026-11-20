@@ -86,9 +86,10 @@ const encoder = new TextEncoder();
 
 function magic(bytes: Uint8Array, expected: string): boolean {
     if (bytes.byteLength < 4) return false;
-    const expectedBytes = encoder.encode(expected);
-    return bytes[0] === expectedBytes[0] && bytes[1] === expectedBytes[1] &&
-        bytes[2] === expectedBytes[2] && bytes[3] === expectedBytes[3];
+    for (let index = 0; index < 4; index++) {
+        if (bytes[index] !== expected.charCodeAt(index)) return false;
+    }
+    return true;
 }
 
 function knownType(value: number): value is WsDataFrameType {
@@ -116,7 +117,7 @@ export function encodeWsDataFrame(
         throw new WsDataProtocolError("data frame payload exceeds limit");
     }
     const output = new Uint8Array(WS_DATA_FRAME_HEADER_BYTES + payload.byteLength);
-    output.set(encoder.encode(WS_DATA_FRAME_MAGIC), 0);
+    encoder.encodeInto(WS_DATA_FRAME_MAGIC, output);
     output[4] = type;
     output[5] = 0;
     const view = new DataView(output.buffer);
@@ -196,7 +197,7 @@ export function encodeWsDataFragment(
     const end = Math.min(logicalPayload.byteLength, offset + limits.maxFragmentPayloadBytes);
     const payload = logicalPayload.subarray(offset, end);
     const output = new Uint8Array(WS_DATA_FRAGMENT_HEADER_BYTES + payload.byteLength);
-    output.set(encoder.encode(WS_DATA_FRAGMENT_MAGIC), 0);
+    encoder.encodeInto(WS_DATA_FRAGMENT_MAGIC, output);
     output[4] = type;
     output[5] = (fragmentIndex === 0 ? FRAGMENT_FIRST : 0) |
         (fragmentIndex + 1 === fragmentCount ? FRAGMENT_LAST : 0);
@@ -316,13 +317,13 @@ export function negotiateWsDataCapability(value: unknown): WsDataCapability | nu
     };
 }
 
-function encodeHelloPayload(magicValue: string, limits: WsDataLimits): Uint8Array {
+export function encodeWsDataHello(limits: WsDataLimits): Uint8Array {
     validateLimits(limits);
     if (limits.maxInflightRequests > 0xffff || limits.maxPayloadBytes > 0xffff_ffff) {
         throw new WsDataProtocolError("data-lane hello limit overflows its field");
     }
     const output = new Uint8Array(HELLO_BYTES);
-    output.set(encoder.encode(magicValue), 0);
+    encoder.encodeInto(HELLO_MAGIC, output);
     const view = new DataView(output.buffer);
     view.setUint16(4, 1, true);
     view.setUint16(6, limits.maxInflightRequests, true);
@@ -330,10 +331,6 @@ function encodeHelloPayload(magicValue: string, limits: WsDataLimits): Uint8Arra
     view.setUint32(12, 0, true);
     view.setBigUint64(16, BigInt(limits.maxInflightBytes), true);
     return output;
-}
-
-export function encodeWsDataHello(limits: WsDataLimits): Uint8Array {
-    return encodeHelloPayload(HELLO_MAGIC, limits);
 }
 
 export function decodeWsDataHelloAck(
@@ -374,7 +371,7 @@ export function initialWsDataV2Limits(limits: WsDataLimits): WsDataV2Limits {
     };
 }
 
-function encodeHelloV2Payload(magicValue: string, limits: WsDataV2Limits): Uint8Array {
+export function encodeWsDataHelloV2(limits: WsDataV2Limits): Uint8Array {
     validateLimits(limits);
     validateV2FragmentLimits(limits);
     if (limits.maxInflightRequests > 0xffff || limits.maxPayloadBytes > 0xffff_ffff ||
@@ -382,7 +379,7 @@ function encodeHelloV2Payload(magicValue: string, limits: WsDataV2Limits): Uint8
         throw new WsDataProtocolError("OBW2 data-lane hello limit overflows its field");
     }
     const output = new Uint8Array(HELLO_V2_BYTES);
-    output.set(encoder.encode(magicValue), 0);
+    encoder.encodeInto(HELLO_V2_MAGIC, output);
     const view = new DataView(output.buffer);
     view.setUint16(4, 2, true);
     view.setUint16(6, limits.maxInflightRequests, true);
@@ -393,10 +390,6 @@ function encodeHelloV2Payload(magicValue: string, limits: WsDataV2Limits): Uint8
     view.setUint16(28, limits.maxFragments, true);
     view.setUint16(30, 0, true);
     return output;
-}
-
-export function encodeWsDataHelloV2(limits: WsDataV2Limits): Uint8Array {
-    return encodeHelloV2Payload(HELLO_V2_MAGIC, limits);
 }
 
 export function decodeWsDataHelloAckV2(
