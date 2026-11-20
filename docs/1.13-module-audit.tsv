@@ -294,7 +294,7 @@ reviewed	plugin/src/priority-sort.ts	production	Traced synchronous and reviewed 
 reviewed	plugin/src/pull-echo.test.ts	tests	Checked matching and mismatching bytes, renames, expiration, renewal and backward wall-clock movement. All 14 assertions pass.
 reviewed	plugin/src/pull-echo.ts	production	Traced registration through pull and local event consumption. Prune expired prefixes during registration and move renewals to the tail. Live checks still validate each requested path.
 read	plugin/src/pull.test.ts	tests	Checked crash-resumed rename and same-size target fixtures. Added two live edits during adapter lookups and ran the pull suite. Other scenarios remain under review.
-read	plugin/src/pull.ts	production	Traced paged snapshot ordering, deferred checkpoints and final root verification. Checked live rename guards across target lookup and post-move stat. Expired snapshots and remaining apply paths need review.
+read	plugin/src/pull.ts	production	Traced paged snapshot ordering, deferred checkpoints and final root verification. Checked live rename guards across target lookup and post-move stat. Content progress excludes deferred writes and reports retried outcomes. Size partitioning preserves modifications-first order. Expired snapshots and remaining apply paths need review.
 reviewed	plugin/src/push-memory.test.ts	tests	Executed mobile/desktop budget tests covering whole and ranged reads, backing allocations, per-worker feed costs, WS floor and grouping capacity.
 pending	plugin/src/push-memory.ts	production	Not reviewed
 pending	plugin/src/push-prepared.test.ts	tests	Not reviewed

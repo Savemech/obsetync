@@ -1413,7 +1413,7 @@ async function applyDeltas(
         bytesDownloaded: 0,
     };
 
-    const toDownload = [...modifications, ...additions];
+    const contentCount = modifications.length + additions.length;
     // Files that threw while applying (a dropped connection, a large-file
     // manifest fetch that timed out under memory pressure on mobile). A single
     // one of these MUST NOT abort the whole pull: a 68k-delta catch-up on a
@@ -1421,7 +1421,21 @@ async function applyDeltas(
     // We collect them, retry once, and defer whatever still fails.
     const failed: FileDelta[] = [];
     const startedAt = Date.now();
-    let completed = 0;
+    const deferredBeforeContent = locallyDeferred.length;
+    let processed = 0;
+    const report = (pendingFailures: number): void => {
+        const deferred = locallyDeferred.length - deferredBeforeContent + pendingFailures;
+        const completed = processed - deferred;
+        const verified = stats.cacheHit + stats.localHit;
+        const elapsed = (Date.now() - startedAt) / 1000;
+        const rate = elapsed > 0 ? ` · ${(completed / elapsed).toFixed(0)} f/s` : "";
+        const failMsg = deferred > 0 ? ` · ✗${deferred} deferred` : "";
+        onProgress?.(
+            `${completed}/${contentCount} files applied · ` +
+            `✓${verified} verified · ↓${stats.downloaded} (${fmtBytes(stats.bytesDownloaded)})${failMsg}${rate}`
+        );
+    };
+
     const checkpointAndReport = async (batchLength: number): Promise<void> => {
         // Persist every completed batch as a tiny WAL append. A process kill
         // resumes from here without re-hashing all already-applied files.
@@ -1431,15 +1445,8 @@ async function applyDeltas(
         } finally {
             endCheckpoint?.();
         }
-        completed += batchLength;
-        const verified = stats.cacheHit + stats.localHit;
-        const elapsed = (Date.now() - startedAt) / 1000;
-        const rate = elapsed > 0 ? ` · ${(completed / elapsed).toFixed(0)} f/s` : "";
-        const failMsg = failed.length > 0 ? ` · ✗${failed.length} deferred` : "";
-        onProgress?.(
-            `${completed}/${toDownload.length} files applied · ` +
-            `✓${verified} verified · ↓${stats.downloaded} (${fmtBytes(stats.bytesDownloaded)})${failMsg}${rate}`
-        );
+        processed += batchLength;
+        report(failed.length);
     };
 
     const applyLargeBatch = async (batch: FileDelta[]) => {
@@ -1572,8 +1579,13 @@ async function applyDeltas(
     // Small files retain bounded parallelism. Large files run strictly one at
     // a time: six simultaneous encrypted/chunked transfers were enough to
     // exceed the practical Jetsam limit on older 2 GB iPads.
-    const smallDownloads = toDownload.filter((delta) => (delta.size ?? 0) < CHUNK_THRESHOLD);
-    const largeDownloads = toDownload.filter((delta) => (delta.size ?? 0) >= CHUNK_THRESHOLD);
+    const smallDownloads: FileDelta[] = [];
+    const largeDownloads: FileDelta[] = [];
+    for (const group of [modifications, additions]) {
+        for (const delta of group) {
+            ((delta.size ?? 0) < CHUNK_THRESHOLD ? smallDownloads : largeDownloads).push(delta);
+        }
+    }
     const desktop = smallDownloads.length > 0 &&
         io.getAbsolutePath(smallDownloads[0].path) !== null;
     const smallBatches = adaptiveBatches(
@@ -1628,6 +1640,7 @@ async function applyDeltas(
                 console.warn(`[obsetync] pull: deferring ${delta.path}: ${String((e as any)?.message ?? e)}`);
             }
         }
+        report(unfetched.length);
         if (unfetched.length > 0) {
             console.error(
                 `[obsetync] pull: ${unfetched.length} file(s) could not be fetched — deferred to ` +
@@ -1637,7 +1650,7 @@ async function applyDeltas(
         }
     }
 
-    if (toDownload.length > 0) {
+    if (contentCount > 0) {
         const deferredTotal = locallyDeferred.length + unfetched.length;
         console.log(
             `[obsetync] applyDeltas: ${stats.cacheHit} cache-hit, ` +
@@ -1925,9 +1938,6 @@ async function finishContentDownload(
         });
         if (!applied) return false;
     }
-    stats.downloaded++;
-    if (countTransferredBytes) stats.bytesDownloaded += size;
-
     const postStat = await io.stat(delta.path);
     syncBase.setEntry(
         delta.path,
@@ -1936,6 +1946,8 @@ async function finishContentDownload(
         postStat?.size ?? size,
         delta.mtime_ms,
     );
+    stats.downloaded++;
+    if (countTransferredBytes) stats.bytesDownloaded += size;
     perf?.increment({ filesCompleted: 1,
         bytesTransferred: size < CHUNK_THRESHOLD && countTransferredBytes ? size : 0 });
     return true;

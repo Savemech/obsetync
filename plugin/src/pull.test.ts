@@ -1399,7 +1399,7 @@ async function smallMissesUseOneVerifiedBulkDownload(): Promise<void> {
         "one bulk download was not split into bounded apply/echo windows");
 }
 
-async function ownedSmallBatchRetainsAllNativeSiblingsAndCheckpoint(): Promise<void> {
+async function ownedSmallBatchRetainsAllNativeSiblingsAndCheckpoint(retrySucceeds: boolean): Promise<void> {
     const hashes = ["a".repeat(64), "b".repeat(64), "c".repeat(64)];
     const deltas: FileDelta[] = hashes.map((hash, index) => ({
         action: "added", path: `owned-${index}.md`, hash, size: 1, mtime_ms: 2,
@@ -1411,6 +1411,7 @@ async function ownedSmallBatchRetainsAllNativeSiblingsAndCheckpoint(): Promise<v
     let memory: TransientWorkScope | undefined;
     let releases = 0;
     let requests = 0;
+    let failedWrites = 0;
     let activeWrites = 0;
     let peakWrites = 0;
     let localRead = false;
@@ -1455,7 +1456,9 @@ async function ownedSmallBatchRetainsAllNativeSiblingsAndCheckpoint(): Promise<v
         writeFile: async (path: string, data: Uint8Array) => {
             check(budget.snapshot().usedBytes > 0, "native apply started without download ownership");
             check(memory!.snapshot().work.usedBytes >= perApplyBytes, "native apply lacked copy quota");
-            if (path === deltas[1].path) throw new Error("injected native apply failure");
+            if (path === deltas[1].path && (failedWrites++ === 0 || !retrySucceeds)) {
+                throw new Error("injected native apply failure");
+            }
             activeWrites++;
             peakWrites = Math.max(peakWrites, activeWrites);
             enteredWrite.resolve();
@@ -1486,7 +1489,8 @@ async function ownedSmallBatchRetainsAllNativeSiblingsAndCheckpoint(): Promise<v
         Hasher: class { update(): void {} finalize(): string { return "old-base"; } free(): void {} },
     } as any;
     const tree = transactionalTree({ root_hash_hex: () => "base-root", delete_batch: () => {}, update_batch: () => {} });
-    const pulling = pull(api, io, syncBase, "vault", "base-root", wasm, tree);
+    const progress: string[] = [];
+    const pulling = pull(api, io, syncBase, "vault", "base-root", wasm, tree, msg => progress.push(msg));
     await enteredWrite.promise;
     for (let i = 0; i < 12; i++) await Promise.resolve();
     check(releases === 0, "individual apply failure released another native consumer");
@@ -1497,7 +1501,10 @@ async function ownedSmallBatchRetainsAllNativeSiblingsAndCheckpoint(): Promise<v
     releaseCheckpoint.resolve();
     const result = await pulling;
     check(requests === 2 && releases === 2, "failed item retry did not use/release independent owned API");
-    check(result.deferredCount === 1 && !files.has(deltas[1].path), "failed file was falsely applied");
+    check(progress.some(msg => msg.startsWith("2/3 files applied")) &&
+        progress.some(msg => msg.startsWith("3/3 files applied")) === retrySucceeds,
+        "failed write counted as an applied file");
+    check(result.deferredCount === (retrySucceeds ? 0 : 1) && files.has(deltas[1].path) === retrySucceeds, "failed file was falsely applied");
     check(files.get(deltas[2].path)?.[0] === 3, "one apply failure prevented a sibling file");
     check(budget.snapshot().usedBytes === 0, "owned pull leaked admission");
 }
@@ -1613,7 +1620,8 @@ void boundedApplyNeverExceedsTheSelectedLaneCount()
     .then(synchronousStopDuringFinalCandidateWitnessCannotCommit)
     .then(admittedPullNeverAbortsAReplacementCandidate)
     .then(smallMissesUseOneVerifiedBulkDownload)
-    .then(ownedSmallBatchRetainsAllNativeSiblingsAndCheckpoint)
+    .then(() => ownedSmallBatchRetainsAllNativeSiblingsAndCheckpoint(false))
+    .then(() => ownedSmallBatchRetainsAllNativeSiblingsAndCheckpoint(true))
     .then(longFreshPullReportsLiveProgressAndRegistersOnlyActualWrites)
     .then(() => console.log("pull.test: regression scenarios passed"))
     .catch((error) => {
