@@ -326,4 +326,7 @@ async function run() {
     await closeStopsUndispatchedWork();
     console.log(`root-conflicts: ${assertions} assertions passed`);
 }
-void run().catch(error => { console.error(error); process.exitCode = 1; });
+const unfinished = () => { throw new Error("root-conflicts suite stopped before settlement checks finished"); };
+process.once("beforeExit", unfinished);
+void run().catch(error => { console.error(error); process.exitCode = 1; })
+    .finally(() => process.off("beforeExit", unfinished));
