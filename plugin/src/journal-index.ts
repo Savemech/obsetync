@@ -70,9 +70,11 @@ function validateAcknowledgement(path: string, throughId: number): void {
  * Captured roots/iterators retain reachable metadata, not file contents.
  */
 export class JournalIndex {
-    private ordered = new PersistentPathIndex<JournalRecord>();
-    private normalByPath = new PersistentPathIndex<string>();
-    private groupsByEndpoint = new PersistentPathIndex<PersistentPathIndex<true>>();
+    constructor(
+        private readonly ordered = new PersistentPathIndex<JournalRecord>(),
+        private readonly normalByPath = new PersistentPathIndex<string>(),
+        private readonly groupsByEndpoint = new PersistentPathIndex<PersistentPathIndex<true>>(),
+    ) {}
 
     /** Number of projected entries, not the number of rename endpoints. */
     get size(): number { return this.ordered.size; }
@@ -108,8 +110,7 @@ export class JournalIndex {
                 if (!sameEntry(previous.entry, entry)) invalid("contradicting journal path generation");
                 return this;
             }
-            return this.withState(this.ordered.delete(previousKey), this.normalByPath, this.groupsByEndpoint)
-                .insertRecord(key, record);
+            return this.insertRecord(key, record, this.ordered.delete(previousKey));
         }
         return this.insertRecord(key, record);
     }
@@ -168,7 +169,7 @@ export class JournalIndex {
         let current: JournalIndex = this;
         const normalKey = this.normalByPath.get(path);
         if (normalKey !== undefined && this.ordered.get(normalKey)!.entry.id <= throughId) {
-            current = current.withState(current.ordered.delete(normalKey), current.normalByPath.delete(path), current.groupsByEndpoint);
+            current = new JournalIndex(current.ordered.delete(normalKey), current.normalByPath.delete(path), current.groupsByEndpoint);
             yield current;
         }
         const groups = this.groupsByEndpoint.get(path);
@@ -184,7 +185,7 @@ export class JournalIndex {
                 newPending: record.newPending && record.entry.path !== path,
             });
             const endpoints = current.removeEndpoint(path, key);
-            current = current.withState(
+            current = new JournalIndex(
                 updated.oldPending || updated.newPending ? current.ordered.set(key, updated) : current.ordered.delete(key),
                 current.normalByPath, endpoints,
             );
@@ -192,7 +193,7 @@ export class JournalIndex {
         }
     }
 
-    private insertRecord(key: string, record: JournalRecord): JournalIndex {
+    private insertRecord(key: string, record: JournalRecord, ordered = this.ordered): JournalIndex {
         let normals = this.normalByPath;
         let endpoints = this.groupsByEndpoint;
         if (record.kind === "entry") normals = normals.set(record.entry.path, key);
@@ -204,22 +205,11 @@ export class JournalIndex {
             if (record.oldPending) add(record.entry.oldPath!);
             if (record.newPending) add(record.entry.path);
         }
-        return this.withState(this.ordered.set(key, record), normals, endpoints);
+        return new JournalIndex(ordered.set(key, record), normals, endpoints);
     }
 
     private removeEndpoint(path: string, key: string): PersistentPathIndex<PersistentPathIndex<true>> {
         const remaining = this.groupsByEndpoint.get(path)!.delete(key);
         return remaining.size ? this.groupsByEndpoint.set(path, remaining) : this.groupsByEndpoint.delete(path);
-    }
-
-    private withState(
-        ordered: PersistentPathIndex<JournalRecord>,
-        normalByPath: PersistentPathIndex<string>,
-        groupsByEndpoint: PersistentPathIndex<PersistentPathIndex<true>>,
-    ): JournalIndex {
-        if (ordered === this.ordered && normalByPath === this.normalByPath && groupsByEndpoint === this.groupsByEndpoint) return this;
-        const next = new JournalIndex();
-        next.ordered = ordered; next.normalByPath = normalByPath; next.groupsByEndpoint = groupsByEndpoint;
-        return next;
     }
 }
