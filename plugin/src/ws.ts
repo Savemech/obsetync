@@ -60,6 +60,7 @@ export class ObsetyncWsChannel {
     ) {}
 
     start(): void {
+        if (!this.stopped) return;
         this.stopped = false;
         this.foregroundStale = document.visibilityState !== "visible";
         // A host may freeze a socket without delivering close/error. Crossing
@@ -120,17 +121,6 @@ export class ObsetyncWsChannel {
     /** ms since the last frame (any sealed frame), -1 if never. */
     lastFrameAgeMs(): number {
         return this.lastFrameMs ? Date.now() - this.lastFrameMs : -1;
-    }
-
-    /** Reconnect now if the socket is not live (app resume, manual sync). */
-    ensureConnected(): void {
-        if (this.stopped || this.state === "connected" || this.state === "connecting") return;
-        if (this.reconnectTimer !== null) {
-            window.clearTimeout(this.reconnectTimer);
-            this.reconnectTimer = null;
-        }
-        this.backoffMs = BACKOFF_START_MS;
-        void this.connect();
     }
 
     private resumeForeground(): void {

@@ -86,6 +86,11 @@ test("foreground resume invalidates an apparently-connected stale session exactl
     try {
         channel.start();
         await eventually(() => FakeSocket.sockets.length === 1, "initial WS did not start");
+        channel.start();
+        assert.equal(mints, 1, "repeated start requested a second ticket");
+        assert.equal(documentEvents.count("visibilitychange"), 1);
+        assert.equal(windowEvents.count("pagehide"), 1);
+        assert.equal(windowEvents.count("pageshow"), 1);
         const stale = FakeSocket.sockets[0];
         stale.readyState = FakeSocket.OPEN;
         (channel as any).state = "connected";
