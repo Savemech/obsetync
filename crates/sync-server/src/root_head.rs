@@ -41,7 +41,7 @@ impl RootReceipt {
         validate_result(&self.result)?;
         // Bound the complete receipt, including identities and conflict paths,
         // before allocating the enclosing head's serialization buffer.
-        bounded_json(self, MAX_ROOT_RECEIPT_BYTES)?;
+        write_bounded_json(self, MAX_ROOT_RECEIPT_BYTES, io::sink())?;
         Ok(())
     }
 }
@@ -117,8 +117,13 @@ pub fn encode(vault_id: &str, head: &RootHead) -> io::Result<Vec<u8>> {
         )
         .into_bytes());
     }
-    let payload = payload_bytes(vault_id, head)?;
-    Ok(frame_payload(&payload))
+    let mut frame = vec![0; PREFIX_BYTES];
+    write_payload(vault_id, head, &mut frame)?;
+    let digest = checksum_hex(&frame[PREFIX_BYTES..]);
+    frame[..MAGIC.len()].copy_from_slice(MAGIC);
+    frame[MAGIC.len()..PREFIX_BYTES - 1].copy_from_slice(digest.as_bytes());
+    frame[PREFIX_BYTES - 1] = b'\n';
+    Ok(frame)
 }
 
 pub fn decode(vault_id: &str, bytes: &[u8]) -> io::Result<RootHead> {
@@ -182,7 +187,21 @@ pub fn decode(vault_id: &str, bytes: &[u8]) -> io::Result<RootHead> {
 }
 
 fn payload_bytes(vault_id: &str, head: &RootHead) -> io::Result<Vec<u8>> {
-    bounded_json(
+    let mut bytes = Vec::new();
+    write_payload(vault_id, head, &mut bytes)?;
+    Ok(bytes)
+}
+
+pub fn validate_encoded_size(vault_id: &str, head: &RootHead) -> io::Result<()> {
+    validate_head(head)?;
+    if head.receipts.is_empty() {
+        return Ok(()); // A validated legacy head is exactly 64 hex bytes.
+    }
+    write_payload(vault_id, head, io::sink())
+}
+
+fn write_payload(vault_id: &str, head: &RootHead, output: impl Write) -> io::Result<()> {
+    write_bounded_json(
         &PayloadRef {
             schema: 1,
             vault_id,
@@ -190,6 +209,7 @@ fn payload_bytes(vault_id: &str, head: &RootHead) -> io::Result<Vec<u8>> {
             receipts: &head.receipts,
         },
         MAX_ROOT_HEAD_BYTES - PREFIX_BYTES,
+        output,
     )
 }
 
@@ -200,6 +220,7 @@ fn checksum_hex(payload: &[u8]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+#[cfg(test)]
 fn frame_payload(payload: &[u8]) -> Vec<u8> {
     let mut result = Vec::with_capacity(PREFIX_BYTES + payload.len());
     result.extend_from_slice(MAGIC);
@@ -274,30 +295,32 @@ fn validate_result(value: &serde_json::Value) -> io::Result<()> {
     Ok(())
 }
 
-fn bounded_json(value: &impl Serialize, limit: usize) -> io::Result<Vec<u8>> {
-    struct LimitedWriter {
-        bytes: Vec<u8>,
-        limit: usize,
+fn write_bounded_json(value: &impl Serialize, limit: usize, output: impl Write) -> io::Result<()> {
+    struct LimitedWriter<W> {
+        output: W,
+        remaining: usize,
     }
-    impl Write for LimitedWriter {
+    impl<W: Write> Write for LimitedWriter<W> {
         fn write(&mut self, input: &[u8]) -> io::Result<usize> {
-            if input.len() > self.limit.saturating_sub(self.bytes.len()) {
+            if input.len() > self.remaining {
                 return Err(invalid("root metadata byte capacity exceeded"));
             }
-            self.bytes.extend_from_slice(input);
-            Ok(input.len())
+            let written = self.output.write(input)?;
+            self.remaining -= written;
+            Ok(written)
         }
         fn flush(&mut self) -> io::Result<()> {
-            Ok(())
+            self.output.flush()
         }
     }
-    let mut writer = LimitedWriter {
-        bytes: Vec::new(),
-        limit,
-    };
-    serde_json::to_writer(&mut writer, value)
-        .map_err(|_| invalid("root metadata encoding or capacity failure"))?;
-    Ok(writer.bytes)
+    serde_json::to_writer(
+        LimitedWriter {
+            output,
+            remaining: limit,
+        },
+        value,
+    )
+    .map_err(|_| invalid("root metadata encoding or capacity failure"))
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -373,6 +396,8 @@ mod tests {
     fn canonical_roundtrip_and_legacy_read() {
         let h = head();
         let bytes = encode("vault", &h).unwrap();
+        assert_eq!(bytes, frame_payload(&payload_bytes("vault", &h).unwrap()));
+        validate_encoded_size("vault", &h).unwrap();
         assert_eq!(decode("vault", &bytes).unwrap(), h);
         assert!(decode("other-vault", &bytes).is_err());
         let legacy = RootHead {
@@ -467,6 +492,7 @@ mod tests {
                 .collect(),
         };
         assert!(encode("vault", &h).is_err());
+        assert!(validate_encoded_size("vault", &h).is_err());
         r.result["conflicts"][0]["path"] = json!("x".repeat(MAX_ROOT_RECEIPT_BYTES));
         assert!(r.validate().is_err());
     }

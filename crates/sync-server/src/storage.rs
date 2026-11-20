@@ -381,8 +381,7 @@ impl VaultStore {
         receipt: &RootReceipt,
     ) -> io::Result<()> {
         let head = self.prepare_root_receipt(vault_id, hash, device_id, receipt)?;
-        root_head::encode(vault_id, &head).map_err(root_head_input_error)?;
-        Ok(())
+        root_head::validate_encoded_size(vault_id, &head).map_err(root_head_input_error)
     }
 
     fn prepare_root_receipt(
