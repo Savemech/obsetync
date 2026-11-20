@@ -669,11 +669,19 @@ export async function measureNativeRoot(options, phase) {
                 if (counters.inFlight) activeIO.push(`${partition}:native.${operation}=${counters.inFlight}`);
             }
         }
-        assert.equal(measured.io.total.inFlight, 0, `native IO still in flight: ${activeIO.join(",")}`);
+        assert.deepEqual(activeIO, [], "adapter or native IO still in flight");
         assert.equal(measured.transientAfter.usedBytes, 0, "transient admission still retained");
         assert.deepEqual(getHashTuning(), tuning, "fixed tuning changed during benchmark");
         assert.equal(diagnostics.rootPublicationsObserved, roots.length);
-        assert(roots.length > 0 && roots.every(row => row.status === "accepted" && row.entries > 0 && row.entries <= 256));
+        assert(roots.length > 0);
+        for (const row of roots) {
+            assert.equal(row.status, "accepted", "server did not accept the root");
+            assert.equal(row.result, "accepted", "client did not settle the accepted root");
+            assert(row.entries > 0 && row.entries <= 256);
+            assert(started <= row.started && row.started <= row.apiAdmitted &&
+                row.apiAdmitted <= row.reply && row.reply <= row.completed,
+            "root publication measurements are missing or out of order");
+        }
         const expectedCount = count + (liveScenario ? 70 : 0);
         assert.equal(base.entryCount(), expectedCount); assert.equal(tree.total_files(), expectedCount);
         const finalRoot = tree.root_hash_hex(); assert.equal(base.treeBaseRoot, finalRoot);
