@@ -133,54 +133,55 @@ impl ReachabilityCursor {
                 }
                 continue;
             }
-            let Some((hash, depth)) = self.pending.pop() else {
+            let Some(&(hash, depth)) = self.pending.last() else {
                 break;
             };
-            units += 1;
-            self.completed = self.completed.saturating_add(1);
-            if self.reachable.contains(&hash) {
-                continue;
-            }
-            if self.reachable.len() >= MAX_MARKED_NODES {
-                return Err(ChunkError::Deserialize("tree has too many nodes".into()));
-            }
-            if depth > MAX_TREE_DEPTH {
-                return Err(ChunkError::Deserialize("tree is too deep".into()));
-            }
-
-            let bytes = store
-                .get_chunk(&hash)
-                .ok_or_else(|| ChunkError::NotFound(crate::hash::hash_to_hex(&hash)))?;
-            if hash_bytes(&bytes) != hash {
-                return Err(ChunkError::Deserialize(format!(
-                    "index object {} failed content-address validation",
-                    crate::hash::hash_to_hex(&hash),
-                )));
-            }
-            self.reachable.insert(hash);
-
-            if let Ok(leaf) = LeafChunk::deserialize(&bytes) {
-                self.entries = self.entries.saturating_add(leaf.entries.len());
-                if self.entries > MAX_MARKED_ENTRIES {
-                    return Err(ChunkError::Deserialize("tree has too many entries".into()));
-                }
-                continue;
-            }
-            if let Ok(node) = InternalNode::deserialize(&bytes) {
-                if self.pending.len().saturating_add(node.children.len()) > MAX_MARKED_NODES {
+            if !self.reachable.contains(&hash) {
+                if self.reachable.len() >= MAX_MARKED_NODES {
                     return Err(ChunkError::Deserialize("tree has too many nodes".into()));
                 }
-                if !node.children.is_empty() {
-                    self.expanding = Some(ChildExpansion {
-                        children: node.children,
-                        depth: depth + 1,
-                    });
+                if depth > MAX_TREE_DEPTH {
+                    return Err(ChunkError::Deserialize("tree is too deep".into()));
                 }
-                continue;
+
+                let bytes = store
+                    .get_chunk(&hash)
+                    .ok_or_else(|| ChunkError::NotFound(crate::hash::hash_to_hex(&hash)))?;
+                if hash_bytes(&bytes) != hash {
+                    return Err(ChunkError::Deserialize(format!(
+                        "index object {} failed content-address validation",
+                        crate::hash::hash_to_hex(&hash),
+                    )));
+                }
+
+                if let Ok(leaf) = LeafChunk::deserialize(&bytes) {
+                    let entries = self.entries.saturating_add(leaf.entries.len());
+                    if entries > MAX_MARKED_ENTRIES {
+                        return Err(ChunkError::Deserialize("tree has too many entries".into()));
+                    }
+                    self.entries = entries;
+                } else if let Ok(node) = InternalNode::deserialize(&bytes) {
+                    if (self.pending.len() - 1).saturating_add(node.children.len())
+                        > MAX_MARKED_NODES
+                    {
+                        return Err(ChunkError::Deserialize("tree has too many nodes".into()));
+                    }
+                    if !node.children.is_empty() {
+                        self.expanding = Some(ChildExpansion {
+                            children: node.children,
+                            depth: depth + 1,
+                        });
+                    }
+                } else {
+                    return Err(ChunkError::Deserialize(
+                        "could not parse index object as LeafChunk or InternalNode".into(),
+                    ));
+                }
+                self.reachable.insert(hash);
             }
-            return Err(ChunkError::Deserialize(
-                "could not parse index object as LeafChunk or InternalNode".into(),
-            ));
+            self.pending.pop();
+            units += 1;
+            self.completed = self.completed.saturating_add(1);
         }
         Ok(self.progress(units))
     }
@@ -1284,6 +1285,14 @@ mod tests {
         }
         cursor.finish_seeding();
         assert!(cursor.step(&store, 0).is_err());
+        let before = cursor.progress(0);
+        let missing = MemoryChunkStore::new();
+        for _ in 0..2 {
+            assert!(cursor.step(&missing, 1).is_err());
+            assert_eq!(cursor.progress(0).remaining, before.remaining);
+            assert_eq!(cursor.progress(0).completed, before.completed);
+            assert!(cursor.take_reachable().is_err());
+        }
         let mut steps = 0usize;
         while !cursor.progress(0).done {
             let progress = cursor.step(&store, 1).unwrap();

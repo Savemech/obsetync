@@ -377,7 +377,7 @@ struct Segment {
     stable_end: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct TraversalBudget {
     nodes: usize,
     entries: usize,
@@ -743,32 +743,35 @@ impl V2ReachabilityCursor {
                 }
                 continue;
             }
-            let Some(range) = self.pending.pop() else {
+            let Some(range) = self.pending.last() else {
                 break;
             };
-            units += 1;
-            self.completed = self.completed.saturating_add(1);
             if let Some(previous) = self.descriptors.get(&range.hash) {
-                if previous != &range {
+                if previous != range {
                     return Err(invalid(
                         "Tree v2 repeated hash has a different child descriptor",
                     ));
                 }
-                continue;
-            }
-            self.budget.node(range.height)?;
-            match load_node(store, &range).await? {
-                V2Node::Leaf(entries) => self.budget.entries(entries.len())?,
-                V2Node::Internal { children, .. } => {
-                    if !children.is_empty() {
+                self.pending.pop();
+            } else {
+                // Keep the descriptor and its budget available if the read fails or is cancelled.
+                let mut budget = self.budget;
+                budget.node(range.height)?;
+                match load_node(store, range).await? {
+                    V2Node::Leaf(entries) => budget.entries(entries.len())?,
+                    V2Node::Internal { children, .. } => {
                         self.expanding = Some(V2ChildExpansion {
                             children: children.into_iter(),
                         });
                     }
                 }
+                self.budget = budget;
+                let range = self.pending.pop().expect("validated pending descriptor");
+                self.reachable.insert(range.hash);
+                self.descriptors.insert(range.hash, range);
             }
-            self.reachable.insert(range.hash);
-            self.descriptors.insert(range.hash, range);
+            units += 1;
+            self.completed = self.completed.saturating_add(1);
         }
         Ok(self.progress(units))
     }
@@ -2010,6 +2013,29 @@ mod tests {
             validate_descriptor_for_node(&internal_range, u32::MAX as usize + 1, &internal)
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn missing_leaf_stays_pending_until_a_successful_retry() {
+        let complete = MemoryChunkStore::new();
+        let root = build_tree(&complete, entries(1)).await.unwrap();
+        let leaf = root.child.clone().unwrap();
+        let mut cursor = V2ReachabilityCursor::new(&root).unwrap();
+        cursor.seed_root_child(leaf.clone()).unwrap();
+        cursor.finish_seeding();
+        let before = cursor.progress(0);
+        let missing = MemoryChunkStore::new();
+        for _ in 0..2 {
+            assert!(cursor.step(&missing, 1).await.is_err());
+            let after = cursor.progress(0);
+            assert!(!after.done);
+            assert_eq!(after.remaining, before.remaining);
+            assert_eq!(after.completed, before.completed);
+            assert_eq!(cursor.budget.nodes, 0);
+            assert!(cursor.take_reachable().is_err());
+        }
+        assert!(cursor.step(&complete, 1).await.unwrap().done);
+        assert_eq!(cursor.finish().unwrap(), HashSet::from([leaf.hash]));
     }
 
     #[tokio::test]
