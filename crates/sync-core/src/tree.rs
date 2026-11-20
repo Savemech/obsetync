@@ -24,7 +24,7 @@ pub const TARGET_CHUNK_ENTRIES: usize = 1000;
 /// Extract the top-level directory prefix from a path.
 /// "notes/2024/jan.md" -> "notes/"
 /// "readme.md" -> ""  (root-level file)
-fn top_level_prefix(path: &str) -> &str {
+pub(crate) fn top_level_prefix(path: &str) -> &str {
     match path.find('/') {
         Some(idx) => &path[..=idx],
         None => "",
@@ -228,10 +228,10 @@ pub async fn update_tree<S: ChunkStore>(
     deleted: &[String],
 ) -> Result<RootNode, ChunkError> {
     // Group changes by top-level prefix.
-    let mut changes_by_prefix: BTreeMap<String, (Vec<FileEntry>, Vec<String>)> = BTreeMap::new();
+    let mut changes_by_prefix: BTreeMap<&str, (Vec<FileEntry>, Vec<String>)> = BTreeMap::new();
 
     for entry in changed {
-        let prefix = top_level_prefix(&entry.path).to_string();
+        let prefix = top_level_prefix(&entry.path);
         changes_by_prefix
             .entry(prefix)
             .or_default()
@@ -240,7 +240,7 @@ pub async fn update_tree<S: ChunkStore>(
     }
 
     for path in deleted {
-        let prefix = top_level_prefix(path).to_string();
+        let prefix = top_level_prefix(path);
         changes_by_prefix
             .entry(prefix)
             .or_default()
@@ -256,7 +256,7 @@ pub async fn update_tree<S: ChunkStore>(
         // binary-search insertion point instead of scanning (and later
         // sorting) the complete root child list for every changed prefix.
         let child_position =
-            new_children.binary_search_by(|(child_prefix, _)| child_prefix.cmp(&prefix));
+            new_children.binary_search_by(|(child_prefix, _)| child_prefix.as_str().cmp(prefix));
         let existing_hash = child_position.ok().map(|index| new_children[index].1);
 
         // Load existing entries from the store.
@@ -298,7 +298,7 @@ pub async fn update_tree<S: ChunkStore>(
             // Update or insert the child in root.
             match child_position {
                 Ok(index) => new_children[index].1 = new_hash,
-                Err(index) => new_children.insert(index, (prefix, new_hash)),
+                Err(index) => new_children.insert(index, (prefix.to_owned(), new_hash)),
             }
         }
     }

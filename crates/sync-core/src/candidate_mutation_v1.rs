@@ -7,7 +7,7 @@
 use crate::chunk::{ChunkError, FileEntry, InternalNode, LeafChunk, RootNode};
 use crate::hash::{hash_bytes, hash_to_hex, FileHash, IncrementalHasher};
 use crate::store::MemoryChunkStore;
-use crate::tree::TARGET_CHUNK_ENTRIES;
+use crate::tree::{top_level_prefix, TARGET_CHUNK_ENTRIES};
 use crate::tree_work_memory::IndirectSortMemory;
 use std::collections::{btree_map, BTreeMap, HashMap};
 use std::iter::Peekable;
@@ -21,13 +21,6 @@ type Operations = (Vec<FileEntry>, Vec<String>);
 fn invalid(message: &str) -> ChunkError {
     ChunkError::Deserialize(message.into())
 }
-fn prefix(path: &str) -> String {
-    prefix_slice(path).to_owned()
-}
-pub(crate) fn prefix_slice(path: &str) -> &str {
-    path.find('/').map_or("", |index| &path[..=index])
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SortPhase {
     Indexing,
@@ -1268,7 +1261,7 @@ impl PrefixMutation {
                             return Ok(true);
                         }
                         if position < entries.len() {
-                            if prefix_slice(&entries[position].path) != self.prefix
+                            if top_level_prefix(&entries[position].path) != self.prefix
                                 || (position > 0
                                     && entries[position - 1].path >= entries[position].path)
                             {
@@ -2389,15 +2382,23 @@ impl CandidateMutationV1 {
     fn tick(&mut self, store: &MemoryChunkStore) -> Result<bool, ChunkError> {
         if self.grouping {
             if let Some(row) = self.changed.next() {
-                self.groups
-                    .entry(prefix(&row.path))
-                    .or_default()
-                    .0
-                    .push(row);
+                let prefix = top_level_prefix(&row.path);
+                if let Some(group) = self.groups.get_mut(prefix) {
+                    group.0.push(row);
+                } else {
+                    self.groups
+                        .insert(prefix.to_owned(), (vec![row], Vec::new()));
+                }
                 return Ok(true);
             }
             if let Some(path) = self.deleted.next() {
-                self.groups.entry(prefix(&path)).or_default().1.push(path);
+                let prefix = top_level_prefix(&path);
+                if let Some(group) = self.groups.get_mut(prefix) {
+                    group.1.push(path);
+                } else {
+                    self.groups
+                        .insert(prefix.to_owned(), (Vec::new(), vec![path]));
+                }
                 return Ok(true);
             }
             self.grouping = false;

@@ -18,13 +18,13 @@ use crate::replacement_rebuild::{
 };
 use crate::store::{ChunkRetirement, ChunkStoreMemory, MemoryChunkStore};
 use crate::transactional_tree::{ReachabilityCursor, TransactionalTree, TreeRetirementV1};
-use crate::tree::TARGET_CHUNK_ENTRIES;
+use crate::tree::{top_level_prefix, TARGET_CHUNK_ENTRIES};
 use crate::tree_metadata::{OwnedRootV1, TreeMetadataMemory};
 use crate::tree_work_memory::{
     ReplacementInputMemory, ReplacementSortMemory, ReplacementV1EntriesMemory,
     ReplacementV1GraphMemory, VecBackingMemory,
 };
-use std::collections::{btree_map, BTreeMap};
+use std::collections::BTreeMap;
 use std::vec::IntoIter;
 
 type Children = Vec<(String, FileHash)>;
@@ -460,19 +460,18 @@ impl ReplacementRebuildV1 {
         match self.phase {
             Phase::Group => {
                 if let Some(entry) = self.input.as_mut().and_then(Iterator::next) {
-                    let prefix = entry.path.find('/').map_or("", |end| &entry.path[..=end]);
-                    match self.groups.entry(prefix.to_owned()) {
-                        btree_map::Entry::Occupied(mut group) => {
-                            let before = VecBackingMemory::of(group.get());
-                            group.get_mut().push(entry);
-                            let after = VecBackingMemory::of(group.get());
-                            self.entry_memory.input_to_existing_group(before, after);
-                        }
-                        btree_map::Entry::Vacant(group) => {
-                            self.graph_memory.add_group_key(group.key());
-                            let group = group.insert(vec![entry]);
-                            self.entry_memory.input_to_new_group(group);
-                        }
+                    let prefix = top_level_prefix(&entry.path);
+                    if let Some(group) = self.groups.get_mut(prefix) {
+                        let before = VecBackingMemory::of(group);
+                        group.push(entry);
+                        self.entry_memory
+                            .input_to_existing_group(before, VecBackingMemory::of(group));
+                    } else {
+                        let key = prefix.to_owned();
+                        let rows = vec![entry];
+                        self.graph_memory.add_group_key(&key);
+                        self.entry_memory.input_to_new_group(&rows);
+                        self.groups.insert(key, rows);
                     }
                 } else {
                     // Exhaustion does not free Vec::IntoIter backing. Drop it
