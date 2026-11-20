@@ -177,7 +177,7 @@ export function decodeDiffPage(
         if (previousKey) {
             const pathOrder = compareBytes(previousKey.pathBytes, pathBytes);
             if (pathOrder === 0) throw new Error("diff page touches one target path more than once");
-            if (compareKeys(previousKey, key) >= 0) throw new Error("diff records are not strictly ordered");
+            if (pathOrder > 0) throw new Error("diff records are not strictly ordered");
         }
         previousKey = key;
 

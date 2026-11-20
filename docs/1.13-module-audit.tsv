@@ -213,7 +213,7 @@ pending	plugin/src/desktop-reconcile-upload.ts	production	Not reviewed
 pending	plugin/src/desktop-verified-read.test.ts	tests	Not reviewed
 read	plugin/src/desktop-verified-read.ts	production	Native before/after handle and path timestamps now match exactly; fractional timestamp regressions require drift rejection and handle close; remaining platform cases pending
 reviewed	plugin/src/diff-page-codec.test.ts	tests	1933 assertions cover negotiation, binary framing, fuzzed pages, Unicode name preservation and independence from Node Buffer input
-reviewed	plugin/src/diff-page-codec.ts	production	Traced HTTP request, strict cursor/record ordering, UTF-8 and safe integer decoding; preserve leading U+FEFF and copy only the retained cursor bytes
+reviewed	plugin/src/diff-page-codec.ts	production	Traced HTTP request, strict cursor/record ordering, UTF-8 and safe integer decoding; preserve leading U+FEFF and copy only the retained cursor bytes; reuse the bytewise path comparison across adjacent records and page boundaries
 read	plugin/src/dirty-set.test.ts	tests	Checked replay bounds, sparse rows and iterator-independent retirement against engine recovery callers; 323 assertions pass. Remaining test bodies pending.
 reviewed	plugin/src/dirty-set.ts	production	Traced stable captures, path claims, observer overflow, restore and retirement. Replay validates detached indexed rows before publication; removed unused addMany.
 reviewed	plugin/src/editor-pull-guard.test.ts	tests	Reviewed baseline, concurrent edits, disposal and oversized/incomplete host fixtures; a same-path replacement while reading now has regression coverage.
