@@ -95,7 +95,7 @@ function fixture() {
     const app = { vault: { adapter } } as unknown as App;
     const io = new ObsetyncMobileIO(app, host);
     return {
-        io, source, requests,
+        io, host, source, requests,
         fetches: () => fetches,
         bodyReaders: () => bodyReaders,
         bodyCancels: () => bodyCancels,
@@ -186,6 +186,30 @@ async function capabilityAndSourceDriftStayDistinct(): Promise<void> {
     check(drift instanceof MobileRangeReadError && drift.code === "SOURCE_CHANGED" &&
         transientMemorySnapshot().usedBytes === postReadBaseline,
     "post-read source drift returned bytes or leaked their admission");
+}
+
+async function slowProbeCannotUndoHostRejection(): Promise<void> {
+    const f = fixture();
+    const fetch = f.host.fetch.bind(f.host);
+    let release!: () => void, entered!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const waiting = new Promise<void>(resolve => { entered = resolve; });
+    f.host.fetch = async (url, init) => {
+        const answer = await fetch(url, init);
+        if (f.fetches() === 1) { entered(); await held; }
+        return answer;
+    };
+    const expected = { size: 8, mtime: 7 };
+    const slow = f.io.openMobileRangeReader("large.bin", expected);
+    try {
+        await waiting;
+        f.setMode("200");
+        assert.equal(await f.io.openMobileRangeReader("large.bin", expected), null);
+    } finally { release(); }
+    assert.equal(await slow, null);
+    assert.equal(f.io.mobileRangeCapability().reason, "PROTOCOL");
+    assert.equal(await f.io.openMobileRangeReader("large.bin", expected), null);
+    assert.equal(f.fetches(), 2);
 }
 
 async function finalStatCannotPublishStaleBytes(): Promise<void> {
@@ -349,6 +373,7 @@ async function run(): Promise<void> {
     await qualifiedReaderIsStrictAndOwned();
     await invalidHostResponsesFailClosed();
     await capabilityAndSourceDriftStayDistinct();
+    await slowProbeCannotUndoHostRejection();
     await finalStatCannotPublishStaleBytes();
     await boundsAbortAndDesktopIsolation();
     await writesAvoidExistingFolderMutations();

@@ -333,7 +333,7 @@ export class ObsetyncMobileIO extends ObsetyncDesktopIO {
     async readFileIdentityVerified(_path: string, _expected: FileStat,
         _signal?: AbortSignal): Promise<Uint8Array | null> { return null; }
 
-    // No Node.js fs on iOS — streaming hash not available.
+    // Mobile range reads use the vault resource URL.
     getAbsolutePath(_path: string): string | null { return null; }
     mobileRangeCapability() {
         return {
@@ -373,8 +373,12 @@ export class ObsetyncMobileIO extends ObsetyncDesktopIO {
                     this.rangeReason = code;
                 },
             });
+            // Another file can reject the host while this one-byte probe is pending.
+            if (this.rangeReason !== null) {
+                reader.close();
+                return null;
+            }
             this.rangeState = "qualified";
-            this.rangeReason = null;
             return reader;
         } catch (error) {
             if (error instanceof MobileRangeReadError &&
