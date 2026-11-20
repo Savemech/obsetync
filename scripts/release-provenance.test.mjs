@@ -9,7 +9,6 @@ import { fileURLToPath } from "node:url";
 
 import {
     canonicalContainerManifest,
-    runReleaseProvenanceCli,
     validateContainerManifest,
     validateServerBuildIdentity,
 } from "./release-provenance.mjs";
@@ -17,32 +16,10 @@ import {
 const execFile = promisify(execFileCallback);
 const SCRIPT = fileURLToPath(new URL("./release-provenance.mjs", import.meta.url));
 const RELEASE_WORKFLOW = fileURLToPath(new URL("../.github/workflows/release.yml", import.meta.url));
-// The local sandbox reports a non-reentrant Hermes shim as execPath; normal
-// Node and GitHub Actions use the executable directly.
-const NODE = process.execPath.includes("/.hermes/") ? "/usr/local/bin/node" : process.execPath;
-
-async function cli(args) {
-    const child = await execFile(NODE, [SCRIPT, ...args]);
-    if (child.stdout !== "" || !process.execPath.includes("/.hermes/")) return child;
-    // This sandbox's Node shim suppresses captured stdout from nested JS. A
-    // created file proves that the spawned CLI ran; CI captures stdout too.
-    if (args[0] === "create-containers") {
-        await readFile(args[1], "utf8");
-        return { stdout: "container image provenance created\n", stderr: "" };
-    }
-    let stdout = "";
-    await runReleaseProvenanceCli(args, value => { stdout += value; });
-    return { stdout, stderr: "" };
+function cli(args) {
+    return execFile(process.execPath, [SCRIPT, ...args]);
 }
 
-async function rejectsCli(args, pattern) {
-    if (!process.execPath.includes("/.hermes/")) {
-        await assert.rejects(() => cli(args), pattern);
-        return;
-    }
-    await assert.rejects(() => execFile(NODE, [SCRIPT, ...args]), error => error.code === 1);
-    await assert.rejects(() => runReleaseProvenanceCli(args, () => {}), pattern);
-}
 const VERSION = "1.2.3";
 const SHA = "a".repeat(40);
 const expectedIdentity = { version: VERSION, gitCommit: SHA, sourceState: "clean" };
@@ -110,8 +87,8 @@ test("CLI creates once, verifies exact inputs, and rejects unsafe output", async
         assert.equal(await readFile(output, "utf8"), canonicalContainerManifest(containers));
         const verified = await cli(["verify-containers", ...args]);
         assert.match(verified.stdout, /verified/);
-        await rejectsCli(["create-containers", ...args], /EEXIST/);
-        await rejectsCli(["create-containers", join(directory, "wrong.json"), ...args.slice(1)],
+        await assert.rejects(cli(["create-containers", ...args]), /EEXIST/);
+        await assert.rejects(cli(["create-containers", join(directory, "wrong.json"), ...args.slice(1)]),
             /filename must be container-images\.json/);
     } finally {
         await rm(directory, { recursive: true, force: true });

@@ -423,10 +423,10 @@ reviewed	scripts/deploy-plugin.sh	tooling	Traced just ship-plugin staging, activ
 reviewed	scripts/deploy-plugin.test.sh	tests	Executed six temporary-directory cases covering success, preflight, failed activation, lock contention, TERM and failed rollback.
 pending	scripts/deploy-server.sh	tooling	Not reviewed
 pending	scripts/deploy-server.test.sh	tests	Not reviewed
-pending	scripts/release-artifact-manifest.mjs	tooling	Not reviewed
-pending	scripts/release-artifact-manifest.test.mjs	tests	Not reviewed
-pending	scripts/release-provenance.mjs	tooling	Not reviewed
-pending	scripts/release-provenance.test.mjs	tests	Not reviewed
+reviewed	scripts/release-artifact-manifest.mjs	tooling	Traced flat inventory, streamed SHA-256, manifest publication and independent release verification. ZIP staging uses the same seven plugin inputs as the loose release files.
+reviewed	scripts/release-artifact-manifest.test.mjs	tests	Read and executed deterministic regeneration, flat inventory, tampering, self-reference and canonical encoding cases.
+reviewed	scripts/release-provenance.mjs	tooling	Traced executable and JSON server identity, CLI inputs, canonical Docker/Nix digest manifest and exclusive creation into the release workflow.
+reviewed	scripts/release-provenance.test.mjs	tests	Removed simulated subprocess output. Four suites exercise real CLI creation/rejection, server identity, immutable container references and workflow invocation.
 read	scripts/verify-wasm-memory.mjs	tooling	Reviewed qualification entrypoint and completed packaged scalar/SIMD allocator lifecycle run, both prefix corpora and tree formats, three cycles each. Individual qualification helper review pending.
 pending	scripts/verify-wasm-parity.mjs	tooling	Not reviewed
 reviewed	versions.json	configuration/schema	Current compatibility entry passed shared release checker; verified minimums against 21 available tagged root manifests
