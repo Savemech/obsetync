@@ -17,6 +17,7 @@ blake3.workspace = true
 # Sealed realtime notifications and the separate bulk/control data lane.
 axum = { version = "0.8", features = ["ws"] }
 http-body = "1"
+percent-encoding = "2"
 # Split the WebSocket into sink/stream halves so one task can forward
 # broadcast frames while another reads client subs/pings.
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }

@@ -134,11 +134,11 @@ async fn dashboard(State(state): State<SharedState>) -> Html<String> {
                 "<tr><td>{} {}</td><td>{}</td><td>{}</td><td>{}</td>\
                  <td><a href='/admin/devices/{}'>details</a></td></tr>",
                 dot,
-                d.name,
+                html_escape(&d.name),
                 status,
                 format_time(d.last_seen),
                 format_time(d.enrolled_at),
-                d.device_id
+                path_segment(&d.device_id)
             )
         })
         .collect();
@@ -157,9 +157,12 @@ async fn dashboard(State(state): State<SharedState>) -> Html<String> {
                 CurrentRootStats::ReadError => ("Read error".into(), "unknown".into()),
             };
             format!(
-                "<tr><td><a href='/admin/vaults/{name}'>{name}</a></td>\
+                "<tr><td><a href='/admin/vaults/{segment}'>{label}</a></td>\
                  <td>{}</td><td>{}</td></tr>",
-                size, mtime,
+                size,
+                mtime,
+                segment = path_segment(name),
+                label = html_escape(name),
             )
         })
         .collect();
@@ -242,16 +245,16 @@ async fn device_list(State(state): State<SharedState>) -> Html<String> {
             format!(
                 "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
                  <td><a href='/admin/devices/{}'>details</a></td></tr>",
-                d.name,
+                html_escape(&d.name),
                 status,
                 format_time(d.last_seen),
                 format_time(d.enrolled_at),
                 if d.vaults.is_empty() {
                     "—".into()
                 } else {
-                    d.vaults.join(", ")
+                    html_escape(&d.vaults.join(", "))
                 },
-                d.device_id
+                path_segment(&d.device_id)
             )
         })
         .collect();
@@ -310,7 +313,6 @@ async fn create_device(
     tracing::info!(
         device_name = %info.device_name,
         device = %&info.device_id[..info.device_id.len().min(12)],
-        code = %info.code,
         "enrollment: code issued"
     );
 
@@ -333,7 +335,10 @@ async fn create_device(
 </ol>
 <p><a href="/admin/devices">Back to devices</a></p>
 </body></html>"#,
-        info.device_name, info.code, info.device_id, info.code
+        html_escape(&info.device_name),
+        info.code,
+        info.device_id,
+        info.code
     )))
 }
 
@@ -387,7 +392,7 @@ async fn device_detail(
             r#"<form method="POST" action="/admin/devices/{}/revoke" onsubmit="return confirm('Revoke this device?')">
             <button type="submit" class="btn btn-danger">Revoke Device</button>
             </form>"#,
-            device_id
+            path_segment(&device_id)
         )
     };
 
@@ -413,15 +418,15 @@ async fn device_detail(
     } else {
         format!(
             r#"<h3>Bulk deletion</h3><p>If this device is stuck pushing a large but <em>intentional</em> deletion (you removed a build tree, say) and the guard keeps rejecting it (409), approve a <strong>one-time</strong> bypass for its next push. The guard stays fully on for every other device and every later push.</p><form method="POST" action="/admin/devices/{}/approve-deletion" onsubmit="return confirm('Allow this device to bypass the deletion guard ONCE on its next push?')"><button type="submit" class="btn-small">Approve one-time bulk deletion</button></form>"#,
-            device_id
+            path_segment(&device_id)
         )
     };
 
     Ok(Html(format!(
         r#"<!DOCTYPE html>
-<html><head><title>{} - ObsetyNC</title>{CSS}</head>
+<html><head><title>{name} - ObsetyNC</title>{CSS}</head>
 <body>
-<h1><a href="/admin">ObsetyNC</a> / <a href="/admin/devices">Devices</a> / {}</h1>
+<h1><a href="/admin">ObsetyNC</a> / <a href="/admin/devices">Devices</a> / {name}</h1>
 <table>
 <tr><td>Status</td><td>{status}</td></tr>
 <tr><td>Device ID</td><td><code>{}</code></td></tr>
@@ -432,11 +437,10 @@ async fn device_detail(
 {approve_section}
 <p><a href="/admin/devices">Back to devices</a></p>
 </body></html>"#,
-        device.name,
-        device.name,
-        device_id,
+        html_escape(&device_id),
         format_time(device.enrolled_at),
         format_time(device.last_seen),
+        name = html_escape(&device.name),
     )))
 }
 
@@ -455,10 +459,13 @@ async fn revoke_device(
         .map_err(|e| ServerErrorHtml(format!("revoke unavailable: {e}")))?
         .map_err(|e| ServerErrorHtml(format!("revoke failed: {e}")))?;
     tracing::info!(
-        device = %&device_id[..device_id.len().min(12)],
+        device = %format_args!("{device_id:.12}"),
         "devices: revoked"
     );
-    Ok(Redirect::to(&format!("/admin/devices/{}", device_id)))
+    Ok(Redirect::to(&format!(
+        "/admin/devices/{}",
+        path_segment(&device_id)
+    )))
 }
 
 // --- One-time bulk-deletion approval ---
@@ -480,10 +487,13 @@ async fn approve_deletion(
         .map_err(|e| ServerErrorHtml(format!("approval unavailable: {e}")))?
         .map_err(|e| ServerErrorHtml(format!("approve failed: {e}")))?;
     tracing::warn!(
-        device = %&device_id[..device_id.len().min(12)],
+        device = %format_args!("{device_id:.12}"),
         "devices: granted a one-time guard bypass (bulk-deletion approval)"
     );
-    Ok(Redirect::to(&format!("/admin/devices/{}", device_id)))
+    Ok(Redirect::to(&format!(
+        "/admin/devices/{}",
+        path_segment(&device_id)
+    )))
 }
 
 // --- Vault List ---
@@ -513,7 +523,11 @@ async fn vault_list(State(state): State<SharedState>) -> Html<String> {
     let rows: String = vaults
         .iter()
         .map(|(name, status)| {
-            format!("<tr><td><a href='/admin/vaults/{name}'>{name}</a></td><td>{status}</td></tr>")
+            format!(
+                "<tr><td><a href='/admin/vaults/{segment}'>{label}</a></td><td>{status}</td></tr>",
+                segment = path_segment(name),
+                label = html_escape(name)
+            )
         })
         .collect();
 
@@ -577,6 +591,7 @@ async fn vault_detail(
     // stable ordering.
     metas.sort_by(|a, b| b.created_ms.cmp(&a.created_ms).then(a.hash.cmp(&b.hash)));
 
+    let vault_path = path_segment(&vault_id);
     let root_rows: String = metas
         .iter()
         .map(|m| {
@@ -589,7 +604,7 @@ async fn vault_detail(
             let rollback = if !is_current {
                 format!(
                     r#"<form method="POST" action="/admin/vaults/{}/rollback" style="display:inline"><input type="hidden" name="root_hash" value="{}"><button type="submit" class="btn-small">rollback</button></form> "#,
-                    vault_id, m.hash
+                    vault_path, m.hash
                 )
             } else {
                 String::new()
@@ -602,7 +617,7 @@ async fn vault_detail(
                 version = m.tree_version,
                 files = m.total_files,
                 rollback = rollback,
-                vault = vault_id,
+                vault = vault_path,
             )
         })
         .collect();
@@ -617,7 +632,7 @@ async fn vault_detail(
     let tree_controls = match current_version {
         Some(1) if fleet.ready() => format!(
             r#"<p>Tree v1 · fleet ready ({}/{} devices).</p>
-<form method="POST" action="/admin/vaults/{vault_id}/tree-v2/activate"
+<form method="POST" action="/admin/vaults/{vault_path}/tree-v2/activate"
       onsubmit="return confirm('Activate Tree v2 for this vault? Older plugin sessions will receive HTTP 426 until updated.')">
 <button type="submit" class="btn-small">activate Tree v2</button></form>"#,
             fleet.ready_devices, fleet.enrolled_devices,
@@ -628,7 +643,7 @@ async fn vault_detail(
         ),
         Some(2) => format!(
             r#"<p><strong>Tree v2 active</strong> · fleet readiness {}/{}.</p>
-<form method="POST" action="/admin/vaults/{vault_id}/tree-v2/downgrade"
+<form method="POST" action="/admin/vaults/{vault_path}/tree-v2/downgrade"
       onsubmit="return confirm('Project the current snapshot back to Tree v1? File content and history are preserved.')">
 <button type="submit" class="btn-small">downgrade current snapshot to v1</button></form>"#,
             fleet.ready_devices, fleet.enrolled_devices,
@@ -646,7 +661,7 @@ async fn vault_detail(
 <h2>Tree format</h2>
 {tree_controls}
 <h2>Root History</h2>
-<p><a class="btn" href="/admin/vaults/{vault_id}/explorer">🔍 Open version explorer</a> &nbsp; browse every version, see changed files (svn-style), and diff them inline — all on one page.</p>
+<p><a class="btn" href="/admin/vaults/{vault_path}/explorer">🔍 Open version explorer</a> &nbsp; browse every version, see changed files (svn-style), and diff them inline — all on one page.</p>
 <table>
 <tr><th>When</th><th>Root</th><th>Tree</th><th>Files</th><th>Actions</th></tr>
 {root_rows}
@@ -657,7 +672,7 @@ root in one shot, so devices that ignore those paths can converge. This is
 <strong>reversible</strong> — the pre-purge root stays in history above; roll back
 to undo. Local files on each device are kept; they are only untracked. One
 pattern per line, gitignore-style (<code>target/</code>, <code>*.tmp</code>).</p>
-<form method="POST" action="/admin/vaults/{vault_id}/purge"
+<form method="POST" action="/admin/vaults/{vault_path}/purge"
       onsubmit="return confirm('Purge matching paths from the current root? Reversible via rollback.')">
 <textarea name="patterns" rows="5" cols="48" placeholder="target/&#10;node_modules/&#10;.git/&#10;*.tmp"></textarea><br>
 <button type="submit" class="btn-small">purge</button>
@@ -665,6 +680,7 @@ pattern per line, gitignore-style (<code>target/</code>, <code>*.tmp</code>).</p
 <p><a href="/admin/vaults">Back to vaults</a></p>
 </body></html>"#,
         current_hex,
+        vault_id = html_escape(&vault_id),
     )))
 }
 
@@ -709,7 +725,10 @@ async fn rollback_vault(
         .map_err(|e| ServerErrorHtml(format!("rollback failed: {}", e)))?;
     state.notify_root_changed(&vault_id, &hash_to_hex(&hash));
 
-    Ok(Redirect::to(&format!("/admin/vaults/{}", vault_id)))
+    Ok(Redirect::to(&format!(
+        "/admin/vaults/{}",
+        path_segment(&vault_id)
+    )))
 }
 
 async fn activate_tree_v2(
@@ -752,7 +771,10 @@ async fn project_tree_version(
         .ok_or_else(|| ServerErrorHtml("vault has no current root".into()))?;
     let current_root = admin_history_root(&state, &vault_id, &current_hash)?;
     if current_root.version() == target_version {
-        return Ok(Redirect::to(&format!("/admin/vaults/{vault_id}")));
+        return Ok(Redirect::to(&format!(
+            "/admin/vaults/{}",
+            path_segment(&vault_id)
+        )));
     }
 
     let mut projected = crate::bridge::run_project_root_version(
@@ -789,7 +811,10 @@ async fn project_tree_version(
         tree_version = target_version,
         "admin changed current tree format without changing file content"
     );
-    Ok(Redirect::to(&format!("/admin/vaults/{vault_id}")))
+    Ok(Redirect::to(&format!(
+        "/admin/vaults/{}",
+        path_segment(&vault_id)
+    )))
 }
 
 fn admin_unix_time_ms() -> u64 {
@@ -843,7 +868,10 @@ async fn purge_vault(
 
     if removed == 0 {
         // Nothing matched — don't mint a redundant identical root.
-        return Ok(Redirect::to(&format!("/admin/vaults/{}", vault_id)));
+        return Ok(Redirect::to(&format!(
+            "/admin/vaults/{}",
+            path_segment(&vault_id)
+        )));
     }
 
     // Link the new root to the one it descends from so history stays a chain.
@@ -874,7 +902,10 @@ async fn purge_vault(
         "admin purge: removed ignored paths from current root (reversible via rollback)"
     );
 
-    Ok(Redirect::to(&format!("/admin/vaults/{}", vault_id)))
+    Ok(Redirect::to(&format!(
+        "/admin/vaults/{}",
+        path_segment(&vault_id)
+    )))
 }
 
 // --- Vault export ---
@@ -1097,7 +1128,6 @@ async fn claim_enrollment(
             tracing::info!(
                 device_name = %info.device_name,
                 device = %&info.device_id[..info.device_id.len().min(12)],
-                code = %code,
                 "enrollment: claimed (bundle issued)"
             );
             let bundle = serde_json::json!({
@@ -1118,7 +1148,7 @@ async fn claim_enrollment(
                 .into_response()
         }
         Err(e) => {
-            tracing::warn!(code = %code, reason = %e, "enrollment: claim failed");
+            tracing::warn!(reason = %e, "enrollment: claim failed");
             (
                 StatusCode::BAD_REQUEST,
                 [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -1149,7 +1179,7 @@ impl IntoResponse for ServerErrorHtml {
 <p class="error">{}</p>
 <p><a href="/admin">Back to dashboard</a></p>
 </body></html>"#,
-                self.0
+                html_escape(&self.0)
             )),
         )
             .into_response()
@@ -1389,6 +1419,53 @@ mod tests {
             html_escape("<a href=\"x\">&y"),
             "&lt;a href=&quot;x&quot;&gt;&amp;y"
         );
+    }
+
+    #[tokio::test]
+    async fn admin_device_names_render_as_text_on_every_page() {
+        let (_dir, state, _) = current_root_fixture();
+        let name = "iPad <Paris> & bureau";
+        state
+            .devices
+            .register("ipad", name, &"b".repeat(64))
+            .unwrap();
+        let pages = [
+            create_device(
+                State(state.clone()),
+                Form(NewDeviceForm {
+                    device_name: name.into(),
+                }),
+            )
+            .await
+            .unwrap(),
+            dashboard(State(state.clone())).await,
+            device_list(State(state.clone())).await,
+            device_detail(State(state), Path("ipad".into()))
+                .await
+                .unwrap(),
+        ];
+        for Html(page) in pages {
+            assert!(page.contains("iPad &lt;Paris&gt; &amp; bureau"));
+            assert!(!page.contains(name));
+        }
+    }
+
+    #[tokio::test]
+    async fn vault_labels_and_links_preserve_the_original_identifier() {
+        let (_dir, state, _) = current_root_fixture();
+        let vault = "Paris & <A>#?__VAULT_H__";
+        let escaped = "Paris &amp; &lt;A&gt;#?__VAULT_H__";
+        let path = "/admin/vaults/Paris%20%26%20%3CA%3E%23%3F__VAULT_H__";
+        for Html(page) in [
+            vault_detail(State(state.clone()), Path(vault.into()))
+                .await
+                .unwrap(),
+            explorer(State(state), Path(vault.into())).await.unwrap(),
+        ] {
+            assert!(page.contains(escaped));
+            assert!(page.contains(path));
+            assert!(!page.contains(vault));
+        }
     }
 
     #[test]
@@ -1776,6 +1853,15 @@ mod tests {
 
 const ZERO_HASH_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
+fn path_segment(value: &str) -> percent_encoding::PercentEncode<'_> {
+    const ESCAPED: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'_')
+        .remove(b'.')
+        .remove(b'~');
+    percent_encoding::utf8_percent_encode(value, ESCAPED)
+}
+
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -2071,13 +2157,13 @@ async fn explorer(
         })
         .collect();
     let versions_json = serde_json::to_string(&versions).unwrap_or_else(|_| "[]".into());
-    let vault_json = serde_json::to_string(&vault_id).unwrap_or_else(|_| "\"\"".into());
-
     let page = EXPLORER_HTML
-        .replace("__VAULT_H__", &html_escape(&vault_id))
-        .replace("__VAULT_JSON__", &vault_json)
         .replace("__VERSIONS_JSON__", &versions_json)
-        .replace("__ZERO__", ZERO_HASH_HEX);
+        .replace("__ZERO__", ZERO_HASH_HEX)
+        .split("__VAULT_H__")
+        .map(|part| part.replace("__VAULT_PATH__", &path_segment(&vault_id).to_string()))
+        .collect::<Vec<_>>()
+        .join(&html_escape(&vault_id));
     Ok(Html(page))
 }
 
@@ -2120,21 +2206,21 @@ body{font-family:var(--mono);font-size:13px;color:#1e1e1e;display:flex;flex-dire
 .l-a{background:#e6ffed;color:#22863a;} .l-d{background:#ffeef0;color:#b31d28;}
 .l-h{background:#f1f8ff;color:#005cc5;} .l-m{color:#6a737d;} .l-c{color:#24292e;}
 </style></head><body>
-<div class="top"><a href="/admin/vaults/__VAULT_H__">← __VAULT_H__</a> &nbsp; version explorer &nbsp; <span class="hint">click a version → click or hover a file</span></div>
+<div class="top"><a id="vault-home" href="/admin/vaults/__VAULT_PATH__">← __VAULT_H__</a> &nbsp; version explorer &nbsp; <span class="hint">click a version → click or hover a file</span></div>
 <div class="explorer">
   <div class="pane versions"><div class="ph">Versions</div><div id="versions"></div></div>
   <div class="pane files"><div class="ph">Changed files</div><div id="files"><div class="hint">select a version</div></div></div>
   <div class="pane diff"><div class="ph">Diff</div><div id="diff"><div class="hint">select a file</div></div></div>
 </div>
 <script>
-const VAULT=__VAULT_JSON__;
+const vaultPath=document.getElementById("vault-home").getAttribute("href");
 const VERSIONS=__VERSIONS_JSON__;
 const ZERO="__ZERO__";
 let cachedDiff,versionRequest,fileRequest;
 let CHANGES=[];
 function E(id){return document.getElementById(id);}
 function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}
-function api(p){return "/admin/vaults/"+encodeURIComponent(VAULT)+p;}
+function api(p){return vaultPath+p;}
 function renderVersions(){
   E("versions").innerHTML=VERSIONS.map(function(v,i){
     return '<div class="ver" data-i="'+i+'"><span class="when">'+esc(v.when)+(v.current?' <span class="cur">(current)</span>':'')+

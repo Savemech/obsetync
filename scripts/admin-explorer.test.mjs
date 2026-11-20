@@ -7,12 +7,12 @@ test("explorer keeps the selected version, path and diff across late replies", a
     const source = readFileSync(new URL("../crates/sync-server/src/admin.rs", import.meta.url), "utf8");
     const script = source.split("const EXPLORER_HTML:")[1].match(/<script>([\s\S]*?)<\/script>/)[1];
     const pane = () => ({ innerHTML: "", addEventListener() {}, classList: { add() {} } });
-    const elements = { versions: pane(), files: pane(), diff: pane() };
+    const elements = { "vault-home": {getAttribute: () => "/admin/vaults/test"}, versions: pane(), files: pane(), diff: pane() };
     const replies = [];
     const ctx = {
         document: { getElementById: id => elements[id], querySelectorAll: () => [] },
         AbortController, clearTimeout,
-        __VAULT_JSON__: "test", __VERSIONS_JSON__: [{hash: "first"}, {hash: "second"}],
+        __VERSIONS_JSON__: [{hash: "first"}, {hash: "second"}],
         fetch: url => url.endsWith("/stats") ? Promise.resolve({ok: false})
             : new Promise(resolve => replies.push(json => resolve({ok: true, json: async () => json}))),
     };
