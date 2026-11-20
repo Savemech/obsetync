@@ -206,28 +206,22 @@ async function timeoutDoesNotFreeChildCryptoWorkspace(): Promise<void> {
     budget.close();
 }
 
-async function reuseWaitsForNativeSettlement(): Promise<void> {
+async function lastNativeTaskReleasesClosedScope(): Promise<void> {
     const budget = new ResourceBudget({ capacityBytes: 100 });
     const scope = await reserveTransientScope({ ownerBytes: 60, workBytes: 40 }, { budget });
-    const native = deferred<void>();
-    let fallbackStarted = false;
-    const result = scope.run(40, async (context) => {
-        const first = context.track(() => native.promise);
-        const idle = context.waitForIdle();
-        check(idle === context.waitForIdle(), "idle waiting allocated separate waiter queues");
-        await idle;
-        await first;
-        fallbackStarted = true;
-        return context.track(async () => "fallback");
-    });
-    await microtasks();
-    check(!fallbackStarted && scope.snapshot().work.usedBytes === 40,
-        "same-attempt fallback reused an active native buffer allowance");
-    native.resolve();
-    check(await result === "fallback", "workspace could not be reused after native settlement");
+    const send = deferred<void>(), receive = deferred<void>();
+    const tasks = await scope.run(40, context => [
+        context.track(() => send.promise), context.track(() => receive.promise),
+    ]);
     scope.close();
-    check(budget.snapshot().usedBytes === 0, "same-context fallback leaked the global lease");
-    budget.close();
+    receive.resolve();
+    await tasks[1];
+    check(scope.snapshot().work.usedBytes === 40 && budget.snapshot().usedBytes === 100,
+        "out-of-order completion released memory still owned by the send");
+    send.resolve();
+    await tasks[0];
+    check(scope.snapshot().work.usedBytes === 0 && budget.snapshot().usedBytes === 0,
+        "last tracked completion did not release both budgets");
 }
 
 async function cancelledNativeWorkRetainsClosedParent(): Promise<void> {
@@ -331,7 +325,7 @@ void fullCapacitySubscopeDoesNotDeadlock()
     .then(nestedNoWaitDoesNotJoinTheQueue)
     .then(scopeCloseWaitsForAllOwners)
     .then(timeoutDoesNotFreeChildCryptoWorkspace)
-    .then(reuseWaitsForNativeSettlement)
+    .then(lastNativeTaskReleasesClosedScope)
     .then(cancelledNativeWorkRetainsClosedParent)
     .then(hashSourcesAndTransfersShareAdmission)
     .then(transientReservationsUseTheInjectedLifetimeArbiter)

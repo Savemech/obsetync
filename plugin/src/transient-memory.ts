@@ -229,9 +229,6 @@ export interface TransientWorkContext {
     /** Retain THIS child quota, not merely its global parent, while native work
      * outlives a caller-visible timeout. Pass the actual completion promise. */
     track<T>(work: () => T | Promise<T>): Promise<T>;
-    /** Before reusing one callback's workspace for a fallback/retry, wait for
-     * tracked old native work and fence that old attempt against new tasks. */
-    waitForIdle(): Promise<void>;
 }
 
 class RetainedWorkContext implements TransientWorkContext {
@@ -239,8 +236,6 @@ class RetainedWorkContext implements TransientWorkContext {
     private ownerClosed = false;
     private released = false;
     private activeTasks = 0;
-    private idlePromise?: Promise<void>;
-    private resolveIdle?: () => void;
 
     constructor(private readonly lease: ResourceReservation) { this.bytes = lease.bytes; }
 
@@ -250,21 +245,8 @@ class RetainedWorkContext implements TransientWorkContext {
         try { return await work(); }
         finally {
             this.activeTasks--;
-            if (this.activeTasks === 0) {
-                this.resolveIdle?.();
-                this.idlePromise = undefined;
-                this.resolveIdle = undefined;
-            }
             this.releaseIfDrained();
         }
-    }
-
-    waitForIdle(): Promise<void> {
-        if (this.activeTasks === 0) return Promise.resolve();
-        if (!this.idlePromise) {
-            this.idlePromise = new Promise<void>((resolve) => { this.resolveIdle = resolve; });
-        }
-        return this.idlePromise;
     }
 
     close(): void {
