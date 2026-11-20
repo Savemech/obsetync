@@ -95,6 +95,7 @@ async function repairMutexPreventsIdleCapabilityProbe(): Promise<void> {
     const { engine } = fixture();
     check(!engine.isBusy(), "idle engine reported busy before repair");
     engine._reconcileInner = async () => {
+        check((await engine.reconcileContent()).skipped === "busy", "concurrent reconcile reported a completed check");
         check(engine.getState() === "idle" && engine.isBusy(),
             "idle phase label concealed active reconcile mutex from diagnostics");
         return { ...complete };

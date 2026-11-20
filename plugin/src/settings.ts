@@ -100,11 +100,11 @@ export class ObsetyncSettingTab extends PluginSettingTab {
 
         new Setting(containerEl).setName("ObsetyNC Sync").setHeading();
 
-        // Connection status.
+        // Enrollment status.
         const statusEl = containerEl.createDiv({ cls: "obsetync-status" });
         if (this.plugin.settings.enrolled) {
             statusEl.createEl("span", {
-                text: "Connected",
+                text: "Enrolled",
                 cls: "obsetync-connected",
             });
             statusEl.createEl("span", {
@@ -531,23 +531,20 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                         new Notice("Sync engine not ready.");
                         return;
                     }
-                    const startedAt = Date.now();
                     try {
                         const r = await engine.reconcileContent();
                         const total = r.smallUploaded + r.largeUploaded + r.treeChunksUploaded;
-                        if (total === 0) {
+                        if (r.skipped) {
+                            new Notice(r.skipped === "busy" ? "Reconcile skipped: a sync is already running." : "Sync engine is inactive.");
+                        } else if (r.deferred > 0) {
+                            new Notice(`Repair incomplete: ${total} uploaded, ${r.deferred} deferred (${r.drifted} changed locally, ${r.readErrors} read errors, ${r.uploadErrors} upload errors).`);
+                        } else if (total === 0) {
                             new Notice("Server already has all content.");
                         } else {
                             new Notice(
                                 `Uploaded ${r.smallUploaded} files, ` +
                                 `${r.largeUploaded} large files, ` +
                                 `${r.treeChunksUploaded} tree chunks.`
-                            );
-                        }
-                        const err = engine.getLastError();
-                        if (err && err.ts >= startedAt) {
-                            new Notice(
-                                `Reconcile had errors: [${err.origin}] ${err.message.slice(0, 80)}${err.message.length > 80 ? "…" : ""}`
                             );
                         }
                     } catch (e: any) {

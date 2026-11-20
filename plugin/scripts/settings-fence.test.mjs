@@ -246,3 +246,23 @@ test("debug report belongs to the settings view that requested it", async () => 
         assert.equal(globalThis.__settingsFence.reports - before, end === "open" ? 1 : 0);
     }
 });
+
+test("reconcile only reports all content present after a completed check", async () => {
+    const f = fixture();
+    f.setBlocked(false);
+    for (const [result, expected] of [
+        [{ skipped: "busy" }, /already running/],
+        [{ skipped: "inactive" }, /inactive/],
+        [{ deferred: 2, drifted: 1, readErrors: 1, uploadErrors: 0 }, /2 deferred/],
+        [{ deferred: 0 }, /Server already has all content/],
+    ]) {
+        f.plugin.syncEngineOrNull().reconcileContent = async () => ({
+            smallUploaded: 0, largeUploaded: 0, treeChunksUploaded: 0, ...result,
+        });
+        const start = globalThis.__settingsFence.notices.length;
+        await invoke("Reconcile with server:button");
+        const notices = globalThis.__settingsFence.notices.slice(start);
+        assert.equal(notices.length, 1);
+        assert.match(notices[0], expected);
+    }
+});

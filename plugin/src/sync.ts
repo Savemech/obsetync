@@ -233,6 +233,7 @@ interface LegacyDowngradeFreezeState {
 }
 
 export interface ReconcileResult {
+    skipped?: "inactive" | "busy";
     smallUploaded: number;
     largeUploaded: number;
     treeChunksUploaded: number;
@@ -1334,7 +1335,8 @@ export class ObsetyncSyncEngine {
      * in batches. Only missing manifests need local chunking and chunk checks.
      */
     reconcileContent(onProgress?: (msg: string) => void): Promise<ReconcileResult> {
-        return this.trackOperation(() => this.reconcileContentInner(onProgress), {
+        return this.trackOperation<ReconcileResult>(() => this.reconcileContentInner(onProgress), {
+            skipped: "inactive",
             smallUploaded: 0, largeUploaded: 0, treeChunksUploaded: 0, bytes: 0,
             deferred: 0, drifted: 0, readErrors: 0, uploadErrors: 0,
         });
@@ -1349,7 +1351,7 @@ export class ObsetyncSyncEngine {
         // handle while we bootstrap + inspect it.
         if (this.syncing || this.startupReplayInProgress) {
             console.log("[obsetync] reconcile skipped — another sync in progress");
-            return { smallUploaded: 0, largeUploaded: 0, treeChunksUploaded: 0, bytes: 0,
+            return { skipped: "busy", smallUploaded: 0, largeUploaded: 0, treeChunksUploaded: 0, bytes: 0,
                 deferred: 0, drifted: 0, readErrors: 0, uploadErrors: 0 };
         }
         this.syncing = true;
