@@ -7,7 +7,7 @@ import {
     type ShrinkableResourceReservation,
 } from "./resource-budget";
 import { throwIfWorkAborted } from "./work-scheduler";
-import type { SyncMemoryArbiter, SyncMemoryLease } from "./sync-memory-arbiter";
+import { SyncMemoryUnavailableError, type SyncMemoryArbiter, type SyncMemoryLease } from "./sync-memory-arbiter";
 
 const MIB = 1024 * 1024;
 const MOBILE_TRANSIENT_CEILING = 32 * MIB;
@@ -23,7 +23,7 @@ export interface TransientMemoryTuning {
 
 /** A scope lends already-admitted bytes through this same small interface. */
 export interface TransientReservationBudget {
-    reserve(bytes: number, options?: { signal?: AbortSignal }): Promise<ResourceReservation>;
+    reserve(bytes: number, options?: { signal?: AbortSignal; wait?: boolean }): Promise<ResourceReservation>;
 }
 
 function byteCount(value: number, name: string, allowZero = false): number {
@@ -63,7 +63,14 @@ export class TransientMemoryBudget {
         }
     }
 
-    async reserve(bytes: number, options: { signal?: AbortSignal } = {}): Promise<ShrinkableResourceReservation> {
+    async reserve(bytes: number, options: { signal?: AbortSignal; wait?: boolean } = {}): Promise<ShrinkableResourceReservation> {
+        if (options.wait === false) {
+            throwIfWorkAborted(options.signal);
+            const pool = this.budget.snapshot();
+            if (!pool.closed && bytes <= pool.capacityBytes && (pool.queuedRequests || bytes > pool.availableBytes)) {
+                throw new SyncMemoryUnavailableError("transfer", bytes);
+            }
+        }
         const local = await this.budget.reserve(bytes, options);
         let shared: SyncMemoryLease | undefined;
         try {
@@ -354,7 +361,7 @@ class OwnedTransientWorkScope implements TransientWorkScope {
  * allocations use track(); independently reusable transport bytes use run(). */
 export async function reserveTransientScope(
     workset: Pick<TransientWorksetEstimate, "ownerBytes" | "workBytes">,
-    options: { signal?: AbortSignal; budget?: TransientReservationBudget } = {},
+    options: { signal?: AbortSignal; wait?: boolean; budget?: TransientReservationBudget } = {},
 ): Promise<TransientWorkScope> {
     byteCount(workset.ownerBytes, "ownerBytes", true);
     byteCount(workset.workBytes, "workBytes");

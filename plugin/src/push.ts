@@ -2458,15 +2458,10 @@ export async function push(
         }
         if (neededChunks && neededChunks.length > 0) {
             onProgress?.(`↑ uploading ${neededChunks.length} index chunks...`);
-            const capacity = transientMemorySnapshot().capacityBytes;
-            const uploadCapacity = capacity - neededChunks.capacityBytes;
-            if (uploadCapacity < 1) {
-                throw new ResourceBudgetOversizedError(neededChunks.capacityBytes + 1, capacity);
-            }
             const endIndexUpload = perf?.phase("tree_index_upload");
             try {
                 await uploadIndexChunks(api, wasm, tree, neededChunks, perf, beforeHeavyBatch, signal,
-                    assertCandidateCurrent, uploadCapacity);
+                    assertCandidateCurrent);
             } finally {
                 endIndexUpload?.();
             }

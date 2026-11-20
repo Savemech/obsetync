@@ -167,17 +167,9 @@ export async function uploadIndexChunks(
     beforeHeavyBatch?: () => Promise<void>,
     signal?: AbortSignal,
     assertCurrent?: () => void,
-    /** Capacity available in the shared pool after a caller-owned compact
-     * hash source. Pack estimates above this headroom must fail instead of
-     * queueing behind that source forever. */
-    availableCapacityBytes?: number,
 ): Promise<void> {
     if (!Number.isSafeInteger(hashes.length) || hashes.length < 0) {
         throw new RangeError("index hash source length must be a safe non-negative count");
-    }
-    if (availableCapacityBytes !== undefined &&
-        (!Number.isSafeInteger(availableCapacityBytes) || availableCapacityBytes < 1)) {
-        throw new RangeError("index upload available capacity must be a positive safe integer");
     }
     const assertOwner = () => {
         throwIfWorkAborted(signal);
@@ -196,7 +188,9 @@ export async function uploadIndexChunks(
         await cooperate();
         assertOwner();
         const tuning = getHashTuning();
-        const capacity = availableCapacityBytes ?? transientMemorySnapshot().capacityBytes;
+        // A pack must never queue behind memory held by its own hash spool.
+        const retainedBytes = hashes instanceof CompactIndexHashSpool ? hashes.capacityBytes : 0;
+        const capacity = Math.max(0, transientMemorySnapshot().capacityBytes - retainedBytes);
         const maxBytes = pushGroupingByteLimit(tuning, capacity);
         const lengths: number[] = [];
         // Only one bounded pack is detached. Never reread a caller-owned hash
@@ -227,10 +221,10 @@ export async function uploadIndexChunks(
             throw new ResourceBudgetOversizedError(estimatedBytes, capacity);
         }
         let memory;
-        try { memory = await reserveTransientScope(estimate, { signal }); }
+        try { memory = await reserveTransientScope(estimate, { signal, wait: retainedBytes === 0 }); }
         catch (error) {
             if (error instanceof ResourceBudgetOversizedError &&
-                transientMemorySnapshot().capacityBytes < capacity) continue;
+                transientMemorySnapshot().capacityBytes - retainedBytes < capacity) continue;
             // An oversized immutable index object cannot be redefined/split.
             // Keep the candidate unpublished; durable work remains pending.
             throw error;

@@ -241,8 +241,8 @@ reviewed	plugin/src/host-runtime.ts	production	Traced host selection through sta
 reviewed	plugin/src/ignore.test.ts	tests	Checked built-in and custom patterns, legacy settings migration, anchored file/directory matches and nested negative cases
 reviewed	plugin/src/ignore.ts	production	Traced matcher through event capture, scans, legacy and paged pulls; rooted single-segment patterns and directory-only anchored paths corrected
 pending	plugin/src/incremental-tree-test-abi.ts	production	Not reviewed
-pending	plugin/src/index-upload.test.ts	tests	Not reviewed
-pending	plugin/src/index-upload.ts	production	Not reviewed
+reviewed	plugin/src/index-upload.test.ts	tests	Ran nine suites covering admission, export size, paging, ACK, cancellation and cleanup; exercised full local pool while compact spool remains held.
+reviewed	plugin/src/index-upload.ts	production	Traced push and repair callers, compact spool, bounded paged/legacy exports, ACK and error cleanup. Recompute headroom per pack and avoid nested waits with a retained spool.
 pending	plugin/src/journal-concurrency.test.ts	tests	Not reviewed
 pending	plugin/src/journal-format.ts	production	Not reviewed
 pending	plugin/src/journal-index.test.ts	tests	Not reviewed

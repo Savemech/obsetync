@@ -331,8 +331,13 @@ async function compactSpoolAdmissionAndLazyUpload(): Promise<void> {
             assert.deepEqual(records.map(record => record.hash), hashes);
             assert.ok(transientMemorySnapshot().usedBytes > before + admitted.spoolBytes,
                 "compact backing was released before the real upload ACK");
-        } }, fixture.wasm, fixture.tree, admitted.spool, undefined, undefined, undefined, undefined,
-        transientMemorySnapshot().capacityBytes - admitted.spoolBytes);
+        } }, fixture.wasm, fixture.tree, admitted.spool);
+        const blocker = await reserveTransientWorkset(transientMemorySnapshot().availableBytes);
+        try {
+            await assert.rejects(uploadIndexChunks({ putObjects: async () => assert.fail("unadmitted pack") },
+                fixture.wasm, fixture.tree, admitted.spool), /currently unavailable/);
+            assert.equal(transientMemorySnapshot().queuedRequests, 0);
+        } finally { blocker.release(); }
         assert.equal(uploads, 1);
         assert.equal(transientMemorySnapshot().usedBytes, before + admitted.spoolBytes,
             "upload pack leaked beside the compact backing");
