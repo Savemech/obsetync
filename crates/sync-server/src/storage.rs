@@ -568,8 +568,7 @@ impl VaultStore {
             .map(|root| root.version())
     }
 
-    /// Check if a vault exists (has at least one root).
-    #[allow(dead_code)]
+    /// Check whether the vault directory exists, including staged history.
     pub fn vault_exists(&self, vault_id: &str) -> bool {
         self.layout.vault_dir(vault_id).exists()
     }
@@ -737,17 +736,6 @@ fn root_head_checkpoint(boundary: &'static str) -> io::Result<()> {
     })
 }
 
-/// Helper: read a content-addressed blob from a path.
-#[cfg(test)]
-pub fn read_blob(path: &Path) -> Option<Vec<u8>> {
-    read_blob_with_optional_perf(path, None)
-}
-
-#[cfg(test)]
-pub fn read_blob_measured(path: &Path, perf: &ServerPerfCounters) -> Option<Vec<u8>> {
-    read_blob_with_optional_perf(path, Some(perf))
-}
-
 pub(crate) fn read_blob_bounded(
     path: &Path,
     max_bytes: usize,
@@ -778,31 +766,12 @@ pub(crate) fn read_blob_bounded(
     Ok(bytes)
 }
 
-#[cfg(test)]
-fn read_blob_with_optional_perf(path: &Path, perf: Option<&ServerPerfCounters>) -> Option<Vec<u8>> {
-    let started = Instant::now();
-    let bytes = std::fs::read(path).ok()?;
-    if let Some(perf) = perf {
-        perf.record_loose_read(bytes.len() as u64, started.elapsed());
-    }
-    Some(bytes)
-}
-
 /// Write an immutable/content-addressed object without ever exposing a partial
 /// final file. The temp file lives in the same directory so rename is an
 /// atomic namespace operation; file and directory are synced before success.
 #[cfg(test)]
 pub fn write_blob(path: &Path, data: &[u8]) -> Result<(), std::io::Error> {
     write_blob_with_optional_perf(path, data, None)
-}
-
-#[cfg(test)]
-pub fn write_blob_measured(
-    path: &Path,
-    data: &[u8],
-    perf: &ServerPerfCounters,
-) -> Result<(), std::io::Error> {
-    write_blob_with_optional_perf(path, data, Some(perf))
 }
 
 fn write_blob_with_optional_perf(
@@ -818,11 +787,7 @@ fn write_blob_with_optional_perf(
     // Concurrent writers of the same address are common and harmless. Avoid
     // replacing a complete identical object (especially on Windows, where
     // rename-over-existing is not portable).
-    let existing_started = Instant::now();
-    if let Ok(existing) = std::fs::read(path) {
-        if let Some(perf) = perf {
-            perf.record_loose_read(existing.len() as u64, existing_started.elapsed());
-        }
+    if let Ok(existing) = read_blob_bounded(path, data.len(), perf) {
         if existing == data {
             return Ok(());
         }
@@ -853,7 +818,7 @@ fn write_blob_with_optional_perf(
 
     if let Err(rename_error) = std::fs::rename(&tmp, path) {
         // Another writer may have won while our temp was being synced.
-        if std::fs::read(path).is_ok_and(|existing| existing == data) {
+        if read_blob_bounded(path, data.len(), None).is_ok_and(|existing| existing == data) {
             let _ = std::fs::remove_file(&tmp);
             if let Some(perf) = perf {
                 perf.record_loose_write(data.len() as u64, write_elapsed, durability_elapsed, 1);
@@ -895,101 +860,6 @@ fn write_blob_with_optional_perf(
         perf.record_loose_write(data.len() as u64, write_elapsed, durability_elapsed, 2);
     }
     Ok(())
-}
-
-/// Materialize a loose-object mirror after its bytes are already durable in
-/// the storage-writer journal. Atomic promotion still prevents readers from
-/// observing partial data, but an additional per-file fsync would defeat
-/// group commit and is unnecessary: startup recovery can recreate this mirror
-/// from the fdatasync'ed journal after any crash or power loss.
-#[cfg(test)]
-pub(crate) fn materialize_journaled_blob(path: &Path, data: &[u8]) -> Result<(), std::io::Error> {
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "blob path has no parent")
-    })?;
-    std::fs::create_dir_all(parent)?;
-    if std::fs::read(path).is_ok_and(|existing| existing == data) {
-        return Ok(());
-    }
-
-    let tmp = path.with_extension(format!(
-        "journal-tmp-{}-{:016x}",
-        std::process::id(),
-        rand::random::<u64>()
-    ));
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&tmp)?;
-    if let Err(error) = file.write_all(data) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error);
-    }
-    drop(file);
-
-    if let Err(rename_error) = std::fs::rename(&tmp, path) {
-        if std::fs::read(path).is_ok_and(|existing| existing == data) {
-            let _ = std::fs::remove_file(&tmp);
-            return Ok(());
-        }
-        let backup = path.with_extension(format!(
-            "journal-backup-{}-{:016x}",
-            std::process::id(),
-            rand::random::<u64>()
-        ));
-        let had_existing = path.exists();
-        if had_existing {
-            std::fs::rename(path, &backup)?;
-        }
-        if let Err(error) = std::fs::rename(&tmp, path) {
-            if had_existing {
-                let _ = std::fs::rename(&backup, path);
-            }
-            let _ = std::fs::remove_file(&tmp);
-            return Err(std::io::Error::new(
-                error.kind(),
-                format!(
-                    "journaled blob promotion failed after rename error {rename_error}: {error}"
-                ),
-            ));
-        }
-        if had_existing {
-            let _ = std::fs::remove_file(&backup);
-        }
-    }
-    Ok(())
-}
-
-/// Helper: check if a content-addressed blob exists.
-#[cfg(test)]
-pub fn blob_exists(path: &Path) -> bool {
-    path.exists()
-}
-
-/// Verify that an object still matches the content address encoded by its
-/// path. Check endpoints use this for the small set of objects a changed
-/// batch wants to reuse, allowing pre-atomic-write partials or disk damage to
-/// be repaired by a normal re-upload instead of becoming permanently stuck.
-#[cfg(test)]
-pub fn blob_matches_hash(path: &Path, expected: &FileHash) -> bool {
-    std::fs::read(path).is_ok_and(|bytes| sync_core::hash::hash_bytes(&bytes) == *expected)
-}
-
-#[cfg(test)]
-pub fn blob_matches_hash_measured(
-    path: &Path,
-    expected: &FileHash,
-    perf: &ServerPerfCounters,
-) -> bool {
-    let Some(bytes) = read_blob_measured(path, perf) else {
-        perf.record_index_lookup(false);
-        return false;
-    };
-    perf.record_index_lookup(true);
-    let started = Instant::now();
-    let matched = sync_core::hash::hash_bytes(&bytes) == *expected;
-    perf.record_hash_check(bytes.len() as u64, started.elapsed(), matched);
-    matched
 }
 
 #[cfg(test)]
@@ -1985,23 +1855,29 @@ mod tests {
     }
 
     #[test]
-    fn measured_blob_io_updates_aggregate_counters() {
+    fn root_history_roundtrip_updates_aggregate_counters() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("objects/blob");
-        let perf = ServerPerfCounters::default();
-        let expected = hash_bytes(b"measured");
-
-        write_blob_measured(&path, b"measured", &perf).unwrap();
-        assert_eq!(read_blob_measured(&path, &perf).unwrap(), b"measured");
-        assert!(blob_matches_hash_measured(&path, &expected, &perf));
+        let perf = Arc::new(ServerPerfCounters::default());
+        let store = VaultStore::with_perf(StorageLayout::new(dir.path()), Arc::clone(&perf));
+        let root = RootNode {
+            vault_id: "v".into(),
+            created_ms: 1,
+            version: 1,
+            children: vec![],
+            total_files: 0,
+            parent_hash: None,
+            device_id: "device".into(),
+        };
+        let bytes = root.serialize();
+        store.store_root("v", &root.hash(), &bytes).unwrap();
+        assert_eq!(store.get_root("v", &root.hash()).unwrap(), bytes);
 
         let snapshot = perf.snapshot();
         assert_eq!(snapshot.storage.loose_writes, 1);
-        assert_eq!(snapshot.storage.bytes_written, 8);
+        assert_eq!(snapshot.storage.bytes_written, bytes.len() as u64);
         assert_eq!(snapshot.storage.fdatasyncs, 2);
-        assert_eq!(snapshot.storage.loose_reads, 2);
-        assert_eq!(snapshot.storage.bytes_read, 16);
-        assert_eq!(snapshot.storage.bytes_rehashed, 8);
+        assert_eq!(snapshot.storage.loose_reads, 1);
+        assert_eq!(snapshot.storage.bytes_read, bytes.len() as u64);
         assert_eq!(snapshot.storage.corrupted_records, 0);
     }
 
@@ -2236,21 +2112,6 @@ mod tests {
     }
 
     #[test]
-    fn journaled_materialization_is_atomic_and_replaceable() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("objects/blob");
-        materialize_journaled_blob(&path, b"first").unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"first");
-        materialize_journaled_blob(&path, b"first").unwrap();
-        materialize_journaled_blob(&path, b"replacement").unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
-        assert_eq!(
-            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
-            1
-        );
-    }
-
-    #[test]
     fn vault_paths_namespaced_by_vault_id() {
         let layout = StorageLayout::new("/d");
         assert_eq!(layout.vault_dir("v1"), PathBuf::from("/d/vaults/v1"));
@@ -2355,16 +2216,6 @@ mod tests {
     }
 
     #[test]
-    fn vault_store_root_history_roundtrip() {
-        let dir = tempdir().unwrap();
-        let layout = StorageLayout::new(dir.path());
-        let store = VaultStore::new(layout);
-        let h = hash_bytes(b"root-bytes");
-        store.store_root("v", &h, b"the bytes").unwrap();
-        assert_eq!(store.get_root("v", &h).unwrap(), b"the bytes".to_vec());
-    }
-
-    #[test]
     fn vault_store_does_not_rewrite_metadata_for_the_same_semantic_root() {
         let dir = tempdir().unwrap();
         let layout = StorageLayout::new(dir.path());
@@ -2419,8 +2270,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("nested/sub/blob");
         write_blob(&path, b"hello").unwrap();
-        assert!(blob_exists(&path));
-        assert_eq!(read_blob(&path).unwrap(), b"hello".to_vec());
+        assert!(path.is_file());
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello".to_vec());
     }
 
     #[test]
@@ -2430,21 +2281,11 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"partial").unwrap();
         write_blob(&path, b"complete payload").unwrap();
-        assert_eq!(read_blob(&path).unwrap(), b"complete payload".to_vec());
+        assert_eq!(std::fs::read(&path).unwrap(), b"complete payload".to_vec());
         assert_eq!(
             std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
             1
         );
-        assert!(blob_matches_hash(&path, &hash_bytes(b"complete payload")));
-        assert!(!blob_matches_hash(&path, &hash_bytes(b"other")));
-    }
-
-    #[test]
-    fn read_blob_missing_returns_none() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("nope");
-        assert!(read_blob(&path).is_none());
-        assert!(!blob_exists(&path));
     }
 
     #[test]
