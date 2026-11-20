@@ -555,7 +555,7 @@ pub async fn compute_deltas_with_stats<S: ChunkStore>(
                 continue;
             }
 
-            let can_expand = left.iter().chain(&right).any(|range| range.height > 0);
+            let can_expand = left.iter().chain(right).any(|range| range.height > 0);
             if can_expand {
                 let expanded_left = expand_one_level(store, left, &mut budget).await?;
                 let expanded_right = expand_one_level(store, right, &mut budget).await?;
@@ -563,8 +563,8 @@ pub async fn compute_deltas_with_stats<S: ChunkStore>(
                 continue;
             }
 
-            let from_entries = load_leaf_span(store, &left, &mut budget).await?;
-            let to_entries = load_leaf_span(store, &right, &mut budget).await?;
+            let from_entries = load_leaf_span(store, left, &mut budget).await?;
+            let to_entries = load_leaf_span(store, right, &mut budget).await?;
             stats.entries_materialized = stats
                 .entries_materialized
                 .saturating_add((from_entries.len() + to_entries.len()) as u64);
@@ -1038,10 +1038,10 @@ async fn store_internal<S: ChunkStore>(
 }
 
 pub(crate) fn encode_leaf(entries: &[FileEntry]) -> Result<Vec<u8>, ChunkError> {
-    validate_entries(entries)?;
-    if entries.len() > MAX_LEAF_ENTRIES {
-        return Err(invalid("Tree v2 leaf exceeds the entry cap"));
+    if entries.is_empty() || entries.len() > MAX_LEAF_ENTRIES {
+        return Err(invalid("Tree v2 leaf entry count is invalid"));
     }
+    validate_entries(entries)?;
     let capacity = entries.iter().try_fold(LEAF_HEADER_BYTES, |sum, entry| {
         sum.checked_add(leaf_record_len(entry))
             .ok_or_else(|| invalid("Tree v2 leaf length overflow"))
@@ -1071,6 +1071,9 @@ pub(crate) fn encode_internal(
 ) -> Result<Vec<u8>, ChunkError> {
     if children.is_empty() || children.len() > MAX_INTERNAL_CHILDREN {
         return Err(invalid("Tree v2 internal child count is invalid"));
+    }
+    if child_height >= MAX_TREE_DEPTH {
+        return Err(invalid("Tree v2 internal height exceeds the depth limit"));
     }
     validate_ranges(children, child_height)?;
     let capacity = children
@@ -1256,25 +1259,23 @@ async fn load_leaf_span<S: ChunkStore>(
     leaves: &[RangeRef],
     budget: &mut TraversalBudget,
 ) -> Result<Vec<FileEntry>, ChunkError> {
-    for leaf in leaves {
+    let capacity = leaves.iter().try_fold(0usize, |sum, leaf| {
         validate_range(leaf)?;
         if leaf.height != 0 {
             return Err(invalid("Tree v2 leaf span contains an internal node"));
         }
-    }
-    let capacity = leaves.iter().try_fold(0usize, |sum, leaf| {
         let count = usize::try_from(leaf.file_count)
             .map_err(|_| invalid("Tree v2 leaf count does not fit this platform"))?;
         sum.checked_add(count)
             .ok_or_else(|| invalid("Tree v2 entry capacity overflow"))
     })?;
+    budget.entries(capacity)?;
     let mut output = Vec::with_capacity(capacity);
     for leaf in leaves {
         budget.node(0)?;
         let V2Node::Leaf(entries) = load_node(store, leaf).await? else {
             return Err(invalid("Tree v2 leaf descriptor names an internal node"));
         };
-        budget.entries(entries.len())?;
         output.extend(entries);
     }
     validate_entries(&output)?;
@@ -1283,17 +1284,17 @@ async fn load_leaf_span<S: ChunkStore>(
 
 async fn expand_one_level<S: ChunkStore>(
     store: &S,
-    ranges: Vec<RangeRef>,
+    ranges: &[RangeRef],
     budget: &mut TraversalBudget,
 ) -> Result<Vec<RangeRef>, ChunkError> {
     let mut output = Vec::new();
     for range in ranges {
         if range.height == 0 {
-            output.push(range);
+            output.push(range.clone());
             continue;
         }
         budget.node(range.height)?;
-        let V2Node::Internal { children, .. } = load_node(store, &range).await? else {
+        let V2Node::Internal { children, .. } = load_node(store, range).await? else {
             return Err(invalid("Tree v2 internal descriptor names a leaf"));
         };
         output.extend(children);
@@ -1319,13 +1320,16 @@ pub(crate) fn mutation_start_leaf(leaves: &[RangeRef], first_path: &str) -> usiz
     }
 }
 
-fn align_range_windows(from: &[RangeRef], to: &[RangeRef]) -> Vec<(Vec<RangeRef>, Vec<RangeRef>)> {
+fn align_range_windows<'a>(
+    from: &'a [RangeRef],
+    to: &'a [RangeRef],
+) -> Vec<(&'a [RangeRef], &'a [RangeRef])> {
     let mut output = Vec::new();
     let mut i = 0usize;
     let mut j = 0usize;
     while i < from.len() && j < to.len() {
         if from[i].min_path == to[j].min_path && from[i].max_path == to[j].max_path {
-            output.push((vec![from[i].clone()], vec![to[j].clone()]));
+            output.push((&from[i..=i], &to[j..=j]));
             i += 1;
             j += 1;
             continue;
@@ -1355,10 +1359,10 @@ fn align_range_windows(from: &[RangeRef], to: &[RangeRef]) -> Vec<(Vec<RangeRef>
                 }
             }
         }
-        output.push((from[start_i..i].to_vec(), to[start_j..j].to_vec()));
+        output.push((&from[start_i..i], &to[start_j..j]));
     }
     if i < from.len() || j < to.len() {
-        output.push((from[i..].to_vec(), to[j..].to_vec()));
+        output.push((&from[i..], &to[j..]));
     }
     output
 }
@@ -1881,6 +1885,51 @@ mod tests {
         assert!(!cursor.retire_one());
         assert!(cursor.seed_root_child(range(99)).is_err());
         assert!(cursor.finish().is_err());
+    }
+
+    #[tokio::test]
+    async fn leaf_span_checks_remaining_entry_budget_before_reading() {
+        let store = MemoryChunkStore::new();
+        let leaf = store_leaf(&store, &[entry("a", 1), entry("b", 1)])
+            .await
+            .unwrap();
+        let leaves = std::slice::from_ref(&leaf);
+        let mut budget = TraversalBudget {
+            entries: MAX_LOADED_ENTRIES - 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            load_leaf_span(&store, leaves, &mut budget)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(budget.entries, MAX_LOADED_ENTRIES);
+
+        let error = load_leaf_span(&MemoryChunkStore::new(), leaves, &mut budget)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ChunkError::Deserialize(message) if message.contains("entry limit"))
+        );
+    }
+
+    #[test]
+    fn encoders_only_emit_decodable_node_shapes() {
+        assert!(encode_leaf(&[]).is_err());
+        let mut child = RangeRef {
+            min_path: "a".into(),
+            max_path: "a".into(),
+            hash: [0; 32],
+            file_count: 1,
+            serialized_bytes: 64,
+            height: MAX_TREE_DEPTH - 1,
+        };
+        let bytes = encode_internal(child.height, std::slice::from_ref(&child)).unwrap();
+        decode_node(&bytes).unwrap();
+        child.height = MAX_TREE_DEPTH;
+        assert!(encode_internal(child.height, &[child]).is_err());
     }
 
     #[test]
