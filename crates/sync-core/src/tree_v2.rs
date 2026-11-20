@@ -410,16 +410,7 @@ pub async fn build_tree<S: ChunkStore>(
     mut entries: Vec<FileEntry>,
 ) -> Result<TreeV2Root, ChunkError> {
     entries.sort_by(FileEntry::cmp_path);
-    validate_entries(&entries)?;
-    if entries.is_empty() {
-        return Ok(empty_root());
-    }
-
-    let segments = segment_entries(&entries)?;
-    let mut leaves = Vec::with_capacity(segments.len());
-    for segment in segments {
-        leaves.push(store_leaf(store, &entries[segment.start..segment.end]).await?);
-    }
+    let leaves = store_leaf_segments(store, segment_entries(&entries)?, entries).await?;
     root_from_leaves(store, leaves).await.map(|(root, _)| root)
 }
 
@@ -443,19 +434,15 @@ pub async fn update_tree<S: ChunkStore>(
         return Ok((root.clone(), UpdateStats::default()));
     }
 
-    let mut operation_paths: Vec<&str> = changed.iter().map(|entry| entry.path.as_str()).collect();
-    operation_paths.extend(deleted.iter().map(String::as_str));
-    operation_paths.sort_unstable();
-    let first_path = operation_paths[0];
-    let last_path = operation_paths[operation_paths.len() - 1];
-
     let mut budget = TraversalBudget::default();
-    let leaves = collect_leaf_refs(store, root, &mut budget).await?;
+    let mut leaves = collect_leaf_refs(store, root, &mut budget).await?;
     if leaves.is_empty() {
-        let merged =
-            crate::tree::merge_prefix_entries(Vec::new(), changed.to_vec(), deleted.to_vec());
-        let replacement_leaves = segment_entries(&merged)?.len() as u64;
-        let next = build_tree(store, merged).await?;
+        // Deletes on an empty base have no effect, including when an upsert
+        // targets the same path. Input validation above still covers all deletes.
+        let merged = crate::tree::merge_prefix_entries(Vec::new(), changed.to_vec(), Vec::new());
+        let leaves = store_leaf_segments(store, segment_entries(&merged)?, merged).await?;
+        let replacement_leaves = leaves.len() as u64;
+        let (next, _) = root_from_leaves(store, leaves).await?;
         return Ok((
             next,
             UpdateStats {
@@ -466,6 +453,14 @@ pub async fn update_tree<S: ChunkStore>(
         ));
     }
 
+    let mut paths = changed
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .chain(deleted.iter().map(String::as_str));
+    let first = paths.next().expect("empty operation set returned above");
+    let (first_path, last_path) = paths.fold((first, first), |(min, max), path| {
+        (min.min(path), max.max(path))
+    });
     let start = mutation_start_leaf(&leaves, first_path);
     let mut end = leaves
         .partition_point(|range| range.max_path.as_str() < last_path)
@@ -502,21 +497,14 @@ pub async fn update_tree<S: ChunkStore>(
         replacement_entries.extend(appended);
     }
 
-    let mut replacement_refs = Vec::with_capacity(replacement_segments.len());
-    for segment in replacement_segments {
-        replacement_refs
-            .push(store_leaf(store, &replacement_entries[segment.start..segment.end]).await?);
-    }
+    let replacement_refs =
+        store_leaf_segments(store, replacement_segments, replacement_entries).await?;
     stats.replacement_leaves = replacement_refs.len() as u64;
 
-    let mut next_leaves =
-        Vec::with_capacity(leaves.len() - (end - start + 1) + replacement_refs.len());
-    next_leaves.extend_from_slice(&leaves[..start]);
-    next_leaves.append(&mut replacement_refs);
-    next_leaves.extend_from_slice(&leaves[end + 1..]);
-    validate_ranges(&next_leaves, 0)?;
+    leaves.splice(start..=end, replacement_refs);
+    validate_ranges(&leaves, 0)?;
 
-    let (next, internal_nodes) = root_from_leaves(store, next_leaves).await?;
+    let (next, internal_nodes) = root_from_leaves(store, leaves).await?;
     stats.internal_nodes_emitted = internal_nodes as u64;
     Ok((next, stats))
 }
@@ -986,6 +974,18 @@ fn delta_path(delta: &FileDelta) -> &str {
         | FileDelta::Deleted { path, .. }
         | FileDelta::Renamed { path, .. } => path,
     }
+}
+
+async fn store_leaf_segments<S: ChunkStore>(
+    store: &S,
+    segments: Vec<Segment>,
+    entries: Vec<FileEntry>,
+) -> Result<Vec<RangeRef>, ChunkError> {
+    let mut leaves = Vec::with_capacity(segments.len());
+    for segment in segments {
+        leaves.push(store_leaf(store, &entries[segment.start..segment.end]).await?);
+    }
+    Ok(leaves)
 }
 
 async fn store_leaf<S: ChunkStore>(

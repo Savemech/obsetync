@@ -1595,13 +1595,18 @@ mod tests {
         for budget in [1, 3, 256] {
             compare(Vec::new(), Vec::new(), Vec::new(), budget).await;
             compare(Vec::new(), Vec::new(), vec![entry(1, 0).path], budget).await;
-            compare(
+            let (updated, _) = compare(
                 Vec::new(),
                 vec![entry(1, 1), entry(0, 2), entry(1, 3)],
                 vec![entry(1, 0).path],
                 budget,
             )
             .await;
+            let expected =
+                tree_v2::build_tree(&MemoryChunkStore::new(), vec![entry(0, 2), entry(1, 3)])
+                    .await
+                    .unwrap();
+            assert_eq!(updated, expected);
             compare(
                 (0..8).map(|i| entry(i, 0)).collect(),
                 Vec::new(),
