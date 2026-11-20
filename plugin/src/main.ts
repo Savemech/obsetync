@@ -1633,8 +1633,9 @@ export default class ObsetyncPlugin extends Plugin {
         const previous = this.conflictModal;
         previous?.revoke();
         await previous?.closeAndDrain();
-        if (this.conflictModal === previous) this.conflictModal = null;
         hostToken?.assertCurrent();
+        if (this.unloaded || this.conflictModal !== previous) return;
+        this.conflictModal = null;
         const conflicts = findConflicts(this.io);
         if (conflicts.length === 0) {
             new Notice("No sync conflicts found.");

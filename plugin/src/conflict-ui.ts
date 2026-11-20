@@ -5,8 +5,6 @@ export { conflictCopyPath } from "./conflict-path";
 interface ConflictInfo {
     original: string | null;
     preservedAs: string;
-    winnerDevice?: string;
-    preservedDevice?: string;
 }
 
 /**

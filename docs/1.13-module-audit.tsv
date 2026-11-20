@@ -130,7 +130,7 @@ pending	plugin/scripts/browser-probe.test.mjs	tests	Not reviewed
 reviewed	plugin/scripts/build-identity-config.mjs	tooling	Traced Git and archive inputs through esbuild, Docker and Nix. Clean requirement rejects absent revision; explicitly injected archive state must agree with revision.
 reviewed	plugin/scripts/build-identity-config.test.mjs	tests	Checked manifest parity, commit mismatch, clean requirement and archive identity combinations including intentional local-unknown.
 reviewed	plugin/scripts/build-wasm-contract.test.mjs	tests	Read all tests; fixture now reproduces executable paths with spaces; installer tests cover both architecture aliases/native detection and each checksum failure; 26 targeted tests pass
-pending	plugin/scripts/conflict-ui-lifecycle.test.mjs	tests	Not reviewed
+reviewed	plugin/scripts/conflict-ui-lifecycle.test.mjs	tests	Read and ran stale button, drain, failure and discovery scenarios.
 read	plugin/scripts/diagnose-root-drain.mjs	tooling	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
 pending	plugin/scripts/lib/native-root-audit-diagnostic.mjs	tooling	Not reviewed
 pending	plugin/scripts/lib/native-root-auto-diagnostic.mjs	tooling	Not reviewed
@@ -193,7 +193,7 @@ reviewed	plugin/src/candidate-open-root-admission.ts	production	Traced V1/V2 par
 reviewed	plugin/src/conflict-file-verification.test.ts	tests	55 assertions with native files and BLAKE3 include acquiring a hardlink during final adapter stat, bounded feeds, cancellation, queued drift and handle cleanup.
 reviewed	plugin/src/conflict-file-verification.ts	production	Traced native independent-file proof and admitted portable reads to root conflict handling. Native pathname proof now follows final adapter stat.
 read	plugin/src/conflict-path.ts	production	Legacy timestamp naming traced through pull and push to UI discovery. Round-trip with nested directory, Unicode and sanitized device label tested; path length limits remain open.
-read	plugin/src/conflict-ui.ts	production	Traced both filename producers, modal actions and lifecycle; discovery now rejects unrelated parentheticals. Digest names may shorten the original. Discovery returns an unknown original and the modal displays these rows read-only; covered by a colliding-stem fixture.
+reviewed	plugin/src/conflict-ui.ts	production	Traced both filename producers, modal actions and lifecycle; discovery now rejects unrelated parentheticals. Digest names may shorten the original. Discovery returns an unknown original and the modal displays these rows read-only; covered by a colliding-stem fixture.
 reviewed	plugin/src/current-host-work.test.ts	tests	Read all four groups; actual admission bounds, synchronous lease revocation, sibling drain, failure aggregation and late-close behavior pass in full plugin suite
 reviewed	plugin/src/current-host-work.ts	production	Read entire bounded owner; main run/close/replacement callers traced; four owner and bundled-main enrollment/retirement suites pass; only failures crossing the captured retirement cut poison drain
 reviewed	plugin/src/debug-log.test.ts	tests	Tested layered console hooks, hostile error getter, missing/unreadable/existing logs, rotation and 2000 duplicate events during stalled IO through install/uninstall
@@ -410,7 +410,7 @@ pending	plugin/src/ws-data.test.ts	tests	Not reviewed
 pending	plugin/src/ws-data.ts	production	Not reviewed
 pending	plugin/src/ws-resume.test.ts	tests	Not reviewed
 read	plugin/src/ws.ts	production	Read complete connection-generation, foreground, encryption-chain and event lifecycle; server protocol traced; caller/test and queue-bound audit remains
-pending	plugin/styles.css	production	Not reviewed
+reviewed	plugin/styles.css	production	Matched all selectors to settings and debug modal callers.
 reviewed	plugin/tsconfig.json	configuration/schema	Enabled noUnusedLocals/noUnusedParameters; tsc and actual Nix plugin compilation pass
 reviewed	rust-toolchain.toml	configuration/schema	Local rustc 1.95.0 and wasm32 target verified; CI and release Rust setup version pins match
 pending	scripts/benchmark-hash-workers.mjs	tooling	Not reviewed

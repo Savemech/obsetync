@@ -959,7 +959,7 @@ test("prepare closes current-host admission and joins an exact stale history tai
 test("prepare revokes an open conflict modal and drains its IO before engine freeze", async () => {
     const f = fixture(), plugin = await f.started();
     f.state.conflicts = [{ path: "fixture-conflict", versions: [] }];
-    await plugin.showConflicts();
+    await Promise.all([plugin.showConflicts(), plugin.showConflicts()]);
     equal(f.conflictModals.length, 1, "Conflict command did not open exactly one owned modal");
     const modal = f.conflictModals[0];
     const ioGate = f.block("conflict1:io");
