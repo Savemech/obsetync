@@ -479,14 +479,14 @@ async function nativeErrorsParserErrorsAndCleanupPreservePrimary() {
         const stale = new Fixture(), primary = new Error("stale root export token");
         const originalToken = stale.token;
         stale.read_root_export_job = () => { stale.token++; throw primary; };
-        let replacementCancelled = false;
+        const cancelTokens: number[] = [];
         stale.cancel_tree_job = token => {
-            assert.equal(token, originalToken, "cleanup guessed the replacement owner token");
-            if (token === stale.token) replacementCancelled = true;
+            cancelTokens.push(token);
             throw new Error("matching old job no longer exists");
         };
         assert.equal(await stale.export().then(() => null, error => error), primary);
-        assert.equal(replacementCancelled, false); assert.equal(stale.budget.snapshot().usedBytes, 0);
+        assert.deepEqual(cancelTokens, [originalToken], "cleanup must target the original owner exactly once");
+        assert.equal(stale.budget.snapshot().usedBytes, 0);
 
         const dropped = new Fixture(), stepError = new Error("native step dropped poisoned job");
         dropped.step_root_export_job = () => { dropped.job = false; throw stepError; };
