@@ -194,7 +194,7 @@ which gives the client everything it needs to materialize a resolution.
 
 ## 4. Content merge and visible conflict copies
 
-For known text extensions below the 1 MiB blob threshold, the server fetches
+When the base and both edited versions of a known text file are each below 1 MiB, the server fetches
 strict UTF-8 base/A/B bytes and runs
 `sync_core::conflict::three_way_text_merge`. Non-overlapping line edits produce
 one merged content-addressed blob. Insertions preserve the adjacent base line,

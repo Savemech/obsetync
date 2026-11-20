@@ -56,11 +56,11 @@ impl StreamingChunker {
         if self.finished {
             return Err("chunker already finished");
         }
-        self.file_hasher.update(bytes);
         self.total_size = self
             .total_size
             .checked_add(bytes.len() as u64)
             .ok_or("file size overflow")?;
+        self.file_hasher.update(bytes);
         let mut remaining = bytes;
         while !remaining.is_empty() {
             // Reclaim the consumed prefix BEFORE appending. Extending first
@@ -176,13 +176,27 @@ pub fn reassemble_file(manifest: &FileManifest, chunks: &[(FileHash, Vec<u8>)]) 
         return None;
     }
 
-    let mut result = Vec::with_capacity(manifest.total_size as usize);
-
-    for (chunk_ref, (chunk_hash, chunk_data)) in manifest.chunks.iter().zip(chunks.iter()) {
-        if chunk_hash != &chunk_ref.hash || chunk_data.len() != chunk_ref.size as usize {
+    let mut total = 0usize;
+    for (reference, (hash, data)) in manifest.chunks.iter().zip(chunks) {
+        if reference.offset != total as u64
+            || reference.size == 0
+            || reference.size > MAX_CHUNK
+            || data.len() != reference.size as usize
+            || reference.hash != *hash
+            || hash_bytes(data) != *hash
+        {
             return None;
         }
-        result.extend_from_slice(chunk_data);
+        total = total.checked_add(data.len())?;
+    }
+    if manifest.total_size != total as u64 {
+        return None;
+    }
+
+    let mut result = Vec::new();
+    result.try_reserve_exact(total).ok()?;
+    for (_, data) in chunks {
+        result.extend_from_slice(data);
     }
 
     // Verify the reassembled file hash matches.
@@ -201,6 +215,21 @@ pub fn should_chunk(size: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reassembly_rejects_inconsistent_metadata_before_allocation() {
+        let file = chunk_file(b"payload");
+        let mut manifest = file.manifest.clone();
+        manifest.total_size = u64::MAX;
+        assert!(reassemble_file(&manifest, &file.chunk_data).is_none());
+        manifest = file.manifest;
+        manifest.chunks[0].offset = 1;
+        assert!(reassemble_file(&manifest, &file.chunk_data).is_none());
+        manifest.chunks[0].offset = 0;
+        let forged = hash_bytes(b"another");
+        manifest.chunks[0].hash = forged;
+        assert!(reassemble_file(&manifest, &[(forged, b"payload".to_vec())]).is_none());
+    }
 
     #[test]
     fn small_file_no_chunk() {

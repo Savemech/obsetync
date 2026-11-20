@@ -1,7 +1,7 @@
 use crate::chunk::{ChunkError, FileEntry, RootNode};
 use crate::conflict::{three_way_text_merge, FileConflict, TextMergeResult};
 use crate::content_store::ContentStore;
-use crate::fastcdc_chunker::FILE_CHUNK_THRESHOLD;
+use crate::fastcdc_chunker::should_chunk;
 use crate::hash::{hash_bytes, FileHash};
 use crate::store::ChunkStore;
 use crate::sync_rules::is_text_file;
@@ -40,8 +40,10 @@ pub struct VersionedMergeResult {
 struct TextMergeTodo {
     merged_index: usize,
     base_hash: FileHash,
-    a: FileEntry,
-    b: FileEntry,
+    base_size: u64,
+    b_hash: FileHash,
+    b_size: u64,
+    b_mtime: u64,
 }
 
 /// Three-way merge of two trees that diverged from a common ancestor.
@@ -120,25 +122,8 @@ pub async fn merge_trees<S: ChunkStore, C: ContentStore>(
         );
     }
 
-    // --- Content-level text-merge post-pass -------------------------------
-    // Every modify-modify candidate got side A provisionally; here we try a
-    // real three-way LINE merge so non-overlapping edits from both devices
-    // survive in one file. Anything ineligible or overlapping falls back to
-    // today's behavior: A stays in the tree + a FileConflict is recorded.
-    let mut text_merged = 0usize;
-    for todo in &text_todo {
-        let resolved = try_text_merge(content, todo, &mut merged_entries).await?;
-        if resolved {
-            text_merged += 1;
-        } else {
-            file_conflicts.push(FileConflict {
-                path: todo.a.path.clone(),
-                base_hash: todo.base_hash,
-                side_a_hash: todo.a.hash,
-                side_b_hash: todo.b.hash,
-            });
-        }
-    }
+    let text_merged =
+        resolve_text_merges(content, text_todo, &mut merged_entries, &mut file_conflicts).await?;
 
     // Build a new tree from merged entries.
     let mut all_entries = merged_entries;
@@ -212,19 +197,8 @@ pub async fn merge_versioned_trees<S: ChunkStore, C: ContentStore>(
         &mut text_todo,
     );
 
-    let mut text_merged = 0usize;
-    for todo in &text_todo {
-        if try_text_merge(content, todo, &mut merged_entries).await? {
-            text_merged += 1;
-        } else {
-            file_conflicts.push(FileConflict {
-                path: todo.a.path.clone(),
-                base_hash: todo.base_hash,
-                side_a_hash: todo.a.hash,
-                side_b_hash: todo.b.hash,
-            });
-        }
-    }
+    let text_merged =
+        resolve_text_merges(content, text_todo, &mut merged_entries, &mut file_conflicts).await?;
 
     merged_entries.sort();
     merged_entries.dedup_by(|left, right| left.path == right.path);
@@ -245,21 +219,42 @@ pub async fn merge_versioned_trees<S: ChunkStore, C: ContentStore>(
     })
 }
 
-/// Attempt the content-level three-way merge for one modify-modify todo.
-/// On success, patches the file's entry in `merged_entries` (hash/size/mtime)
-/// and returns true. Any ineligibility — non-text extension, either side or
-/// the merged output ≥ the chunking threshold, non-UTF-8 content, a missing
-/// blob, or overlapping edits — returns false (caller records the conflict).
+async fn resolve_text_merges<C: ContentStore>(
+    content: &C,
+    todos: Vec<TextMergeTodo>,
+    merged_entries: &mut [FileEntry],
+    conflicts: &mut Vec<FileConflict>,
+) -> Result<usize, ChunkError> {
+    let mut count = 0;
+    for todo in todos {
+        let entry = &mut merged_entries[todo.merged_index];
+        if try_text_merge(content, &todo, entry).await? {
+            count += 1;
+        } else {
+            conflicts.push(FileConflict {
+                path: entry.path.clone(),
+                base_hash: todo.base_hash,
+                side_a_hash: entry.hash,
+                side_b_hash: todo.b_hash,
+            });
+        }
+    }
+    Ok(count)
+}
+
+/// Updates the provisional entry on a successful line merge. Ineligible inputs
+/// and overlapping edits leave it intact so the caller can record a conflict.
 async fn try_text_merge<C: ContentStore>(
     content: &C,
     todo: &TextMergeTodo,
-    merged_entries: &mut [FileEntry],
+    entry: &mut FileEntry,
 ) -> Result<bool, ChunkError> {
     // v1 gates: text extensions only, small-blob storage only (files at or
     // above FILE_CHUNK_THRESHOLD live as FastCDC manifests, not blobs).
-    if !is_text_file(&todo.a.path)
-        || todo.a.size_bytes >= FILE_CHUNK_THRESHOLD
-        || todo.b.size_bytes >= FILE_CHUNK_THRESHOLD
+    if !is_text_file(&entry.path)
+        || should_chunk(todo.base_size)
+        || should_chunk(entry.size_bytes)
+        || should_chunk(todo.b_size)
     {
         return Ok(false);
     }
@@ -272,8 +267,8 @@ async fn try_text_merge<C: ContentStore>(
     };
     let (base_bytes, a_bytes, b_bytes) = match (
         optional(content.get(&todo.base_hash).await)?,
-        optional(content.get(&todo.a.hash).await)?,
-        optional(content.get(&todo.b.hash).await)?,
+        optional(content.get(&entry.hash).await)?,
+        optional(content.get(&todo.b_hash).await)?,
     ) {
         (Some(base), Some(a), Some(b)) => (base, a, b),
         _ => return Ok(false),
@@ -286,23 +281,22 @@ async fn try_text_merge<C: ContentStore>(
 
     // A merged blob crossing the chunking threshold would be stored where
     // pullers won't look (clients fetch blob-vs-manifest by size).
-    if merged.len() as u64 >= FILE_CHUNK_THRESHOLD {
+    if should_chunk(merged.len() as u64) {
         return Ok(false);
     }
 
     let merged_hash = hash_bytes(&merged);
     let merged_len = merged.len() as u64;
-    if merged_hash != todo.a.hash {
+    if merged_hash != entry.hash {
         content.put(merged_hash, merged).await?;
     }
 
-    let entry = &mut merged_entries[todo.merged_index];
     entry.hash = merged_hash;
     entry.size_bytes = merged_len;
     // max(a, b): deterministic (the root hash covers mtime, so a retried
     // merge must reproduce the same root) and never behind side A (the
     // guard's mtime-regression tripwire must not see merges as reverts).
-    entry.mtime_ms = todo.a.mtime_ms.max(todo.b.mtime_ms);
+    entry.mtime_ms = entry.mtime_ms.max(todo.b_mtime);
     Ok(true)
 }
 
@@ -357,8 +351,10 @@ fn merge_entry_lists(
                     text_todo.push(TextMergeTodo {
                         merged_index: merged.len() - 1,
                         base_hash: base.hash,
-                        a: a.clone(),
-                        b: b.clone(),
+                        base_size: base.size_bytes,
+                        b_hash: b.hash,
+                        b_size: b.size_bytes,
+                        b_mtime: b.mtime_ms,
                     });
                 }
             }
@@ -402,6 +398,7 @@ mod tests {
     use super::*;
     use crate::chunk::FileEntry;
     use crate::content_store::MemoryContentStore;
+    use crate::fastcdc_chunker::FILE_CHUNK_THRESHOLD;
     use crate::hash::hash_bytes;
     use crate::store::MemoryChunkStore;
     use crate::tree::build_tree;
@@ -832,6 +829,34 @@ mod tests {
             .unwrap();
         assert_eq!(result.text_merged_count, 0);
         assert_eq!(result.file_conflicts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn chunked_base_is_never_opened_as_a_small_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryChunkStore::new();
+        let content = crate::content_store::DiskContentStore::new(dir.path());
+        let base_hash = hash_bytes(&vec![b'x'; FILE_CHUNK_THRESHOLD as usize]);
+        let base_entry = FileEntry::new("a.md".into(), base_hash, 1, FILE_CHUNK_THRESHOLD);
+        // A directory at the unused blob address makes any attempted read fail.
+        let hex = crate::hash::hash_to_hex(&base_hash);
+        std::fs::create_dir_all(dir.path().join(&hex[..2]).join(&hex[2..])).unwrap();
+        let base = build_tree(&store, vec![base_entry], "v", "d")
+            .await
+            .unwrap();
+        let mut sides = Vec::new();
+        for bytes in [b"a", b"b"] {
+            let hash = hash_bytes(bytes);
+            content.put(hash, bytes.to_vec()).await.unwrap();
+            let entry = FileEntry::new("a.md".into(), hash, 2, 1);
+            sides.push(build_tree(&store, vec![entry], "v", "d").await.unwrap());
+        }
+        let result = merge_trees(&store, &content, &base, &sides[0], &sides[1])
+            .await
+            .unwrap();
+        assert_eq!(result.text_merged_count, 0);
+        assert_eq!(result.file_conflicts.len(), 1);
+        assert_eq!(result.file_conflicts[0].base_hash, base_hash);
     }
 
     #[tokio::test]
