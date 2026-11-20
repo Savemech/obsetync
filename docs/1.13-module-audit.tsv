@@ -243,16 +243,16 @@ reviewed	plugin/src/ignore.ts	production	Traced matcher through event capture, s
 pending	plugin/src/incremental-tree-test-abi.ts	production	Not reviewed
 reviewed	plugin/src/index-upload.test.ts	tests	Ran nine suites covering admission, export size, paging, ACK, cancellation and cleanup; exercised full local pool while compact spool remains held.
 reviewed	plugin/src/index-upload.ts	production	Traced push and repair callers, compact spool, bounded paged/legacy exports, ACK and error cleanup. Recompute headroom per pack and avoid nested waits with a retained spool.
-pending	plugin/src/journal-concurrency.test.ts	tests	Not reviewed
+reviewed	plugin/src/journal-concurrency.test.ts	tests	Reviewed real journal/store with a gated 300-group hot-endpoint ACK. Ran 11 assertions covering cooperative steps, captured visibility and newer append across compaction/reload.
 reviewed	plugin/src/journal-format.ts	production	Traced checksums, sealed and append-only replay, row limits, EOF and half-ACKs into legacy import. Removed unused compatibility projection and synchronous parser; migration consumes physical rows and ACK map directly.
 reviewed	plugin/src/journal-index.test.ts	tests	Checked generation ordering, Unicode ties, immutable captured iterators, linked renames, 10k edits and 3000 reference operations. Native journal recovery passed three runs.
 reviewed	plugin/src/journal-index.ts	production	Traced generation keys, duplicate replay, endpoint acknowledgements and sealed snapshots to journal load/append/compact. Build immutable roots directly without throwaway indexes or intermediate replacement state.
 reviewed	plugin/src/journal-legacy.ts	production	Reviewed staged/backup selection, torn-tail recovery, fingerprint and read caps. Size-only admission uses allocation-free UTF-8 counts.
-pending	plugin/src/journal-owned.test.ts	tests	Not reviewed
+reviewed	plugin/src/journal-owned.test.ts	tests	Reviewed queued reload and stale/wrong epoch, unissued cuts, exact repeated ACK and linked endpoints. Ran 15 assertions.
 read	plugin/src/journal-rename.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
 read	plugin/src/journal-semantics.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
-pending	plugin/src/journal.test.ts	tests	Not reviewed
-pending	plugin/src/journal.ts	production	Not reviewed
+reviewed	plugin/src/journal.test.ts	tests	Reviewed and ran segmented batch and restart scenarios, migration proof, corruption and failed writes. Added sparse input beside a valid edit and checked persisted generation after restart; 373 assertions passed.
+reviewed	plugin/src/journal.ts	production	Traced event/scan submissions, bounded group commit, durable ACK ownership, startup import, close and failed writes. Fixed sparse input reaching the shared writer and poisoning unrelated queued appends.
 pending	plugin/src/large-transfer.test.ts	tests	Not reviewed
 pending	plugin/src/legacy-downgrade-host.test.ts	tests	Not reviewed
 pending	plugin/src/legacy-downgrade-host.ts	production	Not reviewed

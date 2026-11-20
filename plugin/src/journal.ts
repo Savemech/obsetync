@@ -93,11 +93,12 @@ export class ObsetyncJournal {
                 throw new JournalRecoveryError("LIMIT", "journal append batch exceeds request ceiling");
             }
             if (entries.length === 0) return Promise.resolve([]);
-            const detached = entries.map(entry => {
-                const checked = validateJournalEntry({ ...entry, id: 1 });
+            const detached: NewJournalEntry[] = [];
+            for (let i = 0, count = entries.length; i < count; i++) {
+                const checked = validateJournalEntry({ ...entries[i], id: 1 });
                 const { id: _id, ...value } = checked;
-                return Object.freeze(value);
-            });
+                detached.push(Object.freeze(value));
+            }
             return this.enqueue({ kind: "append-batch", entries: Object.freeze(detached) });
         } catch (error) { return Promise.reject(error); }
     }

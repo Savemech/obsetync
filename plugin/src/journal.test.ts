@@ -157,6 +157,16 @@ async function explicitAppendBatchIsAtomicBoundedAndDetached(): Promise<void> {
     await rejects(journal.appendBatch(Array.from({ length: 257 }, (_, index) => ({
         action: "modified" as const, path: `overflow-${index}.md`, ts: index, synced: false,
     }))), "LIMIT");
+    const sparse = [inputs[1], inputs[2]];
+    delete sparse[1];
+    const [invalid, valid] = await Promise.allSettled([
+        journal.appendBatch(sparse), journal.append(inputs[3]),
+    ]);
+    check(invalid.status === "rejected" && invalid.reason instanceof JournalRecoveryError &&
+        invalid.reason.code === "CORRUPT", "sparse scan batch was accepted");
+    check(valid.status === "fulfilled" && valid.value === 257,
+        "malformed scan batch poisoned an unrelated same-turn edit");
+    check((await restart(io)).unsynced().at(-1)?.id === 257, "valid sibling edit was not durable");
     boundedFrames(io.events.slice(start));
 }
 
