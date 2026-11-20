@@ -682,10 +682,10 @@ export class AdaptiveResourceGovernor {
             measurement.activeDurationMs >= WINDOW_MIN_MS &&
             measurement.activeDurationMs >= measurement.durationMs * 0.9;
         if (!continuous) {
+            this.lastDecision = "controls held without continuous foreground evidence";
             this.rollbackWindowProbe("window interrupted or not continuously visible");
             this.resetWindowProbe();
             this.lastBottleneck = "suspended, hidden or unbounded window";
-            this.lastDecision = "controls held without continuous foreground evidence";
             return;
         }
         this.windowCooldownMs = Math.max(0, this.windowCooldownMs - measurement.activeDurationMs);
@@ -707,13 +707,13 @@ export class AdaptiveResourceGovernor {
             measurement.eventLoopLagP95Ms <= HEALTHY_LAG_MS &&
             measurement.retries === 0 && measurement.backpressureEvents === 0;
         if (!healthy || work <= 0) {
+            this.lastDecision = "controls held";
             this.rollbackWindowProbe(!healthy ? "unhealthy or unmeasured UI window" : "no comparable work");
             this.windowHealthy = 0;
             this.windowHealthyKey = null;
             this.healthyHintWindows = 0;
             this.lastBottleneck = measurement.eventLoopLagP95Ms === null
                 ? "UI latency unmeasured" : work <= 0 ? "no useful work" : "non-healthy window";
-            this.lastDecision = "controls held";
             return;
         }
 

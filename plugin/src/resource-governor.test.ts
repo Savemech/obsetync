@@ -332,6 +332,26 @@ function windowProbeRegressionRollsBackOnlyItsAxis(): void {
     assert.deepEqual(governor.snapshot().controls, initial);
 }
 
+function windowDiagnosticsPreserveActualRollback(): void {
+    for (const window of [
+        { continuousVisible: false },
+        { bytesTransferred: 0, filesCompleted: 0 },
+        { eventLoopLagP95Ms: null },
+    ]) {
+        const governor = new AdaptiveResourceGovernor({ ...SNAPDRAGON });
+        const initial = governor.snapshot().controls;
+        for (let sequence = 1; sequence <= 3; sequence++) {
+            governor.observeWindow(windowMeasurement(sequence, { demand: { read: 8 } }));
+        }
+        assert.equal(governor.snapshot().probeAxis, "read");
+        governor.observeWindow(windowMeasurement(4, window));
+        assert.deepEqual(governor.snapshot().controls, initial);
+        assert.match(governor.snapshot().decision, /read probe rollback/);
+        governor.observeWindow(windowMeasurement(5, window));
+        assert.match(governor.snapshot().decision, /controls held/);
+    }
+}
+
 function windowsRequireObservedForegroundUiDemandAndBudget(): void {
     const ineligible: Array<Partial<ResourceWindowMeasurement>> = [
         { eventLoopLagP95Ms: null },
@@ -658,6 +678,7 @@ async function run(): Promise<void> {
     windowPressureControlsIndependentAxesEvenWithoutProgress();
     flatHealthyWindowsProbeOnlyOneDemandedAxisAndRespectCaps();
     windowProbeRegressionRollsBackOnlyItsAxis();
+    windowDiagnosticsPreserveActualRollback();
     windowsRequireObservedForegroundUiDemandAndBudget();
     lifecycleChangesAndPressureCancelUnvalidatedProbes();
     memoryWindowsUseLeaseCeilingsWithoutGrowingThem();
