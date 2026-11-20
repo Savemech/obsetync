@@ -162,7 +162,7 @@ pending	plugin/scripts/test-native-ws-data.mjs	tooling	Not reviewed
 read	plugin/scripts/test-wasm-memory.mjs	tooling	Checked allocator snapshot against native counter semantics, including contradictory live allocation counts; tree component review pending
 reviewed	plugin/src/adaptive-batches.test.ts	tests	Checked eager grouping parity, refreshed limits, singleton boundaries, timed batches, cancellation by early exit and invalid inputs. Untimed batches also skip clock reads.
 reviewed	plugin/src/adaptive-batches.ts	production	Traced use in push, reconcile and pull. Each requested batch snapshots its limits and stops at the first boundary without retaining a plan for the remaining tail.
-pending	plugin/src/adaptive-transport-chaos.test.ts	tests	Not reviewed
+reviewed	plugin/src/adaptive-transport-chaos.test.ts	tests	Traced reordered replies, byte credits, cancellation, carrier choice, timeout recovery and replaced sessions. Assert real queued ownership before release and require the old message handler before replay. Node suite passes 35 assertions.
 reviewed	plugin/src/api-enrollment.test.ts	tests	New actual-API regressions cover HTTPS/prefix/admin routing, valid and malformed bundles, rejected URLs/codes and no-dispatch validation; full test chain passes
 read	plugin/src/api-memory.test.ts	tests	Traced fake encrypted transport and ran suite; added legacy item, response and repeated-hash checks; remaining scenarios pending individual review
 read	plugin/src/api-root-outcome.test.ts	tests	Added out-of-order sealed response regression covering forced refresh, channel rotation and authenticated root observation; full fixture audit pending.

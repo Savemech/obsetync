@@ -28,6 +28,10 @@ async function eventually(predicate: () => boolean, message: string): Promise<vo
     throw new Error(message);
 }
 
+function hasQueuedRequest(lane: ObsetyncWsDataLane): boolean {
+    return (lane as unknown as { creditWaiters: unknown[] }).creditWaiters.length === 1;
+}
+
 async function drainMicrotasks(): Promise<void> {
     for (let turn = 0; turn < 16; turn++) await Promise.resolve();
 }
@@ -202,8 +206,8 @@ async function reorderedFramesAndByteCreditsStaySingleOwner(): Promise<void> {
             new Uint8Array(800), WsDataFrameType.PutAck);
         const second = creditLane.request(WsDataFrameType.PutPack,
             new Uint8Array(800), WsDataFrameType.PutAck);
-        await eventually(() => creditSocket.rpcFrames.length === 1,
-            "byte-credit matrix did not send its first request");
+        await eventually(() => hasQueuedRequest(creditLane) && creditSocket.rpcFrames.length === 1,
+            "byte-credit matrix did not queue its second request");
         ok(creditSocket.rpcFrames.length === 1,
             "bounded in-flight bytes admitted a second WS request");
         creditSocket.release(creditSocket.rpcFrames[0].requestId);
@@ -241,7 +245,7 @@ async function cancelPreemptsAFullCreditWindow(): Promise<void> {
             new Uint8Array([8]),
             WsDataFrameType.CheckResult,
         ).finally(() => { controlCompletions++; });
-        await Promise.resolve();
+        await eventually(() => hasQueuedRequest(dataLane), "control did not queue behind bulk");
         ok(socket.rpcFrames.length === 1, "control bypassed the negotiated request credit");
         controller.abort();
         ok(await bulk === "WsDataCancelledError", "CANCEL changed caller-visible identity");
@@ -440,8 +444,7 @@ async function silentHalfOpenTimeoutRecoversWsWithoutAProbeStampede(): Promise<v
         }),
     )
         .finally(() => { queuedCompletions++; });
-    await eventually(() => (dataLane as unknown as { creditWaiters: unknown[] })
-        .creditWaiters.length === 1,
+    await eventually(() => hasQueuedRequest(dataLane),
     "lost-ACK fixture did not queue a real credit waiter");
     const parallel = await run("parallel", "control", async () => "stampede");
     ok(parallel === "http:parallel" &&
@@ -581,6 +584,7 @@ async function serverRestartCannotPublishAStaleSessionResult(): Promise<void> {
     const oldFrame = oldSocket.rpcFrames[0];
     const staleResponse = oldSocket.takeHeld(oldFrame.requestId);
     const staleHandler = oldSocket.onmessage;
+    if (!staleHandler) throw new Error("old socket has no message handler");
     oldSocket.disconnect();
     const result = await routed;
     ok(result[0] === 42 && httpCalls === 1 && completions === 1 &&
@@ -613,7 +617,7 @@ async function serverRestartCannotPublishAStaleSessionResult(): Promise<void> {
             "fresh session did not send its recovery probe");
         // Deliver the old session's authenticated frame while the replacement
         // request is live. It must neither settle nor poison the current lane.
-        staleHandler?.({ data: staleResponse });
+        staleHandler({ data: staleResponse });
         await drainMicrotasks();
         ok(!freshSettled && sameLane.getState() === "ready" &&
             invocations.join() === "ws:restart-op,http:restart-op,ws:fresh-session",
@@ -623,7 +627,7 @@ async function serverRestartCannotPublishAStaleSessionResult(): Promise<void> {
         ok(fresh[0] === 43 && httpCalls === 1 && freshCompletions === 1 &&
             completions === 1 && sameLane.getState() === "ready",
             "fresh post-restart session did not own the recovered result");
-        staleHandler?.({ data: staleResponse });
+        staleHandler({ data: staleResponse });
         await Promise.resolve();
         ok(sameLane.getState() === "ready" && router.snapshot().circuit === "closed" &&
             invocations.join() === "ws:restart-op,http:restart-op,ws:fresh-session",
