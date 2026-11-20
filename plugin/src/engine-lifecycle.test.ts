@@ -29,10 +29,10 @@ function gate() {
     return { started, resolve, reject, wait: async () => { entered(); await completion; } };
 }
 function observe<T>(work: Promise<T>) {
-    const state: { settled: boolean; error?: unknown; value?: T } = { settled: false };
-    const done = work.then(value => { state.settled = true; state.value = value; },
+    const state: { settled: boolean; error?: unknown } = { settled: false };
+    const done = work.then(() => { state.settled = true; },
         error => { state.settled = true; state.error = error; });
-    return { state, done };
+    return { state, done, work };
 }
 const turn = () => new Promise<void>(resolve => setImmediate(resolve));
 
@@ -43,12 +43,11 @@ async function fixture() {
     const adapter = new MemorySegmentedIO();
     const refs = new Set<{ event: string; callback: (...args: any[]) => Promise<void> }>();
     const registration = { before: undefined as undefined | ((event: string) => void) };
-    const events: string[] = [];
-    const cachedRoots: Uint8Array[] = [];
+    let cachedRoot: Uint8Array | undefined;
     const app = {
         vault: {
             adapter: Object.assign(adapter, { writeBinary: async (_path: string, data: ArrayBuffer) => {
-                cachedRoots.push(new Uint8Array(data).slice()); events.push("root-cache");
+                cachedRoot = new Uint8Array(data).slice();
             } }),
             on: (event: string, callback: (...args: any[]) => Promise<void>) => {
                 registration.before?.(event);
@@ -94,7 +93,7 @@ async function fixture() {
             },
             commit_candidate: () => {
                 if (!candidate) throw new Error("missing candidate");
-                state.commits++; events.push(`${name}:candidate-commit`);
+                state.commits++;
                 committed = candidate; candidate = null;
                 return { before: 1, reachable: 1, removed: 0, after: 1 };
             },
@@ -109,12 +108,11 @@ async function fixture() {
             checkContent: async () => [],
             closeDataLane: () => { state.laneCloses++; },
             putRoot: async (_vault: string, data: Uint8Array) => {
-                state.roots++; events.push(`${name}:root-sent`);
+                state.roots++;
                 const accepted = new Map<string, Entry>(JSON.parse(new TextDecoder().decode(data)));
                 const acceptedRoot = rootFor(accepted);
                 server.hash = accepted.get(PATH)!.hash; server.root = acceptedRoot;
                 await state.beforeRootAnswer?.();
-                events.push(`${name}:root-answer`);
                 return { root_hash: acceptedRoot, conflicts: [] };
             },
         };
@@ -145,7 +143,8 @@ async function fixture() {
         return { engine, state };
     };
     return {
-        adapter, app, base, journal, source, server, events, refs, registration, cachedRoots, create,
+        adapter, base, journal, source, server, refs, registration, create,
+        get cachedRoot() { return cachedRoot; },
         queue: async (engine: any, version: number) => {
             source.version = version;
             const id = await journal.append({ action: "modified", path: PATH, ts: version, synced: false });
@@ -247,6 +246,8 @@ async function drainWaitsForRootBaseAndJournalNativeSettlement(): Promise<void> 
         const cold = await f.cold();
         check(f.server.hash === hashFor(3) && cold.base.getHash(PATH) === hashFor(3) && cold.journal.unsyncedCount() === 0,
             "joined replacement still allowed old metadata to overwrite newer B");
+        check(f.cachedRoot !== undefined && hash(f.cachedRoot) === f.server.root,
+            "replacement left an older root in the local cache");
         await stopAndDrain(a.engine);
     } finally { root.resolve(); base.resolve(); ack.resolve(); f.close(); }
 }
@@ -313,7 +314,7 @@ async function startedCaptureIsDrainedThroughItsNativeAppend(): Promise<void> {
             await turn();
             check(!drained.state.settled && !callback.state.settled,
                 "drain completed while a registered local callback still owned a native append");
-            append.resolve(); await Promise.all([callback.done, drained.done]);
+            append.resolve(); await Promise.all([callback.done, drained.work]);
             check(a.engine.pendingChanges.size === 1 && a.engine.localEventsInFlight.size === 0,
                 "started callback lost its dirty hint or leaked its local guard after stop");
             const pending = a.engine.pendingChanges.take();
@@ -383,7 +384,7 @@ async function quiescenceCapturesEditsWhileAcceptedRootFinishes(): Promise<void>
         await modify(fileAt(PATH, 3));
         check(!drained.state.settled && a.engine.pendingChanges.has(PATH) && f.journal.unsynced()[0]?.id === 2,
             "capture during quiescence was lost or runtime drained before root completion");
-        root.resolve(); await Promise.all([pushing.done, drained.done]);
+        root.resolve(); await Promise.all([pushing.work, drained.work]);
         check(f.journal.unsyncedCount() === 1 && f.journal.unsynced()[0].id === 2,
             "old accepted root ACK erased the edit captured during quiescence");
         const b = f.create("B", false, { vaultId: "changed-remote-vault", ignores: ["ignored/"] });
@@ -416,7 +417,7 @@ async function overlappingEchoAndThirdReplacementKeepLatestCapture(): Promise<vo
         const bDrained = observe(b.engine.quiesceAndDrain()); await turn();
         check(!firstHandoff.state.settled && !bDrained.state.settled,
             "third replacement could bypass the inherited old native callback");
-        nativeRead.resolve(); await Promise.all([oldCallback.done, firstHandoff.done, bDrained.done]);
+        nativeRead.resolve(); await Promise.all([oldCallback.done, firstHandoff.work, bDrained.work]);
         check(b.engine.localEventsInFlight.size === 0, "settled echo callback leaked a shared path guard");
         const current = b.engine.pendingChanges.capture().get(PATH);
         check(current && b.engine.recentLocalUpserts.matches(current),
@@ -449,7 +450,7 @@ async function failedRenameAppendKeepsUncertainLinksAcrossHandoff(): Promise<voi
         await nativeAppend.started;
         const b = f.create("B", false); const transferred = observe(handoff(a.engine, b.engine));
         await turn(); check(!transferred.state.settled, "handoff omitted uncertain native rename append");
-        nativeAppend.resolve(); await Promise.all([callback.done, transferred.done]);
+        nativeAppend.resolve(); await Promise.all([callback.done, transferred.work]);
         const queued = b.engine.pendingChanges.take(); b.engine.pendingChanges.restore(queued);
         check(queued.length === 2 && queued.every((hint: any) => hint.journalId === undefined),
             "failed rename handoff lost an endpoint or invented durable IDs");
@@ -491,7 +492,7 @@ async function failedNextRegistrationBridgesItsStartedCallbackToRetry(): Promise
         const cDrained = observe(c.engine.quiesceAndDrain()); await turn();
         check(!retry.state.settled && !cDrained.state.settled,
             "retry C bypassed callback ownership admitted by failed replacement B");
-        nativeAppend.resolve(); await Promise.all([failedCallback!.done, retry.done, cDrained.done]);
+        nativeAppend.resolve(); await Promise.all([failedCallback!.done, retry.work, cDrained.work]);
         check(c.engine.pendingChanges.has(PATH) && f.journal.unsyncedCount() === 1 && c.engine.localEventsInFlight.size === 0,
             "failed-B callback result was lost or leaked after retry handoff C");
     } finally { nativeAppend.resolve(); f.registration.before = undefined; f.close(); }
@@ -534,7 +535,7 @@ async function stopInsideRealJournalReplayKeepsItsDurableRemainder(): Promise<vo
             check(!drained.state.settled, "reentrant stop did not own the currently executing replay");
         };
         const preparing = observe(withUi(() => b.engine.prepareLocal()));
-        await preparing.done; if (drained) await drained.done;
+        await preparing.done; if (drained) await drained.work;
         check(enteredAtYield && (preparing.state.error as Error)?.name === "AbortError" && !b.engine.localPrepared,
             "real replay did not abort at its bounded yield after stop");
         const cold = await f.cold();
