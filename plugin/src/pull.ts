@@ -604,11 +604,10 @@ async function pullPagedIfSupported(
     let localDeferredCount = 0;
     let remoteOmissionCount = 0;
     let durableCursorAllowed = true;
-    let processedPageThisRun = false;
     // Any checkpoint recovered at entry may cover pages which this volatile
     // tree never observed in this renderer. Even when later pages are processed
     // now, only a base-derived replacement proves the full resumed prefix.
-    let requiresTreeRebuild = checkpoint !== null;
+    const requiresTreeRebuild = checkpoint !== null;
 
     if (localRootHash === null) {
         onProgress?.("first sync: downloading paged snapshot...");
@@ -633,7 +632,6 @@ async function pullPagedIfSupported(
             }
             return undefined;
         }
-        processedPageThisRun = true;
         if (toRoot === null) toRoot = page.toRoot;
         if (page.toRoot !== toRoot) throw new Error("paged diff target changed mid-snapshot");
         if (localRootHash === null && syncBase.setVerifiedBaseRequired(true)) {
@@ -735,15 +733,6 @@ async function pullPagedIfSupported(
     }
 
     if (!toRoot) throw new Error("completed paged diff has no target root");
-    if (!processedPageThisRun) {
-        // Restart after the final cursor append: no delta remains with which
-        // to advance a non-empty stale cached tree. Signal the engine's
-        // admitted full replacement from WAL-recovered sync-base instead of
-        // treating rebaseTree(..., []) as a rebuild (it is intentionally a
-        // no-op for a populated tree).
-        requiresTreeRebuild = true;
-    }
-
     const rootBytes = await candidate.getRootAt.call(api, vaultId, toRoot, perf);
     if (!rootBytes) throw new Error("paged diff snapshot root expired before completion");
     if (wasm) {

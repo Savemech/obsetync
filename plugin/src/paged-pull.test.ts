@@ -124,7 +124,7 @@ async function rendererKillResumesAfterDurablePage(): Promise<void> {
     }
     check(killed, "first pull did not stop at injected renderer kill");
     check(firstBase.getHash("a.md") === hashA, "first page entry was not applied");
-    check(firstBase.diffPageCheckpoint?.nextCursorHex !== null, "first page cursor was not durable");
+    check(firstBase.diffPageCheckpoint?.nextCursorHex === diffCursorToHex(cursor), "first page cursor was not durable");
     const headPath = `${SYNC_BASE_STORE_PATH}/head.json`;
     const head = readStoreTestFrame(adapter, headPath);
     const referencedRows: Array<{ path: string; row: any }> = [];
@@ -249,6 +249,18 @@ async function rendererKillResumesAfterDurablePage(): Promise<void> {
     } as any;
     const staleCompletedTree = makeTree(targetRoot);
     staleCompletedTree.build_from_entries(JSON.stringify([{ path: "stale.md" }]));
+    for (const rootBytes of [null, new Uint8Array([8])]) {
+        const badApi = { ...completedApi, getRootAt: async () => rootBytes };
+        const checkingWasm = { ...wasm, wasm_root_hash_from_bytes: () => sourceRoot };
+        const expected = rootBytes ? "failed hash verification" : "expired before completion";
+        let error: unknown;
+        try {
+            await pull(badApi, io as any, completedBase, "vault", sourceRoot, checkingWasm, staleCompletedTree);
+        } catch (caught) { error = caught; }
+        check(String(error).includes(expected), "unverified resumed root passed final verification");
+        check(completedBase.diffPageCheckpoint?.toRoot === targetRoot,
+            "failed verification discarded the pinned target");
+    }
     const completedResult = await pull(
         completedApi,
         io as any,

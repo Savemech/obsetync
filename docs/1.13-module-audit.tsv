@@ -272,7 +272,7 @@ reviewed	plugin/src/object-confirmation-store.test.ts	tests	Verified concurrent 
 reviewed	plugin/src/object-confirmation-store.ts	production	Removed full-set copies during same-generation retention; traced serialized writer and push consumers; store, prepared push and transaction suites passed
 reviewed	plugin/src/operation-checkpoint.test.ts	tests	Reviewed progress coalescing, barrier ordering, cancellation by replacement and IO errors; injected promotion/cleanup failures and invalid persisted timestamps across restarts
 reviewed	plugin/src/operation-checkpoint.ts	production	Traced serialized marker lifecycle, startup hold and governor use; preserve sole copy on failed archive, deduplicate successful promotion after failed cleanup, distinguish caught failures and validate renderable timestamps
-reviewed	plugin/src/paged-pull.test.ts	tests	Checked renderer restart, torn or unpublished WAL data, immutable root verification and retirement before cursor persistence. All 56 fixture assertions passed.
+reviewed	plugin/src/paged-pull.test.ts	tests	Checked renderer restart, torn or unpublished WAL data, immutable root verification and retirement before cursor persistence. All 60 fixture assertions passed, including expired and mismatched final roots.
 pending	plugin/src/perf-governor.test.ts	tests	Not reviewed
 pending	plugin/src/perf-overhead.bench.ts	tooling	Not reviewed
 pending	plugin/src/perf-trace.test.ts	tests	Not reviewed
@@ -294,7 +294,7 @@ reviewed	plugin/src/priority-sort.ts	production	Traced synchronous and reviewed 
 reviewed	plugin/src/pull-echo.test.ts	tests	Checked matching and mismatching bytes, renames, expiration, renewal and backward wall-clock movement. All 14 assertions pass.
 reviewed	plugin/src/pull-echo.ts	production	Traced registration through pull and local event consumption. Prune expired prefixes during registration and move renewals to the tail. Live checks still validate each requested path.
 read	plugin/src/pull.test.ts	tests	Checked crash-resumed rename and same-size target fixtures. Added two live edits during adapter lookups and ran the pull suite. Other scenarios remain under review.
-read	plugin/src/pull.ts	production	Traced paged snapshot ordering, deferred checkpoints and final root verification. Checked live rename guards across target lookup and post-move stat. Content progress excludes deferred writes and reports retried outcomes. Size partitioning preserves modifications-first order. Expired snapshots and remaining apply paths need review.
+read	plugin/src/pull.ts	production	Traced paged snapshot ordering, deferred checkpoints and final root verification. Checked live rename guards across target lookup and post-move stat. Content progress excludes deferred writes and reports retried outcomes. Size partitioning preserves modifications-first order. Verified missing/mismatched final roots fail closed with pinned target and resume from a completed checkpoint requires rebuild. Remaining apply paths need review.
 reviewed	plugin/src/push-memory.test.ts	tests	Executed mobile/desktop budget tests covering whole and ranged reads, backing allocations, per-worker feed costs, WS floor and grouping capacity.
 reviewed	plugin/src/push-memory.ts	production	Traced grouping, normal and ranged worksets through push and reconciliation; counted worker demand in the size pass; four focused suites passed
 pending	plugin/src/push-prepared.test.ts	tests	Not reviewed
