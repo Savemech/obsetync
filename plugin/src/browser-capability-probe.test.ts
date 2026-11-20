@@ -116,6 +116,15 @@ async function tests(): Promise<void> {
     assert.equal((await stopped.run(controller.signal)).code, "CANCELLED");
     assert.equal(stopped.cleanup().starts, 0);
 
+    const pendingStart = fixture();
+    const page = new AbortController();
+    const beforeAdmission = transientMemorySnapshot().usedBytes;
+    const pendingReport = pendingStart.run(page.signal);
+    page.abort("pagehide");
+    assert.equal((await pendingReport).code, "INTERRUPTED");
+    assert.deepEqual(pendingStart.cleanup(), { starts: 0, terminations: 0, revocations: 0 });
+    assert.equal(transientMemorySnapshot().usedBytes, beforeAdmission);
+
     const lease = await reserveTransientWorkset(transientMemorySnapshot().capacityBytes);
     try {
         const queued = fixture();

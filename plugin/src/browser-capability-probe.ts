@@ -100,6 +100,7 @@ export async function runBrowserCapabilityProbe(options: {
     let cancel: (() => void) | undefined;
     try {
         report.code = await new Promise<BrowserProbeCode>(resolve => {
+            if (signal.aborted) { resolve(abortCode()); return; }
             let settled = false;
             let phase: "ready" | "result" | "released" = "ready";
             const finish = (code: BrowserProbeCode) => {

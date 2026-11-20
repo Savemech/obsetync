@@ -126,7 +126,7 @@ read	plugin/scripts/bench-native-root.mjs	tooling	Removed obsolete debounce mock
 reviewed	plugin/scripts/bench-prepared-manifest.mjs	tooling	Traced worker instrumentation and replay fixture. Join plan retirement before reopening. Three paired 64 MiB runs matched every chunk and read every source byte with one SIMD worker.
 reviewed	plugin/scripts/bench-sync-base.mjs	tooling	Ran three 25k-entry seed/cold-process pairs. Fixed producer exceeding the bounded queue and disk enumeration racing maintenance. Schema 2 identifies incremental checkpoints.
 reviewed	plugin/scripts/browser-hash-worker.test.mjs	tests	Read and ran minified browser entry with actual modules, transferred input ownership, successful SIMD/scalar and failed self-test outcomes
-pending	plugin/scripts/browser-probe.test.mjs	tests	Not reviewed
+reviewed	plugin/scripts/browser-probe.test.mjs	tests	Reviewed packaged worker round-trip, actual scalar and SIMD module transfer and fixture hash assertions; Node worker harness passed
 reviewed	plugin/scripts/build-identity-config.mjs	tooling	Traced Git and archive inputs through esbuild, Docker and Nix. Clean requirement rejects absent revision; explicitly injected archive state must agree with revision.
 reviewed	plugin/scripts/build-identity-config.test.mjs	tests	Checked manifest parity, commit mismatch, clean requirement and archive identity combinations including intentional local-unknown.
 reviewed	plugin/scripts/build-wasm-contract.test.mjs	tests	Read all tests; fixture now reproduces executable paths with spaces; installer tests cover both architecture aliases/native detection and each checksum failure; 26 targeted tests pass
@@ -170,14 +170,14 @@ read	plugin/src/api.ts	production	HTTPS retained; enrollment URL/code/bundle val
 reviewed	plugin/src/binary.ts	production	Traced adapter, append, HTTP and WS consumers; whole ordinary buffers retain identity, shared views copy to an exact ordinary ArrayBuffer. Covered by platform tests.
 reviewed	plugin/src/bounded-append.test.ts	tests	Checked legacy prefix drift, metadata races, budget and cancellation. Added gated native write rejection with a subarray; parent close retains budget until rejection and no adjacent bytes are passed.
 reviewed	plugin/src/bounded-append.ts	production	Traced native and legacy paths through PlatformIO, large pull staging and conflict copies. Checked exact views, fallback limit and stat fences, reservation lifetime and native error propagation.
-pending	plugin/src/browser-capability-probe.test.ts	tests	Not reviewed
-pending	plugin/src/browser-capability-probe.ts	production	Not reviewed
+reviewed	plugin/src/browser-capability-probe.test.ts	tests	Reproduced unnecessary worker on immediate pagehide; verified no startup and full admission release alongside interruption and transfer coverage
+reviewed	plugin/src/browser-capability-probe.ts	production	Reviewed admission, cancellation, transfer, timeout and cleanup; recheck aborted signal before allocating worker after admission
 reviewed	plugin/src/browser-hash-worker-entry.ts	production	Read init, cancellation, feed, heap checks and buffer return; actual SIMD and forced scalar qualify; failed qualification cannot process subsequent files
 reviewed	plugin/src/browser-hash-worker-protocol.ts	production	Traced fixture/hash and byte/feed bounds across worker, pool and push; real module transfer/hash parity and host lifecycle tests pass
 pending	plugin/src/browser-hash-workers.test.ts	tests	Not reviewed
 reviewed	plugin/src/browser-hash-workers.ts	production	Read worker qualification, transfers, cancellation, fallback and disposal; removed write-only detached-buffer field; npm test worker ownership cases pass; real browser gate remains
 read	plugin/src/browser-probe-entry.ts	production	Read single-run validation, scalar/SIMD initialization, synthetic digest and transfer-back; generated glue receives embedded bytes; browser fixture passes, physical iPad unverified
-pending	plugin/src/browser-probe-protocol.ts	production	Not reviewed
+reviewed	plugin/src/browser-probe-protocol.ts	production	Traced synthetic fixture, buffer limits and message types through worker and host; packaged worker round-trip passed
 reviewed	plugin/src/build-identity-contract.ts	production	Read embedded identity and comparison; version mismatch, dirty and local-unknown diagnostics tested. Build-time and runtime checks share a strict prerelease and metadata identifier validator.
 reviewed	plugin/src/build-identity.test.ts	tests	Read identity, protocol and diagnostic assertions; prerelease identifiers, numeric leading zeros and empty components covered.
 reviewed	plugin/src/build-identity.ts	production	Traced four compile-time defines through esbuild to debug and startup diagnostics. Source-only harness uses visibly unverified local fallback.
