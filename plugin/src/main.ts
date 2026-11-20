@@ -1682,8 +1682,11 @@ export default class ObsetyncPlugin extends Plugin {
             catch { return; }
             if (this.unloaded || generation !== this.syncInitGeneration) return;
             const workers = this.hashWorkers;
-            await workers?.closeAndDrainNative();
-            await this.syncEngine?.quiesceAndDrain();
+            const engine = this.syncEngine;
+            await settleRuntimeOwners([
+                startRuntimeOwner(() => workers?.closeAndDrainNative()),
+                startRuntimeOwner(() => engine?.quiesceAndDrain()),
+            ]);
             if (this.hashWorkers === workers) this.hashWorkers = null;
             if (this.unloaded || generation !== this.syncInitGeneration) return;
             throw error;

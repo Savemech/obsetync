@@ -1030,6 +1030,42 @@ test("settings scope changes across WASM, cache and negotiation never activate m
     }
 });
 
+test("startup failure closes engine admission while its worker is still draining", async () => {
+    const f = fixture({ workers: true }), plugin = await f.loaded();
+    const startup = f.block("engine1:start"), worker = f.block("pool1:native");
+    const failure = new Error("fixture startup failure"), pending = observe(plugin.initSync());
+    await f.waitFor("engine1:start");
+    startup.reject(failure);
+    await f.waitFor("pool1:native");
+    try {
+        check(f.engines[0].isStopped(), "Failed startup kept engine admission open during worker cleanup");
+        check(!pending.done, "Startup returned before the worker drain");
+    } finally { worker.resolve(); }
+    await Promise.allSettled([pending.promise]);
+    equal(pending.error, failure, "Startup did not preserve its original error after cleanup");
+    await f.unload(plugin);
+});
+
+test("worker cleanup failure still waits for the failed engine to drain", async () => {
+    const f = fixture({ workers: true }), plugin = await f.loaded();
+    const startup = f.block("engine1:start"), worker = f.block("pool1:native"), engine = f.block("engine1:native");
+    const cleanupFailure = new Error("fixture worker drain failed"), pending = observe(plugin.initSync());
+    await f.waitFor("engine1:start");
+    startup.reject(new Error("fixture startup failure"));
+    await f.waitFor("pool1:native");
+    worker.reject(cleanupFailure);
+    await nextTurn();
+    try {
+        check(f.engines[0].isStopped(), "Worker failure skipped engine cleanup");
+        check(!pending.done, "Worker failure abandoned the outstanding engine drain");
+    } finally { engine.resolve(); }
+    await Promise.allSettled([pending.promise]);
+    equal(pending.error, cleanupFailure, "Failed cleanup was reported as successful");
+    f.absent("tree1:free");
+    plugin.onunload();
+    await assert.rejects(plugin.retirement, error => error === cleanupFailure);
+});
+
 test("reinitialization joins engine and native worker owners before free, handoff, reload and activation", async () => {
     const f = fixture({ workers: true });
     const plugin = await f.started();
