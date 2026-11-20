@@ -203,12 +203,18 @@ async function publicationVisibilityAndClose(): Promise<void> {
 }
 
 async function faultedPublicationRetainsOnlyWholeCuts(): Promise<void> {
-    const seed = await fixture(); await seed.plan.retain(input());
+    const oldInput = input();
+    const newInput = input({ chunks: 300, generation: 2 });
+    newInput.baseRoot = digest(100);
+    newInput.manifest.chunks[0].hash = digest(900);
+    const oldRecord = { ...structuredClone(oldInput), mutationId: 1 };
+    const newRecord = { ...structuredClone(newInput), mutationId: 2 };
+    const seed = await fixture(); await seed.plan.retain(oldInput);
     const disk = seed.io.snapshot();
     const referenceIO = new MemorySegmentedIO(disk);
     const reference = await reopened(referenceIO);
     const start = referenceIO.events.length;
-    await reference.retain(input({ chunks: 300, generation: 2 }));
+    await reference.retain(newInput);
     const boundaries = referenceIO.events.slice(start).length;
     let rejected = 0, acceptedMaintenance = 0;
     for (let target = 0; target < boundaries; target++) {
@@ -217,7 +223,7 @@ async function faultedPublicationRetainsOnlyWholeCuts(): Promise<void> {
         let index = 0, hit = false;
         io.onBoundary = () => { if (index++ === target) { hit = true; throw storeTestIOError(); } };
         let failed = false;
-        try { await plan.retain(input({ chunks: 300, generation: 2 })); } catch { failed = true; }
+        try { await plan.retain(newInput); } catch { failed = true; }
         check(hit, "prepared publication fault missed its intended boundary");
         io.onBoundary = undefined;
         if (failed) {
@@ -231,11 +237,8 @@ async function faultedPublicationRetainsOnlyWholeCuts(): Promise<void> {
         } else acceptedMaintenance++;
         const restored = await reopened(io);
         const actual = restored.lookup(SCOPE, "prepared.md")!;
-        check(actual.mutationId === 1 || actual.mutationId === 2, "recovery invented a prepared mutation ID");
-        check(actual.manifest.chunks.length === (actual.mutationId === 1 ? 2 : 300) &&
-            actual.manifest.chunks.every((chunk, i) => chunk.hash === digest(i + 10) && chunk.offset === i * 3 && chunk.size === 3),
-            "fault recovery exposed a partial or mixed manifest cut");
-        if (!failed) check(actual.mutationId === 2, "successful retain did not recover its accepted manifest");
+        const expected = failed && actual.mutationId === 1 ? oldRecord : newRecord;
+        same(actual, expected, `fault at boundary ${target} recovered an incomplete or unexpected manifest`);
     }
     check(rejected > 0, "publication failure matrix never exercised an authoritative rejection");
     console.log(`transfer-plan fault matrix: ${rejected} rejected boundaries, ${acceptedMaintenance} accepted maintenance faults`);

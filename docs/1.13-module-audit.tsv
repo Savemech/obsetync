@@ -372,7 +372,7 @@ reviewed	plugin/src/sync-status.ts	production	Traced main presenter, fallback pu
 read	plugin/src/sync.ts	production	Automatic push and lifecycle paths traced; removed unused debounce seam; actual coalescer regression and engine suites pass; remaining engine paths pending
 reviewed	plugin/src/transfer-plan-scope.test.ts	tests	Validated enrollment, policy, version separation, concurrent callers sharing a failure and successful retry on the same runtime.
 reviewed	plugin/src/transfer-plan-scope.ts	production	Traced capture and per-tree promise cache through engine construction; failed digests now release their cache slot for retry.
-pending	plugin/src/transfer-plan.test.ts	tests	Not reviewed
+reviewed	plugin/src/transfer-plan.test.ts	tests	Reviewed generation and scope isolation, admission, queue closure, recovery proof, corruption and fault injection. All 58 publication boundaries compare full recovered inputs including changed first chunk and base root. Focused runner passes 670 assertions.
 reviewed	plugin/src/transfer-plan.ts	production	Traced admission, immutable publication, queue drain, migration proof, snapshot and WAL recovery. Reject per-record retained and queued byte overruns at header decode. Transfer-plan 734 assertions, mobile reuse and push-prepared 384 assertions pass.
 pending	plugin/src/transient-memory.test.ts	tests	Not reviewed
 pending	plugin/src/transient-memory.ts	production	Not reviewed
