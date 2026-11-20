@@ -43,10 +43,16 @@ export function planPushMemory(
     let contentBytes = 0;
     let manifestBytes = 0;
     let largestSingle = 0;
+    let workerFiles = 0;
+    let workerChunkers = 0;
     for (const file of files) {
         if (!Number.isSafeInteger(file.size) || file.size < 0 ||
             (file.backingBytes !== undefined && (!Number.isSafeInteger(file.backingBytes) || file.backingBytes < file.size))) {
             throw new RangeError("invalid push source size");
+        }
+        if (file.worker || file.ranged) {
+            workerFiles++;
+            if (file.chunked) workerChunkers++;
         }
         if (file.ranged) {
             retainedRangeBytes += Math.min(file.size, rangeQueueBytes);
@@ -77,17 +83,15 @@ export function planPushMemory(
         feedBytes: tuning.maxFeedBytes,
         transportPayloadBytes,
     });
-    const workerFeeds = Math.min(tuning.readConcurrency,
-        files.filter(file => file.worker || file.ranged).length);
+    const workerFeeds = Math.min(tuning.readConcurrency, workerFiles);
     // Worker fixed heaps remain outside this ledger, but each running job's
     // native feed + WASM bridge buffer belongs to this admitted workset.
     const extraFeeds = 2 * tuning.maxFeedBytes * Math.max(0, workerFeeds - 1);
     estimate.ownerBytes += extraFeeds;
     // Hash/chunker and upload are separate phases. Lend the reusable transport
     // quota to chunkers instead of pretending both peaks happen simultaneously.
-    const concurrentChunkers = Math.max(1, Math.min(tuning.readConcurrency,
-        files.filter(file => file.chunked && (file.worker || file.ranged)).length));
-    if (files.some(file => file.chunked)) {
+    if (manifestBytes > 0) {
+        const concurrentChunkers = Math.max(1, Math.min(tuning.readConcurrency, workerChunkers));
         estimate.workBytes = Math.max(estimate.workBytes, concurrentChunkers * PUSH_CHUNKER_WORK_BYTES);
     }
     estimate.totalBytes = estimate.ownerBytes + estimate.workBytes;
