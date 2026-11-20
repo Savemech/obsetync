@@ -2,6 +2,7 @@ import type { HashRuntime } from "./hash-runtime";
 import {
     ResourceBudget,
     ResourceBudgetClosedError,
+    ResourceBudgetUnavailableError,
     type ResourceBudgetSnapshot,
     type ResourceReservation,
     type ShrinkableResourceReservation,
@@ -31,6 +32,15 @@ function byteCount(value: number, name: string, allowZero = false): number {
         throw new RangeError(`${name} must be a ${allowZero ? "non-negative" : "positive"} safe integer`);
     }
     return value;
+}
+
+function reserveTransferBytes(budget: ResourceBudget, bytes: number, options: { signal?: AbortSignal; wait?: boolean }) {
+    const reservation = budget.reserve(bytes, options);
+    if (options.wait !== false) return reservation;
+    return reservation.catch(error => {
+        if (error instanceof ResourceBudgetUnavailableError) throw new SyncMemoryUnavailableError("transfer", bytes);
+        throw error;
+    });
 }
 
 /** One policy/accounting pool for admitted source and transfer worksets.
@@ -64,15 +74,8 @@ export class TransientMemoryBudget {
     }
 
     async reserve(bytes: number, options: { signal?: AbortSignal; wait?: boolean } = {}): Promise<ShrinkableResourceReservation> {
-        if (options.wait === false) {
-            throwIfWorkAborted(options.signal);
-            const pool = this.budget.snapshot();
-            if (!pool.closed && bytes <= pool.capacityBytes && (pool.queuedRequests || bytes > pool.availableBytes)) {
-                throw new SyncMemoryUnavailableError("transfer", bytes);
-            }
-        }
         const requiresSharedGrant = this.arbiter !== undefined;
-        const local = await this.budget.reserve(bytes, options);
+        const local = await reserveTransferBytes(this.budget, bytes, options);
         let shared: SyncMemoryLease | undefined;
         try {
             if (requiresSharedGrant && !this.arbiter) throw new ResourceBudgetClosedError();
@@ -288,9 +291,9 @@ class OwnedTransientWorkScope implements TransientWorkScope {
         this.workBudget = new ResourceBudget({ capacityBytes: workBytes });
     }
 
-    async reserve(bytes: number, options: { signal?: AbortSignal } = {}): Promise<ResourceReservation> {
+    async reserve(bytes: number, options: { signal?: AbortSignal; wait?: boolean } = {}): Promise<ResourceReservation> {
         if (this.ownerClosed) throw new ResourceBudgetClosedError();
-        const lease = await this.workBudget.reserve(bytes, options);
+        const lease = await reserveTransferBytes(this.workBudget, bytes, options);
         let released = false;
         return {
             bytes: lease.bytes,

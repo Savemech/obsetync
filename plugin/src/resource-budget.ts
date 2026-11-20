@@ -46,6 +46,13 @@ export class ResourceBudgetOversizedError extends RangeError {
     }
 }
 
+export class ResourceBudgetUnavailableError extends Error {
+    constructor() {
+        super("resource reservation cannot be granted immediately");
+        this.name = "ResourceBudgetUnavailableError";
+    }
+}
+
 export class ResourceBudgetQueueFullError extends Error {
     constructor() {
         super("resource reservation queue is full");
@@ -122,7 +129,7 @@ export class ResourceBudget {
         );
     }
 
-    reserve(bytes: number, options: { signal?: AbortSignal } = {}): Promise<ShrinkableResourceReservation> {
+    reserve(bytes: number, options: { signal?: AbortSignal; wait?: boolean } = {}): Promise<ShrinkableResourceReservation> {
         try { positiveBytes(bytes, "reservation bytes"); }
         catch (error) { return Promise.reject(error); }
         if (options.signal?.aborted) return Promise.reject(abortReason(options.signal));
@@ -135,6 +142,7 @@ export class ResourceBudget {
             // the same free bytes while their await continuations are queued.
             return Promise.resolve(this.grant(bytes));
         }
+        if (options.wait === false) return Promise.reject(new ResourceBudgetUnavailableError());
         if (this.queue.length >= this.maxQueuedRequests ||
             bytes > this.maxQueuedBytes - this.queuedBytes) {
             return Promise.reject(new ResourceBudgetQueueFullError());

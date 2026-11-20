@@ -17,7 +17,7 @@ import {
     withHashSource,
 } from "./hash-source-budget";
 import { ResourceBudget, ResourceBudgetClosedError, ResourceBudgetOversizedError } from "./resource-budget";
-import { SyncMemoryArbiter } from "./sync-memory-arbiter";
+import { SyncMemoryArbiter, SyncMemoryUnavailableError } from "./sync-memory-arbiter";
 
 let assertions = 0;
 const check = (condition: unknown, message: string) => {
@@ -136,6 +136,21 @@ async function queuedScopeKeepsItsOriginalQuotaAndSignal(): Promise<void> {
     original.abort(reason);
     check(await cancelled === reason && budget.snapshot().usedBytes === 0,
         "signal replacement lost the original cancellation or retained its parent");
+}
+
+async function nestedNoWaitDoesNotJoinTheQueue(): Promise<void> {
+    const budget = new ResourceBudget({ capacityBytes: 100 });
+    const scope = await reserveTransientScope({ ownerBytes: 60, workBytes: 40 }, { budget });
+    const held = await scope.reserve(30);
+    const queued = scope.reserve(20);
+    const refused = rejected(scope.reserve(1, { wait: false }));
+    check(scope.snapshot().work.queuedRequests === 1, "no-wait child joined the existing queue");
+    check(await refused instanceof SyncMemoryUnavailableError, "busy child quota did not report contention");
+    held.release();
+    (await queued).release();
+    (await scope.reserve(40, { wait: false })).release();
+    scope.close();
+    check(budget.snapshot().usedBytes === 0, "no-wait child leaked the parent budget");
 }
 
 async function scopeCloseWaitsForAllOwners(): Promise<void> {
@@ -313,6 +328,7 @@ async function shutdownBetweenLocalAndSharedGrants(): Promise<void> {
 estimatesAndAliases();
 void fullCapacitySubscopeDoesNotDeadlock()
     .then(queuedScopeKeepsItsOriginalQuotaAndSignal)
+    .then(nestedNoWaitDoesNotJoinTheQueue)
     .then(scopeCloseWaitsForAllOwners)
     .then(timeoutDoesNotFreeChildCryptoWorkspace)
     .then(reuseWaitsForNativeSettlement)
