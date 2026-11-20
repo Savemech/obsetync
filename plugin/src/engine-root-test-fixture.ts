@@ -488,5 +488,15 @@ async function fixture(count = 1) {
 }
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
-export { fixture, hashFor, pathAt, gate, rejection, turns, observe, rows };
+async function assertFinished(f: Fixture, engine: any) {
+    assert.equal(f.server.legacy, 0); assert.equal(engine.pendingChanges.size, 0);
+    assert.equal(f.journal.unsyncedCount(), 0); assert.equal(engine.rootRuntime.pending(), null);
+    assert.equal(f.base.treeBaseRoot, f.server.root);
+    const cold = await f.cold();
+    assert.equal(cold.pending, null); assert.equal(cold.journal.unsyncedCount(), 0);
+    assert.equal(cold.base.treeBaseRoot, f.server.root); assert.equal(cold.sequence, f.server.floor);
+    return cold;
+}
+
+export { assertFinished, fixture, hashFor, pathAt, gate, rejection, turns, observe, rows };
 export type { Fixture };

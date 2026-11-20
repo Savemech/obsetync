@@ -71,7 +71,7 @@ async function childMain() {
             const work = {
                 statCalls: 0, statMultiplicity: new Map(),
                 materialize: [], materializeMs: 0,
-                planner: [], plannerMs: 0, plans: [],
+                planner: [], plans: [],
                 hostYieldsRequested: 0, hostYieldsCompleted: 0, rootContinuations: 0,
                 readinessCalls: 0, readinessHintVisits: 0, readinessTakeCalls: 0, readinessRestoreCalls: 0,
                 dirtyTakeLengths: [], dirtyRestoreLengths: [], dirtyClaimLengths: [], dirtyClaimedPaths: 0,
@@ -164,9 +164,15 @@ async function childMain() {
             assert.equal(work.rootContinuations, expectedBatches.length - 1);
             assert.equal(work.hostYieldsRequested, work.hostYieldsCompleted);
             assert.equal(f.server.requests.length, expectedBatches.length);
-            assert.equal(f.server.legacy, 0); assert.equal(f.journal.unsyncedCount(), 0);
-            assert.equal(a.engine.pendingChanges.size, 0);
-            for (const path of paths) assert.equal(f.base.getHash(path), hashFor(2));
+            assert.deepEqual(f.server.publicationSizes, expectedBatches);
+            const cold = await assertFinished(f, a.engine);
+            const expectedHash = hashFor(2);
+            assert.equal(cold.base.entryCount(), count);
+            assert.equal(f.server.entries.size, count);
+            for (const path of paths) {
+                assert.equal(cold.base.getHash(path), expectedHash);
+                assert.equal(f.server.entries.get(path)?.hash, expectedHash);
+            }
             const multiplicities = {};
             for (const visits of work.statMultiplicity.values()) multiplicities[visits] = (multiplicities[visits] ?? 0) + 1;
             results.push({ paths: count, roots: f.server.requests.length, publicationSizes: f.server.publicationSizes,
@@ -221,7 +227,7 @@ try {
         absWorkingDir: pluginDirectory, bundle: true, platform: "node", format: "cjs", target: "node20", outfile: output,
         stdin: { resolveDir: pluginDirectory, loader: "js", contents: `
             import { strict as assert } from "node:assert";
-            import { fixture, pathAt, hashFor } from "./src/engine-root-test-fixture";
+            import { assertFinished, fixture, pathAt, hashFor } from "./src/engine-root-test-fixture";
             import { workSchedulerSnapshot, disposeWorkScheduler } from "./src/work-scheduler";
             const COUNTS = ${JSON.stringify(counts)};
             (${childMain.toString()})().catch(error => { console.error(error); process.exitCode = 1; });
@@ -250,11 +256,10 @@ try {
             builder.onLoad({ filter: /[\\/]root-batch\.ts$/ }, async ({ path }) => ({
                 contents: replaceOnce(await readFile(path, "utf8"), "export function selectRootBatch(", "function measuredRootBatch(") + `
                     export function selectRootBatch(...args: Parameters<typeof measuredRootBatch>): ReturnType<typeof measuredRootBatch> {
-                        const work = (globalThis as any).__rootDrainWork, started = performance.now();
+                        const work = (globalThis as any).__rootDrainWork;
                         const result = measuredRootBatch(...args);
-                        if (work) { work.plannerMs += performance.now() - started;
-                            work.planner.push({ready: args[0].length, queued: args[1].length, dependencies: args[2]?.length ?? 0,
-                                selected: result.ready.length}); }
+                        if (work) work.planner.push({ready: args[0].length, queued: args[1].length, dependencies: args[2]?.length ?? 0,
+                                selected: result.ready.length});
                         return result;
                     }`, loader: "ts",
             }));

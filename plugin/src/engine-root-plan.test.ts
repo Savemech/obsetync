@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { TFile } from "obsidian";
-import { fixture, hashFor, pathAt, gate, observe, turns, rows, type Fixture } from "./engine-root-test-fixture";
+import { assertFinished, fixture, hashFor, pathAt, gate, observe, turns, rows, type Fixture } from "./engine-root-test-fixture";
 import { JOURNAL_STORE_PATH } from "./journal";
 import { ROOT_INTENT_PATH } from "./root-intent";
 import { SYNC_BASE_STORE_PATH } from "./sync-base";
@@ -51,14 +51,6 @@ const sum = (values: number[]) => values.reduce((total, value) => total + value,
 function requestHashAt(request: RootCommitIntent, path: string): string | undefined {
     const decoded = JSON.parse(Buffer.from(request.root, "base64").toString("utf8"));
     return decoded.entries.find((entry: [string, { hash: string }]) => entry[0] === path)?.[1].hash;
-}
-async function assertFinished(f: Fixture, engine: any) {
-    assert.equal(f.server.legacy, 0); assert.equal(engine.pendingChanges.size, 0);
-    assert.equal(f.journal.unsyncedCount(), 0); assert.equal(engine.rootRuntime.pending(), null);
-    assert.equal(f.base.treeBaseRoot, f.server.root);
-    const cold = await f.cold();
-    assert.equal(cold.pending, null); assert.equal(cold.journal.unsyncedCount(), 0);
-    assert.equal(cold.base.treeBaseRoot, f.server.root); assert.equal(cold.sequence, f.server.floor);
 }
 async function deleteEvent(f: Fixture, engine: any, path: string) {
     f.source.delete(path);
