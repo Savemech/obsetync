@@ -1915,12 +1915,8 @@ async function finishContentDownload(
                 throw new Error(`small-file content hash mismatch for ${delta.path}`);
             }
             if (shouldDefer?.()) return false;
-            if (preserveExisting && await io.exists(delta.path)) {
-                const conflictPath = await uniqueLocalConflictPath(io, delta.path);
-                await io.renameFile(delta.path, conflictPath);
-                console.warn(
-                    `[obsetync] preserved unsynced local bytes as ${conflictPath} before pull`,
-                );
+            if (preserveExisting) {
+                if (!await preserveLocalBeforePull(io, delta.path, shouldDefer) || shouldDefer?.()) return false;
             }
             beforeWrite?.();
             await io.writeFile(delta.path, data, perf);
@@ -2493,13 +2489,8 @@ export async function applyLargeFile(
     if (!sameTargetState(targetState(await io.stat(path)), effectiveScope.targetState)) {
         throw new LocalEditDuringPull();
     }
-    if (preserveExisting && await io.exists(path)) {
-        const conflictPath = await uniqueLocalConflictPath(io, path);
-        await io.renameFile(path, conflictPath);
-        console.warn(
-            `[obsetync] preserved unsynced local bytes as ${conflictPath} before pull`,
-        );
-    }
+    if (preserveExisting && !await preserveLocalBeforePull(io, path, shouldAbort)) throw new LocalEditDuringPull();
+    if (shouldAbort?.()) throw new LocalEditDuringPull();
         beforeWrite?.();
         await io.replaceFile(stagingPath, path);
         await safeDelete(io, checkpointPath);
@@ -2804,7 +2795,8 @@ async function safeDelete(io: PlatformIO, path: string): Promise<void> {
     try { await io.deleteFile(path); } catch { /* absent/stale file */ }
 }
 
-async function uniqueLocalConflictPath(io: PlatformIO, path: string): Promise<string> {
+async function preserveLocalBeforePull(io: PlatformIO, path: string, shouldDefer?: () => boolean): Promise<boolean> {
+    if (!(await io.exists(path))) return true;
     const now = Date.now();
     for (let attempt = 0; attempt < 1_000; attempt++) {
         const candidate = conflictCopyPath(
@@ -2812,7 +2804,12 @@ async function uniqueLocalConflictPath(io: PlatformIO, path: string): Promise<st
             "local-before-pull",
             new Date(now + attempt * 60_000),
         );
-        if (!(await io.exists(candidate))) return candidate;
+        const taken = await io.exists(candidate);
+        if (shouldDefer?.()) return false;
+        if (taken) continue;
+        await io.renameFile(path, candidate);
+        console.warn(`[obsetync] preserved unsynced local bytes as ${candidate} before pull`);
+        return true;
     }
     throw new Error(`could not allocate a conflict-copy path for ${path}`);
 }

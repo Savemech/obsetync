@@ -726,6 +726,24 @@ async function untrackedLocalCollisionIsPreservedBeforePullWrite(): Promise<void
     check(moves.length === 1 && moves[0][0] === "doc.md", "untracked local file was not preserved");
     check(moves[0][1].includes("(conflict local-before-pull "), "preserved file used an invisible name");
     check(writes === 1, "remote file was not installed after preserving local bytes");
+
+    for (const boundary of ["lookup", "rename"]) {
+        let dirty = false;
+        moves.length = 0;
+        writes = 0;
+        io.exists = async (path: string) => {
+            if (boundary === "lookup" && path !== "doc.md") dirty = true;
+            return path === "doc.md";
+        };
+        io.renameFile = async (from: string, to: string) => {
+            moves.push([from, to]);
+            if (boundary === "rename") dirty = true;
+        };
+        const raced = await pull(api, io, syncBase, "vault", "base-root", wasm, tree,
+            undefined, undefined, { has: () => dirty });
+        check(writes === 0 && raced.localDeferredCount === 1, `edit during conflict ${boundary} was overwritten`);
+        check(moves.length === (boundary === "lookup" ? 0 : 1), "conflict move crossed local edit");
+    }
 }
 
 async function unchangedBaseIsReplacedWithoutConflictCopy(): Promise<void> {
