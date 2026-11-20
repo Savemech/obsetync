@@ -24,7 +24,7 @@ fn invalid(message: &str) -> ChunkError {
 fn prefix(path: &str) -> String {
     prefix_slice(path).to_owned()
 }
-fn prefix_slice(path: &str) -> &str {
+pub(crate) fn prefix_slice(path: &str) -> &str {
     path.find('/').map_or("", |index| &path[..=index])
 }
 

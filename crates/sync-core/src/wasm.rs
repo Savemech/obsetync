@@ -1496,8 +1496,23 @@ fn candidate_v1_output_memory_plan(
     // fixed per-row FlatBuffer/topology allowance cover inserts and boundary
     // reshaping. The Ready report checks actual private payload against this
     // witness before publication.
-    let node_payload_bytes = memory
-        .payload_bytes
+    // A new top-level prefix has no previous subtree for the cursor to rebuild.
+    let touches_existing_prefix = changed
+        .iter()
+        .map(|row| row.path.as_str())
+        .chain(deleted.iter().map(String::as_str))
+        .any(|path| {
+            let prefix = crate::candidate_mutation_v1::prefix_slice(path);
+            root.children
+                .binary_search_by(|child| child.0.as_str().cmp(prefix))
+                .is_ok()
+        });
+    let old_payload = if touches_existing_prefix {
+        memory.payload_bytes
+    } else {
+        0
+    };
+    let node_payload_bytes = old_payload
         .checked_mul(2)
         .and_then(|bytes| {
             path_bytes
@@ -9432,6 +9447,63 @@ mod root_export_tests {
         tree.cancel_candidate_mutation_deferred_native(token)
             .unwrap();
         assert!(drain_test_retirement(&mut tree, token, 1) > 1);
+    }
+
+    #[test]
+    fn v1_new_prefix_plan_excludes_unrelated_subtrees() {
+        let mut tree = WasmTree::new("vault", "device");
+        let WasmTreeInner::V1(inner) = &mut tree.inner else {
+            unreachable!()
+        };
+        let nested = "nested-folder/".repeat(8);
+        let rows = (0..32_249)
+            .map(|i| rebuild_row(&format!("archive/{nested}{i}.md"), 1))
+            .collect();
+        run_local(inner.rebuild(rows)).unwrap();
+        inner.begin_candidate().unwrap();
+        let added: Vec<_> = (0..64)
+            .map(|i| rebuild_row(&format!("new-dir/{i}.md"), 2))
+            .collect();
+        let plan = candidate_v1_output_memory_plan(inner, &added, &[]).unwrap();
+        let available = 11_463_466;
+        assert!(plan.peak_admission_bytes < available);
+        let mixed =
+            candidate_v1_output_memory_plan(inner, &added, &["archive/old.md".into()]).unwrap();
+        assert!(
+            mixed.node_payload_bytes
+                >= plan.node_payload_bytes + 2 * inner.chunk_memory().payload_bytes
+        );
+        assert!(mixed.peak_admission_bytes > available);
+
+        let token = tree
+            .begin_candidate_update_job(&rebuild_page(&added))
+            .unwrap();
+        assert_eq!(
+            tree.step_candidate_mutation_output_memory_v1_native(token, 256)
+                .unwrap()
+                .phase,
+            "plan ready"
+        );
+        tree.resume_candidate_mutation_output_memory_v1_native(
+            token,
+            plan.node_payload_bytes,
+            plan.range_endpoint_peak_requested_bytes,
+            plan.range_endpoint_resident_requested_bytes,
+        )
+        .unwrap();
+        while !tree
+            .step_candidate_mutation_output_memory_v1_native(token, 256)
+            .unwrap()
+            .done
+        {}
+        let ready = tree
+            .candidate_mutation_output_memory_ready_v1_native(token)
+            .unwrap();
+        assert!(ready.staged_node_payload_bytes <= plan.node_payload_bytes);
+        tree.finish_candidate_mutation_deferred_native(token)
+            .unwrap();
+        drain_test_retirement(&mut tree, token, 256);
+        assert_eq!(tree.candidate_total_files(), 32_313.0);
     }
 
     #[test]
