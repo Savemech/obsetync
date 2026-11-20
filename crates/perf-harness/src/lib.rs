@@ -179,13 +179,7 @@ impl WorkloadPlan {
             ),
             WorkloadId::W5 => {
                 let files = markdown_files(seed, scale.count(100_000), "notes");
-                let index = (mix64(seed) as usize) % files.len();
-                let file = &files[index];
-                let operation = ScenarioOperation::Modify {
-                    path: file.path.clone(),
-                    size: file.size,
-                    content_seed: derive_seed(seed ^ 0x5755, index as u64),
-                };
+                let operation = w5_operation(&files, seed, mix64(seed));
                 (files, vec![operation])
             }
             WorkloadId::W6 => {
@@ -546,8 +540,15 @@ fn load_plan(input: &Path) -> Result<(WorkloadManifest, WorkloadPlan), HarnessEr
             manifest.schema_version
         )));
     }
-    let plan = WorkloadPlan::build(manifest.workload, manifest.seed, manifest.scale)?;
-    if plan.digest()? != manifest.plan_digest
+    let mut plan = WorkloadPlan::build(manifest.workload, manifest.seed, manifest.scale)?;
+    let mut digest = plan.digest()?;
+    if digest != manifest.plan_digest && plan.workload == WorkloadId::W5 {
+        // Older 32-bit generators discarded the upper half before choosing the modified file.
+        let selection = u64::from(mix64(plan.seed) as u32);
+        plan.operations[0] = w5_operation(&plan.files, plan.seed, selection);
+        digest = plan.digest()?;
+    }
+    if digest != manifest.plan_digest
         || plan.files.len() as u64 != manifest.file_count
         || plan.total_bytes() != manifest.total_bytes
         || plan.operations.len() as u64 != manifest.operation_count
@@ -889,7 +890,7 @@ pub async fn benchmark_prefix_merge(
         .max(1);
     let changed: Vec<_> = (0..upsert_operations)
         .map(|operation| {
-            let index = mix64(seed.wrapping_add(operation as u64)) as usize % path_universe;
+            let index = mix64(seed.wrapping_add(operation as u64)) % path_universe as u64;
             benchmark_tree_entry(
                 &format!("wide/{index:08}.md"),
                 existing_entries as u64 + operation as u64 + 1,
@@ -898,7 +899,7 @@ pub async fn benchmark_prefix_merge(
         .collect();
     let deleted: Vec<_> = (0..delete_operations)
         .map(|operation| {
-            let index = mix64(seed ^ (operation as u64).rotate_left(17)) as usize % path_universe;
+            let index = mix64(seed ^ (operation as u64).rotate_left(17)) % path_universe as u64;
             format!("wide/{index:08}.md")
         })
         .collect();
@@ -1475,6 +1476,16 @@ fn benchmark_tree_entry(path: &str, revision: u64) -> sync_core::chunk::FileEntr
     )
 }
 
+fn w5_operation(files: &[FileSpec], seed: u64, selection: u64) -> ScenarioOperation {
+    let index = (selection % files.len() as u64) as usize;
+    let file = &files[index];
+    ScenarioOperation::Modify {
+        path: file.path.clone(),
+        size: file.size,
+        content_seed: derive_seed(seed ^ 0x5755, index as u64),
+    }
+}
+
 fn markdown_files(seed: u64, count: usize, prefix: &str) -> Vec<FileSpec> {
     (0..count)
         .map(|index| FileSpec {
@@ -1854,6 +1865,26 @@ mod tests {
             Err(HarnessError::ManifestMismatch(_))
         ));
         assert_eq!(fs::read(source).unwrap(), bytes);
+    }
+
+    #[test]
+    fn w5_selection_is_portable_and_accepts_old_32_bit_manifests() {
+        let mut plan = WorkloadPlan::build(WorkloadId::W5, 42, "0.001".parse().unwrap()).unwrap();
+        assert!(
+            matches!(&plan.operations[0], ScenarioOperation::Modify { path, .. } if path == "notes/013/000013.md")
+        );
+
+        let legacy_file = &plan.files[21];
+        plan.operations[0] = ScenarioOperation::Modify {
+            path: legacy_file.path.clone(),
+            size: legacy_file.size,
+            content_seed: derive_seed(42 ^ 0x5755, 21),
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("legacy");
+        materialize(&plan, &output, MaterializeOptions::default()).unwrap();
+        verify(&output, true).unwrap();
+        assert_eq!(apply_operation(&output, 0).unwrap(), plan.operations[0]);
     }
 
     #[test]
