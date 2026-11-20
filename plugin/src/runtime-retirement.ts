@@ -9,7 +9,7 @@ function registry(): Registry {
 
 /** Join every owner even when another rejects. A failure cannot allow a new
  * runtime to open shared storage while a sibling is still completing writes. */
-export async function settleRuntimeOwners(owners: readonly Promise<unknown>[]): Promise<void> {
+export async function settleRuntimeOwners(owners: readonly (Promise<unknown> | null | undefined)[]): Promise<void> {
     const results = await Promise.allSettled(owners);
     for (const result of results) if (result.status === "rejected") throw result.reason;
 }

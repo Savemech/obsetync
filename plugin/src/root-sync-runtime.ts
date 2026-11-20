@@ -1,3 +1,4 @@
+import { settleRuntimeOwners, startRuntimeOwner } from "./runtime-retirement";
 import type { ObsetyncApi } from "./api";
 import type { PlatformIO } from "./platform";
 import type { WasmModule } from "./push";
@@ -200,11 +201,13 @@ export class RootSyncRuntime {
         this.closed = true;
         let resolve!: () => void, reject!: (reason: unknown) => void;
         this.closeWork = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
-        try { Promise.all([this.recovery?.closeAndDrain(), this.conflicts?.closeAndDrain()]).then(() => {
+        settleRuntimeOwners([
+            startRuntimeOwner(() => this.recovery?.closeAndDrain()),
+            startRuntimeOwner(() => this.conflicts?.closeAndDrain()),
+        ]).then(() => {
             this.quiesced = true;
             resolve();
-        }, reject); }
-        catch (error) { reject(error); }
+        }, reject);
         return this.closeWork;
     }
     /** Only after the engine's operation/preparation drain. Repeated terminal

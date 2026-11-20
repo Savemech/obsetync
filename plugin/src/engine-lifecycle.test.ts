@@ -1,3 +1,4 @@
+import { RootSyncRuntime } from "./root-sync-runtime";
 import { createHash } from "node:crypto";
 import { TFile } from "obsidian";
 import { ObsetyncSyncEngine } from "./sync";
@@ -248,6 +249,34 @@ async function drainWaitsForRootBaseAndJournalNativeSettlement(): Promise<void> 
             "joined replacement still allowed old metadata to overwrite newer B");
         await stopAndDrain(a.engine);
     } finally { root.resolve(); base.resolve(); ack.resolve(); f.close(); }
+}
+
+async function failedRootDrainWaitsForEverySibling(): Promise<void> {
+    const f = await fixture(), conflict = gate();
+    try {
+        const { engine } = f.create("A");
+        const failure = new Error("root recovery close failed");
+        engine.rootRuntime = Object.assign(Object.create(RootSyncRuntime.prototype), {
+            recovery: { closeAndDrain() { throw failure; } },
+            conflicts: { closeAndDrain: () => conflict.wait() },
+        });
+        const finishCallback = engine.callbackWork().enter();
+        const finishOperation = engine.operationWork().enter();
+        const quiesced = observe(engine.quiesceAndDrain());
+        const stopped = observe(engine.stopAndDrain());
+        await conflict.started;
+        await turn();
+        check(!quiesced.state.settled, "failed recovery skipped the pending conflict close");
+        conflict.resolve();
+        await turn();
+        check(!quiesced.state.settled, "failed root drain skipped the engine operation");
+        finishOperation();
+        await quiesced.done;
+        check(quiesced.state.error === failure && !stopped.state.settled, "terminal drain skipped the callback");
+        finishCallback();
+        await stopped.done;
+        check(stopped.state.error === failure, "terminal drain lost the original error");
+    } finally { conflict.resolve(); f.close(); }
 }
 
 async function stoppedAdmissionCannotStartAnotherOperation(): Promise<void> {
@@ -544,6 +573,7 @@ const deadline = setTimeout(() => {
 }, 30_000);
 void legacyStopLateAckOverwritesNewerDurableBase()
     .then(drainWaitsForRootBaseAndJournalNativeSettlement)
+    .then(failedRootDrainWaitsForEverySibling)
     .then(stoppedAdmissionCannotStartAnotherOperation)
     .then(startedCaptureIsDrainedThroughItsNativeAppend)
     .then(rejectedRootDoesNotPretendToBeNativeCompletion)

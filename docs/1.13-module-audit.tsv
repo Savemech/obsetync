@@ -225,8 +225,8 @@ read	plugin/src/engine-root-plan.test.ts	tests	Removed obsolete debounce mocks o
 read	plugin/src/engine-root-test-fixture.ts	production	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
 read	plugin/src/engine-root.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
 read	plugin/src/engine-urgent-upload.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
-pending	plugin/src/engine-work.test.ts	tests	Not reviewed
-pending	plugin/src/engine-work.ts	production	Not reviewed
+reviewed	plugin/src/engine-work.test.ts	tests	Read six lifecycle groups covering reentrant stop, failed cleanup, caller cancellation, stable drain and repeated release.
+reviewed	plugin/src/engine-work.ts	production	Traced synchronous operation and callback admission through stop, downgrade freeze and generation handoff; tracker releases once after actual cleanup.
 reviewed	plugin/src/file-safety.test.ts	tests	Checked serial/parallel ordering, cancellation, errors, missing paths and config listing; 150 assertions including malformed responses
 reviewed	plugin/src/file-safety.ts	production	Traced adapter stats, config enumeration, grouped metadata reads and deletion classification through platform and both scan paths; validate sizes, exact directory error paths and direct unique listed children
 reviewed	plugin/src/hash-runtime.test.ts	tests	Read profile, pressure/growth, batch limits and clock cases; executed via plugin suite
@@ -338,7 +338,7 @@ pending	plugin/src/root-settlement.ts	production	Not reviewed
 reviewed	plugin/src/root-stream-scope.test.ts	tests	Full six ownership/endpoint/bounds/secret-free suites read and run; stable legacy HTTP digest retained; HTTP and HTTPS partition scope, case aliases remain equivalent
 reviewed	plugin/src/root-stream-scope.ts	production	Read full canonicalization/fingerprint/fences and main callers; explicit HTTPS policy matches API; one-time enrolled-settings migration retains old HTTP scope and existing intents fail closed on genuine scope change
 pending	plugin/src/root-sync-runtime.test.ts	tests	Not reviewed
-pending	plugin/src/root-sync-runtime.ts	production	Not reviewed
+read	plugin/src/root-sync-runtime.ts	production	Audited quiesce and dispose with recovery and conflict owners. Synchronous close failure still starts and joins siblings; 15 runtime integration suites pass. Remaining publication paths pending.
 pending	plugin/src/root-tree-repair-job.test.ts	tests	Not reviewed
 pending	plugin/src/root-tree-repair.test.ts	tests	Not reviewed
 pending	plugin/src/root-tree-repair.ts	production	Not reviewed

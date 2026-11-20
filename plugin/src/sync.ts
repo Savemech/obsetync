@@ -1,3 +1,4 @@
+import { settleRuntimeOwners } from "./runtime-retirement";
 import { App, TAbstractFile, TFile, Notice } from "obsidian";
 
 import { yieldWork as yieldToUI, throwIfWorkAborted, type WorkLane } from "./work-scheduler";
@@ -1015,7 +1016,7 @@ export class ObsetyncSyncEngine {
                 throw new Error("legacy downgrade authority changed");
             }
         };
-        const work = Promise.all([operationDrain, callbackDrain, rootDrain]).then(() => {
+        const work = settleRuntimeOwners([operationDrain, callbackDrain, rootDrain]).then(() => {
             if (state.revoked || state.released || this.legacyDowngradeFreeze !== state) {
                 throw new Error("legacy downgrade authority was revoked before acquisition");
             }
@@ -1053,7 +1054,7 @@ export class ObsetyncSyncEngine {
         if (state.retirement) return state.retirement;
         state.released = true;
         if (this.legacyDowngradeAuthorityToken === state.token) this.legacyDowngradeAuthorityToken = null;
-        state.retirement = Promise.all([state.operationDrain, state.callbackDrain, state.rootDrain]).then(async () => {
+        state.retirement = settleRuntimeOwners([state.operationDrain, state.callbackDrain, state.rootDrain]).then(async () => {
             this.rootRetirement ??= state.runtime.dispose();
             await this.rootRetirement;
         });
@@ -1081,7 +1082,7 @@ export class ObsetyncSyncEngine {
             catch (error) { console.warn("[obsetync] data lane close failed:", error); }
         }
         if (!this.rootRuntime) return drained;
-        return this.rootRetirement ??= Promise.all([drained, rootDrain]).then(() => this.rootRuntime!.dispose());
+        return this.rootRetirement ??= settleRuntimeOwners([drained, rootDrain]).then(() => this.rootRuntime!.dispose());
     }
 
     /** Synchronous terminal admission/capture stop; admitted work is never
@@ -1096,10 +1097,10 @@ export class ObsetyncSyncEngine {
     stopAndDrain(): Promise<void> {
         this.stop();
         const downgradeRetirement = this.legacyDowngradeFreeze?.retirement;
-        return this.terminalDrain ??= Promise.all([
+        return this.terminalDrain ??= settleRuntimeOwners([
             this.operationWork().closeAndDrain(), this.callbackWork().closeAndDrain(),
             downgradeRetirement, this.rootRetirement,
-        ]).then(() => undefined);
+        ]);
     }
 
     /** Synchronous capture cut followed by a finite old-callback join. Local
