@@ -1,6 +1,6 @@
 //! Historical stale-tree regression. A separate observer checks the published
 //! vault after a device submits an outdated snapshot. Both test cases require
-//! every newer file to retain its exact bytes, regardless of the push response.
+//! the E2E guard to reject the stale root and preserve every newer file.
 
 use e2e_tests::*;
 use std::collections::BTreeMap;
@@ -135,6 +135,29 @@ fn assert_no_data_loss(seen: &BTreeMap<String, Vec<u8>>, files: &[(String, Vec<u
     }
 }
 
+/// The original snapshot's chunks were published at E0. Submit only its
+/// root so an upload/setup failure cannot masquerade as guard enforcement.
+async fn assert_stale_root_refused(
+    client: &WireClient,
+    vault: &str,
+    files: &[(String, Vec<u8>)],
+    parent: &RootNode,
+    deletions: u64,
+) {
+    let (mut root, _) = build_root_for_files(vault, &client.creds().device_name, files);
+    root.parent_hash = Some(parent.hash());
+    let mut body = hash_to_hex(&parent.hash()).into_bytes();
+    body.extend(root.serialize());
+    let response = client
+        .raw("PUT", &format!("/api/v1/root/{vault}"), &body)
+        .await
+        .unwrap();
+    assert_eq!(response.status.as_u16(), 409);
+    let verdict: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(verdict["error"], "guard_rejected");
+    assert_eq!(verdict["deletions"], deletions);
+}
+
 /// Check the observer after the stale device polls the current root.
 #[tokio::test]
 async fn stale_parent_fast_forward_clobbers() {
@@ -154,11 +177,7 @@ async fn stale_parent_fast_forward_clobbers() {
     );
 
     // B pushes its STALE {f1} tree claiming parent = the freshly-polled current.
-    let push_res = push_vault_snapshot(&b, &vault, &b_stale, &polled_hex).await;
-    eprintln!(
-        "[T1] stale snapshot response: {:?}",
-        push_res.map(|(_, response)| response)
-    );
+    assert_stale_root_refused(&b, &vault, &b_stale, &polled, 4).await;
 
     let seen = fleet_view(&env, &vault, "stale-ff-observer").await;
     assert_no_data_loss(&seen, &files, "stale-parent fast-forward clobber");
@@ -187,11 +206,7 @@ async fn poisoned_merge_base_reverts() {
     //   side_b = {f1}               (B's stale incoming)
     // → f2/f3/f4 look like B-deletes against an unchanged current → reverted;
     //   only f5 (new in current, absent from base) survives.
-    let push_res = push_vault_snapshot(&b, &vault, &b_stale, &parent_hex).await;
-    eprintln!(
-        "[T2] stale snapshot response: {:?}",
-        push_res.map(|(_, response)| response)
-    );
+    assert_stale_root_refused(&b, &vault, &b_stale, one_behind, 3).await;
 
     let seen = fleet_view(&env, &vault, "poison-merge-observer").await;
     assert_no_data_loss(&seen, &files, "poisoned merge base");
