@@ -326,7 +326,7 @@ export class SegmentedStore {
             }
             const head = selected.head;
             if (this.migration) {
-                if (copies.some(copy => copy.head.epoch !== this.migration!.epoch)) {
+                if (head.epoch !== this.migration.epoch) {
                     throw new StoreRecoveryError("CONTRADICTING_COPIES", "migration and head epochs differ");
                 }
                 if (!this.migrationAdvanced && (head.generation !== 1 || head.sequence !== 0 || head.snapshot.id !== 1 ||
@@ -365,7 +365,7 @@ export class SegmentedStore {
                 }
                 await this.promote(selected.raw);
             }
-            this.head = validateHead(unseal(selected.raw)); this.absent = false; this.writable = true;
+            this.head = head; this.absent = false; this.writable = true;
             return true;
         });
     }

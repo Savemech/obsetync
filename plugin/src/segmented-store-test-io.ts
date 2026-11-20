@@ -35,7 +35,7 @@ export class MemorySegmentedIO implements SegmentedStoreIO {
         return { files: new Map(this.files), directories: new Set(this.directories) };
     }
 
-    clone(): MemorySegmentedIO { return new MemorySegmentedIO(this.snapshot()); }
+    clone(): MemorySegmentedIO { return new MemorySegmentedIO(this); }
 
     private async boundary(event: Omit<StoreTestBoundary, "index">): Promise<void> {
         const entry = { ...event, index: this.events.length };
@@ -88,7 +88,8 @@ export class MemorySegmentedIO implements SegmentedStoreIO {
     async stat(path: string): Promise<{ type: string; size: number } | null> {
         await this.boundary({ method: "stat", phase: "before", path });
         const value = this.files.get(path);
-        const result = value === undefined ? null : { type: "file", size: new TextEncoder().encode(value).byteLength };
+        const result = value !== undefined ? { type: "file", size: new TextEncoder().encode(value).byteLength }
+            : this.directories.has(path) ? { type: "folder", size: 0 } : null;
         await this.boundary({ method: "stat", phase: "after", path });
         return result;
     }

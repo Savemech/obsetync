@@ -314,6 +314,11 @@ async function referencedDamageAndUnknownSchemaFailClosed(): Promise<void> {
         const missing = baseline.clone();
         missing.files.delete(path);
         await rejectsRecovery(missing, "CORRUPT");
+        const folder = baseline.clone();
+        folder.files.delete(path);
+        folder.directories.add(path);
+        await rejectsRecovery(folder, "CORRUPT");
+        assert(!folder.events.some(event => event.method === "read" && event.path === path));
         const corrupted = baseline.clone();
         corrupted.files.set(path, corrupted.files.get(path)!.slice(0, -8));
         await rejectsRecovery(corrupted, "CORRUPT");
