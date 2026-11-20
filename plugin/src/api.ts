@@ -605,8 +605,8 @@ export class ObsetyncApi {
                     throw new Error(`tree capability negotiation failed: ${response.status}`);
                 }
                 const bundle = await response.json();
-                this.applyCapabilityBundle(bundle);
                 result = decodeTreeNegotiation(bundle);
+                if (this.channelGeneration === generation) this.applyCapabilityBundle(bundle);
             }
             // `sealed` used the current channel synchronously; still fail
             // closed if a future refactor swaps it while the request awaits.

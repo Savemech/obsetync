@@ -64,4 +64,22 @@ rejects({
     },
 }, "unsafe fleet count was accepted");
 
+for (const malformed of [null, true, [], "tree-v2"]) {
+    rejects(malformed, "malformed capability response was treated as a legacy server");
+}
+for (const [ready, enrolled] of [[0, 0], [0, 1], [1, 1], [1, 2]]) {
+    for (const version of [1, 2]) {
+        const fleetReady = enrolled > 0 && ready === enrolled;
+        const expected = version === 2 ? "active" : fleetReady ? "eligible" : "blocked";
+        const tree = { current_version: version, ready_devices: ready, enrolled_devices: enrolled,
+            fleet_ready: fleetReady, activation: expected };
+        const bundle = { capabilities: ["tree-v2"], tree };
+        ok(decodeTreeNegotiation(bundle).activation === expected, "valid server activation rejected");
+        rejects({ ...bundle, tree: { ...tree, fleet_ready: !fleetReady } }, "inconsistent readiness accepted");
+        for (const activation of ["active", "eligible", "blocked"].filter(value => value !== expected)) {
+            rejects({ ...bundle, tree: { ...tree, activation } }, "inconsistent activation accepted");
+        }
+    }
+}
+
 console.log(`tree-negotiation.test: ${assertions} assertions passed`);

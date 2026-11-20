@@ -10,7 +10,10 @@ export interface TreeNegotiation {
  * bundle. Absence means an older server and therefore Tree v1; malformed or
  * internally contradictory data fails closed instead of selecting a format. */
 export function decodeTreeNegotiation(bundle: any): TreeNegotiation {
-    const tree = bundle?.tree;
+    if (!bundle || typeof bundle !== "object" || Array.isArray(bundle)) {
+        throw new Error("server returned an invalid capability bundle");
+    }
+    const tree = bundle.tree;
     if (tree === undefined) {
         return {
             currentVersion: 1,
@@ -30,7 +33,8 @@ export function decodeTreeNegotiation(bundle: any): TreeNegotiation {
         !Number.isSafeInteger(readyDevices) || readyDevices < 0 ||
         !Number.isSafeInteger(enrolledDevices) || enrolledDevices < 0 ||
         readyDevices > enrolledDevices ||
-        !["active", "eligible", "blocked"].includes(activation)
+        tree.fleet_ready !== (enrolledDevices > 0 && readyDevices === enrolledDevices) ||
+        activation !== (currentVersion === 2 ? "active" : tree.fleet_ready ? "eligible" : "blocked")
     ) {
         throw new Error("server returned an invalid Tree capability status");
     }

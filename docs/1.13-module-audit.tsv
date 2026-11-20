@@ -388,8 +388,8 @@ pending	plugin/src/tree-chunk-export-job.test.ts	tests	Not reviewed
 pending	plugin/src/tree-chunk-export-job.ts	production	Not reviewed
 removed	plugin/src/tree-format.test.ts	tests	Only exercised the retired synchronous helper. Active cross-format pull/recovery tests live in engine-root.test.ts.
 removed	plugin/src/tree-format.ts	production	Obsolete synchronous whole-vault JSON rebuild had only its own test as caller. Pull validates the observed version in sync.ts and calls rebuildRootTreeFromBase with owner and memory fences.
-pending	plugin/src/tree-negotiation.test.ts	tests	Not reviewed
-pending	plugin/src/tree-negotiation.ts	production	Not reviewed
+reviewed	plugin/src/tree-negotiation.test.ts	tests	Covered absent versus malformed bundles, counts, readiness and activation combinations for both versions including active V2 with partial fleet readiness.
+reviewed	plugin/src/tree-negotiation.ts	production	Validated decoder against fleet.ready() and server activation branches. Invalid payloads fail before applying transport capabilities. Legacy object responses may omit tree.
 reviewed	plugin/src/tree-output-settlement.test.ts	tests	Verified commit/abort reports, malformed receipts, native failure, stale format, unobservable open state, final fence and legacy dispatch on synthetic wrappers.
 reviewed	plugin/src/tree-output-settlement.ts	production	Unified V1/V2 pre-transition observations. Failed observations cannot mint sweep proofs. Checked native and legacy dispatch, shape/revision validation and single-use ledger handoff.
 pending	plugin/src/tree-root-export-job.test.ts	tests	Not reviewed
