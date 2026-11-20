@@ -105,7 +105,7 @@ async function twentyFiveThousandRowsAreVisitedOnce(): Promise<void> {
     const built = plan.snapshot();
     same([built.preflightRows, built.queuedRows, built.readyRows, built.dependencyRows, built.graphNodes, built.graphComponents],
         [50_000, 25_000, 25_000, 0, 25_000, 25_000], "full reviewed corpus was not built exactly once");
-    same(built.graphSteps, 125_000, "graph traversal is not linear in the independent corpus");
+    same(built.graphSteps, 100_000, "graph traversal is not linear in the independent corpus");
     check(hostTurns >= 195 && hostTurns === built.cooperationCalls, "preflight/build omitted actual host cooperation");
     check(built.admittedMetadataBytes <= ROOT_BATCH_PLAN_ADMISSION.maxMetadataBytes, "25k metadata model exceeded its actual admission");
     const all: string[] = []; let batches = 0, lastVisits = 0;

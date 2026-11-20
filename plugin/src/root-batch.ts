@@ -85,7 +85,6 @@ export interface RootBatchGraphComponent {
     unresolved: boolean;
     stale: boolean;
     ready: RootBatchGraphNode[];
-    queued: RootBatchGraphNode[];
 }
 export interface RootBatchGraph {
     nodes: RootBatchGraphNode[];
@@ -234,7 +233,7 @@ export function* buildRootBatchGraphSteps(
         const node = nodes[id], key = root(id);
         let current = byRoot.get(key);
         if (!current) {
-            current = { paths: 0, cuts: 0, bytes: 0, missing: false, unresolved: false, stale: false, ready: [], queued: [] };
+            current = { paths: 0, cuts: 0, bytes: 0, missing: false, unresolved: false, stale: false, ready: [] };
             byRoot.set(key, current);
         }
         node.component = current;
@@ -257,16 +256,19 @@ export function* buildRootBatchGraphSteps(
         if ((left.witness?.journalId ?? 0) < edge.generation || (right.witness?.journalId ?? 0) < edge.generation) current.stale = true;
         yield "link-state";
     }
-    const components: RootBatchGraphComponent[] = [], ordered = new Set<RootBatchGraphComponent>();
+    const components: RootBatchGraphComponent[] = [];
     for (const node of readyNodes) {
-        const current = node.component!; current.ready.push(node);
-        if (!ordered.has(current)) { ordered.add(current); components.push(current); }
+        const current = node.component!;
+        if (current.ready.length === 0) components.push(current);
+        current.ready.push(node);
         yield "order";
     }
-    for (const node of queuedNodes) {
-        const current = node.component!; current.queued.push(node);
-        if (!ordered.has(current)) { ordered.add(current); components.push(current); }
-        yield "order";
+    if (components.length < byRoot.size) {
+        // Nodes are created in queued order before external dependency peers.
+        for (const current of byRoot.values()) {
+            if (current.paths > 0 && current.ready.length === 0) components.push(current);
+            yield "order";
+        }
     }
     return { nodes, ready: readyNodes, queued: queuedNodes, components };
 }

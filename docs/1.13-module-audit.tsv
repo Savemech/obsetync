@@ -315,10 +315,10 @@ pending	plugin/src/resource-governor.test.ts	tests	Not reviewed
 pending	plugin/src/resource-governor.ts	production	Not reviewed
 reviewed	plugin/src/root-batch-drain.test.ts	tests	1068 assertions cover 257 sequential batches, progress gates, errors, held cleanup and closure
 reviewed	plugin/src/root-batch-drain.ts	production	Traced serial pushPendingInner, real host yield, both continuation checks and tracked cleanup into sync.ts
-pending	plugin/src/root-batch-plan.test.ts	tests	Not reviewed
-pending	plugin/src/root-batch-plan.ts	production	Not reviewed
-pending	plugin/src/root-batch.test.ts	tests	Not reviewed
-pending	plugin/src/root-batch.ts	production	Not reviewed
+reviewed	plugin/src/root-batch-plan.test.ts	tests	Ran 141175 assertions covering plan equivalence, ordering, mutation/cancellation fences, memory admission and 25k-row fixtures.
+reviewed	plugin/src/root-batch-plan.ts	production	Traced preflight, shared admission, scalar witnesses, cooperative construction, compaction, prefix selection and disposal. The 25k independent case takes four graph steps per row.
+reviewed	plugin/src/root-batch.test.ts	tests	Ran 167 assertions covering coverage of both partitions, priority, rename closure, exact count/byte limits and detached input provenance.
+reviewed	plugin/src/root-batch.ts	production	Traced shared graph validation, generations, rename edges, grouping and bounded selection through the reviewed queue. Removed redundant per-component queue arrays and the second ordering pass for fully ready graphs.
 read	plugin/src/root-conflicts.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
 pending	plugin/src/root-conflicts.ts	production	Not reviewed
 pending	plugin/src/root-intent.test.ts	tests	Not reviewed

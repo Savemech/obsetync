@@ -38,7 +38,7 @@ export interface RootBatchPlanOptions {
     limits?: RootBatchLimits;
     /** May lower, never raise, the experimental cache ceilings. */
     admission?: RootBatchPlanAdmission;
-    /** Phase-A injection seam. Omission preserves the legacy unwired caller. */
+    /** Shared budget for graph construction and the retained plan. */
     memoryArbiter?: SyncMemoryArbiter;
     /** Nested owners must use false to avoid waiting on their own parent lease. */
     memoryWait?: boolean;
@@ -121,7 +121,7 @@ interface PlannedComponent {
     cuts: number;
     bytes: number;
     metadataBytes: number;
-    /** One membership array; graph ready/queued adjacency arrays are dropped. */
+    /** Members retain both queued and ready order. */
     members: PlannedEntry[];
 }
 function assertHint(node: PlannedEntry): void {
@@ -202,7 +202,7 @@ class AdmittedRootBatchPlan implements RootBatchPlan {
     }
 }
 
-/** Prerequisite planner only; NOT engine review-cache activation.
+/** Build the batch plan for one reviewed queue.
  *
  * ALL arrays, queued hints and dependency rows must describe ONE already fully
  * materialized/reviewed immutable epoch and remain immutable during creation
@@ -381,9 +381,8 @@ export async function createRootBatchPlan(
                 state.remainingEligiblePaths += component.paths; state.remainingEligibleComponents++;
             }
         }
-        // The compact plan never keeps union parents, node/component cycles,
-        // or a second ready/queued membership array alive.
-        component.ready = []; component.queued = [];
+        // Release the graph nodes as each component is compacted.
+        component.ready = [];
         buildingComponents[index] = undefined;
         units++; const wait = checkpoint(); if (wait) await wait;
     }

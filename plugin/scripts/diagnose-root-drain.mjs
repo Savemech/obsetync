@@ -144,7 +144,7 @@ async function childMain() {
             assert.equal(work.plans.length, 1, "quiet drain rebuilt its reviewed dependency graph");
             const plan = work.plans[0];
             assert.equal(plan.queued, count); assert.equal(plan.ready, count); assert.equal(plan.dependencies, 0);
-            assert.equal(plan.initial.preflightRows, 2 * count); assert.equal(plan.initial.graphSteps, 5 * count);
+            assert.equal(plan.initial.preflightRows, 2 * count); assert.equal(plan.initial.graphSteps, 4 * count);
             assert.equal(plan.latest.selectedPaths, count); assert.equal(plan.latest.remainingEligiblePaths, 0);
             assert(plan.latest.selectionComponentVisits <= count + expectedBatches.length);
             assert.equal(plan.latest.disposed, true, "drain retained its reviewed plan after completion");
