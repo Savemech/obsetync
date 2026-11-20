@@ -224,7 +224,7 @@ read	plugin/src/engine-mobile-lifecycle.test.ts	tests	Removed obsolete debounce 
 read	plugin/src/engine-root-plan.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
 read	plugin/src/engine-root-test-fixture.ts	production	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
 read	plugin/src/engine-root.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
-read	plugin/src/engine-urgent-upload.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
+reviewed	plugin/src/engine-urgent-upload.test.ts	tests	Traced schedulerLaneForChanges to object PUT options. Exercised active queued note, inactive queued note and fresh inactive edit as separate pushes through the real engine; final hash checked.
 reviewed	plugin/src/engine-work.test.ts	tests	Read six lifecycle groups covering reentrant stop, failed cleanup, caller cancellation, stable drain and repeated release.
 reviewed	plugin/src/engine-work.ts	production	Traced synchronous operation and callback admission through stop, downgrade freeze and generation handoff; tracker releases once after actual cleanup.
 reviewed	plugin/src/file-safety.test.ts	tests	Checked serial/parallel ordering, cancellation, errors, missing paths and config listing; 150 assertions including malformed responses
@@ -331,7 +331,7 @@ reviewed	plugin/src/root-publication-memory.test.ts	tests	Reviewed independent B
 reviewed	plugin/src/root-publication-memory.ts	production	Traced owner and hash preparation estimates and arena bounds to push and root runtime. Four publication memory suites pass including maximum root and rejected admission.
 reviewed	plugin/src/root-recovery.test.ts	tests	Ran 440 recovery assertions with real client stores and injected network/IO faults, including reentrant close, expired outcomes and failed ACK restart
 reviewed	plugin/src/root-recovery.ts	production	Traced runtime prepare, exclusive dispatch, durable receipt replay and quiesce; lost-response recovery queries original identity and preserves later journal cuts
-read	plugin/src/root-reviewed-queue.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
+reviewed	plugin/src/root-reviewed-queue.test.ts	tests	Reviewed preparation/overlay, dependency and cooldown fences, claim rollback, priority selection and nested memory lease tests. Added cancellation while queued and immediately after grant; 300 assertions passed.
 reviewed	plugin/src/root-reviewed-queue.ts	production	Traced creation, review, overlay, dependency checks, claim, settlement and dispose; takeLocal uses the actual retirement limit; distant linked omissions tested through next()
 reviewed	plugin/src/root-settlement.test.ts	tests	Restart cuts, cancellation, shared owner and full 256-copy permutation/hash mismatch covered; 44 assertions passed
 reviewed	plugin/src/root-settlement.ts	production	Traced runtime, recovery and conflict preservation; check receipts by path and exact content hash before journal ACK and recheck after writes

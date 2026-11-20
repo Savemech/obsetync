@@ -963,6 +963,23 @@ async function sharedReviewAndPlanAdmissionOwnFullLifetime() {
         "review admission denial was not propagated for deterministic retry");
     same(captures, 0, "review tracking/maps were allocated before shared admission");
 
+    for (const grantBeforeAbort of [false, true]) {
+        const waiting = fixture(["pending.md"]);
+        const arbiter = new SyncMemoryArbiter({ capacityBytes: ROOT_REVIEW_LIMITS.metadataBytes });
+        waiting.ports.memoryArbiter = arbiter;
+        const other = await arbiter.reserve("interactive", ROOT_REVIEW_LIMITS.metadataBytes);
+        const creation = RootReviewedQueue.create(waiting.ports);
+        same(arbiter.snapshot().owners["root-review"].queuedRequests, 1, "review did not wait for memory");
+        if (grantBeforeAbort) other.release();
+        waiting.controller.abort();
+        await rejects(creation, error => error instanceof Error && error.name === "AbortError", "cancelled review proceeded to planning");
+        if (!grantBeforeAbort) other.release();
+        const after = arbiter.snapshot();
+        check(after.usedBytes === 0 && after.queuedRequests === 0, "cancelled review retained memory or a waiter");
+        check(waiting.calls === 0 && waiting.reviews.length === 0 && waiting.dirty.has("pending.md"),
+            "cancelling before review changed pending work");
+    }
+
     const nested = fixture(["nested.md"]);
     const nestedArbiter = new SyncMemoryArbiter({ capacityBytes: ROOT_BATCH_PLAN_ADMISSION.maxMetadataBytes });
     nested.ports.memoryArbiter = nestedArbiter;
