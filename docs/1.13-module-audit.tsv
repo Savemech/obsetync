@@ -110,7 +110,7 @@ reviewed	crates/sync-server/src/transport_memory.rs	production	Read complete non
 read	crates/sync-server/src/ws.rs	production	Read all handshake/seal/subscription/presence/relay/tests and plugin consumer; JoinSet aborts forwarders on early return; stale-session updates and cleanup fixed; shared ID validation and distinct subscription cap tested; notification memory bounds remain
 pending	crates/sync-server/src/ws_data.rs	production	Not reviewed
 reviewed	crates/sync-server/src/ws_ticket.rs	production	Complete mint/claim/sweep and all consumers traced; concurrent lost-ticket race reproduced then fixed; staging/claim TTL cleanup, 0600 files and v2 keys tested; realtime and data E2E pass; directory-permission follow-up recorded separately
-pending	docker-compose.e2e.yml	configuration/schema	Not reviewed
+reviewed	docker-compose.e2e.yml	configuration/schema	Traced init, guard settings, ports and volumes. Separate Compose project for E2E up/logs/down in just, CI and release prevents dev containers being removed as orphans. Validated resolved Compose models.
 reviewed	docker-compose.yml	configuration/schema	Read services/mounts/build args/artifact extraction/healthcheck; reconciled comments with packed storage and bind mounts; dev service actual build passes; release runtime gates remain
 pending	docs/native-root-read-concurrency-2026-09-05.json	historical evidence	Not reviewed
 pending	docs/root-drain-reviewed-counts-2026-09-05.json	historical evidence	Not reviewed

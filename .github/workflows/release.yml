@@ -150,14 +150,14 @@ jobs:
           node scripts/release-provenance.mjs verify-server-json server-build-identity.json \
             '${{ needs.precheck.outputs.version }}' '${{ github.sha }}' clean
       - name: Bring up E2E stack
-        run: docker compose -f docker-compose.e2e.yml up -d
+        run: docker compose -p obsetync-e2e -f docker-compose.e2e.yml up -d
       - name: Wait for health
         run: |
           for i in $(seq 1 60); do
             if curl -fsS http://127.0.0.1:27282/health >/dev/null 2>&1; then exit 0; fi
             sleep 1
           done
-          docker compose -f docker-compose.e2e.yml logs --tail=120 e2e-server
+          docker compose -p obsetync-e2e -f docker-compose.e2e.yml logs --tail=120 e2e-server
           exit 1
       - name: Run E2E suite
         env:
@@ -166,10 +166,10 @@ jobs:
         run: cargo test -p e2e-tests --features e2e --locked -- --test-threads=1
       - name: Dump server logs on failure
         if: failure()
-        run: docker compose -f docker-compose.e2e.yml logs --tail=300 e2e-server
+        run: docker compose -p obsetync-e2e -f docker-compose.e2e.yml logs --tail=300 e2e-server
       - name: Tear down E2E stack
         if: always()
-        run: docker compose -f docker-compose.e2e.yml down -v --remove-orphans
+        run: docker compose -p obsetync-e2e -f docker-compose.e2e.yml down -v --remove-orphans
 
   nix-check:
     name: Release Nix flake check
