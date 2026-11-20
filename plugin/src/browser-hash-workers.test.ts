@@ -202,6 +202,21 @@ async function byteAdmissionAndProtocolFaultAreFailClosed(): Promise<void> {
     assert.equal(pool.stats().ownedBytes, 0);
 }
 
+async function unsolicitedCancellationRetiresWorker(): Promise<void> {
+    const worker = new FakeBrowserWorker();
+    const pool = new BrowserHashWorkerPool("source", poolOptions(fakeHost(worker)));
+    await qualify(pool, worker);
+    const active = pool.run(new Uint8Array([7]), { feedBytes: 64 * 1024 });
+    const job = hashJobFrom(worker);
+    worker.emit({ schema: BROWSER_HASH_WORKER_SCHEMA, type: "cancelled",
+        generation: pool.generation, jobId: job.jobId, bytes: job.bytes }, [job.bytes]);
+    await assert.rejects(active,
+        (error: unknown) => error instanceof BrowserHashWorkerError && error.code === "PROTOCOL");
+    assert.equal(pool.stats().state, "unavailable");
+    assert.equal(pool.stats().quarantinedPayloadBytes, 0);
+    assert.equal(pool.diagnostics().cancelledJobs, 0);
+}
+
 async function hungJobTimesOutAndRetiresWorker(): Promise<void> {
     const worker = new FakeBrowserWorker();
     const pool = new BrowserHashWorkerPool("source", poolOptions(fakeHost(worker), {
@@ -240,12 +255,15 @@ async function main(): Promise<void> {
     await crashDisablesGenerationAndRejectsOwnedWork();
     await unsupportedAndFailedQualificationNeverAdvertiseReady();
     await byteAdmissionAndProtocolFaultAreFailClosed();
+    await unsolicitedCancellationRetiresWorker();
     await hungJobTimesOutAndRetiresWorker();
     await hungCancellationUsesShortRetirementBound();
     console.log("browser hash worker tests passed");
 }
 
+const unfinished = () => { throw new Error("browser hash worker tests did not finish"); };
+process.once("beforeExit", unfinished);
 void main().catch(error => {
     console.error(error);
     process.exitCode = 1;
-});
+}).finally(() => process.off("beforeExit", unfinished));

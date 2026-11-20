@@ -362,7 +362,7 @@ export class BrowserHashWorkerPool {
         }
         this.active = null;
         this.clearJobTimer();
-        if (message.type === "cancelled" || active.signal?.aborted) {
+        if (active.signal?.aborted) {
             this.cancelledJobs++;
             this.settle(active, abortError());
         } else if (message.type === "result" && validBrowserHash(message.hash) &&

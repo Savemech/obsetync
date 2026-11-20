@@ -174,7 +174,7 @@ reviewed	plugin/src/browser-capability-probe.test.ts	tests	Reproduced unnecessar
 reviewed	plugin/src/browser-capability-probe.ts	production	Reviewed admission, cancellation, transfer, timeout and cleanup; recheck aborted signal before allocating worker after admission
 reviewed	plugin/src/browser-hash-worker-entry.ts	production	Read init, cancellation, feed, heap checks and buffer return; actual SIMD and forced scalar qualify; failed qualification cannot process subsequent files
 reviewed	plugin/src/browser-hash-worker-protocol.ts	production	Traced fixture/hash and byte/feed bounds across worker, pool and push; real module transfer/hash parity and host lifecycle tests pass
-pending	plugin/src/browser-hash-workers.test.ts	tests	Not reviewed
+reviewed	plugin/src/browser-hash-workers.test.ts	tests	Traced worker transfers, generation fencing, admission, qualification failures, crashes, cancellation and deadlines against pool and entry. Added an unsolicited cancellation regression and unfinished-suite guard.
 reviewed	plugin/src/browser-hash-workers.ts	production	Read worker qualification, transfers, cancellation, fallback and disposal; removed write-only detached-buffer field; npm test worker ownership cases pass; real browser gate remains
 reviewed	plugin/src/browser-probe-entry.ts	production	Traced opt-in dispatch, single-job validation, both embedded modules, result and release acknowledgement. Worker bundles pass with real WASM in Node. Fixed host copies for Buffer subviews and tested retained input ownership; physical iPad unverified.
 reviewed	plugin/src/browser-probe-protocol.ts	production	Traced synthetic fixture, buffer limits and message types through worker and host; packaged worker round-trip passed
