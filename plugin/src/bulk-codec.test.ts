@@ -155,6 +155,10 @@ function malformedAndLimitCasesFailClosed(): void {
     } catch { rejected = true; }
     check(rejected, "per-object byte cap ignored");
 
+    bulkRejected(() => planBulkUploadSteps([
+        { kind: BulkObjectKind.Content, hash: "z".repeat(64), data: new Uint8Array() },
+    ], limits), /64 hex/, "invalid hash during planning");
+
     const badAck = new Uint8Array([79, 66, 75, 49, 1, 0, 0, 0, 9]);
     rejected = false;
     try { decodeBulkUploadAck(badAck, 1); } catch { rejected = true; }
@@ -429,7 +433,7 @@ function seededMalformedPacksFailClosed(): void {
     bulkRejected(
         () => decodeBulkDownloadResponse(hugeDownload, 0xffff_ffff, 0,
             { maxObjects: 1, maxBytes: 0xffff_ffff, maxObjectBytes: 1 }),
-        /truncated bulk download bitmap/,
+        /bulk download object count exceeds limit/,
         "bulk download with a 4-billion bitmap declaration",
     );
 }

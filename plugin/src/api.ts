@@ -1331,14 +1331,7 @@ export class ObsetyncApi {
 
     async checkChunks(hashes: string[], perf?: PerfOperation, signal?: AbortSignal,
         memory?: TransientWorkScope): Promise<string[]> {
-        const bulk = await this.checkObjectsBulk(BulkObjectKind.IndexChunk, hashes, perf, signal, memory);
-        if (bulk) return bulk;
-        throwIfBulkCancelled(signal);
-        const body = new TextEncoder().encode(JSON.stringify(hashes));
-        const res = await this.sealed("POST", "/api/v1/chunks/check", body, perf,
-            undefined, replaySafeSealedOptions(signal));
-        if (!res.ok) throw new Error(`checkChunks: ${res.status}`);
-        return (await res.json()).needed;
+        return this.checkObjects(BulkObjectKind.IndexChunk, "/api/v1/chunks/check", hashes, perf, signal, memory);
     }
 
     // --- Content (small files) ---
@@ -1358,14 +1351,7 @@ export class ObsetyncApi {
 
     async checkContent(hashes: string[], perf?: PerfOperation, signal?: AbortSignal,
         memory?: TransientWorkScope): Promise<string[]> {
-        const bulk = await this.checkObjectsBulk(BulkObjectKind.Content, hashes, perf, signal, memory);
-        if (bulk) return bulk;
-        throwIfBulkCancelled(signal);
-        const body = new TextEncoder().encode(JSON.stringify(hashes));
-        const res = await this.sealed("POST", "/api/v1/content/check", body, perf,
-            undefined, replaySafeSealedOptions(signal));
-        if (!res.ok) throw new Error(`checkContent: ${res.status}`);
-        return (await res.json()).needed;
+        return this.checkObjects(BulkObjectKind.Content, "/api/v1/content/check", hashes, perf, signal, memory);
     }
 
     // --- Content manifests (large files) ---
@@ -1400,14 +1386,7 @@ export class ObsetyncApi {
         signal?: AbortSignal,
         memory?: TransientWorkScope,
     ): Promise<string[]> {
-        const bulk = await this.checkObjectsBulk(BulkObjectKind.Manifest, hashes, perf, signal, memory);
-        if (bulk) return bulk;
-        throwIfBulkCancelled(signal);
-        const body = new TextEncoder().encode(JSON.stringify(hashes));
-        const res = await this.sealed("POST", "/api/v1/content/manifests/check", body, perf,
-            undefined, replaySafeSealedOptions(signal));
-        if (!res.ok) throw new Error(`checkManifests: ${res.status}`);
-        return (await res.json()).needed;
+        return this.checkObjects(BulkObjectKind.Manifest, "/api/v1/content/manifests/check", hashes, perf, signal, memory);
     }
 
     // --- Content sub-file chunks ---
@@ -1441,14 +1420,37 @@ export class ObsetyncApi {
         signal?: AbortSignal,
         memory?: TransientWorkScope,
     ): Promise<string[]> {
-        const bulk = await this.checkObjectsBulk(BulkObjectKind.ContentChunk, hashes, perf, signal, memory);
+        return this.checkObjects(BulkObjectKind.ContentChunk, "/api/v1/content/chunks/check", hashes, perf, signal, memory);
+    }
+
+    private async checkObjects(kind: BulkObjectKind, legacyPath: string, hashes: readonly string[],
+        perf?: PerfOperation, signal?: AbortSignal, memory?: TransientWorkScope): Promise<string[]> {
+        const bulk = await this.checkObjectsBulk(kind, hashes, perf, signal, memory);
         if (bulk) return bulk;
-        throwIfBulkCancelled(signal);
-        const body = new TextEncoder().encode(JSON.stringify(hashes));
-        const res = await this.sealed("POST", "/api/v1/content/chunks/check", body, perf,
-            undefined, replaySafeSealedOptions(signal));
-        if (!res.ok) throw new Error(`checkContentChunks: ${res.status}`);
-        return (await res.json()).needed;
+        const needed: string[] = [];
+        // Match the server's legacy JSON item and response limits.
+        const batchSize = 1000;
+        for (let offset = 0; offset < hashes.length; offset += batchSize) {
+            throwIfBulkCancelled(signal);
+            const batch = hashes.slice(offset, offset + batchSize);
+            const body = new TextEncoder().encode(JSON.stringify(batch));
+            const res = await this.sealed("POST", legacyPath, body, perf, 128 * 1024,
+                replaySafeSealedOptions(signal));
+            if (!res.ok) throw new Error(`${legacyPath}: ${res.status}`);
+            const missing: unknown = (await res.json())?.needed;
+            if (!Array.isArray(missing) || missing.length > batch.length) {
+                throw new Error("invalid legacy hash check response");
+            }
+            const remaining = new Map<string, number>();
+            for (const hash of batch) remaining.set(hash, (remaining.get(hash) ?? 0) + 1);
+            for (const hash of missing) {
+                const count = remaining.get(hash);
+                if (!count) throw new Error("unexpected hash in legacy check response");
+                remaining.set(hash, count - 1);
+                needed.push(hash);
+            }
+        }
+        return needed;
     }
 
     private async checkObjectsBulk(

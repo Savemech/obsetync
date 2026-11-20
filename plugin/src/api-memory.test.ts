@@ -722,6 +722,32 @@ async function urgentFilePriorityIsBoundedExplicitAndReplaySafe(): Promise<void>
     assert.equal(budget.snapshot().usedBytes, 0, "urgent-file routing leaked admission");
 }
 
+async function legacyHashChecksRespectBatchAndResponseLimits(): Promise<void> {
+    const fake = fakeApi(new ResourceBudget({ capacityBytes: 4 * MIB }));
+    fake.internal.bulkLimits = null;
+    const checks = ["checkChunks", "checkContent", "checkManifests", "checkContentChunks"] as const;
+    const hashes = Array.from({ length: 1001 }, (_, i) => hash(Math.floor(i / 2)));
+    const encode = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));
+    for (const check of checks) {
+        const sizes: number[] = [];
+        fake.reply((_path, body) => {
+            const batch: string[] = JSON.parse(new TextDecoder().decode(body));
+            sizes.push(batch.length);
+            return { body: encode({ needed: batch }) };
+        });
+        assert.deepEqual(await fake.api[check](hashes), hashes);
+        assert.deepEqual(sizes, [1000, 1]);
+    }
+    for (const needed of [null, "", [hash(9)], [hash(1), hash(1)]]) {
+        fake.reply(() => ({ body: encode({ needed }) }));
+        await assert.rejects(fake.api.checkContent([hash(1), hash(2)]), /legacy.*response/);
+    }
+    fake.reply(() => ({ body: new Uint8Array(128 * 1024 + 1) }));
+    const before = fake.counts.decrypt;
+    await assert.rejects(fake.api.checkContent([hash(1)]));
+    assert.equal(fake.counts.decrypt, before);
+}
+
 async function desktopOwnedReceiveFitsARecoverySizedPool(): Promise<void> {
     const budget = new ResourceBudget({ capacityBytes: 32 * MIB });
     const fake = fakeApi(budget, "desktop");
@@ -761,8 +787,9 @@ void (async () => {
             await scopedCheckUsesParentWorksetAndExactResponseBound();
             await urgentFilePriorityIsBoundedExplicitAndReplaySafe();
         });
+        await legacyHashChecksRespectBatchAndResponseLimits();
         await desktopOwnedReceiveFitsARecoverySizedPool();
-        console.log("api-memory.test: 19 ownership/transport regression scenarios passed");
+        console.log("api-memory.test: 20 ownership/transport regression scenarios passed");
     } finally {
         delete (globalThis as any).__obsetyncTestRequestUrl;
     }

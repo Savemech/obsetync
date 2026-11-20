@@ -1,3 +1,4 @@
+import { strict as assert } from "node:assert";
 import { performance } from "node:perf_hooks";
 import { arch, cpus, platform } from "node:os";
 import {
@@ -30,6 +31,13 @@ function run(profile: "desktop" | "mobile", maxBytes: number) {
     const started = performance.now();
     const steps = planBulkUploadSteps(records, limits);
     const elapsedMs = performance.now() - started;
+    let nextRecord = 0;
+    for (const step of steps) {
+        for (const record of step.kind === "bulk" ? step.records : [step.record]) {
+            assert.equal(record, records[nextRecord++], "planner changed record order");
+        }
+    }
+    assert.equal(nextRecord, records.length, "planner omitted records");
     const bulk = steps.filter((step) => step.kind === "bulk");
     const single = steps.filter((step) => step.kind === "single");
     const maxPackBytes = bulk.reduce(

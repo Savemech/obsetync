@@ -64,8 +64,6 @@ export const BULK_MOBILE_MAX_BYTES = 2 * 1024 * 1024;
 export const BULK_MAX_OBJECTS = 256;
 export const BULK_MAX_OBJECT_BYTES = 1024 * 1024 - 1;
 
-export const BULK_RECORD_WIRE_OVERHEAD = BULK_RECORD_HEADER_BYTES;
-
 const encoder = new TextEncoder();
 
 /** Accept only an authenticated, internally consistent capability bundle.
@@ -216,7 +214,7 @@ export function encodeBulkCheckRequest(
     writeU32(output, 5, hashes.length);
     let cursor = BULK_CHECK_HEADER_BYTES;
     for (const hash of hashes) {
-        output.set(hexToHash(hash), cursor);
+        writeHash(output, cursor, hash);
         cursor += 32;
     }
     return output;
@@ -236,10 +234,11 @@ export function decodeBulkCheckResponse(
     if (body.byteLength !== 8 + bitmapLength) {
         throw new Error("bulk check response length mismatch");
     }
-    assertUnusedBitmapBitsClear(body.subarray(8), count);
+    const bitmap = body.subarray(8);
+    assertUnusedBitmapBitsClear(bitmap, count);
     const needed: string[] = [];
     for (let index = 0; index < count; index++) {
-        if (bitmapGet(body.subarray(8), index)) needed.push(requestedHashes[index]);
+        if (bitmapGet(bitmap, index)) needed.push(requestedHashes[index]);
     }
     return needed;
 }
@@ -264,7 +263,7 @@ export function encodeBulkUploadPack(
         }
         output[cursor] = record.kind;
         output[cursor + 1] = record.flags ?? 0;
-        output.set(hexToHash(record.hash), cursor + 2);
+        writeHash(output, cursor + 2, record.hash);
         writeU32(output, cursor + 34, record.data.byteLength);
         writeU32(output, cursor + 38, record.data.byteLength);
         output.set(record.data, cursor + BULK_RECORD_HEADER_BYTES);
@@ -366,7 +365,7 @@ export function encodeBulkGetRequest(
     writeU32(output, 13, maxResponseBytes);
     let offset = BULK_GET_HEADER_BYTES;
     for (const hash of hashes) {
-        output.set(hexToHash(hash), offset);
+        writeHash(output, offset, hash);
         offset += 32;
     }
     return output;
@@ -387,6 +386,7 @@ export function decodeBulkDownloadResponse(
     const requestCount = readU32(body, 4);
     const nextCursor = readU32(body, 8);
     if (requestCount !== expectedCount) throw new Error("bulk download request count mismatch");
+    requireCount(requestCount, limits.maxObjects, "bulk download");
     if (nextCursor < previousCursor || nextCursor > requestCount) {
         throw new Error("bulk download cursor did not advance monotonically");
     }
@@ -412,18 +412,22 @@ export function hashToHex(hash: Uint8Array): string {
     return output;
 }
 
-export function hexToHash(hex: string): Uint8Array {
-    if (!/^[0-9a-fA-F]{64}$/.test(hex)) throw new Error("bulk hash must be 64 hex characters");
-    const output = new Uint8Array(32);
-    for (let index = 0; index < 32; index++) {
-        output[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
+function assertHashHex(hex: string): void {
+    if (typeof hex !== "string" || !/^[0-9a-fA-F]{64}$/.test(hex)) {
+        throw new Error("bulk hash must be 64 hex characters");
     }
-    return output;
+}
+
+function writeHash(output: Uint8Array, offset: number, hex: string): void {
+    assertHashHex(hex);
+    for (let index = 0; index < 32; index++) {
+        output[offset + index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
+    }
 }
 
 function assertRecordShape(record: BulkUploadRecord): void {
     assertKind(record.kind);
-    hexToHash(record.hash);
+    assertHashHex(record.hash);
     if (!(record.data instanceof Uint8Array)) throw new TypeError("bulk record data must be bytes");
     const flags = record.flags ?? 0;
     if (flags !== 0) throw new Error("bulk record flags are reserved in v1");
