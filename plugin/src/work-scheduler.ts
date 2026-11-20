@@ -258,13 +258,10 @@ export class WorkScheduler {
     }
 
     yield(options: WorkYieldOptions = {}): Promise<void> {
-        if (options.signal?.aborted) return Promise.reject(signalError(options.signal));
-        if (this.closed) return Promise.reject(abortError("Work scheduler is closed"));
+        const { signal } = options;
         const lane = options.lane ?? "bulk";
-        if (!LANES.includes(lane)) return Promise.reject(new RangeError("Unknown work scheduler lane"));
-        if (!this.hasAdmission(lane)) {
-            return Promise.reject(new Error("Work scheduler queue is full or reserved for urgent work"));
-        }
+        const error = this.admissionError(lane, signal);
+        if (error !== undefined) return Promise.reject(error);
         const deadlineMs = options.deadlineMs;
         if (deadlineMs !== undefined &&
             (!Number.isSafeInteger(deadlineMs) || deadlineMs < 0 || deadlineMs > MAX_DEADLINE_MS)) {
@@ -275,7 +272,7 @@ export class WorkScheduler {
             const entry: PendingYield = {
                 resolve,
                 reject,
-                signal: options.signal,
+                signal,
                 endWait: options.perf?.phase("scheduler_wait"),
                 lane,
                 enqueuedAt,
@@ -284,6 +281,9 @@ export class WorkScheduler {
                     : Math.min(Number.MAX_SAFE_INTEGER, enqueuedAt + deadlineMs),
                 sequence: this.nextSequence(),
             };
+            // The clock and timing hook can reenter before the queue owns this entry.
+            const changed = this.admissionError(lane, signal);
+            if (changed !== undefined) { this.finish(entry, changed); return; }
             if (entry.signal) {
                 entry.onAbort = () => {
                     const queue = this.queues[entry.lane];
@@ -385,6 +385,13 @@ export class WorkScheduler {
             oldest = Math.min(oldest, entry.enqueuedAt);
         }
         return found ? Math.max(0, now - oldest) : 0;
+    }
+
+    private admissionError(lane: WorkLane, signal?: AbortSignal): unknown {
+        if (signal?.aborted) return signalError(signal);
+        if (this.closed) return abortError("Work scheduler is closed");
+        if (!LANES.includes(lane)) return new RangeError("Unknown work scheduler lane");
+        if (!this.hasAdmission(lane)) return new Error("Work scheduler queue is full or reserved for urgent work");
     }
 
     private hasAdmission(lane: WorkLane): boolean {

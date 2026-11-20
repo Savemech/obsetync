@@ -401,8 +401,8 @@ reviewed	plugin/src/verified-conflict-content.ts	production	Traced conflict stag
 read	plugin/src/wasm-memory.ts	production	Checked allocator snapshot against native counter semantics, including contradictory live allocation counts; tree component review pending
 reviewed	plugin/src/wasm-runtime.test.ts	tests	Covered SIMD selection, both scalar fallbacks, invalid modules and concurrent callers sharing a failed attempt and a successful retry; assertion count measured at runtime.
 reviewed	plugin/src/wasm-runtime.ts	production	Traced the session loader through main.loadWasm and startup publication. Cache only in-flight and successful selections; a failed load can be retried without reloading the plugin.
-read	plugin/src/work-scheduler.test.ts	tests	Reproduced blocked queue on timing failure; checked successor scheduling and abort reason identity. Scheduler, perf-trace and lifecycle suites pass. Remaining fairness and fallback fixtures pending full audit.
-read	plugin/src/work-scheduler.ts	production	Traced host driver startup, lane selection, cancellation, disposal and per-job timing settlement. A throwing endWait now settles the current promise and allows the next host turn. Consolidated default clock selection. Admission reentrancy pending review.
+read	plugin/src/work-scheduler.test.ts	tests	Reproduced blocked queue on timing failure; checked successor scheduling and abort reason identity. Scheduler, perf-trace and lifecycle suites pass. Added abort, dispose and fill during timing-start regression. Remaining fairness and fallback fixtures pending full audit.
+read	plugin/src/work-scheduler.ts	production	Traced host driver startup, lane selection, cancellation, disposal and per-job timing settlement. A throwing endWait now settles the current promise and allows the next host turn. Consolidated default clock selection. Verified reentrant admission at timing start: abort, dispose and full queue all reject before insertion; nested owner runs normally.
 pending	plugin/src/ws-data-codec.test.ts	tests	Not reviewed
 pending	plugin/src/ws-data-codec.ts	production	Not reviewed
 pending	plugin/src/ws-data.bench.ts	tooling	Not reviewed

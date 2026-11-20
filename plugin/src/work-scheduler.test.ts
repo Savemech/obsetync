@@ -137,6 +137,28 @@ async function timingFailureDoesNotStrandQueuedWork(): Promise<void> {
     scheduler.dispose();
 }
 
+async function admissionSurvivesReentrantTiming(): Promise<void> {
+    for (const event of ["abort", "dispose", "fill"] as const) {
+        const host = new FakeHost(true);
+        const scheduler = new WorkScheduler({ runtime: host, maxPendingJobs: 1 });
+        const controller = new AbortController();
+        let inner: Promise<void> | undefined, ends = 0;
+        const perf = { phase() {
+            if (event === "abort") controller.abort();
+            if (event === "dispose") scheduler.dispose();
+            if (event === "fill") inner = scheduler.yield();
+            return () => { ends++; };
+        } } as unknown as PerfOperation;
+        const outer = scheduler.yield({ perf, signal: controller.signal });
+        assert.equal(scheduler.snapshot().pendingJobs, event === "fill" ? 1 : 0);
+        await assert.rejects(outer, event === "fill" ? /queue is full/ : { name: "AbortError" });
+        assert.equal(ends, 1);
+        if (inner) { host.tick(); await inner; }
+        assert.equal(host.tasks.size, 0);
+        scheduler.dispose();
+    }
+}
+
 async function abortsAreBoundedAndDoNotBlockLaterJobs(): Promise<void> {
     const host = new FakeHost();
     const scheduler = new WorkScheduler({ runtime: host, maxPendingJobs: 2 });
@@ -393,6 +415,7 @@ async function run(): Promise<void> {
     assert.throws(() => new WorkScheduler({ maxPendingJobs: 1025 }), RangeError);
     await boundedFifoNeedsRealTasks();
     await timingFailureDoesNotStrandQueuedWork();
+    await admissionSurvivesReentrantTiming();
     await abortsAreBoundedAndDoNotBlockLaterJobs();
     await disposingCancelsPendingAndReleasesResources();
     await brokenCapabilitiesFallBackWithoutLeaking();
