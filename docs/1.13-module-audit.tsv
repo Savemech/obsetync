@@ -138,7 +138,7 @@ reviewed	plugin/scripts/lib/native-root-child.mjs	tooling	Traced bounded output 
 pending	plugin/scripts/lib/native-root-crash-fixture.mjs	tooling	Not reviewed
 pending	plugin/scripts/lib/native-root-fixture.mjs	tooling	Not reviewed
 pending	plugin/scripts/lib/native-root-instrumentation.mjs	tooling	Not reviewed
-pending	plugin/scripts/lib/native-root-io.mjs	tooling	Not reviewed
+reviewed	plugin/scripts/lib/native-root-io.mjs	tooling	Traced handle open, validation, write, close and counter settlement; return exact whole-file backing directly and normalize binary input once
 reviewed	plugin/scripts/lib/native-root-metrics.mjs	tooling	Reviewed bounded histograms, per-instance memory sampling, call settlement and wrapper ownership; consolidated group/global restore with live registration check
 pending	plugin/scripts/lib/native-root-publication.ts	tooling	Not reviewed
 reviewed	plugin/scripts/lib/native-root-qualification.mjs	tooling	Traced fixture ordinals through per-run nearest-rank p95 and cross-run qualification; reject zero and fractional counts before aggregation
@@ -147,7 +147,7 @@ pending	plugin/scripts/native-root-audit-diagnostic.test.mjs	tests	Not reviewed
 pending	plugin/scripts/native-root-auto-diagnostic.test.mjs	tests	Not reviewed
 reviewed	plugin/scripts/native-root-child.test.mjs	tests	Reviewed process, timeout, orphan, observer and output-limit cases; all ten passed outside restricted sandbox
 pending	plugin/scripts/native-root-instrumentation.test.mjs	tests	Not reviewed
-pending	plugin/scripts/native-root-io.test.mjs	tests	Not reviewed
+reviewed	plugin/scripts/native-root-io.test.mjs	tests	Reviewed adapter operations, hook failures and accounting; independent one-MiB reads and exact byte views covered; all 14 tests passed
 reviewed	plugin/scripts/native-root-metrics.test.mjs	tests	Reproduced stale group cleanup overwriting caller assignment; metrics, qualification and instrumentation suites pass (28 tests)
 reviewed	plugin/scripts/native-root-qualification.test.mjs	tests	Confirmed regression failed before fix; qualification, metrics, auto and audit diagnostic suites passed (21 tests)
 reviewed	plugin/scripts/run-resource-governor-bench.mjs	tooling	Traced worker bundling, child exit, result recording and cleanup; live x86 record run passes and leaves historical reports intact

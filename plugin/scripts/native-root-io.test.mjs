@@ -75,6 +75,18 @@ test("real text/binary/append/stat/list/rename/remove methods satisfy adapter sh
     });
 });
 
+test("a full-size binary read owns exactly its file bytes across repeated reads", async () => {
+    await fixture(async ({ adapter }) => {
+        const source = new Uint8Array(1024 * 1024).fill(43);
+        await adapter.writeBinary("large.bin", source);
+        const first = new Uint8Array(await adapter.readBinary("large.bin"));
+        const second = new Uint8Array(await adapter.readBinary("large.bin"));
+        first.fill(0);
+        assert.deepEqual(second, source);
+        assert.deepEqual(new Uint8Array(await adapter.readBinary("large.bin")), source);
+    });
+});
+
 test("only actual ENOENT becomes absence; type/native failures stay failures", async () => {
     await fixture(async ({ adapter, resetCounters, snapshot }, directory) => {
         await adapter.mkdir("folder"); await adapter.write("file", "preserved"); resetCounters();

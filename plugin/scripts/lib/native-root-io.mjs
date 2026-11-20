@@ -177,8 +177,7 @@ export async function createNativeRootIO(directory, options = {}) {
     const readBytes = (relative, group) => withFile(relative, group, constants.O_RDONLY, async handle => {
         const data = await native(group, "readFile", () => handle.readFile()); bytes(group, "read", data.byteLength); return data;
     });
-    const writeBytes = async (relative, value, group, append) => {
-        const data = typeof value === "string" ? value : binaryView(value);
+    const writeBytes = async (relative, data, group, append) => {
         const length = typeof data === "string" ? Buffer.byteLength(data, "utf8") : data.byteLength;
         await withFile(relative, group, constants.O_WRONLY | constants.O_CREAT | (append ? constants.O_APPEND : 0), async handle => {
             // Do not truncate before verifying the opened regular file.
@@ -200,6 +199,7 @@ export async function createNativeRootIO(directory, options = {}) {
         }),
         readBinary: relative => run("readBinary", [relative], async group => {
             const data = await readBytes(relative, group);
+            if (data.byteOffset === 0 && data.byteLength === data.buffer.byteLength) return data.buffer;
             return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
         }),
         writeBinary: (relative, data) => run("writeBinary", [relative], group => writeBytes(relative, binaryView(data), group, false)),
