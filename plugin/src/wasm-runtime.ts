@@ -66,14 +66,17 @@ async function initializeBest<T>(options: WasmLoaderOptions<T>): Promise<WasmSel
     };
 }
 
-/** Create a session-scoped loader. The first selection promise is retained so
- * concurrent callers cannot initialize two wasm-bindgen module instances. */
+/** Create a session-scoped loader. Concurrent callers share an attempt and the
+ * successful selection stays cached. A later call can retry a failed load. */
 export function createWasmLoader<T>(
     options: WasmLoaderOptions<T>,
 ): () => Promise<WasmSelection<T>> {
     let cached: Promise<WasmSelection<T>> | null = null;
     return () => {
-        cached ??= initializeBest(options);
+        cached ??= Promise.resolve().then(() => initializeBest(options)).catch(error => {
+            cached = null;
+            throw error;
+        });
         return cached;
     };
 }

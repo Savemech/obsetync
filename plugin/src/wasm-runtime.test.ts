@@ -1,6 +1,8 @@
 import { createWasmLoader, type WasmCandidate } from "./wasm-runtime";
 
+let assertions = 0;
 const check = (condition: unknown, message: string) => {
+    assertions++;
     if (!condition) throw new Error(message);
 };
 
@@ -85,11 +87,32 @@ async function invalidScalarFailsClosed(): Promise<void> {
     check(message.includes("scalar"), "scalar failure lost its diagnostic");
 }
 
+async function failedLoadCanBeRetriedWithoutDuplicatingCompilation(): Promise<void> {
+    let attempts = 0;
+    const failure = new Error("transient initialization failure");
+    const loader = createWasmLoader({
+        scalar: candidate("scalar", 1, async () => {
+            if (++attempts === 1) throw failure;
+        }),
+        simd: candidate("simd", 2, async () => {}),
+        validate: module => module[0] === 1,
+    });
+    const first = loader();
+    check(loader() === first, "concurrent callers did not share the failing attempt");
+    const error = await first.then(() => null, reason => reason);
+    check(error === failure, "initialization error was lost");
+    const retry = loader();
+    check(retry !== first && loader() === retry, "retry did not start one fresh attempt");
+    check((await retry).mode === "scalar" && attempts === 2, "retry did not initialize the scalar module");
+    check(loader() === retry, "successful retry did not stay cached");
+}
+
 void supportedSimdIsSelectedAndCached()
     .then(unsupportedSimdFallsBackToScalar)
     .then(simdInitFailureFallsBackToScalar)
     .then(invalidScalarFailsClosed)
-    .then(() => console.log("wasm-runtime.test: 13 assertions passed"))
+    .then(failedLoadCanBeRetriedWithoutDuplicatingCompilation)
+    .then(() => console.log(`wasm-runtime.test: ${assertions} assertions passed`))
     .catch((error) => {
         console.error(error);
         process.exitCode = 1;
