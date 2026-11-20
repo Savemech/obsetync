@@ -3,13 +3,11 @@ import { exportTreeChunk, TREE_CHUNK_EXPORT_PAGE_BYTES as PAGE,
     type TreeChunkExportJobTree, type ExportTreeChunkOptions } from "./tree-chunk-export-job";
 
 const HASH = "ab".repeat(32);
-const payload = (length: number) => Uint8Array.from({ length }, (_, index) => (index * 17 + (index >>> 8)) & 255);
+const payload = (length: number) => Uint8Array.from({ length }, (_, index) => (index * 17 + (index >>> 8) + Math.floor(index / PAGE)) & 255);
 function gate() { let release!: () => void; const promise = new Promise<void>(resolve => { release = resolve; }); return { promise, release }; }
 
 class ExportFixture implements TreeChunkExportJobTree {
     candidate = true;
-    readonly candidateRevision = 1;
-    readonly committedRevision = 1;
     job = false;
     token = 37;
     offset = 0;
@@ -18,35 +16,33 @@ class ExportFixture implements TreeChunkExportJobTree {
     cancels = 0;
     legacyCalls = 0;
     yields = 0;
-    readonly events: string[] = [];
     readonly reads: Array<{ token: number; offset: number; maxBytes: number }> = [];
     pages: Uint8Array[] = [];
     afterRead?: () => void;
     afterFinish?: () => void;
     constructor(readonly source: Uint8Array) {}
-    has_candidate(): boolean { return this.candidate; }
     begin_tree_chunk_export_job(hash: string): unknown {
         assert.equal(hash, HASH); assert.equal(this.job, false);
-        this.begins++; this.job = true; this.offset = 0; this.events.push("begin");
+        this.begins++; this.job = true; this.offset = 0;
         return { token: this.token, length: this.source.length };
     }
     read_tree_chunk_export_job(token: number, expectedOffset: number, maxBytes: number): unknown {
         assert.equal(token, this.token); assert.equal(this.job, true); assert.equal(expectedOffset, this.offset);
         assert.equal(maxBytes, PAGE); assert(expectedOffset < this.source.length, "unexpected read at EOF");
-        this.reads.push({ token, offset: expectedOffset, maxBytes }); this.events.push("read");
+        this.reads.push({ token, offset: expectedOffset, maxBytes });
         const result = this.source.slice(expectedOffset, expectedOffset + maxBytes);
         this.offset += result.length; this.pages.push(result); this.afterRead?.(); return result;
     }
     finish_tree_chunk_export_job(token: number): void {
         assert.equal(token, this.token); assert.equal(this.job, true); assert.equal(this.offset, this.source.length);
-        this.finishes++; this.job = false; this.events.push("finish"); this.afterFinish?.();
+        this.finishes++; this.job = false; this.afterFinish?.();
     }
     cancel_tree_job(token: number): void {
         assert.equal(token, this.token); assert.equal(this.job, true);
-        this.cancels++; this.job = false; this.events.push("cancel");
+        this.cancels++; this.job = false;
     }
     options(extra: Partial<ExportTreeChunkOptions> = {}): ExportTreeChunkOptions {
-        return { cooperate: async () => { this.yields++; this.events.push("yield"); },
+        return { cooperate: async () => { this.yields++; },
             legacy: () => { this.legacyCalls++; throw new Error("unexpected legacy getter"); }, ...extra };
     }
     export(extra: Partial<ExportTreeChunkOptions> = {}) {
@@ -68,7 +64,6 @@ async function exactPagesAndNoInitialOrTerminalYield() {
         assert.equal(tree.yields, Math.max(0, Math.ceil(length / PAGE) - 1));
         assert.equal(tree.finishes, 1); assert.equal(tree.cancels, 0); assert.equal(tree.job, false);
         assert.equal(tree.legacyCalls, 0); assert.equal(tree.candidate, true);
-        assert.equal(tree.candidateRevision, 1); assert.equal(tree.committedRevision, 1);
         for (const page of tree.pages) page.fill(0);
         assert.deepEqual(result, tree.source, "returned buffer aliases a native page");
     }

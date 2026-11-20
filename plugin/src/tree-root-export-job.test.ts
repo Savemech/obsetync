@@ -6,7 +6,7 @@ import { exportTreeRoot, estimateTreeRootExportWorkset, TREE_ROOT_EXPORT_PAGE_BY
 
 const HASH = "ab".repeat(32);
 const CHEAP_CHARGE = 256; // Scheduled work/CPU proxy, not native bytes touched.
-const payload = (length: number) => Uint8Array.from({ length }, (_, index) => (index * 31 + (index >>> 8)) & 255);
+const payload = (length: number) => Uint8Array.from({ length }, (_, index) => (index * 31 + (index >>> 8) + Math.floor(index / PAGE)) & 255);
 function gate() { let release!: () => void; const promise = new Promise<void>(resolve => { release = resolve; }); return { promise, release }; }
 async function until(predicate: () => boolean) {
     for (let turn = 0; turn < 100; turn++) { if (predicate()) return; await Promise.resolve(); }
