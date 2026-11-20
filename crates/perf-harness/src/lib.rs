@@ -34,6 +34,7 @@ impl fmt::Display for WorkloadId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scale {
+    #[serde(deserialize_with = "Scale::read_millionths")]
     millionths: u64,
 }
 
@@ -42,8 +43,15 @@ impl Scale {
         millionths: SCALE_DENOMINATOR,
     };
 
-    pub fn millionths(self) -> u64 {
-        self.millionths
+    fn read_millionths<'de, D: serde::Deserializer<'de>>(input: D) -> Result<u64, D::Error> {
+        let value = u64::deserialize(input)?;
+        if (1..=SCALE_DENOMINATOR).contains(&value) {
+            Ok(value)
+        } else {
+            Err(serde::de::Error::custom(
+                "scale millionths outside 1..=1000000",
+            ))
+        }
     }
 
     fn count(self, full: usize) -> usize {
@@ -967,6 +975,37 @@ pub async fn benchmark_prefix_merge(
     })
 }
 
+// This workload emits only Added records with short, single-byte-length paths.
+fn matches_benchmark_records(mut bytes: &[u8], expected: &[sync_core::diff::FileDelta]) -> bool {
+    for delta in expected {
+        let sync_core::diff::FileDelta::Added {
+            path,
+            hash,
+            size,
+            mtime_ms,
+        } = delta
+        else {
+            return false;
+        };
+        if path.len() >= 128 {
+            return false;
+        }
+        for field in [
+            &[1, path.len() as u8][..],
+            path.as_bytes(),
+            hash,
+            &size.to_le_bytes(),
+            &mtime_ms.to_le_bytes(),
+        ] {
+            let Some(rest) = bytes.strip_prefix(field) else {
+                return false;
+            };
+            bytes = rest;
+        }
+    }
+    bytes.is_empty()
+}
+
 /// Exercise the production OBD1 encoder over a W1-sized synthetic delta and
 /// report the largest independently releasable page. Tree diff materialization
 /// is deliberately outside the timed section: both formats currently return a
@@ -1018,7 +1057,7 @@ pub fn benchmark_diff_pages(
         max_plain_bytes: page_cap_bytes,
         cursor: None,
     };
-    let started = Instant::now();
+    let mut encode_elapsed = std::time::Duration::ZERO;
     let mut pages = 0usize;
     let mut emitted = 0usize;
     let mut max_page_bytes = 0usize;
@@ -1026,25 +1065,44 @@ pub fn benchmark_diff_pages(
     let mut total_wire_bytes = 0usize;
     let mut every_page_within_cap = true;
     loop {
+        let started = Instant::now();
         let page = diff_page::encode_page(from_root, to_root, &deltas, &request)
             .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+        encode_elapsed += started.elapsed();
+        let (header, payload) = page
+            .bytes
+            .split_at_checked(diff_page::PAGE_HEADER_BYTES)
+            .ok_or_else(|| HarnessError::ManifestMismatch("truncated diff page header".into()))?;
+        let cursor_len = u16::from_le_bytes(header[72..74].try_into().unwrap()) as usize;
+        let (cursor, rows) = payload
+            .split_at_checked(cursor_len)
+            .ok_or_else(|| HarnessError::ManifestMismatch("truncated diff page cursor".into()))?;
+        let wire_count = u32::from_le_bytes(header[68..72].try_into().unwrap()) as usize;
+        let end = emitted.saturating_add(wire_count);
+        if wire_count == 0
+            || wire_count != page.record_count
+            || end > records
+            || !matches_benchmark_records(rows, &deltas[emitted..end])
+        {
+            return Err(HarnessError::ManifestMismatch(
+                "diff page records differ from the workload".into(),
+            ));
+        }
+        emitted = end;
         pages += 1;
-        emitted += page.record_count;
         max_page_bytes = max_page_bytes.max(page.bytes.len());
         max_page_records = max_page_records.max(page.record_count);
         total_wire_bytes = total_wire_bytes.saturating_add(page.bytes.len());
-        every_page_within_cap &= page.bytes.len() <= page_cap_bytes;
+        every_page_within_cap &= page.bytes.len() <= page_cap_bytes && wire_count <= record_cap;
         if !page.has_more {
             break;
         }
-        let cursor_len = u16::from_le_bytes(page.bytes[72..74].try_into().unwrap()) as usize;
+        let started = Instant::now();
         if cursor_len == 0 {
             return Err(HarnessError::ManifestMismatch(
                 "non-final diff page omitted cursor".into(),
             ));
         }
-        let cursor =
-            &page.bytes[diff_page::PAGE_HEADER_BYTES..diff_page::PAGE_HEADER_BYTES + cursor_len];
         let mut continuation = Vec::with_capacity(diff_page::REQUEST_HEADER_BYTES + cursor_len);
         continuation.extend_from_slice(diff_page::REQUEST_MAGIC);
         continuation.extend_from_slice(&from_root);
@@ -1055,8 +1113,9 @@ pub fn benchmark_diff_pages(
         continuation.extend_from_slice(cursor);
         request = diff_page::decode_request(&continuation)
             .map_err(|error| HarnessError::ManifestMismatch(error.to_string()))?;
+        encode_elapsed += started.elapsed();
     }
-    let encode_elapsed_ns = elapsed_ns(started.elapsed());
+    let encode_elapsed_ns = elapsed_ns(encode_elapsed);
 
     Ok(DiffPageBenchmarkReport {
         schema_version: 1,
@@ -1651,7 +1710,25 @@ mod tests {
     #[test]
     fn small_json_report_propagates_final_write_failure() {
         let error = write_json_file(Path::new("/dev/full"), &true).unwrap_err();
-        assert!(matches!(error, HarnessError::Io(e) if e.kind() == std::io::ErrorKind::StorageFull));
+        assert!(
+            matches!(error, HarnessError::Io(e) if e.kind() == std::io::ErrorKind::StorageFull)
+        );
+    }
+
+    #[test]
+    fn manifest_scale_enforces_the_cli_limits_before_planning() {
+        for value in [0, SCALE_DENOMINATOR + 1, u64::MAX] {
+            assert!(
+                serde_json::from_value::<Scale>(serde_json::json!({"millionths": value})).is_err()
+            );
+        }
+        for value in [1, SCALE_DENOMINATOR] {
+            let scale = Scale { millionths: value };
+            assert_eq!(
+                serde_json::from_value::<Scale>(serde_json::to_value(scale).unwrap()).unwrap(),
+                scale
+            );
+        }
     }
 
     #[test]
@@ -1775,6 +1852,24 @@ mod tests {
             .iterations
             .iter()
             .all(|iteration| iteration.linear_update_ns > 0));
+    }
+
+    #[test]
+    fn diff_benchmark_detects_duplicate_records_with_unchanged_count() {
+        use sync_core::diff::FileDelta;
+        let entry = |path: &str| FileDelta::Added {
+            path: path.into(),
+            hash: [0; 32],
+            size: 0,
+            mtime_ms: 0,
+        };
+        let mut bytes = vec![1, 1, b'a'];
+        bytes.resize(51, 0);
+        bytes.extend_from_within(..);
+        let expected = [entry("a"), entry("b")];
+        assert!(!matches_benchmark_records(&bytes, &expected));
+        bytes[53] = b'b';
+        assert!(matches_benchmark_records(&bytes, &expected));
     }
 
     #[test]
