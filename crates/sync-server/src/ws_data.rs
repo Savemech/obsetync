@@ -1136,13 +1136,6 @@ fn take_ready(ready: &mut VecDeque<ReadyRpc>, request_id: u64) -> Option<ReadyRp
     ready.remove(position)
 }
 
-fn take_reassembly<T>(
-    assembling: &mut HashMap<u64, Reassembly<T>>,
-    request_id: u64,
-) -> Option<Reassembly<T>> {
-    assembling.remove(&request_id)
-}
-
 fn is_request_kind(kind: FrameType) -> bool {
     matches!(
         kind,
@@ -1175,7 +1168,8 @@ fn cancel_request(
     admission: &mut AdmissionLedger,
 ) {
     if admission.is_assembling(request_id) {
-        let request = take_reassembly(assembling, request_id)
+        let request = assembling
+            .remove(&request_id)
             .expect("assembling admission must own a reassembly");
         admission.mark_sending(request_id);
         control_ready.push_front(cancelled_ready(
@@ -1795,7 +1789,6 @@ fn encode_error(code: ErrorCode, retry_after_ms: u32, message: &str) -> Vec<u8> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     #[test]
@@ -2358,71 +2351,63 @@ mod tests {
     }
 
     #[test]
-    fn queued_cancel_removes_and_drops_payload_owner_without_dispatch() {
-        struct DropOwner(Arc<AtomicUsize>);
-        impl Drop for DropOwner {
-            fn drop(&mut self) {
-                self.0.fetch_add(1, Ordering::AcqRel);
-            }
-        }
-
-        let drops = Arc::new(AtomicUsize::new(0));
-        let mut queued = VecDeque::from([
-            QueuedRpc {
-                request_id: 1,
-                kind: FrameType::GetPack,
-                payload: vec![1; 1024],
-                owner: DropOwner(Arc::clone(&drops)),
-            },
-            QueuedRpc {
-                request_id: 2,
-                kind: FrameType::PutPack,
-                payload: vec![2; 2048],
-                owner: DropOwner(Arc::clone(&drops)),
-            },
-        ]);
-        let cancelled = take_queued(&mut queued, 2).expect("queued request was not cancellable");
-        assert_eq!(cancelled.request_id, 2);
-        assert_eq!(queued.front().unwrap().request_id, 1);
-        assert_eq!(drops.load(Ordering::Acquire), 0);
-        drop(cancelled);
-        assert_eq!(drops.load(Ordering::Acquire), 1);
-        assert!(take_queued(&mut queued, 2).is_none());
-        drop(queued);
-        assert_eq!(drops.load(Ordering::Acquire), 2);
-    }
-
-    #[test]
-    fn cancel_during_reassembly_releases_only_after_control_response() {
-        struct DropOwner(Arc<AtomicUsize>);
-        impl Drop for DropOwner {
-            fn drop(&mut self) {
-                self.0.fetch_add(1, Ordering::AcqRel);
-            }
-        }
-
-        let drops = Arc::new(AtomicUsize::new(0));
+    fn cancel_reassembly_and_queued_rpc_retain_credit_until_response_handoff() {
+        let budget = crate::transport_memory::TransportMemoryBudget::with_capacity(24);
+        let counters = Arc::new(crate::perf::ServerPerfCounters::default());
+        let owner = || RpcOwner {
+            telemetry: counters.begin_ws_data_rpc(),
+            _memory: budget.try_reserve(8).unwrap(),
+        };
         let encoded = encode_fragment(FrameType::PutPack, 55, 8, 0, 0, 2, b"abcd", 4, 2).unwrap();
         let fragment = decode_fragment(&encoded, 8, 4, 2).unwrap();
-        let mut assembling = HashMap::new();
-        assembling.insert(
-            55,
-            Reassembly::start(fragment, DropOwner(Arc::clone(&drops))).unwrap(),
-        );
+        let mut assembling = HashMap::from([(55, Reassembly::start(fragment, owner()).unwrap())]);
+        let mut queued: VecDeque<_> = [56, 57]
+            .map(|request_id| QueuedRpc {
+                request_id,
+                kind: FrameType::PutPack,
+                payload: vec![2; 8],
+                owner: owner(),
+            })
+            .into();
         let mut ledger = AdmissionLedger::new(LaneLimits {
             max_payload_bytes: 8,
-            max_inflight_requests: 1,
-            max_inflight_bytes: 8,
+            max_inflight_requests: 3,
+            max_inflight_bytes: 24,
         });
         assert!(ledger.admit(55, 8, RpcPhase::Assembling));
+        assert!(ledger.admit(56, 8, RpcPhase::Queued));
+        assert!(ledger.admit(57, 8, RpcPhase::Queued));
 
-        let cancelled = take_reassembly(&mut assembling, 55).unwrap();
-        assert!(assembling.is_empty());
-        assert!(!ledger.admit(56, 1, RpcPhase::Queued));
-        assert_eq!(drops.load(Ordering::Acquire), 0);
-        assert!(ledger.finish(55));
-        assert_eq!(ledger.used_bytes, 0);
-        drop(cancelled);
-        assert_eq!(drops.load(Ordering::Acquire), 1);
+        let mut control = VecDeque::new();
+        for (index, id) in [55, 57].into_iter().enumerate() {
+            cancel_request(
+                id,
+                &mut assembling,
+                &mut queued,
+                &mut HashMap::new(),
+                &mut control,
+                &mut VecDeque::new(),
+                &mut ledger,
+            );
+            assert!(assembling.is_empty());
+            assert_eq!(queued.front().unwrap().request_id, 56);
+            assert_eq!(queued.len(), 2 - index);
+            assert_eq!(control.len(), 1);
+            let ready = &control[0];
+            assert_eq!(ready.response.request_id, id);
+            assert_eq!(ready.response.kind, FrameType::Error);
+            assert_eq!(ready.priority, OutboundPriority::Urgent);
+            assert_eq!(
+                &ready.response.payload[4..6],
+                &(ErrorCode::Cancelled as u16).to_le_bytes()
+            );
+            assert_eq!(ledger.entries[&id].1, RpcPhase::Sending);
+            assert_eq!(budget.available_bytes(), index * 8);
+            finish_ready_head(&mut control, &mut ledger);
+            assert_eq!(budget.available_bytes(), (index + 1) * 8);
+            assert_eq!(ledger.used_bytes, 16 - index * 8);
+        }
+        drop(queued);
+        assert_eq!(budget.available_bytes(), 24);
     }
 }
