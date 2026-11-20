@@ -99,7 +99,7 @@ export async function exportTreeChunk(
         return result;
     }
 
-    let token: number | undefined, jobOpen = false, failed = false, primary: unknown;
+    let token: number | undefined, jobOpen = false, primary: unknown;
     try {
         const raw = begin!.call(tree, hash);
         if (!raw || typeof raw !== "object") throw new TypeError("tree chunk export returned an invalid start");
@@ -133,13 +133,11 @@ export async function exportTreeChunk(
         assertCurrent();
         return result;
     } catch (error) {
-        failed = true; primary = error; throw error;
+        primary = error; throw error;
     } finally {
         if (jobOpen) {
             try { cancel!.call(tree, token!); }
-            catch (cleanup) {
-                if (failed) reportCleanupFailure(primary, cleanup); else throw cleanup;
-            }
+            catch (cleanup) { reportCleanupFailure(primary, cleanup); }
         }
     }
 }

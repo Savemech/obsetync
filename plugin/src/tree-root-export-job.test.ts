@@ -568,10 +568,13 @@ async function guardsCaptureMethodsAndCatchReentrantStop() {
 
 async function legacyOnceExplicitModeAndLateAdmission() {
     const refused = new Fixture(); let refusedCalls = 0;
-    await rejects(exportTreeRoot({}, "candidate", refused.options({
+    const options = refused.options({
         requireIncremental: true,
         legacy: () => { refusedCalls++; return refused.source.slice(); },
-    })), /incremental root export API is required/);
+    });
+    const required = exportTreeRoot({}, "candidate", options);
+    options.requireIncremental = false;
+    await rejects(required, /incremental root export API is required/);
     assert.equal(refusedCalls, 0); assert.equal(refused.budget.snapshot().usedBytes, 0);
 
     for (const mode of ["candidate", "committed"] as const) {

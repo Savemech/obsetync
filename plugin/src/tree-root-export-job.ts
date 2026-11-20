@@ -168,7 +168,7 @@ export async function exportTreeRoot(
     if (!Number.isSafeInteger(stepBytes) || stepBytes < 1 || stepBytes > TREE_ROOT_EXPORT_MAX_STEP_BYTES) {
         throw new TypeError("root export stepBytes must be an integer from 1 to 16 MiB");
     }
-    const { cooperate, signal, assertCurrent: assertOwner, parse, legacy, expectedHash, expectedVersion, budget } = options;
+    const { cooperate, signal, assertCurrent: assertOwner, parse, legacy, expectedHash, expectedVersion, budget, requireIncremental } = options;
     const maxLength = options.maxOutputBytes ?? 0xffff_ffff, maxArenaBytes = options.maxArenaBytes ?? 0xffff_ffff;
     const workOption = options.workBytes ?? 1;
     const check = () => { throwIfWorkAborted(signal); assertOwner?.(); throwIfWorkAborted(signal); };
@@ -201,7 +201,7 @@ export async function exportTreeRoot(
     try {
         await cooperateAndCheck(); check();
         if (!claimed) {
-            if (options.requireIncremental) {
+            if (requireIncremental) {
                 throw new TypeError("incremental root export API is required");
             }
             bytes = exactBytes(legacy(mode)); check();
