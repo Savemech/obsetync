@@ -115,6 +115,29 @@ async function fullCapacitySubscopeDoesNotDeadlock(): Promise<void> {
     budget.close();
 }
 
+async function queuedScopeKeepsItsOriginalQuotaAndSignal(): Promise<void> {
+    const budget = new ResourceBudget({ capacityBytes: 100 });
+    const blocker = await budget.reserve(100);
+    const requested = { ownerBytes: 60, workBytes: 40 };
+    const pending = reserveTransientScope(requested, { budget });
+    requested.ownerBytes = 0;
+    requested.workBytes = 100;
+    blocker.release();
+    const scope = await pending;
+    check(scope.snapshot().ownerBytes === 60 && scope.snapshot().work.capacityBytes === 40,
+        "queued scope changed its admitted owner and child quotas");
+    scope.close();
+
+    const original = new AbortController();
+    const options = { budget, signal: original.signal };
+    const cancelled = rejected(reserveTransientScope(requested, options));
+    options.signal = new AbortController().signal;
+    const reason = new Error("cancel after parent grant");
+    original.abort(reason);
+    check(await cancelled === reason && budget.snapshot().usedBytes === 0,
+        "signal replacement lost the original cancellation or retained its parent");
+}
+
 async function scopeCloseWaitsForAllOwners(): Promise<void> {
     const budget = new ResourceBudget({ capacityBytes: 100 });
     const scope = await reserveTransientScope({ ownerBytes: 60, workBytes: 40 }, { budget });
@@ -265,6 +288,7 @@ async function transientReservationsUseTheInjectedLifetimeArbiter(): Promise<voi
 
 estimatesAndAliases();
 void fullCapacitySubscopeDoesNotDeadlock()
+    .then(queuedScopeKeepsItsOriginalQuotaAndSignal)
     .then(scopeCloseWaitsForAllOwners)
     .then(timeoutDoesNotFreeChildCryptoWorkspace)
     .then(reuseWaitsForNativeSettlement)

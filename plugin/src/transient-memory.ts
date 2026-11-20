@@ -360,13 +360,14 @@ export async function reserveTransientScope(
     workset: Pick<TransientWorksetEstimate, "ownerBytes" | "workBytes">,
     options: { signal?: AbortSignal; wait?: boolean; budget?: TransientReservationBudget } = {},
 ): Promise<TransientWorkScope> {
-    byteCount(workset.ownerBytes, "ownerBytes", true);
-    byteCount(workset.workBytes, "workBytes");
-    const totalBytes = byteCount(workset.ownerBytes + workset.workBytes, "scope totalBytes");
-    const parent = await (options.budget ?? transientMemory).reserve(totalBytes, options);
+    const ownerBytes = byteCount(workset.ownerBytes, "ownerBytes", true);
+    const workBytes = byteCount(workset.workBytes, "workBytes");
+    const totalBytes = byteCount(ownerBytes + workBytes, "scope totalBytes");
+    const { budget = transientMemory, signal, wait } = options;
+    const parent = await budget.reserve(totalBytes, { signal, wait });
     try {
-        throwIfWorkAborted(options.signal);
-        return new OwnedTransientWorkScope(parent, workset.ownerBytes, workset.workBytes);
+        throwIfWorkAborted(signal);
+        return new OwnedTransientWorkScope(parent, ownerBytes, workBytes);
     } catch (error) {
         parent.release();
         throw error;
