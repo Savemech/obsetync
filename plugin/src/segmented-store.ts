@@ -339,14 +339,20 @@ export class SegmentedStore {
             for (let part = 0; part < head.snapshot.pages; part++) {
                 const page = await this.readPage(this.pagePath(head, part), head, "snapshot", head.snapshot.id);
                 if (page.part !== part || page.from !== head.snapshot.cut || page.through !== head.snapshot.cut) fail("snapshot page cut differs");
-                for (const row of page.rows) await onSnapshot(row);
+                for (const row of page.rows) {
+                    const pending = onSnapshot(row);
+                    if (pending) await pending;
+                }
                 await this.pause();
             }
             let expected = head.snapshot.cut + 1;
             for (let id = head.walStart; id <= head.walEnd; id++) {
                 const page = await this.readPage(this.walPath(head.epoch, id), head, "wal", id);
                 if (page.from !== expected || page.through !== expected + page.rows.length - 1) fail("WAL sequence continuity differs");
-                for (const row of page.rows) await onMutation(row);
+                for (const row of page.rows) {
+                    const pending = onMutation(row);
+                    if (pending) await pending;
+                }
                 expected = page.through + 1;
                 await this.pause();
             }

@@ -106,7 +106,7 @@ async function boundedPagesSnapshotAppendAndStableIterator(): Promise<void> {
     assert.equal((await recover(io.clone())).cursor, 1);
     io.onBoundary = undefined;
     assert.equal(traversed, stableRows.length);
-    assert.ok(firstWriteTraversed <= STORE_LIMITS.rowsPerPage + 1, "snapshot was eagerly materialized before the first page write");
+    assert.ok(firstWriteTraversed > 0 && firstWriteTraversed <= STORE_LIMITS.rowsPerPage + 1, "snapshot was eagerly materialized before the first page write");
     assert.equal(readStoreTestFrame(io, HEAD).snapshot.pages, 3);
     assert.equal(store.sequence, 0);
     assert.equal(store.walSegments, 0);
@@ -585,7 +585,26 @@ async function limitsRejectBeforeUnboundedReadAndPoisonFailedWriter(): Promise<v
     await assert.rejects(store.commit([]), (error: unknown) => error instanceof StoreRecoveryError && error.code === "RECOVERY_REQUIRED");
 }
 
+async function replayBatchesSynchronousRowsAndAwaitsAsyncRows(): Promise<void> {
+    const io = await fixture();
+    const events: string[] = [];
+    const store = new SegmentedStore(io, DIRECTORY, {
+        yield: async () => { events.push("yield"); }, automaticMaintenance: false,
+    });
+    await store.load(() => {}, value => {
+        const row = value as Extract<Row, { kind: "entry" }>;
+        events.push(row.path);
+        if (row.path === "a.md") queueMicrotask(() => events.push("microtask"));
+    }, value => {
+        const row = value as Row;
+        if (row.kind === "entry") return Promise.resolve().then(() => { events.push(row.path); });
+        events.push(row.kind);
+    });
+    assert.deepEqual(events, ["a.md", "b.md", "yield", "microtask", "seed.md", "cursor", "yield"]);
+}
+
 async function run(): Promise<void> {
+    await replayBatchesSynchronousRowsAndAwaitsAsyncRows();
     await boundedPagesSnapshotAppendAndStableIterator();
     await restartAndFailureAtEveryPublicationBoundary();
     await referencedDamageAndUnknownSchemaFailClosed();
@@ -598,4 +617,7 @@ async function run(): Promise<void> {
     console.log(`segmented-store.test: ${checkedBoundaries} restart boundaries, ${checkedRejections} authoritative IO rejections, ${checkedMaintenanceFailures} accepted maintenance failures, ${checkedTornWrites} torn writes and bounds/identity regressions passed`);
 }
 
-void run().catch((error) => { console.error(error); process.exitCode = 1; });
+const unfinished = () => { throw new Error("segmented store tests did not finish"); };
+process.once("beforeExit", unfinished);
+void run().catch((error) => { console.error(error); process.exitCode = 1; })
+    .finally(() => process.off("beforeExit", unfinished));
