@@ -492,9 +492,11 @@ async function assertFinished(f: Fixture, engine: any) {
     assert.equal(f.server.legacy, 0); assert.equal(engine.pendingChanges.size, 0);
     assert.equal(f.journal.unsyncedCount(), 0); assert.equal(engine.rootRuntime.pending(), null);
     assert.equal(f.base.treeBaseRoot, f.server.root);
+    assert.deepEqual(currentEntries(f.base), f.server.entries, "live sync base differs from published entries");
     const cold = await f.cold();
     assert.equal(cold.pending, null); assert.equal(cold.journal.unsyncedCount(), 0);
     assert.equal(cold.base.treeBaseRoot, f.server.root); assert.equal(cold.sequence, f.server.floor);
+    assert.deepEqual(currentEntries(cold.base), f.server.entries, "reopened sync base differs from published entries");
     return cold;
 }
 

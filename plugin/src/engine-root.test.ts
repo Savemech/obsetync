@@ -5,7 +5,7 @@ import { ROOT_INTENT_PATH } from "./root-intent";
 import { PathIsDirectoryError } from "./file-safety";
 import { RootTreeResidentAdmission } from "./root-tree-resident-admission";
 import { TREE_CANDIDATE_MUTATION_STEP_UNITS } from "./tree-candidate-mutation-job";
-import { fixture, hashFor, pathAt, gate, rejection, turns, observe, rows, type Fixture } from "./engine-root-test-fixture";
+import { assertFinished, fixture, hashFor, pathAt, gate, rejection, turns, observe, rows, type Fixture } from "./engine-root-test-fixture";
 
 async function boundedPublicationsPreserveUnselectedAndNewEvents() {
     const f = await fixture(600), a = await f.create("batch");
@@ -51,9 +51,11 @@ async function boundedPublicationsPreserveUnselectedAndNewEvents() {
         assert.equal(push.state.error, undefined);
         assert.deepEqual(f.server.publicationSizes, [256, 32, 1, 88, 224]);
         assert(f.server.cuts.every(cuts => cuts.length <= 256));
-        assert.equal(f.server.legacy, 0); assert.equal(f.journal.unsyncedCount(), 0); assert.equal(a.engine.pendingChanges.size, 0);
-        assert.equal(f.base.getHash(pathAt(0)), hashFor(3)); assert.equal(f.server.entries.get(pathAt(0))?.hash, hashFor(3));
-        assert.equal(f.base.entryCount(), 600);
+        assert.equal(f.server.entries.size, 600);
+        for (let index = 0; index < 600; index++) {
+            const version = index === 0 ? 3 : 2;
+            assert.deepEqual(f.server.entries.get(pathAt(index)), { hash: hashFor(version), mtime: version, size: 1 });
+        }
         const baseWrites = f.storage.events.slice(cut);
         const headPublishes = baseWrites.filter(event => event.method === "rename" && event.phase === "after" &&
             event.path === `${SYNC_BASE_STORE_PATH}/head.json.next` && event.to === `${SYNC_BASE_STORE_PATH}/head.json`);
@@ -61,8 +63,7 @@ async function boundedPublicationsPreserveUnselectedAndNewEvents() {
         const operations = baseWrites.flatMap(event => rows(event, SYNC_BASE_STORE_PATH));
         assert.equal(operations.filter(row => row.op === "root-publication").length, 5);
         assert(!operations.some(row => row.op === "tree-root" || row.op === "timestamp"), "legacy base bookkeeping ran alongside root settlement");
-        const cold = await f.cold(); assert.equal(cold.sequence, 5); assert.equal(cold.pending, null);
-        assert.equal(cold.journal.unsyncedCount(), 0); assert.equal(cold.base.treeBaseRoot, f.server.root);
+        const cold = await assertFinished(f, a.engine); assert.equal(cold.sequence, 5);
     } finally { for (const root of roots) root.resolve(); await f.close(); }
 }
 
