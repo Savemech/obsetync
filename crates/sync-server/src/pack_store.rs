@@ -134,7 +134,7 @@ pub(crate) struct ActiveSegment {
     id: u64,
     file: std::fs::File,
     len: u64,
-    entries: Vec<IndexEntry>,
+    record_count: usize,
 }
 
 pub(crate) struct OpenedPackStore {
@@ -177,7 +177,7 @@ impl PackStore {
 
             if is_last && !index_path.exists() && pack_len < SEGMENT_HEADER_BYTES as u64 {
                 initialize_segment_file(&pack_path, segment_id)?;
-                active = Some(open_active_segment(&pack_path, segment_id, Vec::new())?);
+                active = Some(open_active_segment(&pack_path, segment_id, 0)?);
                 continue;
             }
             validate_segment_header(&pack_path, segment_id)?;
@@ -198,7 +198,11 @@ impl PackStore {
             if is_last {
                 let scan = scan_segment(&pack_path, segment_id, true, store.perf())?;
                 store.publish_entries(&scan.entries)?;
-                active = Some(open_active_segment(&pack_path, segment_id, scan.entries)?);
+                active = Some(open_active_segment(
+                    &pack_path,
+                    segment_id,
+                    scan.record_count,
+                )?);
             } else {
                 let scan = scan_segment(&pack_path, segment_id, false, store.perf())?;
                 write_sidecar(&layout, segment_id, scan.segment_len, &scan.entries)?;
@@ -373,7 +377,7 @@ impl PackStore {
             rollback_segment(active, group_start)?;
             return Err(invalid_data("active segment exceeds hard byte limit"));
         }
-        if active.entries.len().saturating_add(entries.len()) > MAX_SEGMENT_OBJECTS {
+        if active.record_count.saturating_add(entries.len()) > MAX_SEGMENT_OBJECTS {
             rollback_segment(active, group_start)?;
             return Err(invalid_data("active segment exceeds hard object limit"));
         }
@@ -408,7 +412,7 @@ impl PackStore {
         }
 
         self.publish_entries(&entries)?;
-        active.entries.extend(entries);
+        active.record_count += entries.len();
         if fault == CommitFault::AfterPublishBeforeReply {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Interrupted,
@@ -416,7 +420,7 @@ impl PackStore {
             ));
         }
 
-        if active.len >= SEGMENT_TARGET_BYTES || active.entries.len() >= SEGMENT_OBJECT_TARGET {
+        if active.len >= SEGMENT_TARGET_BYTES || active.record_count >= SEGMENT_OBJECT_TARGET {
             self.seal_active(active)?;
         }
         Ok(())
@@ -567,6 +571,7 @@ impl PackStore {
 }
 
 struct ScannedSegment {
+    record_count: usize,
     entries: Vec<IndexEntry>,
     segment_len: u64,
 }
@@ -620,7 +625,7 @@ fn create_active_segment(
         id: segment_id,
         file,
         len: SEGMENT_HEADER_BYTES as u64,
-        entries: Vec::new(),
+        record_count: 0,
     })
 }
 
@@ -640,7 +645,7 @@ fn initialize_segment_file(path: &Path, segment_id: u64) -> Result<(), std::io::
 fn open_active_segment(
     path: &Path,
     segment_id: u64,
-    entries: Vec<IndexEntry>,
+    record_count: usize,
 ) -> Result<ActiveSegment, std::io::Error> {
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -651,7 +656,7 @@ fn open_active_segment(
         id: segment_id,
         file,
         len,
-        entries,
+        record_count,
     })
 }
 
@@ -778,20 +783,11 @@ fn scan_segment(
     let mut records_seen = 0usize;
 
     while offset < file_len {
-        records_seen = records_seen
-            .checked_add(1)
-            .ok_or_else(|| invalid_data("segment record count overflow"))?;
-        if records_seen > MAX_SEGMENT_OBJECTS {
-            return Err(invalid_data("segment exceeds hard object limit"));
-        }
         let remaining = file_len - offset;
         if remaining < RECORD_HEADER_BYTES as u64 {
             if allow_tail_truncate {
                 truncate_segment_tail(&mut file, offset)?;
-                return Ok(ScannedSegment {
-                    entries,
-                    segment_len: offset,
-                });
+                break;
             }
             return Err(invalid_data("sealed segment has a truncated record header"));
         }
@@ -811,14 +807,15 @@ fn scan_segment(
         if next_offset > file_len {
             if allow_tail_truncate {
                 truncate_segment_tail(&mut file, offset)?;
-                return Ok(ScannedSegment {
-                    entries,
-                    segment_len: offset,
-                });
+                break;
             }
             return Err(invalid_data("sealed segment has a truncated record"));
         }
 
+        records_seen += 1;
+        if records_seen > MAX_SEGMENT_OBJECTS {
+            return Err(invalid_data("segment exceeds hard object limit"));
+        }
         let stored_len = usize::try_from(decoded.stored_len)
             .map_err(|_| invalid_data("stored length overflow"))?;
         let mut bytes = vec![0u8; stored_len];
@@ -853,6 +850,7 @@ fn scan_segment(
         offset = next_offset;
     }
     Ok(ScannedSegment {
+        record_count: records_seen,
         entries,
         segment_len: offset,
     })
@@ -944,11 +942,7 @@ fn load_sidecar(
     segment_id: u64,
     segment_len: u64,
 ) -> Result<Vec<IndexEntry>, std::io::Error> {
-    let file_len = std::fs::metadata(path)?.len();
-    if file_len > MAX_SIDECAR_BYTES {
-        return Err(invalid_data("sidecar exceeds hard byte limit"));
-    }
-    let bytes = std::fs::read(path)?;
+    let bytes = read_blob_bounded(path, MAX_SIDECAR_BYTES as usize, None)?;
     if bytes.len() < INDEX_HEADER_BYTES + INDEX_TRAILER_BYTES {
         return Err(invalid_data("sidecar is truncated"));
     }
@@ -1331,6 +1325,7 @@ mod tests {
             std::fs::metadata(&path).unwrap().len(),
             SEGMENT_HEADER_BYTES as u64
         );
+        assert_eq!(recovered.active.record_count, 0);
         assert!(!recovered.store.contains(object.kind, &object.hash));
     }
 
@@ -1363,6 +1358,7 @@ mod tests {
             Arc::new(ServerPerfCounters::default()),
         )
         .unwrap();
+        assert_eq!(recovered.active.record_count, 2);
         assert!(!recovered.store.contains(first.kind, &first.hash));
         assert_eq!(
             recovered.store.read(second.kind, &second.hash).unwrap(),
