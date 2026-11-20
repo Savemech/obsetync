@@ -474,16 +474,20 @@ class PerfOperationHandle implements PerfOperation {
                 "bytesTransferred",
             );
         }
-        for (const key of [
-            "preparedFiles",
-            "serverConfirmedFiles",
-            "rootCommittedPaths",
-            "rootCommittedCuts",
-            "trackedDeletesCommitted",
-        ] as const) {
-            if (delta[key] !== undefined) {
-                this.values[key] = addBoundedCounter(this.values[key], delta[key]!, key);
-            }
+        if (delta.preparedFiles !== undefined) {
+            this.values.preparedFiles = addBoundedCounter(this.values.preparedFiles, delta.preparedFiles, "preparedFiles");
+        }
+        if (delta.serverConfirmedFiles !== undefined) {
+            this.values.serverConfirmedFiles = addBoundedCounter(this.values.serverConfirmedFiles, delta.serverConfirmedFiles, "serverConfirmedFiles");
+        }
+        if (delta.rootCommittedPaths !== undefined) {
+            this.values.rootCommittedPaths = addBoundedCounter(this.values.rootCommittedPaths, delta.rootCommittedPaths, "rootCommittedPaths");
+        }
+        if (delta.rootCommittedCuts !== undefined) {
+            this.values.rootCommittedCuts = addBoundedCounter(this.values.rootCommittedCuts, delta.rootCommittedCuts, "rootCommittedCuts");
+        }
+        if (delta.trackedDeletesCommitted !== undefined) {
+            this.values.trackedDeletesCommitted = addBoundedCounter(this.values.trackedDeletesCommitted, delta.trackedDeletesCommitted, "trackedDeletesCommitted");
         }
         if (delta.plaintextBytesSent !== undefined) {
             this.values.plaintextBytesSent += finiteNonNegative(
