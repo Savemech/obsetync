@@ -729,6 +729,21 @@ async function failedLegacyPushWaitsForAnExternalTrigger() {
     } finally { await f.close(); }
 }
 
+async function acknowledgedLegacyPushIsNotRestoredOnBookkeepingFailure() {
+    const f = await fixture(), a = await f.create("legacy-ack");
+    try {
+        const file = pathAt(0);
+        await f.queue(a.engine, [file], 2);
+        f.control.caps = null;
+        a.engine.api.putRoot = async () => ({ root_hash: a.engine.tree.candidate_root_hash_hex() });
+        a.engine.deferredChanges.commitSettlement = () => { throw new Error("local settlement failed"); };
+        await a.engine.pushPending();
+        assert.match(a.engine.lastError.message, /local settlement failed/);
+        assert.equal(f.journal.unsyncedCount(), 0);
+        assert.equal(a.engine.pendingChanges.size, 0, "acknowledged legacy change was requeued");
+    } finally { await f.close(); }
+}
+
 async function automaticPushOwnsEarlyScopeRejection() {
     // The normal runner launches this actual bundle in a strict child. Do not
     // install unhandledRejection/uncaughtException listeners to hide a leak.
@@ -2519,6 +2534,7 @@ async function run() {
         await metadataMutexProtectsNativeAuditAndStillDrainsLiveEdits();
         await metadataErrorAndAbortReleaseOnlyAfterActualRead();
         await failedLegacyPushWaitsForAnExternalTrigger();
+        await acknowledgedLegacyPushIsNotRestoredOnBookkeepingFailure();
         await automaticPushOwnsEarlyScopeRejection();
         await continuationReadinessDoesNotDetachTheBacklog();
         await outputAdmissionRefusalRetriesOnlyWhenFactsChange();
@@ -2540,7 +2556,7 @@ async function run() {
         await deferredFreshPullWithoutAHeadKeepsItsDurableFence();
         await disabledConfigScanPreservesPreviouslyTrackedSettings();
         await ignoredFreshPullCannotAdoptOrPublishMissingLeaves();
-        console.log("engine-root.test: 41 actual engine/root/journal/base integration suites passed (synthetic tree/transport)");
+        console.log("engine-root.test: 42 actual engine/root/journal/base integration suites passed (synthetic tree/transport)");
     } finally {
         if (globals.__obsetyncTestNotice === notice) {
             if (oldNotice === undefined) delete globals.__obsetyncTestNotice; else globals.__obsetyncTestNotice = oldNotice;

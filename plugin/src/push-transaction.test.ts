@@ -1047,7 +1047,8 @@ async function pagedCandidateChunksDriveActualPushSafely(): Promise<void> {
         try {
             await push({
                 ensureTransportReady: async () => {}, checkContent: async () => [],
-                checkChunks: async () => {
+                checkChunks: async (_hashes: string[], _perf: unknown, signal?: AbortSignal) => {
+                    check(signal === stop.signal, "index check lost its push cancellation signal");
                     if (++stoppedChecks === 2) stop.abort(new Error("paged index check stopped"));
                     return [];
                 },

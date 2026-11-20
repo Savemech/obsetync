@@ -3757,10 +3757,12 @@ export class ObsetyncSyncEngine {
             }
 
             await this.journal.acknowledge(settlement.acknowledged);
+            const settledQueue = queued;
+            queued = []; // Retained hints are already restored and the journal ACK is durable.
             this.deferredChanges.commitSettlement(settlement);
             const acknowledged = new Map(settlement.acknowledged.map(cut => [cut.path, cut.throughId]));
             const retainedPaths = new Set(settlement.retained.map(hint => hint.path));
-            for (const hint of queued) if (!retainedPaths.has(hint.path) &&
+            for (const hint of settledQueue) if (!retainedPaths.has(hint.path) &&
                 ((hint.journalId === undefined && published) || acknowledged.get(hint.path) === hint.journalId)) {
                 this.recentLocalUpsertOwner().retire(hint, path =>
                     this.pendingChanges.has(path) || this.localEventsInFlight.has(path));

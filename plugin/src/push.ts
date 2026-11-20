@@ -810,7 +810,7 @@ async function preparePushLookahead(
     throwIfWorkAborted(signal);
     const endCheck = perf?.phase("check");
     let response: unknown;
-    try { response = await api.checkContent(hashes, perf); }
+    try { response = await api.checkContent(hashes, perf, signal); }
     finally { endCheck?.(); }
     throwIfWorkAborted(signal);
     const missingSet = validateLookaheadMissingHashes(hashes, response);
@@ -1966,7 +1966,7 @@ export async function push(
                         const endUpload = perf?.phase("upload");
                         perf?.setDemand({ network: 1 });
                         try {
-                            await api.putObjects(records, perf, memory);
+                            await api.putObjects(records, perf, memory, signal);
                         } finally {
                             endUpload?.();
                             perf?.setDemand({});
@@ -1990,7 +1990,7 @@ export async function push(
                             perf?.observePeakBatchBytes(manifestRecord.data.byteLength);
                             const endUpload = perf?.phase("upload");
                             try {
-                                await api.putObjects([manifestRecord], perf, memory);
+                                await api.putObjects([manifestRecord], perf, memory, signal);
                             } finally {
                                 endUpload?.();
                             }
@@ -2407,7 +2407,7 @@ export async function push(
                     : hashes;
                 const endPageCheck = perf?.phase("check");
                 let rawNeeded: unknown;
-                try { rawNeeded = unchecked.length ? await api.checkChunks(unchecked, perf) : []; }
+                try { rawNeeded = unchecked.length ? await api.checkChunks(unchecked, perf, signal) : []; }
                 finally { endPageCheck?.(); }
                 if (!Array.isArray(rawNeeded) || rawNeeded.length > unchecked.length) {
                     throw new TypeError("server returned an invalid needed index chunk page");
