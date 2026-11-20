@@ -65,7 +65,7 @@ pub struct AppState {
     /// sessions subscribe per vault. Send is sync and non-blocking; a
     /// receiver that lags past the 16-message buffer just misses frames and
     /// falls back to its regular poll (data never depends on this channel).
-    notifiers: StdMutex<HashMap<String, broadcast::Sender<Utf8Bytes>>>,
+    notifiers: StdMutex<HashMap<String, broadcast::Sender<VaultFrame>>>,
     /// Ephemeral presence: vault → device → (name, file, state). Ph3. Never
     /// persisted; refreshed by clients, expired by TTL, cleared on close.
     presence: StdMutex<HashMap<String, HashMap<String, PresenceEntry>>>,
@@ -133,7 +133,7 @@ impl AppState {
     /// Publish a ready-to-send inner frame (JSON string) to a vault's live
     /// WebSocket subscribers. No subscribers → no channel is even created;
     /// never blocks.
-    pub fn publish_frame(&self, vault_id: &str, frame_json: String) {
+    fn publish_frame(&self, vault_id: &str, frame: VaultFrame) {
         let sender = self
             .notifiers
             .lock()
@@ -142,7 +142,7 @@ impl AppState {
             .cloned();
         if let Some(tx) = sender {
             // Err just means nobody is listening right now — fine.
-            let _ = tx.send(frame_json.into());
+            let _ = tx.send(frame);
         }
     }
 
@@ -158,7 +158,7 @@ impl AppState {
         self.storage_writer
             .run_blocking(move |_| {
                 crate::crdt::append(&state.layout, &vault, &note, &update)?;
-                state.publish_frame(&vault, frame);
+                state.publish_frame(&vault, VaultFrame::Ops(frame.into()));
                 Ok(())
             })
             .await
@@ -169,8 +169,11 @@ impl AppState {
     pub fn notify_root_changed(&self, vault_id: &str, root_hex: &str) {
         self.publish_frame(
             vault_id,
-            serde_json::json!({ "v": 1, "t": "root", "vault": vault_id, "root": root_hex })
-                .to_string(),
+            VaultFrame::Root(
+                serde_json::json!({ "v": 1, "t": "root", "vault": vault_id, "root": root_hex })
+                    .to_string()
+                    .into(),
+            ),
         );
     }
 
@@ -235,7 +238,11 @@ impl AppState {
         // Publish under the same lock so concurrent updates cannot reverse frames.
         self.publish_frame(
             vault_id,
-            presence_frame(vault_id, device_id, device_name, file.as_deref(), state),
+            VaultFrame::Presence {
+                device: Arc::from(device_id),
+                json: presence_frame(vault_id, device_id, device_name, file.as_deref(), state)
+                    .into(),
+            },
         );
     }
 
@@ -254,7 +261,11 @@ impl AppState {
         if let Some(entry) = vault.remove(device_id) {
             self.publish_frame(
                 vault_id,
-                presence_frame(vault_id, device_id, &entry.device_name, None, "offline"),
+                VaultFrame::Presence {
+                    device: Arc::from(device_id),
+                    json: presence_frame(vault_id, device_id, &entry.device_name, None, "offline")
+                        .into(),
+                },
             );
         }
         if vault.is_empty() {
@@ -264,7 +275,7 @@ impl AppState {
 
     /// Current live presence for a vault as ready-to-send frames — served to
     /// fresh subscribers so they immediately see who is where.
-    pub fn presence_snapshot(&self, vault_id: &str) -> Vec<String> {
+    pub fn presence_snapshot(&self, vault_id: &str, recipient: &str) -> Vec<String> {
         let now = now_ms();
         let mut map = self.presence.lock().expect("presence poisoned");
         let Some(vault) = map.get_mut(vault_id) else {
@@ -277,6 +288,7 @@ impl AppState {
         }
         vault
             .iter()
+            .filter(|(device_id, _)| device_id.as_str() != recipient)
             .map(|(device_id, e)| {
                 presence_frame(
                     vault_id,
@@ -316,14 +328,30 @@ impl Drop for VaultLock<'_> {
     }
 }
 
+#[derive(Clone, Debug)]
+pub enum VaultFrame {
+    Root(Utf8Bytes),
+    Presence { device: Arc<str>, json: Utf8Bytes },
+    Ops(Utf8Bytes),
+}
+
+impl VaultFrame {
+    pub fn for_device(self, recipient: &str) -> Option<Utf8Bytes> {
+        match self {
+            Self::Presence { device, .. } if device.as_ref() == recipient => None,
+            Self::Presence { json, .. } | Self::Root(json) | Self::Ops(json) => Some(json),
+        }
+    }
+}
+
 pub struct VaultSubscription {
-    receiver: Option<broadcast::Receiver<Utf8Bytes>>,
+    receiver: Option<broadcast::Receiver<VaultFrame>>,
     state: SharedState,
     vault_id: String,
 }
 
 impl VaultSubscription {
-    pub async fn recv(&mut self) -> Result<Utf8Bytes, broadcast::error::RecvError> {
+    pub async fn recv(&mut self) -> Result<VaultFrame, broadcast::error::RecvError> {
         self.receiver
             .as_mut()
             .expect("live subscription")
@@ -337,6 +365,11 @@ impl VaultSubscription {
             .as_mut()
             .expect("live subscription")
             .try_recv()
+            .map(|frame| match frame {
+                VaultFrame::Root(json)
+                | VaultFrame::Ops(json)
+                | VaultFrame::Presence { json, .. } => json,
+            })
     }
 }
 
@@ -377,7 +410,7 @@ fn presence_frame(
         "v": 1,
         "t": "presence",
         "vault": vault_id,
-        "device": &device_id[..device_id.len().min(12)],
+        "device": format!("{device_id:.12}"),
         "name": device_name,
         "file": file,
         "state": state,
@@ -444,12 +477,12 @@ mod tests {
         let state = Arc::new(AppState::new(ServerConfig::new(dir.path().to_path_buf())));
         let mut old = state.subscribe_roots("vault");
         let mut new = state.subscribe_roots("vault");
-        state.publish_frame("vault", "shared".into());
+        state.publish_frame("vault", VaultFrame::Root("shared".into()));
         let first = old.try_recv().unwrap();
         let second = new.try_recv().unwrap();
         assert_eq!(first.as_ptr(), second.as_ptr());
         drop(old);
-        state.publish_frame("vault", "still live".into());
+        state.publish_frame("vault", VaultFrame::Root("still live".into()));
         assert_eq!(new.try_recv().unwrap(), "still live");
         let forwarder = tokio::spawn(async move { new.recv().await });
         forwarder.abort();
@@ -477,6 +510,33 @@ mod tests {
             events.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn presence_routes_by_full_id_even_when_display_prefixes_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        layout.init_directories().unwrap();
+        box_key::init_box_keypair(&layout).unwrap();
+        let state = Arc::new(AppState::new(ServerConfig::new(dir.path().to_path_buf())));
+        let mut events = state.subscribe_roots("vault");
+        let sender = "123456789abc01";
+        let peer = "123456789abc02";
+        state.set_presence(
+            "vault",
+            sender,
+            1,
+            "Tablet",
+            Some("note.md".into()),
+            "active",
+        );
+        let event = events.recv().await.unwrap();
+        assert!(event.clone().for_device(sender).is_none());
+        let delivered = event.for_device(peer).unwrap();
+        assert!(state.presence_snapshot("vault", sender).is_empty());
+        assert_eq!(state.presence_snapshot("vault", peer), [delivered.as_str()]);
+        let json: serde_json::Value = serde_json::from_str(&delivered).unwrap();
+        assert_eq!(json["device"], "123456789abc");
     }
 
     #[tokio::test]
@@ -516,13 +576,13 @@ mod tests {
             Some("late-old.md".into()),
             "active",
         );
-        assert_eq!(state.presence_snapshot("vault"), [latest.as_str()]);
+        assert_eq!(state.presence_snapshot("vault", "peer"), [latest.as_str()]);
         assert!(
             events.try_recv().is_err(),
             "late old frames must not replace the new session"
         );
         state.clear_presence("vault", "device", old_session);
-        assert_eq!(state.presence_snapshot("vault"), [latest.as_str()]);
+        assert_eq!(state.presence_snapshot("vault", "peer"), [latest.as_str()]);
         assert!(
             events.try_recv().is_err(),
             "old close must not broadcast offline"
@@ -530,7 +590,7 @@ mod tests {
 
         state.clear_presence("vault", "device", new_session);
         assert!(state.presence.lock().unwrap().is_empty());
-        assert!(state.presence_snapshot("vault").is_empty());
+        assert!(state.presence_snapshot("vault", "peer").is_empty());
         let offline: serde_json::Value = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
         assert_eq!(offline["state"], "offline");
         state.clear_presence("vault", "device", new_session);
@@ -546,7 +606,7 @@ mod tests {
             .get_mut("device")
             .unwrap()
             .updated_ms = 0;
-        assert!(state.presence_snapshot("vault").is_empty());
+        assert!(state.presence_snapshot("vault", "peer").is_empty());
         assert!(state.presence.lock().unwrap().is_empty());
     }
 }

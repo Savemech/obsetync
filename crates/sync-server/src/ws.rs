@@ -25,7 +25,7 @@
 //!        {"t":"presence","vault":..,"device":..,"name":..,"file":..,"state":..} (v2 only)
 
 use crate::secure;
-use crate::state::SharedState;
+use crate::state::{SharedState, VaultFrame};
 use crate::ws_ticket;
 use axum::{
     extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
@@ -81,7 +81,7 @@ pub async fn ws_route(
             let Some(session_cancelled) = state.devices.session_token(&t.device_id) else {
                 return (StatusCode::FORBIDDEN, "device revoked").into_response();
             };
-            let device_short = t.device_id[..t.device_id.len().min(12)].to_string();
+            let device_short = format!("{:.12}", t.device_id);
             tracing::info!(device = %device_short, "ws: v1 session opening (plaintext, deprecated)");
             upgrade.on_upgrade(move |socket| session(state, socket, t, session_cancelled))
         }
@@ -156,7 +156,7 @@ async fn v2_entry(state: SharedState, socket: WebSocket) {
         return;
     };
 
-    let device_short = ticket.device_id[..ticket.device_id.len().min(12)].to_string();
+    let device_short = format!("{:.12}", ticket.device_id);
     tracing::info!(device = %device_short, "ws: v2 session opening (sealed)");
     session_v2(state, sink, stream, ticket, session_cancelled).await;
 }
@@ -204,7 +204,7 @@ async fn session_v2(
     mut ticket: ws_ticket::WsTicket,
     session_cancelled: CancellationToken,
 ) {
-    let device_short = ticket.device_id[..ticket.device_id.len().min(12)].to_string();
+    let device_short = format!("{:.12}", ticket.device_id);
     let Some(mut seal) = SealCtx::from_ticket(&ticket) else {
         let _ = sink
             .send(Message::Text(bye("corrupt session keys").into()))
@@ -259,19 +259,14 @@ async fn session_v2(
     for vault in &vaults {
         let mut rx = state.subscribe_roots(vault);
         let tx = out_tx.clone();
-        // presence_frame stamps the SHORT (12-char) device id, so compare
-        // against that, not the full ticket id.
-        let my_device = device_short.clone();
+        let my_device = ticket.device_id.clone();
         forwarders.spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(frame) => {
-                        // Never echo a device its OWN presence — it already
-                        // knows it has the file open, and "you are editing this"
-                        // is just noise (only OTHER devices should surface).
-                        if is_own_presence(&frame, &my_device) {
+                        let Some(frame) = frame.for_device(&my_device) else {
                             continue;
-                        }
+                        };
                         if tx.send(frame).await.is_err() {
                             break;
                         }
@@ -286,10 +281,7 @@ async fn session_v2(
 
     // Fresh subscriber immediately learns who is where (minus itself).
     for vault in &vaults {
-        for frame in state.presence_snapshot(vault) {
-            if is_own_presence(&frame, &device_short) {
-                continue;
-            }
+        for frame in state.presence_snapshot(vault, &ticket.device_id) {
             if let Some(f) = seal.seal(&frame) {
                 if sink.send(Message::Binary(f.into())).await.is_err() {
                     return;
@@ -427,7 +419,7 @@ async fn session(
     ticket: ws_ticket::WsTicket,
     session_cancelled: CancellationToken,
 ) {
-    let device_short = ticket.device_id[..ticket.device_id.len().min(12)].to_string();
+    let device_short = format!("{:.12}", ticket.device_id);
     let (mut sink, mut stream) = socket.split();
 
     let subscription = tokio::select! {
@@ -456,17 +448,12 @@ async fn session(
         forwarders.spawn(async move {
             loop {
                 match rx.recv().await {
-                    Ok(frame) => {
-                        // Plaintext wire: presence frames (file paths!) must
-                        // not leak here — root notifications only.
-                        let is_root = serde_json::from_str::<serde_json::Value>(&frame)
-                            .ok()
-                            .and_then(|v| v.get("t").and_then(|t| t.as_str()).map(|t| t == "root"))
-                            .unwrap_or(false);
-                        if is_root && tx.send(frame).await.is_err() {
+                    Ok(VaultFrame::Root(frame)) => {
+                        if tx.send(frame).await.is_err() {
                             break;
                         }
                     }
+                    Ok(_) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
@@ -551,24 +538,8 @@ fn bye(reason: &str) -> String {
     serde_json::json!({"v": 1, "t": "bye", "reason": reason}).to_string()
 }
 
-/// True when `frame` is a presence frame advertising `my_device` — so a session
-/// can skip echoing a device its own presence. Non-presence frames (root
-/// changes, ops) never match, so they always forward.
-fn is_own_presence(frame: &str, my_device: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(frame)
-        .ok()
-        .filter(|v| v.get("t").and_then(|t| t.as_str()) == Some("presence"))
-        .and_then(|v| {
-            v.get("device")
-                .and_then(|d| d.as_str())
-                .map(|d| d == my_device)
-        })
-        .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::is_own_presence;
 
     #[test]
     fn subscriptions_preserve_order_and_bound_distinct_valid_vaults() {
@@ -585,30 +556,5 @@ mod tests {
             .chain((0..15).map(|n| n.to_string()))
             .collect();
         assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn own_presence_frame_is_filtered_others_are_not() {
-        let mine = r#"{"v":2,"t":"presence","vault":"v","device":"dev-A","name":"Laptop","file":"a.md","state":"active"}"#;
-        let other = r#"{"v":2,"t":"presence","vault":"v","device":"dev-B","name":"Tablet","file":"a.md","state":"active"}"#;
-        let root = r#"{"v":2,"t":"root","vault":"v","root":"abc"}"#;
-        assert!(is_own_presence(mine, "dev-A"));
-        assert!(!is_own_presence(other, "dev-A")); // another device — keep
-        assert!(!is_own_presence(root, "dev-A")); // not presence — keep
-        assert!(!is_own_presence("not json", "dev-A"));
-    }
-
-    #[test]
-    fn compares_against_the_short_device_id() {
-        // presence_frame stamps the SHORT (12-char) device id, so callers MUST
-        // pass the short form — comparing the FULL id matches nothing (the 1.9.6
-        // bug that let a device see its own presence).
-        let short = "a1b2c3d4e5f6";
-        let full = "a1b2c3d4e5f6aabbccddeeff00112233";
-        let frame = format!(
-            r#"{{"v":1,"t":"presence","vault":"v","device":"{short}","name":"L","file":"a.md","state":"active"}}"#
-        );
-        assert!(is_own_presence(&frame, short)); // short vs short → filtered
-        assert!(!is_own_presence(&frame, full)); // short vs full → the trap
     }
 }
