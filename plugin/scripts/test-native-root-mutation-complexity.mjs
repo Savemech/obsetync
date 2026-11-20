@@ -16,7 +16,8 @@ Runs one deterministic Tree-v1 candidate mutation through the packaged SIMD
 WASM and production TypeScript driver. The full corpus contains 25,000 existing
 and changed files under one directory prefix; --medium uses 4,096. Assertions
 bind actual native work units to 64-unit WASM calls and real cooperative host
-turns without wall-clock duration assertions. --check only bundles the driver.
+turns. The initial update and final committed contents are checked against full
+rebuilds. --check only bundles the driver.
 `);
     process.exit(0);
 }
@@ -69,11 +70,19 @@ const baseline = Array.from({ length: options.count }, (_, index) => row(index, 
 const changed = Array.from({ length: options.count }, (_, index) => row(index, changedHash, 2));
 const tree = new bindings.WasmTree("native-root-complexity", "synthetic-device");
 
+function rebuiltRoot(entries) {
+    const reference = new bindings.WasmTree("native-root-complexity", "synthetic-device");
+    try {
+        reference.rebuild_from_entries_in_version(1, JSON.stringify(entries));
+        return reference.root_hash_hex();
+    } finally { reference.free(); }
+}
+
 let mutationSteps = 0, mutationUnits = 0, planBarriers = 0, doneSteps = 0;
 let maxRequestedUnits = 0, previousCompleted = 0;
 let hostYieldsRequested = 0, hostYieldsCompleted = 0;
 let retirementYieldsRequested = 0, retirementYieldsCompleted = 0;
-const returnedUnits = [];
+let shapeBoundaryWitnesses = 0;
 const admission = new driver.RootTreeResidentAdmission({ capacityBytes: 96 * 1024 * 1024 });
 try {
     tree.rebuild_from_entries_in_version(1, JSON.stringify(baseline));
@@ -96,7 +105,10 @@ try {
         assert(Number.isSafeInteger(progress.completed) && progress.completed === previousCompleted + progress.units);
         previousCompleted = progress.completed; mutationUnits += progress.units;
         if (progress.phase === "plan ready") { planBarriers++; assert.equal(progress.units, 0); }
-        else returnedUnits.push(progress.units);
+        else {
+            assert(progress.units > 0);
+            if (progress.units === 1) shapeBoundaryWitnesses++;
+        }
         if (progress.done) doneSteps++;
         return progress;
     };
@@ -129,10 +141,8 @@ try {
     const shapeBoundaryAllowance = Math.ceil(options.count / 1_000) + 1;
     assert(dataSteps >= packedDataSteps && dataSteps <= packedDataSteps + shapeBoundaryAllowance,
         `shape-safe native call count escaped its bound: ${dataSteps}/${packedDataSteps}/${shapeBoundaryAllowance}`);
-    assert(returnedUnits.length > 1); assert(returnedUnits.every(units =>
-        units > 0 && units <= driver.TREE_CANDIDATE_MUTATION_STEP_UNITS));
+    assert(dataSteps > 1);
     const shapeLeafWitnessMinimum = Math.ceil(options.count / 1_000);
-    const shapeBoundaryWitnesses = returnedUnits.filter(units => units === 1).length;
     assert(shapeBoundaryWitnesses >= shapeLeafWitnessMinimum,
         `canonical leaf-validation boundaries were not observed: ${shapeBoundaryWitnesses}/${shapeLeafWitnessMinimum}`);
     // One pre-begin turn is unconditional. Even if the monotonic clock never
@@ -158,6 +168,7 @@ try {
     assert.equal(tree.total_files(), options.count); assert.equal(tree.candidate_total_files(), options.count);
     assert.equal(tree.has_candidate(), true);
     assert.notEqual(tree.candidate_root_hash_hex(), baselineRoot);
+    assert.equal(tree.candidate_root_hash_hex(), rebuiltRoot(changed), "bulk update differs from a complete rebuild");
 
     // Reproduce the reported 85 MiB historical charge on a small live V1 tree,
     // then exercise repeated 64-file roots through the actual admission path.
@@ -168,6 +179,7 @@ try {
     assert(historical);
     admission.ready(historical);
     admission.releaseRetired(admission.publish(historical));
+    let lastCommittedRound = 0;
     for (let round = 0; round < 33; round++) {
         await driver.beginTreeCandidate(tree, {
             cooperate, cooperateRetirement,
@@ -188,6 +200,7 @@ try {
         const outcome = round % 3 === 0 ? "abort" : "commit";
         const expectedRoot = outcome === "commit" ? tree.candidate_root_hash_hex() : previousRoot;
         driver.settleTreeCandidateOutputWithAdmission(tree, outcome, admission);
+        if (outcome === "commit") lastCommittedRound = round;
         assert.equal(tree.has_candidate(), false);
         assert.equal(tree.root_hash_hex(), expectedRoot);
         assert.equal(tree.total_files(), options.count);
@@ -202,6 +215,11 @@ try {
         assert.equal(accounted.privateAttempts, 0);
         assert.equal(accounted.retiringOwners, 0);
     }
+
+    const finalHash = bindings.wasm_hash(encoder.encode(`admitted-round-${lastCommittedRound}`));
+    const finalEntries = changed.map((entry, index) =>
+        index < 64 ? row(index, finalHash, lastCommittedRound + 2) : entry);
+    assert.equal(tree.root_hash_hex(), rebuiltRoot(finalEntries), "settled root differs from expected file contents");
 
     const scheduler = driver.workSchedulerSnapshot();
     assert.equal(scheduler.pendingJobs, 0);
