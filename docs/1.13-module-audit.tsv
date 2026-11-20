@@ -75,7 +75,7 @@ read	crates/sync-core/src/wasm.rs	production	Traced V1 candidate admission to pr
 reviewed	crates/sync-core/src/wasm_memory.rs	production	Traced global allocator delegation, failed realloc ownership, saturation, instance isolation and disabled native snapshot through wasm.rs. Six allocator tests pass.
 reviewed	crates/sync-schema/Cargo.toml	configuration/schema	Single workspace FlatBuffers dependency; schema unit suite and wasm32 downstream check passed
 reviewed	crates/sync-schema/schema/chunk.fbs	configuration/schema	Checked six table declarations against generated slots and required-field checks; enum and round-trip tests passed
-read	crates/sync-schema/src/chunk_generated.rs	generated/lock	Compared all 20 vtable slots and required-field builder checks to schema, exercised generated readers/writers; compiler output regeneration not verified
+reviewed	crates/sync-schema/src/chunk_generated.rs	generated/lock	Compared all 20 vtable slots and required-field builder checks to schema, exercised generated readers/writers; regenerated with flatc 24.12.23 --rust and rustfmt --edition 2021; cmp confirmed byte-identical bindings and all five schema tests passed
 reviewed	crates/sync-schema/src/lib.rs	production	Read generated binding export and five enum, leaf, internal-node and decode tests; all five passed
 reviewed	crates/sync-server/Cargo.toml	configuration/schema	Traced server and test dependencies. Removed the normal tower declaration (only test ServiceExt import), duplicate tempfile dev declaration and unused tower-http trace feature; cargo tree confirms CORS remains enabled.
 reviewed	crates/sync-server/build.rs	production	Read complete input validation; 15 real compiled-script cases cover local/clean/dirty identity, exact release inputs, missing/malformed/mismatched hashes/version and invalid flags
@@ -120,7 +120,7 @@ reviewed	manifest.json	configuration/schema	Current version and minimum, package
 reviewed	plugin/esbuild.config.mjs	production	Read all build paths and checked npm/Nix/Docker entry points; production build and six browser tests pass; editing each worker entry independently updates the running dev bundle
 reviewed	plugin/manifest.json	configuration/schema	Verified root copy byte parity; mobile-availability discrepancy regression added
 reviewed	plugin/package-lock.json	generated/lock	Fresh offline npm ci and npm ls succeeded on Linux; release checker verifies both version declarations
-read	plugin/package.json	configuration/schema	Entry-point/build inventory; behavior/callers still under review
+reviewed	plugin/package.json	configuration/schema	Traced build, dev, test and benchmark scripts to their entry points; CI and release invoke native/browser qualification separately. Removed unused tslib. Clean offline npm ci, npm ls and typecheck passed without it.
 reviewed	plugin/scripts/bench-journal.mjs	tooling	Traced documented native fixture, actual journal calls, returned IDs and restart checks. Fixed enumeration racing WAL cleanup and retired the writer before new-instance reload. Three cold-load pairs passed on 25k paths and 10k edits.
 read	plugin/scripts/bench-native-root.mjs	tooling	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
 reviewed	plugin/scripts/bench-prepared-manifest.mjs	tooling	Traced worker instrumentation and replay fixture. Join plan retirement before reopening. Three paired 64 MiB runs matched every chunk and read every source byte with one SIMD worker.

@@ -28,7 +28,6 @@
     "@types/node": "^20.0.0",
     "esbuild": "^0.21.0",
     "obsidian": "latest",
-    "tslib": "^2.6.0",
     "typescript": "^5.4.0"
   }
 }

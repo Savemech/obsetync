@@ -201,7 +201,7 @@
           version = "1.12.12";
           src     = ./plugin;
 
-            npmDepsHash = "sha256-TF14ft3An2m0n/0MI4R+zILw9v4O0kCLQBQXnLzdIQ0=";
+          npmDepsHash = "sha256-b3YCX30L99azLZswp2PG2eGTC1v6BfUOVj+hdno6bgw=";
           OBSETYNC_BUILD_GIT_COMMIT = pluginBuildIdentity.commit;
           OBSETYNC_BUILD_SOURCE_STATE = pluginBuildIdentity.sourceState;
           OBSETYNC_BUILD_ALLOW_LOCAL_UNKNOWN = "1";
