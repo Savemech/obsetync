@@ -667,7 +667,7 @@ export class ObsetyncSyncBase {
                 // backwards; legacy has no sequence cut to prove otherwise.
                 throw new StoreRecoveryError("CORRUPT", "legacy WAL is damaged or has an ambiguous snapshot boundary");
             }
-            try { applyBaseOperation(state, validateOperation(row)); }
+            try { applyBaseOperation(state, validateOperation(row, true)); }
             catch (error) {
                 if (!releasedPriority) throw error;
             }
@@ -820,10 +820,11 @@ function validateMetadata(value: unknown, legacy = false): SyncBaseData {
         bulkChangeApproval: row.bulkChangeApproval ? { ...row.bulkChangeApproval } : null };
 }
 
-function validateOperation(value: unknown): SyncBaseOperation {
+function validateOperation(value: unknown, legacy = false): SyncBaseOperation {
     if (!value || typeof value !== "object" || Array.isArray(value)) invalid("invalid sync-base mutation");
     const row = value as SyncBaseOperation & { schema?: unknown };
     if (row.op === "root-publication") {
+        if (legacy) throw new StoreRecoveryError("UNKNOWN_SCHEMA", "root publication authority cannot be imported from legacy WAL");
         if (row.schema !== 2) throw new StoreRecoveryError("UNKNOWN_SCHEMA", "unsupported root publication operation schema");
         exactObject(value, ["schema", "op", "value"], "invalid root publication operation fields");
         return { schema: 2, op: row.op, value: validatePublicationMarker(row.value) };

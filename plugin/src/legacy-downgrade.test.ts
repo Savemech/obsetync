@@ -210,10 +210,17 @@ async function run(): Promise<void> {
             entries: { "next.md": { hash: "d".repeat(64), mtime: 5, size: 5 } } }));
         crashBase.files.set(`${BASE}.bak`, JSON.stringify({ lastSyncTimestamp: 300,
             entries: { "backup.md": { hash: "e".repeat(64), mtime: 3, size: 3 } } }));
-        crashBase.files.set(`${ROOT}/sync-base.wal.ndjson`, `${JSON.stringify({ op: "set", path: "wal.md",
-            entry: { hash: "f".repeat(64), mtime: 6, size: 6 } })}\n{torn\n`);
+        crashBase.files.set(`${ROOT}/sync-base.wal.ndjson`, [
+            JSON.stringify({ op: "set", path: "wal.md", entry: { hash: "f".repeat(64), mtime: 6, size: 6 } }),
+            "{torn",
+            JSON.stringify({ schema: 2, op: "root-publication", value: {
+                identity: { scopeHash: "a".repeat(64), sequence: 1, mutationId: "b".repeat(32), requestHash: "c".repeat(64) },
+                candidateRoot: "d".repeat(64), committedAt: 501, payloadHash: "e".repeat(64),
+            } }),
+        ].join("\n"));
         await authorizeLegacyDowngradeCurrentImport(crashBase, 1, lease);
         const recoveredCrashBase = new ObsetyncSyncBase(appFor(crashBase)); await recoveredCrashBase.load();
+        check(recoveredCrashBase.lastSyncTimestamp === 500, "legacy WAL installed a modern root publication");
         check(recoveredCrashBase.getHash("next.md") === "d".repeat(64) &&
             recoveredCrashBase.getHash("backup.md") === null,
         "active re-upgrade did not use released .next/main/.bak priority");

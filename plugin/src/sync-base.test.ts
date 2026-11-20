@@ -160,6 +160,10 @@ async function legacyMigrationIsStrictAndPreservesOriginals(): Promise<void> {
     assert.equal(fresh.getEntry("old.md"), null, "legacy originals were replayed over new authoritative store");
 
     for (const bad of [
+        JSON.stringify({ schema: 2, op: "root-publication", value: {
+            identity: { scopeHash: "a".repeat(64), sequence: 1, mutationId: "b".repeat(32), requestHash: "c".repeat(64) },
+            candidateRoot: "d".repeat(64), committedAt: 12, payloadHash: "e".repeat(64),
+        } }),
         '{"op":"future","value":1}\n',
         `${wal}{bad middle}\n${JSON.stringify({ op: "diff-page", value: marker() })}\n`,
         `${wal}{"op":"set"`,
