@@ -178,9 +178,10 @@ pending	plugin/src/browser-hash-workers.test.ts	tests	Not reviewed
 reviewed	plugin/src/browser-hash-workers.ts	production	Read worker qualification, transfers, cancellation, fallback and disposal; removed write-only detached-buffer field; npm test worker ownership cases pass; real browser gate remains
 read	plugin/src/browser-probe-entry.ts	production	Read single-run validation, scalar/SIMD initialization, synthetic digest and transfer-back; generated glue receives embedded bytes; browser fixture passes, physical iPad unverified
 pending	plugin/src/browser-probe-protocol.ts	production	Not reviewed
-read	plugin/src/build-identity-contract.ts	production	Read embedded identity and comparison; version mismatch, dirty and local-unknown diagnostics tested. SemVer suffix validation remains permissive.
-read	plugin/src/build-identity.test.ts	tests	Read identity, protocol and diagnostic assertions; pre-release version edge cases remain open.
+reviewed	plugin/src/build-identity-contract.ts	production	Read embedded identity and comparison; version mismatch, dirty and local-unknown diagnostics tested. Build-time and runtime checks share a strict prerelease and metadata identifier validator.
+reviewed	plugin/src/build-identity.test.ts	tests	Read identity, protocol and diagnostic assertions; prerelease identifiers, numeric leading zeros and empty components covered.
 reviewed	plugin/src/build-identity.ts	production	Traced four compile-time defines through esbuild to debug and startup diagnostics. Source-only harness uses visibly unverified local fallback.
+reviewed	plugin/src/build-version.mjs	production	Shared semantic version validation for archive manifests and runtime identity; numeric prerelease restrictions and dot-separated identifiers covered by both entry points.
 reviewed	plugin/src/bulk-codec.test.ts	tests	Checked bitmap order, invalid inputs, count bounds and planner hash rejection; full suite executed
 reviewed	plugin/src/bulk-codec.ts	production	Read codec, capability limits, split and planner; removed unused alias and temporary hash decodes; checked response count before bitmap expansion; seeded codec suite and W1 planner run
 reviewed	plugin/src/bulk-planner.bench.ts	tooling	Traced bench:bulk entry and production planner; validate identity and order of every output record before reporting order_preserved; both W1 profiles executed

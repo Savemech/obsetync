@@ -1,3 +1,4 @@
+import { isBuildVersion } from "./build-version.mjs";
 export const BUILD_IDENTITY_SCHEMA = "obsetync-build-identity-v1";
 export const BUILD_PROTOCOL_SCHEMA = "obsetync-sync-protocol-set-v1";
 export const BUILD_PROTOCOL_CAPABILITIES = Object.freeze([
@@ -27,7 +28,6 @@ export interface BuildIdentity {
 }
 
 const FULL_GIT_COMMIT = /^[0-9a-f]{40}$/;
-const SEMVER = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 
 export function createBuildIdentity(input: {
     semver: string;
@@ -35,7 +35,7 @@ export function createBuildIdentity(input: {
     sourceState: BuildSourceState;
     buildMode: BuildMode;
 }): BuildIdentity {
-    if (!SEMVER.test(input.semver)) throw new Error("invalid embedded build semantic version");
+    if (!isBuildVersion(input.semver)) throw new Error("invalid embedded build semantic version");
     if (input.sourceState !== "clean" && input.sourceState !== "dirty" &&
         input.sourceState !== "local-unknown") throw new Error("invalid embedded build source state");
     if (input.buildMode !== "production" && input.buildMode !== "development") {

@@ -39,4 +39,11 @@ assert.equal(compareBuildIdentity("1.11.4", createBuildIdentity({
     semver: "1.11.4", gitCommit: "unknown", sourceState: "local-unknown", buildMode: "development",
 })).status, "local-unknown");
 
+for (const semver of ["1.13.0-rc.1", "1.13.0-0", "1.13.0-01a+build.001", "0.0.0-local"]) {
+    assert.equal(createBuildIdentity({ ...identity, semver }).semver, semver);
+}
+for (const semver of ["1.13.0-rc.01", "1.13.0-alpha..1", "1.13.0-.", "1.13.0+meta."]) {
+    assert.throws(() => createBuildIdentity({ ...identity, semver }), /semantic version/);
+}
+
 console.log("build-identity.test: embedded identity and mismatch diagnostics passed");

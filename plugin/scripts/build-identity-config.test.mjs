@@ -52,6 +52,12 @@ assert.deepEqual(validateBuildIdentityInputs(valid({
     buildMode: "development",
 });
 
+for (const version of ["1.13.0-rc.1+build.001", "1.13.0-rc.01", "1.13.0+meta."]) {
+    const resolve = () => validateBuildIdentityInputs(valid({ rootManifest: manifest(version), pluginManifest: manifest(version) }));
+    if (version === "1.13.0-rc.1+build.001") assert.equal(resolve().semver, version);
+    else assert.throws(resolve, /semantic version/);
+}
+
 const isolated = await mkdtemp(join(tmpdir(), "obsetync-build-identity-"));
 try {
     const pluginDirectory = join(isolated, "plugin");

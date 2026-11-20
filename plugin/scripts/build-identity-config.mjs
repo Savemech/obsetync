@@ -1,9 +1,9 @@
+import { isBuildVersion } from "../src/build-version.mjs";
 import { execFileSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
 const FULL_GIT_COMMIT = /^[0-9a-f]{40}$/;
-const SEMVER = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 
 function fail(message) {
     throw new Error(`build identity: ${message}`);
@@ -11,7 +11,7 @@ function fail(message) {
 
 function manifestVersion(manifest, label) {
     if (!manifest || typeof manifest !== "object" || Array.isArray(manifest) ||
-        typeof manifest.version !== "string" || !SEMVER.test(manifest.version)) {
+        !isBuildVersion(manifest.version)) {
         fail(`${label} has no valid semantic version`);
     }
     return manifest.version;

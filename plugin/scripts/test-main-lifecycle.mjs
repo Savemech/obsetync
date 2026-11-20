@@ -15,7 +15,7 @@ const actualInputs = new Set([
     "src/settings-persistence.ts", "src/wasm-memory.ts", "src/resident-memory.ts",
     "src/root-tree-resident-admission.ts", "src/tree-output-settlement.ts",
     "src/tree-candidate-mutation-job.ts", "src/build-identity.ts",
-    "src/build-identity-contract.ts",
+    "src/build-identity-contract.ts", "src/build-version.mjs",
     "src/legacy-downgrade-host.ts", "src/legacy-downgrade-modal.ts", "src/current-host-work.ts",
 ]);
 const fixtures = new Map([
