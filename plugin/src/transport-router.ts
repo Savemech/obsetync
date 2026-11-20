@@ -608,7 +608,7 @@ export class TransportRouter {
     ): void {
         const finished = this.readPerformanceClock(NaN);
         const durationMs = finished - started;
-        if (!externallyValid || !measurements.valid ||
+        if (!externallyValid || !measurements.valid || measurements.usefulBytes > this.performanceMaxUsefulBytes ||
             clockGeneration !== this.performanceClockGeneration ||
             !Number.isFinite(durationMs) || durationMs <= 0 ||
             durationMs > this.performanceMaxSampleMs ||
@@ -762,7 +762,7 @@ export class TransportRouter {
         const hinted = Number.isSafeInteger(retryAfterMs) && (retryAfterMs ?? 0) > 0
             ? Math.min(this.openMaxMs, retryAfterMs!)
             : 0;
-        this.openUntil = this.now() + Math.max(jittered, hinted);
+        this.openUntil = Math.max(this.openUntil, this.now() + Math.max(jittered, hinted));
     }
 
     private probeEligible<T>(request: TransportRouteRequest<T>): boolean {

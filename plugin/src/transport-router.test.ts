@@ -119,6 +119,29 @@ async function lateSuccessCannotEndANewerRecoveryWindow(): Promise<void> {
     ok(router.snapshot().circuit === "closed", "fresh recovery probe could not restore WebSocket");
 }
 
+async function overlappingFailuresKeepTheLongestRetryHint(): Promise<void> {
+    let now = 0, attempts = 0;
+    const router = new TransportRouter({ now: () => now, jitter: () => 0,
+        failureThreshold: 1, openBaseMs: 100, openMaxMs: 1_000, recoverySuccessThreshold: 1 });
+    const gate = deferred<string>();
+    const route = (ws: () => Promise<string>, retryAfterMs?: number) => router.execute({
+        payloadBytes: 1, replay: "content-addressed",
+        ws: () => { attempts++; return ws(); }, http: async () => "http",
+        classifyWsFailure: () => ({ retryable: true, retryAfterMs }),
+    });
+    const delayed = route(() => gate.promise);
+    await route(async () => { throw new Error("busy"); }, 900);
+    now = 10;
+    gate.reject(new Error("disconnected"));
+    ok(await delayed === "http", "late failure lost its HTTP fallback");
+    now = 899;
+    ok(await route(async () => "ws") === "http" && attempts === 2,
+        "a concurrent failure shortened the server retry interval");
+    now = 900;
+    ok(await route(async () => "ws") === "ws" && attempts === 3,
+        "recovery did not resume when the server retry interval expired");
+}
+
 async function retryHintsAndPermanentErrorsAreFailClosed(): Promise<void> {
     let now = 0, http = 0;
     const router = new TransportRouter({
@@ -443,8 +466,17 @@ async function invalidAndSuspendedSamplesAreBoundedAndIgnored(): Promise<void> {
     await request(() => { now += 1_000; });
     await request((measurements) => { measurements.addQueueWaitMs(Number.NaN); now += 100; });
     await request((measurements) => { measurements.setUsefulBytes(1_001); now += 100; });
+    const asymmetric = (measuredBytes?: number) => router.execute({
+        payloadBytes: 1_001, expectedUsefulBytes: 100, replay: "content-addressed", lane: "bulk",
+        http: async measurements => { now += 100; if (measuredBytes !== undefined) measurements.setUsefulBytes(measuredBytes); },
+        classifyWsFailure: retryable,
+    });
+    await asymmetric();
+    ok(router.snapshot().httpBulkSamples === 0, "oversized default useful-byte count entered HTTP scoring");
+    await asymmetric(100);
+    ok(router.snapshot().httpBulkSamples === 1, "valid measured response was excluded by request size");
     const excluded = router.snapshot();
-    ok(excluded.wsBulkSamples === 1 && excluded.invalidPerformanceSamples === 4,
+    ok(excluded.wsBulkSamples === 1 && excluded.invalidPerformanceSamples === 5,
         "hidden, clock-gap, NaN, or over-cap evidence entered carrier scoring");
 
     now = NaN;
@@ -609,6 +641,7 @@ void (async () => {
     await healthyWsOwnsTheAttempt();
     await failuresOpenAndHalfOpenWithoutAProbeStampede();
     await lateSuccessCannotEndANewerRecoveryWindow();
+    await overlappingFailuresKeepTheLongestRetryHint();
     await retryHintsAndPermanentErrorsAreFailClosed();
     await timeoutPolicyIsBoundedAndSizeAware();
     await boundedRecoveryHysteresisKeepsBulkOnHttp();
