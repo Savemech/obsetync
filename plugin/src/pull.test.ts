@@ -672,6 +672,15 @@ async function editArrivingDuringDownloadDefersRemoteWrite(): Promise<void> {
         check(writes === 1 && raced.localDeferredCount === 1 && baseUpdates === 0,
             `post-write ${change} file was recorded as a verified download`);
     }
+
+    writes = 0;
+    dirty = false;
+    io.stat = async () => writes ? { mtime: 8, size: 4 } : null;
+    const lateEdit = await pull(api, io, syncBase, "vault", "base-root", wasm, tree,
+        undefined, undefined, { has: () => dirty }, undefined, undefined,
+        async () => { if (writes) dirty = true; });
+    check(writes === 1 && lateEdit.localDeferredCount === 1 && baseUpdates === 0,
+        "edit delivered during batch settlement advanced the sync base");
 }
 
 async function untrackedLocalCollisionIsPreservedBeforePullWrite(): Promise<void> {
@@ -1588,12 +1597,13 @@ async function longFreshPullReportsLiveProgressAndRegistersOnlyActualWrites(): P
                     return { objects, memory, release() { objects.clear(); memory.close(); } };
                 },
             } as any;
+            const published = new Set<string>();
             const base = {
                 diffPageCheckpoint: null,
                 clearDiffPageCheckpoint: () => false,
                 setVerifiedBaseRequired: () => true,
                 getEntry: (path: string) => path === "6.md" ? { hash: deltas[6].hash, size: 1, mtime: 1 } : null,
-                getTreeMtime: () => 1, setEntry: () => {},
+                getTreeMtime: () => 1, setEntry: (path: string) => published.add(path),
                 checkpoint: async () => {}, save: async () => {}, setLastSyncTimestamp: () => {},
             } as any;
             const io = {
@@ -1619,7 +1629,7 @@ async function longFreshPullReportsLiveProgressAndRegistersOnlyActualWrites(): P
                     if (!writesSincePermit) return;
                     windows.push(writesSincePermit); writesSincePermit = 0;
                     const snapshot = trace.activeSnapshots()[0];
-                    check(snapshot.filesCompleted === files.size, "progress remained zero until the diff/page completed");
+                    check(snapshot.filesCompleted === 1 + published.size, "progress counted a write before its batch settled");
                     check(snapshot.bytesTransferred === files.size - 1, "download bytes were not reported live");
                     if (cancel) throw cancelled;
                     now += 61_000;

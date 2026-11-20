@@ -1937,6 +1937,10 @@ async function finishContentDownload(
     }
     const postStat = await io.stat(delta.path);
     if (!postStat || (delta.size != null && postStat.size !== delta.size)) return false;
+    if (countTransferredBytes) {
+        stats.bytesDownloaded += size;
+        if (size < CHUNK_THRESHOLD) perf?.increment({ bytesTransferred: size });
+    }
     const hash = delta.hash;
     const publish = (): boolean => {
         if (shouldDefer?.()) return false;
@@ -1948,20 +1952,16 @@ async function finishContentDownload(
             delta.mtime_ms,
         );
         stats.downloaded++;
-        if (countTransferredBytes) stats.bytesDownloaded += size;
-        perf?.increment({ filesCompleted: 1,
-            bytesTransferred: size < CHUNK_THRESHOLD && countTransferredBytes ? size : 0 });
+        perf?.increment({ filesCompleted: 1 });
         return true;
     };
-    // A create/modify callback can still be authenticating our own write.
-    // Keep the metadata pending until the batch's echo fence classifies it.
-    if (shouldDefer?.() && beforeHeavyBatch) {
-        if (publishAfterEchoes) {
-            publishAfterEchoes(publish);
-            return true;
-        }
-        await beforeHeavyBatch();
+    // The adapter may deliver a local edit or an echo after stat returns.
+    // Check every batched write after the shared fence, just before checkpoint.
+    if (publishAfterEchoes && beforeHeavyBatch) {
+        publishAfterEchoes(publish);
+        return true;
     }
+    if (shouldDefer?.()) await beforeHeavyBatch?.();
     return publish();
 }
 
