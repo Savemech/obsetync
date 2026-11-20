@@ -38,7 +38,7 @@ export class RootTreeResidentStateError extends Error {
 }
 
 export interface RootTreeResidentAdmissionSnapshot {
-    scope: "v2-tree-output-requested-buffers";
+    scope: "tree-output-requested-buffers";
     ledger: NativeResidentLedgerSnapshot;
     residentTrees: number;
     privateAttempts: number;
@@ -655,7 +655,7 @@ export class RootTreeResidentAdmission {
 
     /** Aggregate and O(1); no tree identity, path, hash or token is exposed. */
     snapshot(): RootTreeResidentAdmissionSnapshot {
-        return { scope: "v2-tree-output-requested-buffers", ledger: this.ledger.snapshot(),
+        return { scope: "tree-output-requested-buffers", ledger: this.ledger.snapshot(),
             residentTrees: this.residentTrees, privateAttempts: this.privateAttempts,
             retiringOwners: this.retiringOwners, privateBytes: this.privateBytes,
             residentBytes: this.residentBytes, retiringBytes: this.retiringBytes };

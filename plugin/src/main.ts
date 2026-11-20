@@ -1236,6 +1236,7 @@ export default class ObsetyncPlugin extends Plugin {
             const output = this.rootTreeResidentAdmission.snapshot();
             push(`Tree output ledger: ${formatDebugBytes(output.ledger.usedBytes)}/` +
                 `${formatDebugBytes(output.ledger.capacityBytes)} scoped requested buffers · ` +
+                `${output.ledger.availableBytes} B headroom · ${output.ledger.refusedReservations} refused reservations · ` +
                 `private/resident/retiring ${formatDebugBytes(output.privateBytes)}/` +
                 `${formatDebugBytes(output.residentBytes)}/${formatDebugBytes(output.retiringBytes)}`);
             push("Memory coverage:    admitted source/transfer/apply and tree replacement/mutation output; excludes full tree metadata, fixed WASM/worker heaps and host/RSS");

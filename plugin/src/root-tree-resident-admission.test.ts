@@ -31,7 +31,7 @@ function charges(owner: RootTreeResidentAdmission, expected: {
     privateAttempts: number; residentTrees: number; retiringOwners: number; activeLeases: number;
 }): void {
     const current = owner.snapshot();
-    assert.equal(current.scope, "v2-tree-output-requested-buffers");
+    assert.equal(current.scope, "tree-output-requested-buffers");
     for (const key of ["privateBytes", "residentBytes", "retiringBytes", "privateAttempts",
         "residentTrees", "retiringOwners"] as const) assert.equal(current[key], expected[key], key);
     assert.equal(current.ledger.activeLeases, expected.activeLeases, "activeLeases");

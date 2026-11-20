@@ -1274,7 +1274,7 @@ async function v2RequestedOutputAdmissionLifecycle(): Promise<void> {
             assert.equal(policySnapshot?.privateBytes, plan.peakAdmissionBytes,
                 "policy hook ran before fail-fast output admission");
             assert.deepEqual(admission.snapshot(), {
-                scope: "v2-tree-output-requested-buffers",
+                scope: "tree-output-requested-buffers",
                 ledger: { capacityBytes: plan.peakAdmissionBytes, usedBytes: plan.residentAdmissionBytes,
                     peakUsedBytes: plan.peakAdmissionBytes,
                     availableBytes: plan.peakAdmissionBytes - plan.residentAdmissionBytes,
