@@ -1478,8 +1478,8 @@ export default class ObsetyncPlugin extends Plugin {
         }
         push("");
 
-        push(`--- Recent log lines (up to ${debugLog.recent().length}) ---`);
         const logs = debugLog.recent();
+        push(`--- Recent log lines (up to ${logs.length}) ---`);
         if (logs.length === 0) {
             push("(none yet)");
         } else {

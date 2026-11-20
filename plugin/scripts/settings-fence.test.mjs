@@ -44,6 +44,7 @@ const bundled = await build({
             builder.onLoad({ filter: /^obsidian$/, namespace: "fixture" }, () => ({ contents: `
                 export class App {}
                 export class PluginSettingTab {
+                    hide() {}
                     constructor(app, plugin) { this.app = app; this.plugin = plugin; this.containerEl = app.containerEl; }
                 }
                 export class Setting {
@@ -57,16 +58,16 @@ const bundled = await build({
                     addDropdown(callback) { callback(new globalThis.__settingsFence.Control(this, "dropdown")); return this; }
                     addButton(callback) { callback(new globalThis.__settingsFence.Control(this, "button")); return this; }
                 }
-                export class Notice { constructor(message) { globalThis.__settingsFence.notices.push(String(message)); } }
+                export class Notice { hide() {} constructor(message) { globalThis.__settingsFence.notices.push(String(message)); } }
             `, loader: "js" }));
             builder.onLoad({ filter: /^debug-modal$/, namespace: "fixture" }, () => ({
-                contents: "export class ObsetyncDebugModal { open() {} }", loader: "js",
+                contents: "export class ObsetyncDebugModal { open() { globalThis.__settingsFence.reports++; } }", loader: "js",
             }));
         },
     }],
 });
 
-globalThis.__settingsFence = { Control, notices: [] };
+globalThis.__settingsFence = { Control, notices: [], reports: 0 };
 globalThis.window ??= { setTimeout() {} };
 const source = Buffer.from(bundled.outputFiles[0].contents).toString("base64");
 const { ObsetyncSettingTab, DEFAULT_SETTINGS } = await import(`data:text/javascript;base64,${source}`);
@@ -200,4 +201,23 @@ test("blocked handoff fences enrollment and direct sync/server mutation actions"
     await invoke(rollbackButton);
     assert.equal(rollback.effects.rollbacks, 0);
     assert.equal(rollback.effects.forces, 0);
+});
+
+test("debug report belongs to the settings view that requested it", async () => {
+    for (const end of ["open", "hide", "refresh"]) {
+        const f = fixture();
+        f.setBlocked(false);
+        const before = globalThis.__settingsFence.reports;
+        let finish, calls = 0;
+        const report = new Promise(resolve => { finish = resolve; });
+        f.plugin.getDebugInfo = () => { calls++; return report; };
+        const click = controls.get("Show debug info:button");
+        const first = click(), second = click();
+        if (end === "hide") f.tab.hide();
+        if (end === "refresh") f.tab.display();
+        finish("report");
+        await Promise.all([first, second]);
+        assert.equal(calls, 1);
+        assert.equal(globalThis.__settingsFence.reports - before, end === "open" ? 1 : 0);
+    }
 });

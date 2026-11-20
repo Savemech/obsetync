@@ -79,11 +79,19 @@ export const DEFAULT_SETTINGS: SyncSettings = {
 };
 
 export class ObsetyncSettingTab extends PluginSettingTab {
+    private viewGeneration = 0;
+
     constructor(app: App, private plugin: ObsetyncPlugin) {
         super(app, plugin);
     }
 
+    hide(): void {
+        this.viewGeneration++;
+        super.hide();
+    }
+
     display(): void {
+        const generation = ++this.viewGeneration;
         const { containerEl } = this;
         containerEl.empty();
 
@@ -430,6 +438,7 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                 })
             );
 
+        let gatheringDebugInfo = false;
         new Setting(containerEl)
             .setName("Show debug info")
             .setDesc(
@@ -438,6 +447,7 @@ export class ObsetyncSettingTab extends PluginSettingTab {
             )
             .addButton((btn) =>
                 btn.setButtonText("Show debug info").onClick(async () => {
+                    if (gatheringDebugInfo || generation !== this.viewGeneration) return;
                     try {
                         this.plugin.authorizeSettingsMutation();
                     } catch (e: any) {
@@ -445,13 +455,16 @@ export class ObsetyncSettingTab extends PluginSettingTab {
                         return;
                     }
                     const loading = new Notice("Gathering debug info…", 0);
+                    gatheringDebugInfo = true;
                     try {
                         const text = await this.plugin.getDebugInfo();
-                        loading.hide();
+                        if (generation !== this.viewGeneration) return;
                         new ObsetyncDebugModal(this.app, text).open();
                     } catch (e: any) {
+                        if (generation === this.viewGeneration) new Notice(`Debug info failed: ${e?.message ?? e}`);
+                    } finally {
+                        gatheringDebugInfo = false;
                         loading.hide();
-                        new Notice(`Debug info failed: ${e?.message ?? e}`);
                     }
                 })
             );
