@@ -2106,10 +2106,10 @@ body{font-family:var(--mono);font-size:13px;color:#1e1e1e;display:flex;flex-dire
 const VAULT=__VAULT_JSON__;
 const VERSIONS=__VERSIONS_JSON__;
 const ZERO="__ZERO__";
-const cache={};
+let cachedDiff,versionRequest,fileRequest;
 let CHANGES=[];
 function E(id){return document.getElementById(id);}
-function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
+function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}
 function api(p){return "/admin/vaults/"+encodeURIComponent(VAULT)+p;}
 function renderVersions(){
   E("versions").innerHTML=VERSIONS.map(function(v,i){
@@ -2123,15 +2123,21 @@ function renderVersions(){
 async function selectVersion(i,node){
   document.querySelectorAll(".ver.sel").forEach(function(e){e.classList.remove("sel");});
   node.classList.add("sel");
+  versionRequest?.abort();
+  fileRequest?.abort();
+  clearTimeout(hp);
+  const request=versionRequest=new AbortController();
   const v=VERSIONS[i];
   E("diff").innerHTML='<div class="hint">select a file</div>';
   E("files").innerHTML='<div class="hint">loading…</div>';
   const from=v.parent||ZERO;
   try{
-    const r=await fetch(api("/api/diff/"+from+"/"+v.hash));
+    const r=await fetch(api("/api/diff/"+from+"/"+v.hash),{signal:request.signal});
+    if(request.signal.aborted)return;
     if(!r.ok){E("files").innerHTML='<div class="hint">failed to load changes</div>';return;}
-    renderFiles(await r.json());
-  }catch(e){E("files").innerHTML='<div class="hint">error loading changes</div>';}
+    const changes=await r.json();
+    if(!request.signal.aborted)renderFiles(changes);
+  }catch(e){if(!request.signal.aborted)E("files").innerHTML='<div class="hint">error loading changes</div>';}
 }
 function renderFiles(d){
   CHANGES=d.changes||[];
@@ -2153,13 +2159,18 @@ async function showDiff(c,r){
   document.querySelectorAll(".frow.sel").forEach(function(e){e.classList.remove("sel");});
   r.classList.add("sel");
   const key=c.old+"_"+c.new;
-  if(cache[key]){E("diff").innerHTML=cache[key];return;}
-  const plainHead='<div class="fhead">'+esc(c.path)+'</div>';
+  fileRequest?.abort();
+  const header='<div class="fhead">'+esc(c.path);
+  if(cachedDiff?.key===key){E("diff").innerHTML=header+cachedDiff.suffix;return;}
+  const request=fileRequest=new AbortController();
+  const plainHead=header+'</div>';
   E("diff").innerHTML=plainHead+'<div class="hint">loading…</div>';
   try{
-    const rr=await fetch(api("/api/filediff/"+c.old+"/"+c.new));
+    const rr=await fetch(api("/api/filediff/"+c.old+"/"+c.new),{signal:request.signal});
+    if(request.signal.aborted)return;
     if(!rr.ok){E("diff").innerHTML=plainHead+'<div class="hint">failed to load diff</div>';return;}
     const d=await rr.json();
+    if(request.signal.aborted)return;
     let chc='',body;
     if(d.kind==="text"){
       let add=0,del=0;
@@ -2172,10 +2183,9 @@ async function showDiff(c,r){
       chc=' <span class="chc">+'+add+' / −'+del+' chars</span>';
       body=colorize(d.unified);
     }else{body='<div class="hint">'+esc(d.msg||d.kind)+'</div>';}
-    const html='<div class="fhead">'+esc(c.path)+chc+'</div>'+body;
-    cache[key]=html;
-    E("diff").innerHTML=html;
-  }catch(e){E("diff").innerHTML=plainHead+'<div class="hint">error loading diff</div>';}
+    cachedDiff={key,suffix:chc+'</div>'+body};
+    E("diff").innerHTML=header+cachedDiff.suffix;
+  }catch(e){if(!request.signal.aborted)E("diff").innerHTML=plainHead+'<div class="hint">error loading diff</div>';}
 }
 function colorize(u){
   let out='<div class="diffbox">';
