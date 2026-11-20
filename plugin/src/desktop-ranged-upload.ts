@@ -2,6 +2,8 @@ import { BulkObjectKind, type BulkUploadRecord } from "./bulk-codec";
 import { HashWorkerFileDriftError } from "./desktop-hash-workers";
 import {
     MAX_FASTCDC_CHUNK_BYTES,
+    desktopFileFingerprintMatches,
+    validDesktopFileFingerprint,
     type DesktopFileFingerprint,
 } from "./hash-worker-protocol";
 
@@ -59,29 +61,6 @@ const now = (): number => globalThis.performance?.now?.() ?? Date.now();
 const validHash = (value: string): boolean => /^[0-9a-f]{64}$/.test(value);
 const timestampMatches = (left: number, right: number): boolean =>
     Math.abs(left - right) <= 1;
-
-export function validDesktopFileFingerprint(
-    value: unknown,
-): value is DesktopFileFingerprint {
-    if (!value || typeof value !== "object") return false;
-    const fingerprint = value as DesktopFileFingerprint;
-    return Number.isSafeInteger(fingerprint.size) && fingerprint.size >= 0 &&
-        Number.isFinite(fingerprint.mtime) && fingerprint.mtime >= 0 &&
-        Number.isFinite(fingerprint.ctime) && fingerprint.ctime >= 0 &&
-        Number.isInteger(fingerprint.device) && fingerprint.device >= 0 &&
-        Number.isInteger(fingerprint.inode) && fingerprint.inode >= 0;
-}
-
-export function desktopFileFingerprintMatches(
-    expected: DesktopFileFingerprint,
-    actual: DesktopFileFingerprint,
-): boolean {
-    return expected.size === actual.size &&
-        timestampMatches(expected.mtime, actual.mtime) &&
-        timestampMatches(expected.ctime, actual.ctime) &&
-        expected.device === actual.device &&
-        expected.inode === actual.inode;
-}
 
 function fingerprintFromStats(stats: import("node:fs").Stats): DesktopFileFingerprint {
     return {
@@ -156,8 +135,7 @@ export const openDesktopRangeReader: DesktopRangeReaderOpener = async (source) =
             const pathFingerprint = fingerprintFromStats(pathStats);
             if (
                 !desktopFileFingerprintMatches(source.fingerprint, handleFingerprint) ||
-                !desktopFileFingerprintMatches(source.fingerprint, pathFingerprint) ||
-                !desktopFileFingerprintMatches(handleFingerprint, pathFingerprint)
+                !desktopFileFingerprintMatches(source.fingerprint, pathFingerprint)
             ) {
                 throw driftError("file changed between manifest planning and ranged upload");
             }

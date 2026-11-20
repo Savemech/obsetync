@@ -1,6 +1,5 @@
 import { HashWorkerFileDriftError } from "./desktop-hash-workers";
-import { desktopFileFingerprintMatches } from "./desktop-ranged-upload";
-import type { DesktopFileFingerprint } from "./hash-worker-protocol";
+import { desktopFileFingerprintMatches, validDesktopFileFingerprint, type DesktopFileFingerprint } from "./hash-worker-protocol";
 import { PathIsDirectoryError } from "./file-safety";
 import { throwIfWorkAborted } from "./work-scheduler";
 
@@ -47,11 +46,7 @@ function fingerprint(stats: DesktopReadStats): DesktopFileFingerprint {
         device: Number(stats.dev),
         inode: Number(stats.ino),
     };
-    if (!Number.isSafeInteger(value.size) || value.size < 0 ||
-        !Number.isFinite(value.mtime) || value.mtime < 0 ||
-        !Number.isFinite(value.ctime) || value.ctime < 0 ||
-        !Number.isInteger(value.device) || value.device < 0 ||
-        !Number.isInteger(value.inode) || value.inode < 0) {
+    if (!validDesktopFileFingerprint(value)) {
         throw new Error("desktop source returned invalid file metadata");
     }
     return value;
@@ -217,10 +212,8 @@ export async function readDesktopFileIdentityVerified(
         }
         const afterHandle = fingerprint(afterHandleStats);
         const afterPath = fingerprint(afterPathStats);
-        if (!expectedMatches(source.expected, afterHandle) || !expectedMatches(source.expected, afterPath) ||
-            !desktopFileFingerprintMatches(before, afterHandle) ||
-            !desktopFileFingerprintMatches(before, afterPath) ||
-            !desktopFileFingerprintMatches(afterHandle, afterPath)) {
+        if (!desktopFileFingerprintMatches(before, afterHandle) ||
+            !desktopFileFingerprintMatches(before, afterPath)) {
             throw new HashWorkerFileDriftError("desktop source changed during admitted read");
         }
         throwIfWorkAborted(signal);

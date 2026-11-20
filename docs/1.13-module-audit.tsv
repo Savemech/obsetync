@@ -203,14 +203,14 @@ pending	plugin/src/deferred-changes.ts	production	Not reviewed
 reviewed	plugin/src/delta-validation.test.ts	tests	60 assertions including dot and empty segments, Unicode, controls and length boundaries
 reviewed	plugin/src/delta-validation.ts	production	Reviewed legacy JSON actions, path/rename uniqueness and bounds; shared path predicate no longer expands code points or splits segments; differential parity over 131966 inputs
 pending	plugin/src/desktop-hash-workers.test.ts	tests	Not reviewed
-pending	plugin/src/desktop-hash-workers.ts	production	Not reviewed
+read	plugin/src/desktop-hash-workers.ts	production	Traced worker result fingerprint validation; exact result timestamp agrees with native observation; pool lifecycle review pending
 pending	plugin/src/desktop-ranged-upload.bench.ts	tooling	Not reviewed
 pending	plugin/src/desktop-ranged-upload.test.ts	tests	Not reviewed
-pending	plugin/src/desktop-ranged-upload.ts	production	Not reviewed
+read	plugin/src/desktop-ranged-upload.ts	production	Traced range source qualification, native handle/path checks and fingerprint sharing; exact native timestamp regression; complete queue audit pending
 pending	plugin/src/desktop-reconcile-upload.test.ts	tests	Not reviewed
 pending	plugin/src/desktop-reconcile-upload.ts	production	Not reviewed
 pending	plugin/src/desktop-verified-read.test.ts	tests	Not reviewed
-pending	plugin/src/desktop-verified-read.ts	production	Not reviewed
+read	plugin/src/desktop-verified-read.ts	production	Native before/after handle and path timestamps now match exactly; fractional timestamp regressions require drift rejection and handle close; remaining platform cases pending
 reviewed	plugin/src/diff-page-codec.test.ts	tests	1933 assertions cover negotiation, binary framing, fuzzed pages, Unicode name preservation and independence from Node Buffer input
 reviewed	plugin/src/diff-page-codec.ts	production	Traced HTTP request, strict cursor/record ordering, UTF-8 and safe integer decoding; preserve leading U+FEFF and copy only the retained cursor bytes
 pending	plugin/src/dirty-set.test.ts	tests	Not reviewed
@@ -228,13 +228,13 @@ pending	plugin/src/engine-work.test.ts	tests	Not reviewed
 pending	plugin/src/engine-work.ts	production	Not reviewed
 reviewed	plugin/src/file-safety.test.ts	tests	Checked serial/parallel ordering, cancellation, errors, missing paths and config listing; 150 assertions including malformed responses
 reviewed	plugin/src/file-safety.ts	production	Traced adapter stats, config enumeration, grouped metadata reads and deletion classification through platform and both scan paths; validate sizes, exact directory error paths and direct unique listed children
-pending	plugin/src/hash-runtime.test.ts	tests	Not reviewed
-pending	plugin/src/hash-runtime.ts	production	Not reviewed
+reviewed	plugin/src/hash-runtime.test.ts	tests	Read profile, pressure/growth, batch limits and clock cases; executed via plugin suite
+reviewed	plugin/src/hash-runtime.ts	production	Read platform defaults, adaptive feed, batching and global publication; traced governor configuration and cooperative feedback; removed unused configureHashRuntime; tuner and batching regressions
 reviewed	plugin/src/hash-source-budget.test.ts	tests	Verified cancellation, concurrent leases, worker fallback and native streaming; real shared pool queued-growth regression; 59 assertions passed
 reviewed	plugin/src/hash-source-budget.ts	production	Traced whole-file and streaming lease lifetimes and all three whole-file callers; tested queued file growth before native read and release on rejection
-pending	plugin/src/hash-worker-entry.ts	production	Not reviewed
-pending	plugin/src/hash-worker-protocol.ts	production	Not reviewed
-pending	plugin/src/hash-worker-source.d.ts	production	Not reviewed
+read	plugin/src/hash-worker-entry.ts	production	Read request checks, cancellation chain, native IO, WASM cleanup and result path; real worker hashes empty file and rejects simulated quarter-millisecond ctime drift in both modes; cancellation lifecycle review pending
+reviewed	plugin/src/hash-worker-protocol.ts	production	Traced messages, actual worker producer and pool validator; exact native fingerprints shared by worker and both desktop readers; real SIMD hash and manifest checked
+reviewed	plugin/src/hash-worker-source.d.ts	production	All three virtual modules matched to esbuild entries and main imports; production bundle builds
 pending	plugin/src/host-runtime.test.ts	tests	Not reviewed
 pending	plugin/src/host-runtime.ts	production	Not reviewed
 reviewed	plugin/src/ignore.test.ts	tests	Checked built-in and custom patterns, legacy settings migration, anchored file/directory matches and nested negative cases

@@ -218,14 +218,6 @@ export function planByteBoundedBatches<T>(
 
 let activeTuner = new AdaptiveHashTuner("unknown");
 
-export function configureHashRuntime(
-    runtime: HashRuntime,
-    onChange?: (tuning: HashTuning) => void,
-): HashTuning {
-    activeTuner = new AdaptiveHashTuner(runtime, onChange);
-    return activeTuner.current();
-}
-
 /** Reset the feed tuner around a governor-selected platform profile. */
 export function configureHashTuning(
     tuning: HashTuning,

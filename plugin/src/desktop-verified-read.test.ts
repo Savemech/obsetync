@@ -113,7 +113,8 @@ async function exactHandleReadAndIdentityProof(): Promise<void> {
 async function driftAndDirectoryNeverReturnBytes(): Promise<void> {
     for (const [name, options] of [
         ["path replacement", { path: file({ ino: 99 }) }],
-        ["in-place metadata drift", { after: file({ ctimeMs: 22 }) }],
+        ["fractional ctime drift", { after: file({ ctimeMs: 20.25 }) }],
+        ["fractional mtime drift", { after: file({ mtimeMs: 10.25 }) }],
         ["symlink replacement", { path: file({ isFile: () => false, isSymbolicLink: () => true }) }],
         ["hard-linked handle", { before: file({ nlink: 2 }) }],
         ["hard-linked pathname", { path: file({ nlink: 2 }) }],

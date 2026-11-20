@@ -10,6 +10,30 @@ export interface DesktopFileFingerprint {
     inode: number;
 }
 
+export function validDesktopFileFingerprint(
+    value: unknown,
+): value is DesktopFileFingerprint {
+    if (!value || typeof value !== "object") return false;
+    const fingerprint = value as DesktopFileFingerprint;
+    return Number.isSafeInteger(fingerprint.size) && fingerprint.size >= 0 &&
+        Number.isFinite(fingerprint.mtime) && fingerprint.mtime >= 0 &&
+        Number.isFinite(fingerprint.ctime) && fingerprint.ctime >= 0 &&
+        Number.isInteger(fingerprint.device) && fingerprint.device >= 0 &&
+        Number.isInteger(fingerprint.inode) && fingerprint.inode >= 0;
+}
+
+/** Both observations are native timestamps. Keep their fractional milliseconds. */
+export function desktopFileFingerprintMatches(
+    expected: DesktopFileFingerprint,
+    actual: DesktopFileFingerprint,
+): boolean {
+    return expected.size === actual.size &&
+        expected.mtime === actual.mtime &&
+        expected.ctime === actual.ctime &&
+        expected.device === actual.device &&
+        expected.inode === actual.inode;
+}
+
 export const MAX_FASTCDC_CHUNK_BYTES = 4 * 1024 * 1024;
 
 export interface HashWorkerJob {

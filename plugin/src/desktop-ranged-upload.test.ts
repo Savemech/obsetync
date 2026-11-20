@@ -1,13 +1,13 @@
 import { HashWorkerFileDriftError } from "./desktop-hash-workers";
 import {
     DESKTOP_RANGE_QUEUE_BYTES,
-    desktopFileFingerprintMatches,
     openDesktopRangeReader,
     uploadDesktopMissingRanges,
     type DesktopMissingRange,
     type DesktopRangeReader,
     type DesktopRangeSource,
 } from "./desktop-ranged-upload";
+import { desktopFileFingerprintMatches } from "./hash-worker-protocol";
 import { mkdtemp, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -410,7 +410,7 @@ async function hostileRangesAreRejectedBeforeOpening(): Promise<void> {
         "same size/mtime pathname replacement was accepted",
     );
     check(
-        !desktopFileFingerprintMatches(original, { ...original, ctime: original.ctime + 2 }),
+        !desktopFileFingerprintMatches(original, { ...original, ctime: original.ctime + 0.25 }),
         "ctime drift was accepted",
     );
 }
