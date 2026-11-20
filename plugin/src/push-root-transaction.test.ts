@@ -605,7 +605,8 @@ async function exactAcceptedCandidateAndBaseOwnership(): Promise<void> {
         "merged outcome root replaced local candidate/base");
     check(f.base.getEntry("gone.md") === null && f.base.getHash("keep.md") === hash(bytes(10, 11, 12)),
         "actual atomic base publication did not match candidate states");
-    check(f.events.indexOf("durable-base") < f.events.indexOf("candidate-commit"), "candidate committed before publication callback completed");
+    check(f.events.includes("durable-base") &&
+        f.events.indexOf("durable-base") < f.events.indexOf("candidate-commit"), "candidate committed before publication callback completed");
     check(f.counts.commit === 1 && f.counts.abort === 0 && f.counts.publish === 1, "accepted candidate had wrong lifetime");
     noLegacy(f);
     same(f.rootExportCounts, { begin: 1, plan: 1, build: 1, read: 3, finish: 1, cancel: 0,
@@ -922,7 +923,8 @@ async function finalSendCandidateRevisionRejectsABAAndReleasesOwner(): Promise<v
     released(owner, "final-send ABA rejection");
     check(f.counts.publish === 1 && f.counts.commit === 0 && f.counts.abort === 0 && f.tree.has_candidate(),
         "candidate ABA rejection rolled back a newer provisional generation");
-    check(f.events.indexOf("root-export-finish") < f.events.indexOf("candidate-aba") &&
+    check(f.events.includes("root-export-finish") &&
+        f.events.indexOf("root-export-finish") < f.events.indexOf("candidate-aba") &&
         !f.events.includes("candidate-abort"),
     "candidate ABA did not remain isolated at the post-export final-send boundary");
     same(f.disk.snapshot(), beforeDisk, "candidate ABA rejection changed durable base state");
@@ -1109,7 +1111,8 @@ async function pagedIndexExportCompletesBeforeIndexAckAndRoot(): Promise<void> {
     const indexes = f.uploaded.filter(record => record.kind === BulkObjectKind.IndexChunk);
     same(indexes.map(record => [record.hash, record.data]), [[hash(payload), payload]],
         "paged index bytes/order/hash changed before upload");
-    check(f.events.indexOf("export-finish") < f.events.indexOf("index-ack") &&
+    check(f.events.includes("export-finish") &&
+        f.events.indexOf("export-finish") < f.events.indexOf("index-ack") &&
         f.events.indexOf("index-ack") < f.events.indexOf("publish") &&
         f.events.indexOf("publish") < f.events.indexOf("candidate-commit"),
     "export/index ACK/root/candidate commit ordering changed");
@@ -1151,7 +1154,8 @@ async function indexExportPageInterruptionCancelsBeforeCandidateAbort(): Promise
                 "page interruption did not reject actual push");
             same(f.exportCounts, { begin: 1, read: 1, finish: 0, cancel: 1, legacy: 0,
                 offsets: [0], lengths: [EXPORT_PAGE] }, "failed page boundary read more data, finished, or lost cancellation ownership");
-            check(f.events.indexOf("export-cancel") < f.events.indexOf("candidate-abort"),
+            check(f.events.includes("export-cancel") &&
+                f.events.indexOf("export-cancel") < f.events.indexOf("candidate-abort"),
                 "outer push aborted before export cleanup released the tree job");
             check(f.counts.abort === 1 && f.counts.commit === 0 && f.counts.publish === 0 && !f.tree.has_candidate(),
                 "page interruption leaked or committed a candidate/root");
@@ -1314,7 +1318,9 @@ async function updateAdmissionRefusalAfterDeleteAbortsOuterCandidate(exactSettle
         ["plan", 800, 0, 800], ["cancel", 800, 0, 800],
         ["retire-1", 800, 0, 800], ["retire-2", 800, 0, 800],
     ], "refused update allocated output or released the previously attached delete cohort");
-    check(f.events.indexOf("candidate-delete") < f.events.indexOf("mutation-output:update:plan") &&
+    check(f.events.includes("candidate-delete") &&
+        f.events.indexOf("candidate-delete") < f.events.indexOf("mutation-output:update:plan") &&
+        f.events.includes("mutation-output:update:retire-2") &&
         f.events.indexOf("mutation-output:update:retire-2") < f.events.indexOf("candidate-abort"),
     "outer abort did not follow actual delete mutation and failed-update retirement");
     check(f.counts.abort === 1 && f.counts.commit === 0 && !f.tree.has_candidate() &&

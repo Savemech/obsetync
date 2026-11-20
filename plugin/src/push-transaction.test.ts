@@ -636,7 +636,8 @@ async function failedChunkRetirementRetainsExactAbortUntilPushRetry(): Promise<v
             "successful retry left a candidate or native cleanup owner");
         check(!f.entries.has("gone.md") && f.treePaths().join(",") === "keep.md",
             "successful retry did not adopt the accepted deletion");
-        check(f.events.indexOf("finalize:2") < f.events.indexOf(`abort:${oldRevision}`) &&
+        check(f.events.includes("finalize:2") &&
+            f.events.indexOf("finalize:2") < f.events.indexOf(`abort:${oldRevision}`) &&
             f.events.indexOf(`abort:${oldRevision}`) < f.events.indexOf("begin:3:begin") &&
             f.events.indexOf("begin:3:begin") < f.events.indexOf("put-root"),
             "retry did not finalize/abort the original owner before its next candidate and root");

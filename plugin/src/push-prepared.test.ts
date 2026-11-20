@@ -284,7 +284,8 @@ async function sameMetadataOfflineEditCannotPublishOldManifest(): Promise<void> 
         check(f.state.workerBytes === 2 * changed.length, "mismatch did not read current content for both worker stages");
         check(f.state.roots[0][0][1].hash === latest && latest !== f.originalManifest.file_hash,
             "old available server manifest was published after offline content change");
-        check(f.events.indexOf("store:retain:done") < f.events.indexOf("check:content"),
+        check(f.events.includes("store:retain:done") &&
+            f.events.indexOf("store:retain:done") < f.events.indexOf("check:content"),
             "fresh manifest reached object checks before durable retention");
         check(f.state.plan.lookup(SCOPE, PATH)?.manifest.file_hash === latest, "replacement preparation was not durable");
         check(f.state.rangeHashBytes === 0 && f.state.rendererReads === 0,
@@ -604,7 +605,8 @@ async function actualEngineCleanupFollowsAckAndCannotUndoIt(): Promise<void> {
         };
         await e.engine.pushPending();
         check(cleanupCalls === 1 && ackedAtCleanup, "actual engine cleanup preceded durable journal ACK/settlement");
-        check(f.events.indexOf("root") < f.events.indexOf("journal:ack") &&
+        check(f.events.includes("root") &&
+            f.events.indexOf("root") < f.events.indexOf("journal:ack") &&
             f.events.indexOf("journal:ack") < f.events.indexOf("plan:cleanup"),
         "root → journal ACK → prepared cleanup order changed");
         check(f.state.rootCalls === 1 && f.state.commits === 1 && f.state.baseRoot !== BASE,
