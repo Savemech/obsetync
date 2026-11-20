@@ -38,6 +38,9 @@ assert.throws(() => validateBuildIdentityInputs(valid({
     dirty: true,
     requireClean: true,
 })), /tracked modifications/);
+assert.throws(() => validateBuildIdentityInputs(valid({
+    gitCommit: undefined, allowUnknownProduction: true, requireClean: true,
+})), /requires clean source state/);
 assert.equal(validateBuildIdentityInputs(valid({ dirty: true })).sourceState, "dirty");
 assert.deepEqual(validateBuildIdentityInputs(valid({
     gitCommit: undefined,
@@ -75,6 +78,12 @@ try {
         production: true,
         environment: {},
     }), /cannot determine the checked-out Git commit/);
+    for (const [revision, state] of [[SHA, "local-unknown"], [SHA, "typo"], ["unknown", "clean"]]) {
+        await assert.rejects(resolveBuildIdentity({ pluginDirectory, production: true, environment: {
+            OBSETYNC_BUILD_GIT_COMMIT: revision, OBSETYNC_BUILD_SOURCE_STATE: state,
+            OBSETYNC_BUILD_ALLOW_LOCAL_UNKNOWN: "1",
+        } }), /commit.source.state pair/);
+    }
     assert.equal((await resolveBuildIdentity({
         pluginDirectory,
         production: true,

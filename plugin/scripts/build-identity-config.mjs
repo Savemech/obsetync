@@ -49,6 +49,7 @@ export function validateBuildIdentityInputs({
     if (expectedCommit !== undefined && gitCommit !== expectedCommit) {
         fail("expected Git commit does not match the checkout");
     }
+    if (requireClean && gitCommit === undefined) fail("release build requires clean source state");
     if (requireClean && dirty) fail("release checkout has tracked modifications");
     return Object.freeze({
         semver: pluginVersion,
@@ -95,6 +96,13 @@ export async function resolveBuildIdentity({ pluginDirectory, production, enviro
     const checkoutCommit = git(repoDirectory, ["rev-parse", "--verify", "HEAD"]);
     const allowLocalUnknown = environment.OBSETYNC_BUILD_ALLOW_LOCAL_UNKNOWN === "1";
     const injectedValue = environment.OBSETYNC_BUILD_GIT_COMMIT || undefined;
+    const injectedState = environment.OBSETYNC_BUILD_SOURCE_STATE;
+    if (checkoutCommit === undefined && injectedState !== undefined) {
+        const knownState = injectedState === "clean" || injectedState === "dirty";
+        const validPair = knownState ? FULL_GIT_COMMIT.test(injectedValue ?? "")
+            : injectedState === "local-unknown" && (injectedValue === undefined || injectedValue === "unknown");
+        if (!validPair) fail("injected commit/source-state pair is invalid");
+    }
     const injectedCommit = injectedValue === "unknown" && allowLocalUnknown &&
         environment.OBSETYNC_BUILD_SOURCE_STATE === "local-unknown"
         ? undefined : injectedValue;
