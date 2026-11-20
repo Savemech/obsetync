@@ -1496,22 +1496,14 @@ fn candidate_v1_output_memory_plan(
     // fixed per-row FlatBuffer/topology allowance cover inserts and boundary
     // reshaping. The Ready report checks actual private payload against this
     // witness before publication.
-    // A new top-level prefix has no previous subtree for the cursor to rebuild.
-    let touches_existing_prefix = changed
-        .iter()
-        .map(|row| row.path.as_str())
-        .chain(deleted.iter().map(String::as_str))
-        .any(|path| {
-            let prefix = crate::candidate_mutation_v1::prefix_slice(path);
-            root.children
-                .binary_search_by(|child| child.0.as_str().cmp(prefix))
-                .is_ok()
-        });
-    let old_payload = if touches_existing_prefix {
-        memory.payload_bytes
-    } else {
-        0
-    };
+    let old_payload = tree
+        .candidate_prefix_payload_bytes(
+            changed
+                .iter()
+                .map(|row| row.path.as_str())
+                .chain(deleted.iter().map(String::as_str)),
+        )
+        .unwrap_or(memory.payload_bytes);
     let node_payload_bytes = old_payload
         .checked_mul(2)
         .and_then(|bytes| {
@@ -9450,29 +9442,36 @@ mod root_export_tests {
     }
 
     #[test]
-    fn v1_new_prefix_plan_excludes_unrelated_subtrees() {
+    fn v1_prefix_plan_excludes_unrelated_subtrees() {
         let mut tree = WasmTree::new("vault", "device");
         let WasmTreeInner::V1(inner) = &mut tree.inner else {
             unreachable!()
         };
         let nested = "nested-folder/".repeat(8);
         let rows = (0..32_249)
-            .map(|i| rebuild_row(&format!("archive/{nested}{i}.md"), 1))
+            .map(|i| {
+                let dir = if i < 1_500 { "tasks" } else { "archive" };
+                rebuild_row(&format!("{dir}/{nested}{i}.md"), 1)
+            })
             .collect();
         run_local(inner.rebuild(rows)).unwrap();
         inner.begin_candidate().unwrap();
         let added: Vec<_> = (0..64)
-            .map(|i| rebuild_row(&format!("new-dir/{i}.md"), 2))
+            .map(|i| rebuild_row(&format!("tasks/new-dir/{i}.md"), 2))
             .collect();
         let plan = candidate_v1_output_memory_plan(inner, &added, &[]).unwrap();
         let available = 11_463_466;
         assert!(plan.peak_admission_bytes < available);
+        let new_prefix =
+            candidate_v1_output_memory_plan(inner, &[rebuild_row("fresh/note.md", 1)], &[])
+                .unwrap();
+        assert_eq!(
+            new_prefix.node_payload_bytes,
+            128 * 1024 + 512 + 4 * "fresh/note.md".len() as u64
+        );
         let mixed =
             candidate_v1_output_memory_plan(inner, &added, &["archive/old.md".into()]).unwrap();
-        assert!(
-            mixed.node_payload_bytes
-                >= plan.node_payload_bytes + 2 * inner.chunk_memory().payload_bytes
-        );
+        assert!(mixed.node_payload_bytes >= 2 * inner.chunk_memory().payload_bytes);
         assert!(mixed.peak_admission_bytes > available);
 
         let token = tree

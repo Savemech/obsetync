@@ -71,7 +71,7 @@ pending	crates/sync-core/src/tree_metadata.rs	production	Not reviewed
 pending	crates/sync-core/src/tree_v2.rs	production	Not reviewed
 pending	crates/sync-core/src/tree_work_memory.rs	production	Not reviewed
 reviewed	crates/sync-core/src/versioned_root.rs	production	Traced format dispatch, history fields, canonical rebuild and complete-inventory checks; v1 totals now checked per loaded subtree without speculatively reserving the entire declared count; dual-format and overrun tests pass
-read	crates/sync-core/src/wasm.rs	production	Traced V1 candidate admission to prefix lookup, resume, ready and publication. Native regression exercises 64 inserts under a new prefix on 32,249 files with 11,463,466 available bytes. Existing-prefix plans still include the full store; remaining WASM bindings pending.
+read	crates/sync-core/src/wasm.rs	production	Traced V1 candidate admission to prefix lookup, resume, ready and publication. Native regression exercises 64 inserts under an existing 1,500-file prefix on 32,249 files with 11,463,466 available bytes. Bounded subtree inspection falls back to the full store for oversized or ambiguous graphs; remaining WASM bindings pending.
 reviewed	crates/sync-core/src/wasm_memory.rs	production	Traced global allocator delegation, failed realloc ownership, saturation, instance isolation and disabled native snapshot through wasm.rs. Six allocator tests pass.
 reviewed	crates/sync-schema/Cargo.toml	configuration/schema	Single workspace FlatBuffers dependency; schema unit suite and wasm32 downstream check passed
 reviewed	crates/sync-schema/schema/chunk.fbs	configuration/schema	Checked six table declarations against generated slots and required-field checks; enum and round-trip tests passed

@@ -1175,6 +1175,22 @@ impl TransactionalTree {
         self.store.get_chunk(hash)
     }
 
+    #[cfg(feature = "wasm")]
+    pub(crate) fn candidate_prefix_payload_bytes<'a>(
+        &self,
+        paths: impl Iterator<Item = &'a str>,
+    ) -> Option<u64> {
+        let children = &self.candidate_root()?.children;
+        self.store
+            .v1_subtree_payload_bytes(paths.filter_map(|path| {
+                let prefix = crate::candidate_mutation_v1::prefix_slice(path);
+                let index = children
+                    .binary_search_by(|child| child.0.as_str().cmp(prefix))
+                    .ok()?;
+                Some((index, children[index].1))
+            }))
+    }
+
     pub fn chunk_byte_length(&self, hash: &FileHash) -> Option<usize> {
         self.store.chunk_byte_length(hash)
     }

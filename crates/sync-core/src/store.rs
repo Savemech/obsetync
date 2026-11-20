@@ -513,6 +513,59 @@ impl MemoryChunkStore {
             .map(|chunk| chunk.bytes.len())
     }
 
+    /// Bound synchronous admission work. A larger or unreadable V1 subtree
+    /// falls back to the already accounted full-store payload.
+    #[cfg(feature = "wasm")]
+    pub(crate) fn v1_subtree_payload_bytes(
+        &self,
+        roots: impl Iterator<Item = (usize, FileHash)>,
+    ) -> Option<u64> {
+        use sync_schema::sync_chunk::{ChunkEnvelope, NodeType};
+        const SCAN_BYTES: usize = 512 * 1024;
+        const MAX_NODES: usize = 256;
+        let state = self.data.borrow();
+        let mut visited = HashSet::new();
+        let mut pending = Vec::new();
+        let mut bytes = 0usize;
+        let mut prefixes = HashSet::new();
+        for (index, root) in roots {
+            if !prefixes.insert(index) {
+                continue;
+            }
+            pending.push(root);
+            while let Some(hash) = pending.pop() {
+                if !visited.insert(hash) || visited.len() > MAX_NODES {
+                    return None;
+                }
+                let chunk = &state.map.get(&hash)?.bytes;
+                bytes = bytes.checked_add(chunk.len())?;
+                if bytes > SCAN_BYTES {
+                    return None;
+                }
+                // Shared FlatBuffer offsets can expand far beyond their wire size.
+                let limits = flatbuffers::VerifierOptions {
+                    max_apparent_size: 2 * chunk.len(),
+                    ..Default::default()
+                };
+                let envelope = flatbuffers::root_with_opts::<ChunkEnvelope>(&limits, chunk).ok()?;
+                match envelope.node_type() {
+                    NodeType::LeafChunk => (),
+                    NodeType::InternalNode => {
+                        let children = envelope.node_as_internal_node()?.children();
+                        if children.len() > MAX_NODES - pending.len() {
+                            return None;
+                        }
+                        for child in children {
+                            pending.push(child.hash().bytes().try_into().ok()?);
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        Some(bytes as u64)
+    }
+
     /// Compare one resident object in place. The borrow remains local and no
     /// node-sized buffer is cloned merely to detect a content-addressed
     /// collision before a private overlay accepts its bytes.
