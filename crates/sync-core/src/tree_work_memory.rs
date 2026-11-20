@@ -72,7 +72,7 @@ impl VecBackingMemory {
     /// A plain Vec field with no allocation is outside backing-memory scope.
     /// Once capacity exists, its owner remains visible after length reaches 0.
     fn allocated<T>(values: &Vec<T>) -> Self {
-        if values.capacity() == 0 {
+        if values.capacity() == 0 || std::mem::size_of::<T>() == 0 {
             Self::default()
         } else {
             Self::of(values)
@@ -80,13 +80,9 @@ impl VecBackingMemory {
     }
 
     fn refresh<T>(&mut self, values: &Vec<T>) {
-        let next = Self::of(values);
-        self.counters_valid &= next.counters_valid;
-        self.owners = next.owners;
-        self.length_slots = next.length_slots;
-        self.capacity_slots = next.capacity_slots;
-        self.slot_size_bytes = next.slot_size_bytes;
-        self.backing_capacity_bytes = next.backing_capacity_bytes;
+        let mut next = Self::of(values);
+        next.counters_valid &= self.counters_valid;
+        *self = next;
     }
 
     fn remove_slot(&mut self) {
@@ -1595,6 +1591,19 @@ mod tests {
             first_snapshot.paths.length_bytes + owner[2].path.len() as u64
         );
         assert!(memory.counters_valid);
+    }
+
+    #[test]
+    fn allocated_ignores_zero_sized_slots_but_counts_retained_backing() {
+        assert_eq!(
+            VecBackingMemory::allocated(&vec![(); 3]),
+            VecBackingMemory::default()
+        );
+        let bytes = Vec::<u8>::with_capacity(8);
+        assert_eq!(
+            VecBackingMemory::allocated(&bytes),
+            VecBackingMemory::of(&bytes)
+        );
     }
 
     #[test]
