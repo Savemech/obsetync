@@ -209,7 +209,6 @@ export class SegmentedStore {
     private readonly automaticMaintenance: boolean;
     private readonly maxPendingCleanupJobs: number;
     private readonly cleanupJobs: CleanupJob[] = [];
-    private maintenanceScheduled = false;
     private maintenanceClosed = false;
     private automaticMaintenanceFlight: Promise<void> | null = null;
     private explicitMaintenanceFlight: Promise<void> | null = null;
@@ -241,7 +240,8 @@ export class SegmentedStore {
     runMaintenance(): Promise<void> {
         if (this.maintenanceClosed) return Promise.resolve();
         if (this.explicitMaintenanceFlight) return this.explicitMaintenanceFlight;
-        const flight = this.runExplicitMaintenancePass();
+        const jobs = this.cleanupJobs.slice();
+        const flight = Promise.resolve().then(() => this.runExplicitMaintenancePass(jobs));
         this.explicitMaintenanceFlight = flight;
         void flight.then(() => {
             if (this.explicitMaintenanceFlight === flight) this.explicitMaintenanceFlight = null;
@@ -256,7 +256,7 @@ export class SegmentedStore {
      * writer. Unlike closeAndDrainMaintenance(), this keeps future cleanup
      * admission open for a long-lived store. */
     async drainMaintenance(): Promise<void> {
-        if (this.maintenanceClosed) return;
+        if (this.maintenanceRetirement) return this.maintenanceRetirement;
         await this.runMaintenance();
         for (;;) {
             const automatic = this.automaticMaintenanceFlight;
@@ -275,7 +275,6 @@ export class SegmentedStore {
     closeAndDrainMaintenance(): Promise<void> {
         if (this.maintenanceRetirement) return this.maintenanceRetirement;
         this.maintenanceClosed = true;
-        this.maintenanceAbort.abort();
         this.maintenanceRetirement = (async () => {
             const explicit = this.explicitMaintenanceFlight;
             const automatic = this.automaticMaintenanceFlight;
@@ -284,6 +283,7 @@ export class SegmentedStore {
             // authoritative operation accepted before its owning facade closed.
             await this.enqueue(async () => {});
         })();
+        this.maintenanceAbort.abort();
         return this.maintenanceRetirement;
     }
 
@@ -640,7 +640,7 @@ export class SegmentedStore {
      * A fixed queue cap keeps a broken adapter from turning maintenance evidence
      * into unbounded heap. This remains a single-writer, not a locking, proof. */
     private queueReclaim(candidate: StoreHead, retained: readonly StoreHead[]): void {
-        this.activateCleanupJobs(false);
+        for (const job of this.cleanupJobs) job.ready = true;
         const targets: CleanupTarget[] = [];
         if (candidate.snapshot.pages > 0 &&
             !retained.some(head => head.epoch === candidate.epoch && head.snapshot.id === candidate.snapshot.id)) {
@@ -680,11 +680,6 @@ export class SegmentedStore {
         this.requestAutomaticMaintenance();
     }
 
-    private activateCleanupJobs(schedule = true): void {
-        for (const job of this.cleanupJobs) job.ready = true;
-        if (schedule) this.requestAutomaticMaintenance();
-    }
-
     private nextReadyCleanupJob(): CleanupJob | undefined {
         return this.cleanupJobs.find(job => job.ready);
     }
@@ -692,8 +687,7 @@ export class SegmentedStore {
     /** The lane wait never owns the serialized writer. Each admitted path is
      * appended independently, allowing foreground work to interleave between
      * any two cleanup paths even for an explicitly requested full pass. */
-    private async runExplicitMaintenancePass(): Promise<void> {
-        const jobs = this.cleanupJobs.slice();
+    private async runExplicitMaintenancePass(jobs: CleanupJob[]): Promise<void> {
         for (const job of jobs) job.ready = true;
         for (const job of jobs) {
             let passFinished = false;
@@ -722,20 +716,17 @@ export class SegmentedStore {
      * publications can therefore pass while a low-priority turn is waiting;
      * only the admitted single-path IO slice joins the writer chain. */
     private requestAutomaticMaintenance(): void {
-        if (!this.automaticMaintenance || this.maintenanceClosed || this.maintenanceScheduled ||
+        if (!this.automaticMaintenance || this.maintenanceClosed || this.automaticMaintenanceFlight ||
             !this.nextReadyCleanupJob()) return;
-        this.maintenanceScheduled = true;
-        const flight = this.dispatchAutomaticCleanupSlice();
+        const flight = Promise.resolve().then(() => this.dispatchAutomaticCleanupSlice());
         this.automaticMaintenanceFlight = flight;
         void flight.then(() => {
             if (this.automaticMaintenanceFlight === flight) this.automaticMaintenanceFlight = null;
-            this.maintenanceScheduled = false;
             this.requestAutomaticMaintenance();
         }, () => {
             // Internal maintenance must never produce an unhandled rejection
             // or poison authoritative publication. Preserve the queued owner.
             if (this.automaticMaintenanceFlight === flight) this.automaticMaintenanceFlight = null;
-            this.maintenanceScheduled = false;
             if (!this.maintenanceClosed) {
                 const job = this.nextReadyCleanupJob();
                 if (job) this.suspendCleanupJob(job);
@@ -745,6 +736,7 @@ export class SegmentedStore {
     }
 
     private async dispatchAutomaticCleanupSlice(): Promise<void> {
+        if (this.maintenanceClosed) return;
         try {
             await this.maintenancePause(this.maintenanceAbort.signal);
         } catch {

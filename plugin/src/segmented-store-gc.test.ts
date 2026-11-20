@@ -325,6 +325,30 @@ async function explicitMaintenanceWaitDoesNotOwnTheWriterLane(): Promise<void> {
 }
 
 async function closeCancelsWaitingAdmissionAndJoinsAdmittedIO(): Promise<void> {
+    for (const automaticMaintenance of [false, true]) {
+        let release!: () => void;
+        const held = new Promise<void>(resolve => { release = resolve; });
+        let retirement: Promise<void> | undefined, nested: Promise<void> | undefined;
+        let store!: SegmentedStore;
+        const fixture = await readyForGC({ automaticMaintenance, maintenanceYield: async signal => {
+            signal.addEventListener("abort", () => { nested = store.closeAndDrainMaintenance(); }, { once: true });
+            retirement = store.closeAndDrainMaintenance();
+            await held;
+        } });
+        store = fixture.store;
+        await store.snapshot(rows("C"), { cursor: 4 });
+        const explicit = automaticMaintenance ? undefined : store.runMaintenance();
+        await Promise.resolve();
+        assert.ok(retirement);
+        assert.equal(nested, retirement, "abort listener started a second retirement");
+        let drained = false;
+        const drain = store.drainMaintenance().then(() => { drained = true; });
+        await new Promise<void>(resolve => setTimeout(resolve, 0));
+        assert.equal(drained, false, "drain missed the scheduler callback that initiated close");
+        release();
+        await Promise.all([drain, retirement, explicit]);
+    }
+
     {
         let enterLane!: () => void;
         const entered = new Promise<void>(resolve => { enterLane = resolve; });
