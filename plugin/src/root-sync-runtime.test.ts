@@ -217,6 +217,22 @@ async function loadIsStrictlyLocal() {
 }
 
 async function selectionRequiresCompleteFreshPreflight() {
+    for (const phase of ["negotiate", "query"]) {
+        const changed = await fixture();
+        if (phase === "negotiate") changed.network.onNegotiate = async () => {
+            changed.setAllowed(false);
+            return null;
+        };
+        else changed.network.onQuery = async () => {
+            changed.setAllowed(false);
+            return { protocol_version: 1, status: "stream", server_incarnation: INCARNATION,
+                last_sequence: 0, current_root_hash: null };
+        };
+        await assert.rejects(changed.runtime.selectMode(), /credential owner changed/);
+        assert.throws(() => changed.runtime.selectedServerGeneration, /lacks negotiated/);
+        assert.equal(changed.network.count("commit"), 0);
+        await changed.runtime.dispose();
+    }
     const f = await fixture(); assert.equal(await f.runtime.selectMode(), "durable");
     assert.deepEqual(f.network.calls.map(call => call.method), ["negotiate", "query"]);
     assert.equal(f.network.calls[1].value, undefined); assert.equal(f.runtime.lastSequence, 0);

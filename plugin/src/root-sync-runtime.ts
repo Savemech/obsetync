@@ -118,7 +118,8 @@ export class RootSyncRuntime {
         return this.caps.serverIncarnation;
     }
     snapshot(): { loaded: boolean; pending: boolean; closed: boolean } {
-        return { loaded: !!this.intents?.snapshot().ready, pending: this.intents?.snapshot().pending ?? false, closed: this.closed };
+        const store = this.intents?.snapshot();
+        return { loaded: store?.ready ?? false, pending: store?.pending ?? false, closed: this.closed };
     }
     captureDowngradeAuthority(): RootDowngradeAuthoritySnapshot {
         if (!this.quiesced) throw new Error("root runtime must be fully quiesced before downgrade capture");
@@ -135,16 +136,15 @@ export class RootSyncRuntime {
      * unsupported offer. Never adopt a remote sequence after local state loss. */
     async selectMode(perf?: PerfOperation): Promise<"durable" | "legacy"> {
         const store = this.requireStore();
-        if (store.pending()) throw new Error("root recovery must finish before publication selection");
+        if (store.snapshot().pending) throw new Error("root recovery must finish before publication selection");
         this.caps = null;
         this.assertDispatch();
         const caps = await this.api.negotiateRootOutcomes(true, perf);
-        this.assertOpen();
+        this.assertDispatch();
         if (caps === null) return "legacy";
         if (!caps) throw new Error("invalid root capability selection");
-        this.assertDispatch();
         const stream = decodeRootOutcome(await this.api.queryRootOutcome(this.identity.vaultId, undefined, perf));
-        this.assertOpen();
+        this.assertDispatch();
         if (stream.status !== "stream" || stream.last_sequence !== store.lastSequence) {
             throw new Error("root stream high-water differs; explicit reconciliation is required");
         }
@@ -163,7 +163,7 @@ export class RootSyncRuntime {
         try {
             const store = this.requireStore(), caps = this.caps;
             this.assertOpen();
-            if (!caps || !this.recovery || store.pending()) throw new Error("durable root publication lacks an exclusive negotiated stream");
+            if (!caps || !this.recovery || store.snapshot().pending) throw new Error("durable root publication lacks an exclusive negotiated stream");
             this.caps = null; // One successful stream preflight authorizes one submission only.
             if (candidate.entries.length > ROOT_INTENT_LIMITS.entries || candidate.journalCuts.length > ROOT_INTENT_LIMITS.journalCuts) {
                 throw new Error("candidate root bytes differ from the validated tree or exceed publication limits");
