@@ -1506,7 +1506,7 @@ async function longFreshPullReportsLiveProgressAndRegistersOnlyActualWrites(): P
     const originalTuning = getHashTuning();
     try {
         for (const [paged, cancel] of [[false, false], [true, false], [true, true]]) {
-            configureHashTuning({ ...originalTuning, readConcurrency: 1, applyConcurrency: 1, maxBatchFiles: 32 });
+            configureHashTuning({ ...originalTuning, readConcurrency: 1, applyConcurrency: 1, maxBatchFiles: 4 });
             let now = 0, writesSincePermit = 0, activeWrites = 0, peakWrites = 0;
             const windows: number[] = [];
             const echoes = new PullEchoTracker(60_000, () => now);
@@ -1515,16 +1515,20 @@ async function longFreshPullReportsLiveProgressAndRegistersOnlyActualWrites(): P
                 hash: (index + 1).toString(16).repeat(64),
             }));
             const files = new Map<string, Uint8Array>([["6.md", new Uint8Array([7])]]);
+            const ordered = [deltas[6], ...deltas.slice(0, 6), deltas[7]];
+            const requests: number[] = [];
             const budget = new ResourceBudget({ capacityBytes: 512 * 1024 });
             const trace = new PerfTrace({ monitorEventLoop: false, monitorWindows: false });
             const perf = trace.begin("pull");
             const api = {
                 supportsPagedDiff: async () => paged,
-                getDiff: async () => deltas,
-                getDiffPage: async () => ({ toRoot: "e".repeat(64), deltas, nextCursor: null }),
+                getDiff: async () => ordered,
+                getDiffPage: async () => ({ toRoot: "e".repeat(64), deltas: ordered, nextCursor: null }),
                 getRoot: async () => new Uint8Array([1]),
                 getRootAt: async () => new Uint8Array([1]),
                 getObjectsOwned: async (_kind: number, hashes: string[]) => {
+                    requests.push(hashes.length);
+                    configureHashTuning({ ...getHashTuning(), maxBatchFiles: 1 });
                     check(echoes.size === 0, "unwritten paths acquired expiring echo expectations before download");
                     now += 90_000;
                     const memory = await reserveTransientScope({ ownerBytes: hashes.length, workBytes: 256 * 1024 }, { budget });
@@ -1578,6 +1582,7 @@ async function longFreshPullReportsLiveProgressAndRegistersOnlyActualWrites(): P
                 continue;
             }
             check(result !== null, "healthy pull was cancelled");
+            check(requests.join() === "3,1,1,1", "download batches ignored a reduction during the first request");
             check(windows.join() === "1,2,1,1,1" && peakWrites === 2, "apply windows ignored a mid-batch governor increase/decrease");
             check(result!.applied === 7 && result!.downloaded === 6 && result!.localDeferredCount === 1,
                 "fresh pull lost cached/downloaded/deferred accounting");

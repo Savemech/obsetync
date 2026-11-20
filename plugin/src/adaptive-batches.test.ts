@@ -10,7 +10,9 @@ function stableLimitsMatchExistingGrouping(): void {
         [0, 0, 0, 0, 0, 0], [8, 0, 9, 10, 11, 0, 1, 0],
     ];
     for (const items of cases) {
-        const actual = [...adaptiveBatches(items, (size) => size, () => defaults, () => 0)];
+        const actual = [...adaptiveBatches(items, (size) => size, () => defaults, () => {
+            throw new Error("untimed batches should not sample the clock");
+        })];
         assert.deepEqual(actual, planByteBoundedBatches(items, (size) => size, defaults, () => 0));
         assert.deepEqual(actual.flat(), items);
         for (const batch of actual) {

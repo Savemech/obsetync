@@ -6,7 +6,8 @@ import type { PullWriteExpectation } from "./pull-echo";
 import { conflictCopyPath } from "./conflict-path";
 import type { PerfOperation } from "./perf-trace";
 import { BulkObjectKind } from "./bulk-codec";
-import { getHashTuning, planByteBoundedBatches } from "./hash-runtime";
+import { getHashTuning } from "./hash-runtime";
+import { adaptiveBatches } from "./adaptive-batches";
 import { diffCursorFromHex, diffCursorToHex } from "./diff-page-codec";
 import type { TransientWorkScope } from "./transient-memory";
 import { throwIfWorkAborted, yieldWork } from "./work-scheduler";
@@ -31,6 +32,15 @@ const MAX_CONTENT_CHUNK = 4 * 1_048_576;
 const DESKTOP_BULK_DOWNLOAD_BYTES = 8 * 1_048_576;
 const MOBILE_BULK_DOWNLOAD_BYTES = 2 * 1_048_576;
 const BULK_DOWNLOAD_FILES = 256;
+
+function downloadBatchLimits(desktop: boolean, bulk = true) {
+    const tuning = getHashTuning();
+    return {
+        maxFiles: bulk ? Math.min(BULK_DOWNLOAD_FILES, tuning.maxBatchFiles) : 1,
+        maxBytes: Math.min(desktop ? DESKTOP_BULK_DOWNLOAD_BYTES : MOBILE_BULK_DOWNLOAD_BYTES, tuning.maxBatchBytes),
+        maxSingleBytes: CHUNK_THRESHOLD - 1,
+    };
+}
 const TRANSFER_DIR = ".obsidian/plugins/obsetync/transfers";
 const STAGING_CHECKPOINT_MAX_BYTES = 16 * 1024;
 const STAGING_QUOTA_BYTES = 4 * 1024 * 1024 * 1024;
@@ -1566,18 +1576,10 @@ async function applyDeltas(
     const largeDownloads = toDownload.filter((delta) => (delta.size ?? 0) >= CHUNK_THRESHOLD);
     const desktop = smallDownloads.length > 0 &&
         io.getAbsolutePath(smallDownloads[0].path) !== null;
-    const downloadTuning = getHashTuning();
-    const smallBatches = planByteBoundedBatches(
+    const smallBatches = adaptiveBatches(
         smallDownloads,
         (delta) => delta.size ?? 0,
-        {
-            maxFiles: Math.min(BULK_DOWNLOAD_FILES, downloadTuning.maxBatchFiles),
-            maxBytes: Math.min(
-                desktop ? DESKTOP_BULK_DOWNLOAD_BYTES : MOBILE_BULK_DOWNLOAD_BYTES,
-                downloadTuning.maxBatchBytes,
-            ),
-            maxSingleBytes: CHUNK_THRESHOLD - 1,
-        },
+        () => downloadBatchLimits(desktop),
     );
     for (const batch of smallBatches) {
         await beforeHeavyBatch?.();
@@ -2386,30 +2388,17 @@ export async function applyLargeFile(
     const wholeHasher = checkpoint!.nextChunk === 0 ? new wasm.Hasher() : null;
     let assembledHash: string | null = null;
     try {
-        const pendingChunks = manifest.chunks
-            .map((chunk, index) => ({ chunk, index }))
-            .slice(checkpoint!.nextChunk);
+        const pendingChunks = checkpoint!.nextChunk === 0
+            ? manifest.chunks : manifest.chunks.slice(checkpoint!.nextChunk);
         const desktop = typeof (io as any).getAbsolutePath === "function" &&
             io.getAbsolutePath(path) !== null;
         const bulkEnabled = typeof (api as any).supportsBulkHttp === "function"
             ? await api.supportsBulkHttp(perf)
             : false;
-        const chunkBatches = planByteBoundedBatches(
+        const chunkBatches = adaptiveBatches(
             pendingChunks,
-            ({ chunk }) => chunk.size,
-            {
-                // Legacy GET keeps its original one-chunk transaction and
-                // checkpoint semantics. Only an authenticated bulk page may
-                // group several chunks before the first one is applied.
-                maxFiles: bulkEnabled
-                    ? Math.min(BULK_DOWNLOAD_FILES, getHashTuning().maxBatchFiles)
-                    : 1,
-                maxBytes: Math.min(
-                    desktop ? DESKTOP_BULK_DOWNLOAD_BYTES : MOBILE_BULK_DOWNLOAD_BYTES,
-                    getHashTuning().maxBatchBytes,
-                ),
-                maxSingleBytes: CHUNK_THRESHOLD - 1,
-            },
+            chunk => chunk.size,
+            () => downloadBatchLimits(desktop, bulkEnabled),
         );
         for (const batch of chunkBatches) {
             await beforeHeavyBatch?.();
@@ -2419,14 +2408,15 @@ export async function applyLargeFile(
             try {
                 downloaded = await getContentChunkBatch(
                     api,
-                    batch.map(({ chunk }) => chunk.hash),
+                    batch.map(chunk => chunk.hash),
                     perf,
                 );
             } finally {
                 endDownload?.();
             }
             try {
-                for (const { chunk, index } of batch) {
+                for (const chunk of batch) {
+                    const index = checkpoint!.nextChunk;
                     if (shouldAbort?.()) throw new LocalEditDuringPull();
                     const data = downloaded.objects.get(chunk.hash.toLowerCase());
                     if (!data || data.length !== chunk.size) {

@@ -47,7 +47,7 @@ export function* adaptiveBatches<T>(
         let startedAt = 0;
         while (cursor < items.length && batch.length < limits.maxFiles) {
             const item = items[cursor];
-            const observedAt = now();
+            const observedAt = limits.maxHoldMs === undefined ? 0 : now();
             const size = sizeOf(item, limits);
             if (!Number.isFinite(size) || size < 0) {
                 throw new RangeError("adaptive batch item size must be finite and non-negative");
