@@ -310,7 +310,7 @@ reviewed	plugin/src/resident-memory.test.ts	tests	Checked foreign and consumed l
 reviewed	plugin/src/resident-memory.ts	production	Traced positive reservation invariant through resize, split, transfer, absorb and release; removed redundant active flag; validated with root admission and settlement callers
 reviewed	plugin/src/resource-budget.test.ts	tests	Ran 91 assertions including mixed oversized and fitting waiters on resize, grant order, accounting, abort, closure and repeated release. Added unfinished-suite guard.
 reviewed	plugin/src/resource-budget.ts	production	Traced FIFO grants, shrink/release, abort listeners, queue bounds and live profile updates. Skip unchanged capacity and compact surviving waiters in one pass on shrink.
-read	plugin/src/resource-governor.bench.ts	tooling	Traced fixed-profile worker comparison, hash consistency, timer sampling, throughput/UI gates and cleanup. Worker error and cleanup paths need verification.
+reviewed	plugin/src/resource-governor.bench.ts	tooling	Traced fixed-profile worker comparison, hash consistency, timer sampling, throughput/UI gates and cleanup. Injected scratch creation and worker-close failures: no early pool creation and no leftover source directory. Full six-run worker benchmark passed both gates.
 pending	plugin/src/resource-governor.test.ts	tests	Not reviewed
 pending	plugin/src/resource-governor.ts	production	Not reviewed
 reviewed	plugin/src/root-batch-drain.test.ts	tests	1068 assertions cover 257 sequential batches, progress gates, errors, held cleanup and closure

@@ -121,7 +121,7 @@ async function runProfile(
     };
 }
 
-void (async () => {
+async function benchmark(directory: string): Promise<void> {
     const logicalCores = availableParallelism();
     const runtimeArchitecture = arch() === "arm64"
         ? "arm64"
@@ -152,7 +152,6 @@ void (async () => {
         maxWorkers: adaptive.tuning.maxHashConcurrency,
     });
     if (!pool) throw new Error("production SIMD worker pool is unavailable");
-    const directory = await mkdtemp(join(tmpdir(), "obsetync-governor-bench-"));
     try {
         const sources = await createSources(directory);
         await waitForReady(pool, adaptive.tuning.hashConcurrency);
@@ -226,6 +225,14 @@ void (async () => {
         if (!report.gates.passed) process.exitCode = 1;
     } finally {
         await pool.close();
+    }
+}
+
+void (async () => {
+    const directory = await mkdtemp(join(tmpdir(), "obsetync-governor-bench-"));
+    try {
+        await benchmark(directory);
+    } finally {
         await rm(directory, { recursive: true, force: true });
     }
 })().catch((error) => {
