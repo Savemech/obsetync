@@ -83,3 +83,9 @@ test("audit diagnostic rejects post-admission injection and wrong prefix placeme
         ...result().audit, entriesByRoot: [64, 6, 256, 255],
     } }]), /proof is incomplete/);
 });
+
+test("the wait after injecting edits fits inside the initial review attempt", () => {
+    const row = result();
+    row.audit.injectionToInitialReviewReturnMs = row.audit.initialReviewAttemptMs + 1;
+    assert.throws(() => summarizeNativeRootAuditResults([row]), /proof is incomplete/);
+});

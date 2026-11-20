@@ -43,3 +43,15 @@ test("auto diagnostic stays separate and requires trigger/retrigger completion p
         ...result().diagnostics, publicationObserverMisses: 1,
     } }]), /proof is incomplete/);
 });
+
+test("auto diagnostic accounts for every distinct edited path", () => {
+    for (const exact of [69, 74]) {
+        const row = result();
+        row.callback.exactPublished = exact;
+        row.callback.supersededByAcceptedSuccessor = 73 - exact;
+        row.callback.callbackToExactAccepted.samples = exact;
+        row.callback.callbackToExactAcceptedRootOpportunity.samples = exact;
+        row.callback.callbackToExactAcceptedRootOpportunity.rootAdmissionOpportunities.samples = exact;
+        assert.throws(() => summarizeNativeRootAutoResults([row]), /proof is incomplete/);
+    }
+});

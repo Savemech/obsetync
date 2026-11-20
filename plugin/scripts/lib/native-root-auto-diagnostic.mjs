@@ -29,8 +29,8 @@ export function summarizeNativeRootAutoResults(results) {
         if (result?.scenario !== NATIVE_ROOT_AUTO_SCENARIO ||
             !Number.isFinite(result.durationMs) || result.durationMs <= 0 ||
             callback?.probes !== 73 ||
-            !Number.isSafeInteger(callback?.exactPublished) || callback.exactPublished < 1 ||
-            !Number.isSafeInteger(callback?.supersededByAcceptedSuccessor) ||
+            !Number.isSafeInteger(callback?.exactPublished) || callback.exactPublished < 70 ||
+            !Number.isSafeInteger(callback?.supersededByAcceptedSuccessor) || callback.supersededByAcceptedSuccessor < 0 ||
             callback.exactPublished + callback.supersededByAcceptedSuccessor !== callback.probes ||
             exact?.samples !== callback.exactPublished || !Number.isFinite(exact.p95Ms) || exact.p95Ms < 0 ||
             callback.callbackToExactAcceptedRootOpportunity?.samples !== callback.exactPublished ||

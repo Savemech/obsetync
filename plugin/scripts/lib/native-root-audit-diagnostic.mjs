@@ -60,6 +60,7 @@ export function summarizeNativeRootAuditResults(results) {
             !Number.isFinite(audit.initialReviewAttemptMs) || audit.initialReviewAttemptMs < 0 ||
             !Number.isFinite(audit.injectionToInitialReviewReturnMs) ||
             audit.injectionToInitialReviewReturnMs < 0 ||
+            audit.injectionToInitialReviewReturnMs > audit.initialReviewAttemptMs ||
             !finitePercentiles(audit.callbackToInitialReviewReturn, callback.probes) ||
             !finitePercentiles(audit.initialReviewReturnToExactAccepted, callback.exactPublished) ||
             !finitePercentiles(audit.callbackToFirstRootAdmission, callback.probes) ||

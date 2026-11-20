@@ -132,8 +132,8 @@ reviewed	plugin/scripts/build-identity-config.test.mjs	tests	Checked manifest pa
 reviewed	plugin/scripts/build-wasm-contract.test.mjs	tests	Read all tests; fixture now reproduces executable paths with spaces; installer tests cover both architecture aliases/native detection and each checksum failure; 26 targeted tests pass
 reviewed	plugin/scripts/conflict-ui-lifecycle.test.mjs	tests	Read and ran stale button, drain, failure and discovery scenarios.
 read	plugin/scripts/diagnose-root-drain.mjs	tooling	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
-pending	plugin/scripts/lib/native-root-audit-diagnostic.mjs	tooling	Not reviewed
-pending	plugin/scripts/lib/native-root-auto-diagnostic.mjs	tooling	Not reviewed
+reviewed	plugin/scripts/lib/native-root-audit-diagnostic.mjs	tooling	Traced review start, injection and return timestamps through fixture and report; reject wait exceeding enclosing review
+reviewed	plugin/scripts/lib/native-root-auto-diagnostic.mjs	tooling	Traced 70 paths plus three superseding callbacks through fixture and report; reject impossible exact and superseded counts
 reviewed	plugin/scripts/lib/native-root-child.mjs	tooling	Traced bounded output delivery, graceful and forced termination, group inspection and caller cleanup; ten Linux process tests passed
 pending	plugin/scripts/lib/native-root-crash-fixture.mjs	tooling	Not reviewed
 pending	plugin/scripts/lib/native-root-fixture.mjs	tooling	Not reviewed
@@ -143,8 +143,8 @@ reviewed	plugin/scripts/lib/native-root-metrics.mjs	tooling	Reviewed bounded his
 pending	plugin/scripts/lib/native-root-publication.ts	tooling	Not reviewed
 reviewed	plugin/scripts/lib/native-root-qualification.mjs	tooling	Traced fixture ordinals through per-run nearest-rank p95 and cross-run qualification; reject zero and fractional counts before aggregation
 reviewed	plugin/scripts/lib/native-root-server.mjs	tooling	Read complete fixture ownership, explicit binary, random loopback ports, origin allowlist, request caps and teardown; reused for old/fixed realtime regression without production data
-pending	plugin/scripts/native-root-audit-diagnostic.test.mjs	tests	Not reviewed
-pending	plugin/scripts/native-root-auto-diagnostic.test.mjs	tests	Not reviewed
+reviewed	plugin/scripts/native-root-audit-diagnostic.test.mjs	tests	Regression failed before fix; four related suites passed with 22 tests
+reviewed	plugin/scripts/native-root-auto-diagnostic.test.mjs	tests	Regression failed before fix; four related suites passed with 22 tests
 reviewed	plugin/scripts/native-root-child.test.mjs	tests	Reviewed process, timeout, orphan, observer and output-limit cases; all ten passed outside restricted sandbox
 pending	plugin/scripts/native-root-instrumentation.test.mjs	tests	Not reviewed
 reviewed	plugin/scripts/native-root-io.test.mjs	tests	Reviewed adapter operations, hook failures and accounting; independent one-MiB reads and exact byte views covered; all 14 tests passed
