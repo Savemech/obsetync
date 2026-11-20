@@ -27,7 +27,7 @@ function formatBytes(n: number): string {
 }
 
 /** Files above this size skip WASM hashing during scan — push.ts hashes them
- *  during upload via FastCDC (wasm_chunk_file returns file_hash). This keeps
+ *  during upload with the streaming FastCDC chunker. This keeps
  *  WASM linear memory bounded to the ~4 MiB FastCDC window rather than the
  *  complete file. */
 const LARGE_FILE_THRESHOLD = 1_048_576; // 1 MB

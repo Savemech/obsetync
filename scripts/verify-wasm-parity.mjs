@@ -75,7 +75,19 @@ for (const length of [0, 1, 63, 64, 65, 1024, 65_535, 65_536, 65_537, 1_048_593]
 }
 
 const large = deterministicPayload(10 * 1024 * 1024 + 123);
-const baselineManifest = JSON.stringify(chunkManifest(scalar, large, feedSizes[0]));
+const manifest = scalar.wasm_chunk_file(large);
+assert.equal(manifest.file_hash, scalar.wasm_hash(large));
+assert.equal(manifest.total_size, large.length);
+let coveredBytes = 0;
+for (const chunk of manifest.chunks) {
+    assert.equal(chunk.offset, coveredBytes);
+    assert(Number.isSafeInteger(chunk.size) && chunk.size > 0 && chunk.size <= large.length - coveredBytes);
+    coveredBytes += chunk.size;
+    assert.equal(chunk.hash, scalar.wasm_hash(large.subarray(chunk.offset, coveredBytes)));
+}
+assert.equal(coveredBytes, large.length);
+assert.deepEqual(simd.wasm_chunk_file(large), manifest);
+const baselineManifest = JSON.stringify(manifest);
 const chunkFeedSizes = [...feedSizes, 4 * 1024 * 1024 - 1, 4 * 1024 * 1024,
     4 * 1024 * 1024 + 1, large.length];
 for (const feedBytes of chunkFeedSizes) {
@@ -93,6 +105,9 @@ const sizes = new Uint32Array([1000, 1000, 1000]);
 const expectedBatch = Array.from(offsets, (offset, i) =>
     scalar.wasm_hash(batchData.subarray(offset, offset + sizes[i])));
 for (const module of [scalar, simd]) {
+    for (const size of [0, 2 ** 20 - 1, 2 ** 20, 2 ** 32 - 1, 2 ** 32, 2 ** 32 + 1, Number.MAX_SAFE_INTEGER]) {
+        assert.equal(module.wasm_should_chunk(size), size >= 2 ** 20, `wrong chunking decision for ${size} bytes`);
+    }
     assert.deepEqual(module.wasm_hash_batch(batchData, offsets, sizes), expectedBatch,
         "batch hashes differ from individual slice hashes");
     const endOffsets = new Uint32Array([2999, 2999, 0xffffffff]);

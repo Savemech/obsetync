@@ -10676,7 +10676,7 @@ fn file_chunk_slice(data: &[u8], offset: u32, size: u32) -> &[u8] {
 
 /// Check if a file should use sub-file chunking based on size.
 #[wasm_bindgen]
-pub fn wasm_should_chunk(size: u32) -> bool {
+pub fn wasm_should_chunk(size: f64) -> bool {
     crate::fastcdc_chunker::should_chunk(size as u64)
 }
 

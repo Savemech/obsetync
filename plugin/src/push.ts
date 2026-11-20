@@ -181,8 +181,6 @@ export interface WasmModule {
     wasm_memory_snapshot?(): unknown;
     wasm_hash(data: Uint8Array): string;
     wasm_should_chunk(size: number): boolean;
-    wasm_chunk_file(data: Uint8Array): any;
-    wasm_get_file_chunk(data: Uint8Array, offset: number, size: number): Uint8Array;
     wasm_tree_get_chunk(tree: any, hash: string): Uint8Array | null;
     wasm_tree_chunk_byte_length(tree: any, hash: string): number | undefined;
     wasm_tree_chunk_hashes(tree: any): string[];
@@ -1288,7 +1286,7 @@ export async function push(
         //   For incremental syncs the server already has most content → zero reads.
         //
         // Large file (wasm_should_chunk): must read now for FastCDC.
-        //   wasm_chunk_file computes the hash internally.
+        //   The streaming chunker also computes the file hash.
         //
         // Small file without known hash: read in parallel, then wasm_hash_batch
         //   for the whole sub-group — ONE WASM boundary crossing regardless of N.
@@ -1724,7 +1722,6 @@ export async function push(
                 const residentReadBytes = reads.reduce((sum, row) => sum + row.data.length, 0);
                 perf?.observePeakBatchBytes(residentReadBytes);
 
-                // Large files — wasm_chunk_file hashes internally.
                 for (const { change, data } of reads.filter(r => wasm.wasm_should_chunk(r.data.length))) {
                     const endChunk = perf?.phase("fastcdc");
                     let chunkInfo: any;
