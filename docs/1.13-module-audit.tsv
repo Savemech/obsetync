@@ -365,8 +365,8 @@ reviewed	plugin/src/sync-base-migration.test.ts	tests	Covers retry after partial
 pending	plugin/src/sync-base-publication.test.ts	tests	Not reviewed
 pending	plugin/src/sync-base.test.ts	tests	Not reviewed
 pending	plugin/src/sync-base.ts	production	Not reviewed
-pending	plugin/src/sync-memory-arbiter.test.ts	tests	Not reviewed
-pending	plugin/src/sync-memory-arbiter.ts	production	Not reviewed
+reviewed	plugin/src/sync-memory-arbiter.test.ts	tests	Ran queued abort/close, interactive reserve and synchronous admission. Added actual spool retirement check against both ledgers, live waiter, invalid resize and release.
+reviewed	plugin/src/sync-memory-arbiter.ts	production	Reviewed FIFO lanes, owner ceilings, cancel/close and release. Removed unused budgetFor adapter. Propagate actual compact spool/sort retirement to aggregate accounting.
 pending	plugin/src/sync-status.test.ts	tests	Not reviewed
 pending	plugin/src/sync-status.ts	production	Not reviewed
 read	plugin/src/sync.ts	production	Automatic push and lifecycle paths traced; removed unused debounce seam; actual coalescer regression and engine suites pass; remaining engine paths pending

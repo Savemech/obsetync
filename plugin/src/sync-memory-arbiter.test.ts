@@ -1,5 +1,7 @@
 import { strict as assert } from "node:assert";
 import { ResourceBudgetQueueFullError } from "./resource-budget";
+import { reserveCompactIndexHashSpool } from "./index-upload";
+import { configureTransientMemory, closeTransientMemory, transientMemorySnapshot } from "./transient-memory";
 import { SyncMemoryArbiter } from "./sync-memory-arbiter";
 
 async function sharedCeilingAndInteractiveReserve(): Promise<void> {
@@ -44,9 +46,38 @@ function synchronousAdmissionNeverQueues(): void {
     const next = arbiter.tryReserve("transfer", 1); assert(next); next.release();
 }
 
+async function retiredSortReleasesSharedCapacity(): Promise<void> {
+    const arbiter = new SyncMemoryArbiter({ capacityBytes: 96 });
+    configureTransientMemory({ runtime: "mobile", transientBudgetBytes: 96 }, arbiter);
+    const admitted = await reserveCompactIndexHashSpool(1, 64);
+    try {
+        const queued = arbiter.reserve("root-plan", 64);
+        admitted.coOwner.release();
+        const snapshot = arbiter.snapshot();
+        assert.equal(snapshot.owners.transfer.usedBytes, 32);
+        assert.equal(snapshot.owners.transfer.activeLeases, 1);
+        assert.equal(snapshot.queuedRequests, 0);
+        assert.equal(snapshot.peakUsedBytes, 96);
+        assert.equal(transientMemorySnapshot().usedBytes, 32);
+        const next = await queued;
+        assert.throws(() => next.shrinkTo(65), RangeError);
+        assert.throws(() => next.shrinkTo(0), RangeError);
+        next.shrinkTo(64);
+        assert.equal(arbiter.snapshot().usedBytes, 96);
+        next.release();
+        assert.throws(() => next.shrinkTo(1), RangeError);
+    } finally {
+        admitted.coOwner.release();
+        admitted.spool.close();
+        closeTransientMemory();
+    }
+    assert.equal(arbiter.snapshot().usedBytes, 0);
+}
+
 void (async () => {
     await sharedCeilingAndInteractiveReserve();
     await boundedQueuesAbortAndClose();
     synchronousAdmissionNeverQueues();
-    console.log("sync memory arbiter: 3 groups passed");
+    await retiredSortReleasesSharedCapacity();
+    console.log("sync memory arbiter: 4 groups passed");
 })().catch(error => { console.error(error); process.exitCode = 1; });

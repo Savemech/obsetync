@@ -1,6 +1,6 @@
 import {
     ResourceBudgetClosedError, ResourceBudgetOversizedError, ResourceBudgetQueueFullError,
-    type ResourceReservation,
+    type ShrinkableResourceReservation,
 } from "./resource-budget";
 
 /** Managed owner accounting only. This is not a process-RSS or JS-heap meter. */
@@ -15,7 +15,7 @@ export interface SyncMemoryArbiterOptions {
     maxQueuedBytes?: number;
 }
 
-export interface SyncMemoryLease extends ResourceReservation {
+export interface SyncMemoryLease extends ShrinkableResourceReservation {
     readonly owner: SyncMemoryOwnerClass;
 }
 
@@ -138,12 +138,6 @@ export class SyncMemoryArbiter {
         return mayEnter && this.fits(owner, bytes) ? this.grant(owner, bytes) : null;
     }
 
-    /** Adapter for transient owners that use the ResourceBudget reserve shape. */
-    budgetFor(owner: SyncMemoryOwnerClass): { reserve(bytes: number, options?: { signal?: AbortSignal }): Promise<ResourceReservation> } {
-        this.assertOwner(owner);
-        return { reserve: (bytes, options) => this.reserve(owner, bytes, options) };
-    }
-
     close(): void {
         if (this.closed) return;
         this.closed = true;
@@ -177,14 +171,29 @@ export class SyncMemoryArbiter {
         this.usedBytes += bytes; this.activeLeases++; this.peakUsedBytes = Math.max(this.peakUsedBytes, this.usedBytes);
         this.ownerUsed.set(owner, (this.ownerUsed.get(owner) ?? 0) + bytes);
         this.ownerActive.set(owner, (this.ownerActive.get(owner) ?? 0) + 1);
-        let released = false;
-        return { owner, bytes, release: () => {
-            if (released) return; released = true;
-            this.usedBytes -= bytes; this.activeLeases--;
-            this.ownerUsed.set(owner, (this.ownerUsed.get(owner) ?? 0) - bytes);
-            this.ownerActive.set(owner, (this.ownerActive.get(owner) ?? 0) - 1);
+        let retained = bytes;
+        const resize = (next: number) => {
+            const returned = retained - next;
+            this.usedBytes -= returned;
+            this.ownerUsed.set(owner, this.ownerUsed.get(owner)! - returned);
+            retained = next;
             this.drain();
-        } };
+        };
+        return {
+            owner,
+            get bytes() { return retained; },
+            shrinkTo: next => {
+                safePositive(next, "reservation bytes");
+                if (next > retained) throw new RangeError("sync memory reservation cannot grow");
+                if (next < retained) resize(next);
+            },
+            release: () => {
+                if (retained === 0) return;
+                this.activeLeases--;
+                this.ownerActive.set(owner, this.ownerActive.get(owner)! - 1);
+                resize(0);
+            },
+        };
     }
     private detach(waiter: Waiter): void {
         this.queuedBytes -= waiter.bytes;

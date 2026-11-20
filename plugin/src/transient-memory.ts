@@ -84,13 +84,10 @@ export class TransientMemoryBudget {
         let released = false;
         return {
             get bytes() { return local.bytes; },
-            shrinkTo(nextBytes: number) { local.shrinkTo(nextBytes); },
+            shrinkTo(nextBytes: number) { local.shrinkTo(nextBytes); shared?.shrinkTo(nextBytes); },
             release() {
                 if (released) return;
                 released = true;
-                // The shared owner deliberately remains charged at the original
-                // complete-workset bound until every child/native tail settles.
-                // Local shrink only improves the dynamic per-profile sublimit.
                 shared?.release();
                 local.release();
             },
