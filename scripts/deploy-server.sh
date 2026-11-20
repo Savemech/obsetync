@@ -34,11 +34,11 @@ flock 9
 docker compose -f "$staged_compose" config --quiet
 current_image=$(docker inspect --format '{{.Image}}' obsetync-server)
 timestamp=$(date -u +%Y-%m-%dT%H-%M-%SZ)
-backup_dir="${backup_root}/${timestamp}-${commit}"
+mkdir -p -- "$backup_root"
+backup_dir=$(mktemp -d -- "${backup_root}/${timestamp}-${commit}.XXXXXX")
 rollback_tag="obsetync/server:rollback-${commit}"
 release_tag="ghcr.io/savmech/obsetync-nix:${version}-${commit}"
 
-install -d -m 0755 "$backup_dir"
 install -m 0644 docker-compose.yml "$backup_dir/docker-compose.yml"
 docker inspect obsetync-server > "$backup_dir/container-inspect.json"
 docker image save --output "$backup_dir/server-image.tar" "$current_image"
@@ -53,24 +53,30 @@ rollback_armed=0
 rollback() {
     local original_status=$?
     local rollback_status=0
-    trap - ERR
+    trap - EXIT
+    trap '' HUP INT TERM
     set +e
     if [[ $rollback_armed -eq 1 ]]; then
         echo "release deployment failed; restoring the previous compose and image" >&2
-        install -m 0644 "$backup_dir/docker-compose.yml" .docker-compose.rollback \
-            || rollback_status=1
-        mv -f .docker-compose.rollback docker-compose.yml || rollback_status=1
         docker image tag "$rollback_tag" obsetync/server:local || rollback_status=1
-        OBSETYNC_SERVER_IMAGE="$rollback_tag" \
-            docker compose up -d --wait --wait-timeout 120 server || rollback_status=1
-        curl -fsS http://127.0.0.1:27182/health >/dev/null || rollback_status=1
+        if install -m 0644 "$backup_dir/docker-compose.yml" .docker-compose.rollback &&
+            mv -f .docker-compose.rollback docker-compose.yml; then
+            OBSETYNC_SERVER_IMAGE="$rollback_tag" \
+                docker compose up -d --wait --wait-timeout 120 server &&
+                curl --max-time 15 -fsS http://127.0.0.1:27182/health >/dev/null || rollback_status=1
+        else
+            rollback_status=1
+        fi
     fi
     if [[ $rollback_status -ne 0 ]]; then
         echo "automatic rollback failed; use ${backup_dir}" >&2
     fi
     exit "$original_status"
 }
-trap rollback ERR
+trap rollback EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 rollback_armed=1
 mv -f .docker-compose.release docker-compose.yml
@@ -83,10 +89,10 @@ if [[ $running_image != "$expected_image" ]]; then
     echo "running container does not use the release image" >&2
     false
 fi
-curl -fsS http://127.0.0.1:27182/health >/dev/null
+curl --max-time 15 -fsS http://127.0.0.1:27182/health >/dev/null
 docker image tag "$release_tag" obsetync/server:local
 
 rollback_armed=0
-trap - ERR
+trap - EXIT HUP INT TERM
 rm -f "$image_tar" "$staged_compose" || true
 echo "deployed ${version} at ${commit}; rollback bundle: ${backup_dir}"

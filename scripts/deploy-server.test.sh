@@ -69,6 +69,7 @@ if [[ $1 == compose ]]; then
         printf '%s\n' 'sha256:old' > "$FAKE_DOCKER_STATE/running-image"
     else
         printf '%s\n' 'sha256:new' > "$FAKE_DOCKER_STATE/running-image"
+        if [[ -e $FAKE_DOCKER_STATE/terminate ]]; then kill -TERM "$PPID"; fi
     fi
     exit 0
 fi
@@ -153,7 +154,7 @@ run_deploy() {
 find_backup() {
     local root=$1
     local commit=0123456789abcdef0123456789abcdef01234567
-    local backups=("$root/backups"/*-"$commit")
+    local backups=("$root/backups"/*-"$commit"*)
     [[ ${#backups[@]} -eq 1 && -d ${backups[0]} ]] || fail "expected one rollback bundle"
     printf '%s\n' "${backups[0]}"
 }
@@ -246,7 +247,36 @@ test_post_mutation_command_failure_rollback() {
     echo "ok - post-mutation command failure restores the previous compose and image"
 }
 
+test_signal_rollback() {
+    local root status
+    root=$(new_case)
+    touch "$root/state/terminate"
+    status=$(run_deploy "$root" 0 0)
+    assert_eq 143 "$status" "TERM exit status"
+    assert_file_contains "$root/dest/docker-compose.yml" 'services: old' "TERM left new compose active"
+    assert_eq sha256:old "$(cat "$root/state/running-image")" "TERM left new image running"
+    echo "ok - SIGTERM after activation restores previous deployment"
+}
+
+test_retry_preserves_backup() {
+    local root first status
+    root=$(new_case)
+    printf '%s\n' '#!/bin/sh' 'echo 2026-01-01T00-00-00Z' > "$root/bin/date"
+    chmod +x "$root/bin/date"
+    status=$(run_deploy "$root" 1 0)
+    assert_eq 1 "$status" "initial compose failure"
+    first=$(find_backup "$root")
+    printf '%s\n' 'services: edited' > "$root/dest/docker-compose.yml"
+    status=$(run_deploy "$root" 0 0)
+    assert_eq 0 "$status" "repeat deployment"
+    assert_file_contains "$first/docker-compose.yml" 'services: old' "retry overwrote previous backup"
+    assert_eq 700 "$(stat -c %a "$first")" "rollback bundle permissions"
+    echo "ok - same-second retry keeps the first private rollback bundle"
+}
+
 test_success
 test_deploy_failure_rollback
 test_health_failure_rollback
 test_post_mutation_command_failure_rollback
+test_signal_rollback
+test_retry_preserves_backup
