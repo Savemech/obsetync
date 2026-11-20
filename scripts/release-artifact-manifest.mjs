@@ -79,6 +79,7 @@ async function hashFile(directory, name) {
         if (!before.isFile() || !Number.isSafeInteger(before.size) || before.size < 0) {
             fail(`invalid regular file: ${name}`);
         }
+        if (before.size === 0 && name !== "styles.css") fail(`empty release asset: ${name}`);
         const digest = createHash("sha256");
         for await (const chunk of handle.createReadStream({ autoClose: false })) digest.update(chunk);
         const after = await handle.stat();

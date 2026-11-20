@@ -29,6 +29,7 @@ async function rejects(operation, pattern) {
 async function deterministicAndSelfExcluding() {
     const directory = await fixture();
     try {
+        await writeFile(join(directory, "styles.css"), "");
         const first = await generateReleaseArtifactManifest(directory, ZIP);
         const second = await generateReleaseArtifactManifest(directory, ZIP);
         assert.equal(second, first, "same final assets produced different manifests");
@@ -54,6 +55,12 @@ async function exactFlatSetIsRequired() {
         await unlink(join(missing, RELEASE_STATIC_ASSETS[0]));
         await rejects(() => generateReleaseArtifactManifest(missing, ZIP), /missing required flat asset/);
     } finally { await rm(missing, { recursive: true, force: true }); }
+
+    const empty = await fixture();
+    try {
+        await writeFile(join(empty, "sync_core_simd_bg.wasm"), "");
+        await rejects(() => generateReleaseArtifactManifest(empty, ZIP), /empty release asset/);
+    } finally { await rm(empty, { recursive: true, force: true }); }
 
     const extra = await fixture();
     try {
