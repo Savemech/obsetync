@@ -333,6 +333,20 @@ if (checkOnly) {
         assert.equal(diagnostics.wsDataWireVersion, 1, "explicit downgrade did not settle on OBW1");
         assert.equal(diagnostics.lastCarrier, "ws");
 
+        const legacy = makeRecord(BulkObjectKind, blake3, 0x3729a2fb, 150_000);
+        const legacySocket = wsObserver.sockets.at(-1).id;
+        const legacyPutStart = wsObserver.sent.length;
+        await fallbackApi.putObjects([legacy]);
+        const legacyPut = wsObserver.sent.slice(legacyPutStart).filter(frame => frame.bytes >= legacy.data.length);
+        assert.deepEqual(legacyPut.map(frame => frame.socket), [legacySocket], "OBW1 PUT must send one complete object on the downgraded socket");
+        const legacyGetStart = wsObserver.received.length;
+        const legacyFetched = await fallbackApi.getObjectsOwned(BulkObjectKind.Content, [legacy.hash]);
+        try {
+            assert.deepEqual(legacyFetched.objects.get(legacy.hash), legacy.data);
+        } finally { legacyFetched.release(); }
+        const legacyGet = wsObserver.received.slice(legacyGetStart).filter(frame => frame.bytes >= legacy.data.length);
+        assert.deepEqual(legacyGet.map(frame => frame.socket), [legacySocket], "OBW1 GET must receive one complete object on the downgraded socket");
+
         fallbackApi.closeDataLane(); fallbackApi = null;
         await Promise.all(wsObserver.sockets.map(socket => socket.closed));
         done = true;
@@ -344,7 +358,7 @@ if (checkOnly) {
                 "concurrent request-ID interleaving",
                 "control and CANCEL fragment-boundary priority",
                 "socket-loss fresh-session recovery",
-                "fresh-session OBW1 fallback after rejected OBW2",
+                "fresh-session OBW1 fallback, single-frame PUT and GET after rejected OBW2",
             ],
             websocket: {
                 connections: wsObserver.sockets.length,
