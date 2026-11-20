@@ -367,8 +367,8 @@ pending	plugin/src/sync-base.test.ts	tests	Not reviewed
 pending	plugin/src/sync-base.ts	production	Not reviewed
 reviewed	plugin/src/sync-memory-arbiter.test.ts	tests	Ran queued abort/close, interactive reserve and synchronous admission. Added actual spool retirement check against both ledgers, live waiter, invalid resize and release.
 reviewed	plugin/src/sync-memory-arbiter.ts	production	Reviewed FIFO lanes, owner ceilings, cancel/close and release. Removed unused budgetFor adapter. Propagate actual compact spool/sort retirement to aggregate accounting.
-pending	plugin/src/sync-status.test.ts	tests	Not reviewed
-pending	plugin/src/sync-status.ts	production	Not reviewed
+reviewed	plugin/src/sync-status.test.ts	tests	Ran presenter suite; reproduced native-format progress being reduced to generic status. Added fallback push/pull, unknown total and Unicode/numeric path cases.
+reviewed	plugin/src/sync-status.ts	production	Traced main presenter, fallback push/pull progress, visible-window rates, phase priority, milestones, stale/invalid samples, recovery precedence and output cap. Preserve speed units in fallback and suppress paths with non-ASCII components.
 read	plugin/src/sync.ts	production	Automatic push and lifecycle paths traced; removed unused debounce seam; actual coalescer regression and engine suites pass; remaining engine paths pending
 reviewed	plugin/src/transfer-plan-scope.test.ts	tests	Validated enrollment, policy, version separation, concurrent callers sharing a failure and successful retry on the same runtime.
 reviewed	plugin/src/transfer-plan-scope.ts	production	Traced capture and per-tree promise cache through engine construction; failed digests now release their cache slot for retry.

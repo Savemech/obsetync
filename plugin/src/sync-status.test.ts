@@ -269,6 +269,16 @@ assert.equal(
     "↑ working · hashing unknown",
     "non-finite counters escaped into status text",
 );
+for (const base of [
+    "↑ 10/100 · 12.5 f/s · 1.2 MB/s",
+    "↓ 10/?",
+    "10/100 files applied · ✓4 verified · ↓6 (110 KB) · 2 f/s",
+]) {
+    assert.equal(renderActiveSyncStatus(base, []), base, "fallback progress lost its measured rate");
+}
+for (const base of ["sync Работа/планы.pdf", "sync 2026/10/28", "sync 10/100/файл"]) {
+    assert.equal(renderActiveSyncStatus(base, []), "sync …", "a vault path escaped status filtering");
+}
 assert.equal(
     renderActiveSyncStatus("sync /private/vault/secret.md", []),
     "sync …",

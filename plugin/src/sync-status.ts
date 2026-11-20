@@ -52,7 +52,8 @@ const PHASE_PRESENTATION: Record<PerfPhase, PhasePresentation> = {
 
 const SAFETY_STATUS = /(?:sync off|sync ✗|sync ⚠|sync ⏸|re-enroll|review)/i;
 const ACTION_STATUS = /(?:re-enroll|review)/i;
-const PATH_LIKE_TEXT = /(?:[A-Za-z_.-][\\/]|[\\/][A-Za-z_.-]|\S+\.md\b)/i;
+const STATUS_METRIC = /(?:^|\s)(?:\d+\/(?:\d+|\?)|\d+(?:\.\d+)? (?:f|[KMGT]?i?B)\/s)(?=\s|$)/g;
+const PATH_LIKE_TEXT = /[\\/]|\S+\.md\b/i;
 const RATE_PHASES = new Set<SelectedOperation["phaseKey"]>([
     "scan_batch", "prepare_batch", "enumerate", "stat", "read", "hash", "fastcdc",
     "check", "encrypt", "decrypt", "upload", "download", "apply", "write", "tree_index_upload",
@@ -151,7 +152,7 @@ function safeBaseStatus(base: string): string {
         .replace(/[\u0000-\u001f\u007f]+/g, " ")
         .replace(/\s+/g, " ")
         .trim();
-    if (!PATH_LIKE_TEXT.test(normalized)) return capStatus(normalized || "sync …");
+    if (!PATH_LIKE_TEXT.test(normalized.replace(STATUS_METRIC, " "))) return capStatus(normalized || "sync …");
     if (/sync off/i.test(normalized)) return "sync off";
     if (/re-enroll/i.test(normalized)) return "sync ⚠ re-enroll";
     if (/review/i.test(normalized)) return "sync ⚠ review";
