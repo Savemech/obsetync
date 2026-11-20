@@ -123,6 +123,34 @@ async function queuedCancellationAndNativeCapability(): Promise<void> {
     check(budget.snapshot().usedBytes === 0, "native append leaked reservation");
 }
 
+async function nativeAppendFailureRetainsOwnershipUntilSettlement(): Promise<void> {
+    const backing = new Uint8Array([9, 3, 4, 8]);
+    const view = backing.subarray(1, 3);
+    const workBytes = estimateAppendWorkset(view.byteLength);
+    const capacityBytes = workBytes + backing.byteLength;
+    const budget = new ResourceBudget({ capacityBytes });
+    const memory = await reserveTransientScope({ ownerBytes: backing.byteLength, workBytes }, { budget });
+    const started = deferred(), finish = deferred();
+    const failure = new Error("native append failed");
+    const unexpected = async (): Promise<never> => { throw new Error("native append used legacy IO"); };
+    const operation = appendBinaryBounded({
+        readBinary: unexpected, writeBinary: unexpected,
+        appendBinary: async (_path, buffer) => {
+            started.resolve();
+            check(new Uint8Array(buffer).join() === "3,4", "native append included adjacent backing bytes");
+            await finish.promise;
+            throw failure;
+        },
+    }, unexpected, "part", view, { memory });
+    await started.promise;
+    memory.close();
+    check(budget.snapshot().usedBytes === capacityBytes, "close released an unfinished native write");
+    finish.resolve();
+    const error = await operation.then(() => null, reason => reason);
+    check(error === failure, "native append failure was lost");
+    check(budget.snapshot().usedBytes === 0, "failed native write leaked its admission");
+}
+
 async function stalePrefixMetadataFailsClosed(): Promise<void> {
     for (const change of ["queued", "reading", "appeared", "missing"] as const) {
         let metadata: { size: number; mtime: number } | null =
@@ -173,6 +201,7 @@ void admissionBeforePrefixReadAndNativeSettlement()
     .then(unsafeFallbackLeavesExistingPrefix)
     .then(cancellationDoesNotReleaseUnfinishedRead)
     .then(queuedCancellationAndNativeCapability)
+    .then(nativeAppendFailureRetainsOwnershipUntilSettlement)
     .then(stalePrefixMetadataFailsClosed)
     .then(() => console.log(`bounded-append.test: ${assertions} assertions passed`))
     .catch((error) => { console.error(error); process.exitCode = 1; });

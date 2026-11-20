@@ -36,7 +36,7 @@ export interface PlatformIO {
     readFileIdentityVerified?(path: string, expected: FileStat,
         signal?: AbortSignal): Promise<Uint8Array | null>;
     writeFile(path: string, data: Uint8Array, perf?: PerfOperation): Promise<void>;
-    /** Append one binary segment without reading the existing file. */
+    /** Append one binary segment. Adapters without native append use a bounded prefix read. */
     appendFile(path: string, data: Uint8Array): Promise<void>;
     /** Reuse an owned download's work quota for append/copy lifetimes. */
     appendFileOwned?(path: string, data: Uint8Array, memory?: TransientWorkScope): Promise<void>;

@@ -168,8 +168,8 @@ read	plugin/src/api-memory.test.ts	tests	Traced fake encrypted transport and ran
 read	plugin/src/api-root-outcome.test.ts	tests	Added out-of-order sealed response regression covering forced refresh, channel rotation and authenticated root observation; full fixture audit pending.
 read	plugin/src/api.ts	production	HTTPS retained; enrollment URL/code/bundle validated with default/proxy/explicit-admin routes; native HTTPS proxy enroll and sealed negotiation pass; all four legacy check routes matched to server limits and tested at 1001 items; full transport/queue/lifetime audit remains
 reviewed	plugin/src/binary.ts	production	Traced adapter, append, HTTP and WS consumers; whole ordinary buffers retain identity, shared views copy to an exact ordinary ArrayBuffer. Covered by platform tests.
-pending	plugin/src/bounded-append.test.ts	tests	Not reviewed
-pending	plugin/src/bounded-append.ts	production	Not reviewed
+reviewed	plugin/src/bounded-append.test.ts	tests	Checked legacy prefix drift, metadata races, budget and cancellation. Added gated native write rejection with a subarray; parent close retains budget until rejection and no adjacent bytes are passed.
+reviewed	plugin/src/bounded-append.ts	production	Traced native and legacy paths through PlatformIO, large pull staging and conflict copies. Checked exact views, fallback limit and stat fences, reservation lifetime and native error propagation.
 pending	plugin/src/browser-capability-probe.test.ts	tests	Not reviewed
 pending	plugin/src/browser-capability-probe.ts	production	Not reviewed
 reviewed	plugin/src/browser-hash-worker-entry.ts	production	Read init, cancellation, feed, heap checks and buffer return; actual SIMD and forced scalar qualify; failed qualification cannot process subsequent files
