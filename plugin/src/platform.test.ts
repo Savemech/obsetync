@@ -310,6 +310,16 @@ async function run(): Promise<void> {
     const exact = new Uint8Array(exactArrayBuffer(backing.subarray(1, 4)));
     check(exact.length === 3, "binary writer leaked bytes outside a Uint8Array view");
     check(exact.join(",") === "1,2,3", "binary writer changed the selected bytes");
+    assert.equal(exactArrayBuffer(backing), backing.buffer);
+    const shared = new Uint8Array(new SharedArrayBuffer(4));
+    shared.set([9, 1, 2, 8]);
+    for (const view of [shared, shared.subarray(1, 3)]) {
+        const copy = exactArrayBuffer(view);
+        assert.ok(copy instanceof ArrayBuffer);
+        assert.deepEqual([...new Uint8Array(copy)], [...view]);
+        new Uint8Array(copy).fill(0);
+        assert.deepEqual([...shared], [9, 1, 2, 8]);
+    }
     await qualifiedReaderIsStrictAndOwned();
     await invalidHostResponsesFailClosed();
     await capabilityAndSourceDriftStayDistinct();

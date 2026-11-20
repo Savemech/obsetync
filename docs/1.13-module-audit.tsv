@@ -167,7 +167,7 @@ reviewed	plugin/src/api-enrollment.test.ts	tests	New actual-API regressions cove
 read	plugin/src/api-memory.test.ts	tests	Traced fake encrypted transport and ran suite; added legacy item, response and repeated-hash checks; remaining scenarios pending individual review
 pending	plugin/src/api-root-outcome.test.ts	tests	Not reviewed
 read	plugin/src/api.ts	production	HTTPS retained; enrollment URL/code/bundle validated with default/proxy/explicit-admin routes; native HTTPS proxy enroll and sealed negotiation pass; all four legacy check routes matched to server limits and tested at 1001 items; full transport/queue/lifetime audit remains
-pending	plugin/src/binary.ts	production	Not reviewed
+reviewed	plugin/src/binary.ts	production	Traced adapter, append, HTTP and WS consumers; whole ordinary buffers retain identity, shared views copy to an exact ordinary ArrayBuffer. Covered by platform tests.
 pending	plugin/src/bounded-append.test.ts	tests	Not reviewed
 pending	plugin/src/bounded-append.ts	production	Not reviewed
 pending	plugin/src/browser-capability-probe.test.ts	tests	Not reviewed
