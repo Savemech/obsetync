@@ -1378,6 +1378,13 @@ async function v2RequestedOutputAdmissionLifecycle(): Promise<void> {
         const buildFailure = new Error("injected post-resume progress failure");
         const cleanupFailure = new Error("injected cleanup yield failure");
         let failCleanup = true;
+        let joined: Promise<void> | undefined;
+        const releaseRetired = admission.releaseRetired.bind(admission);
+        admission.releaseRetired = token => {
+            joined = drainRootTreeRetirement(f.tree);
+            void joined.catch(() => {});
+            releaseRetired(token);
+        };
         f.hooks.progress = (progress, call) => { if (call === 2) throw buildFailure; return progress; };
         try {
             const error = failure(await outcome(rebuildRootTreeFromBase(f.base, f.tree, 2, undefined, {
@@ -1390,7 +1397,10 @@ async function v2RequestedOutputAdmissionLifecycle(): Promise<void> {
             assert(hasPendingRootTreeRetirement(f.tree));
             assert.equal(admission.snapshot().retiringBytes, plan.peakAdmissionBytes);
             assert.equal(admission.snapshot().residentBytes, 0);
-            failCleanup = false; await drainRootTreeRetirement(f.tree);
+            failCleanup = false;
+            const retry = drainRootTreeRetirement(f.tree);
+            await retry;
+            assert.equal(joined, retry, "release callback must join the active cleanup");
             assert.equal(admission.snapshot().ledger.usedBytes, 0); f.assertReleased();
         } finally { admission.close(); f.budget.close(); }
     }

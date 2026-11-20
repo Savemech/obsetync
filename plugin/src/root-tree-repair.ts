@@ -176,7 +176,6 @@ export function drainRootTreeRetirement(tree: RepairTree): Promise<void> {
         if (owner.done) throw error;
         throw new RootTreeRetirementError(error);
     }).finally(() => {
-        owner.flight = undefined;
         if (owner.done) {
             // Native completion is the proof for both transient input and the
             // scoped output owner. If the host ownership transition itself is
@@ -194,7 +193,7 @@ export function drainRootTreeRetirement(tree: RepairTree): Promise<void> {
             pendingRetirements.delete(tree);
             owner.memory.release();
         }
-    });
+    }).finally(() => { owner.flight = undefined; });
     owner.flight = flight;
     return flight;
 }
