@@ -39,9 +39,11 @@ export function createRootBatchPlan(...args: Parameters<typeof __nativeRootCreat
             if (work.plans.length >= ${NATIVE_ROOT_INSTRUMENTATION_LIMITS.plans}) {
                 __nativeRootMetricIncrement(work, "plansDropped"); return;
             }
-            const sample = { ...input, creationMs: performance.now() - started, selectionMs: 0,
+            const creationMs = performance.now() - started;
+            const initial = plan.snapshot();
+            const sample = { ...input, creationMs, selectionMs: 0,
                 selectionCalls: 0, selectionFailures: 0, disposalCalls: 0, disposalFailures: 0,
-                initial: plan.snapshot(), latest: plan.snapshot(), batches: [] as number[], batchSamplesDropped: 0 };
+                initial, latest: initial, batches: [] as number[], batchSamplesDropped: 0 };
             const next = plan.next, dispose = plan.dispose;
             plan.next = function(...selectedArgs: Parameters<typeof next>): ReturnType<typeof next> {
                 const began = performance.now();
