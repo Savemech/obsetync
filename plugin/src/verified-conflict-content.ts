@@ -109,18 +109,23 @@ async function parseManifest(data: Uint8Array, expectedHash: string, expectedSiz
             do {
                 abort();
                 if (chunks.length >= CONFLICT_MAX_CHUNKS) invalid("manifest chunk limit exceeded");
-                const fields = new Set<string>();
                 let hash: string | undefined, start: number | undefined, size: number | undefined;
                 expect("{");
                 do {
                     const field = string(6);
-                    if (fields.has(field)) invalid("duplicate manifest chunk field"); fields.add(field); expect(":");
-                    if (field === "hash") hash = string(64);
-                    else if (field === "offset") start = integer();
-                    else if (field === "size") size = integer();
-                    else invalid("unexpected manifest chunk field");
+                    expect(":");
+                    if (field === "hash") {
+                        if (hash !== undefined) invalid("duplicate manifest chunk field");
+                        hash = string(64);
+                    } else if (field === "offset") {
+                        if (start !== undefined) invalid("duplicate manifest chunk field");
+                        start = integer();
+                    } else if (field === "size") {
+                        if (size !== undefined) invalid("duplicate manifest chunk field");
+                        size = integer();
+                    } else invalid("unexpected manifest chunk field");
                 } while (next("}"));
-                if (fields.size !== 3 || !canonicalHash(hash) || start !== offset || size === undefined ||
+                if (!canonicalHash(hash) || start !== offset || size === undefined ||
                     size < 1 || size > CONFLICT_MAX_CHUNK_BYTES || offset + size > expectedSize) {
                     invalid("invalid manifest chunk layout");
                 }

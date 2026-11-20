@@ -187,12 +187,19 @@ async function invalidIdentityAndObjects() {
 }
 
 async function malformedManifests() {
-    const part = bytes(MIB), digest = hash(part), chunkHash = hash(part);
+    const part = bytes(MIB), digest = hash(part), chunkHash = digest;
     const base = { file_hash: digest, total_size: MIB, chunks: [{ hash: chunkHash, offset: 0, size: MIB }] };
     const bad: Uint8Array[] = [
         bytes(0), new Uint8Array(CONFLICT_MAX_MANIFEST_BYTES + 1), new Uint8Array([0xff]),
         raw("{}"), raw("[]"), raw("null"), raw(JSON.stringify(base) + " false"),
         raw(JSON.stringify(base).replace('"chunks":', '"chunks":[],"chunks":')),
+        raw(JSON.stringify(base).replace('"hash":', '"hash":"","hash":')),
+        raw(JSON.stringify(base).replace('"offset":', '"offset":0,"offset":')),
+        raw(JSON.stringify(base).replace('"size":', '"size":0,"size":')),
+        ...["hash", "offset", "size"].map(field => {
+            const chunk = Object.fromEntries(Object.entries(base.chunks[0]).filter(([key]) => key !== field));
+            return encode({ ...base, chunks: [chunk] });
+        }),
         raw(JSON.stringify(base).replace('"size":', '"size":1,"size":')),
         raw(JSON.stringify(base).replace('"offset":0', '"offset":00')),
         raw(JSON.stringify(base).replace('"offset":0', '"offset":0.0')),
