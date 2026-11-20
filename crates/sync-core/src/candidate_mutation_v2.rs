@@ -637,10 +637,7 @@ impl V2CandidateMutation {
         let last = self.operations.last_key_value().unwrap().0;
         self.empty_base = self.leaves.is_empty();
         if !self.empty_base {
-            self.start = self
-                .leaves
-                .partition_point(|range| &range.max_path < first)
-                .min(self.leaves.len() - 1);
+            self.start = tree_v2::mutation_start_leaf(&self.leaves, first);
             self.end = self
                 .leaves
                 .partition_point(|range| &range.max_path < last)
@@ -1562,6 +1559,35 @@ mod tests {
         );
         tree_v2::reachable_hashes(&store, &next).await.unwrap();
         (next, stats)
+    }
+
+    #[tokio::test]
+    async fn changes_at_byte_limited_leaf_boundary_match_full_rebuild() {
+        let mut entries: Vec<_> = (0..64)
+            .map(|i| {
+                let mut row = entry(i, 0);
+                row.path = format!("{i:03}{}", "x".repeat(4050));
+                row
+            })
+            .collect();
+        let mut tail = entry(65, 0);
+        tail.path = "065".into();
+        entries.push(tail);
+        let mut inserted = entry(62, 1);
+        inserted.path = "063".into();
+        for (changed, deleted) in [
+            (vec![], vec![entries[63].path.clone()]),
+            (vec![inserted], vec![]),
+        ] {
+            let mut expected = entries.clone();
+            expected.retain(|e| !deleted.contains(&e.path));
+            expected.extend_from_slice(&changed);
+            let rebuilt = tree_v2::build_tree(&MemoryChunkStore::new(), expected)
+                .await
+                .unwrap();
+            let (updated, _) = compare(entries.clone(), changed, deleted, 1).await;
+            assert_eq!(updated, rebuilt);
+        }
     }
 
     #[tokio::test]

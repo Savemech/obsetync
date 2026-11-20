@@ -466,9 +466,7 @@ pub async fn update_tree<S: ChunkStore>(
         ));
     }
 
-    let start = leaves
-        .partition_point(|range| range.max_path.as_str() < first_path)
-        .min(leaves.len() - 1);
+    let start = mutation_start_leaf(&leaves, first_path);
     let mut end = leaves
         .partition_point(|range| range.max_path.as_str() < last_path)
         .min(leaves.len() - 1)
@@ -1303,6 +1301,24 @@ async fn expand_one_level<S: ChunkStore>(
     Ok(output)
 }
 
+pub(crate) fn mutation_start_leaf(leaves: &[RangeRef], first_path: &str) -> usize {
+    let index = leaves
+        .partition_point(|range| range.max_path.as_str() < first_path)
+        .min(leaves.len() - 1);
+    // A byte-limited leaf can end only because the next record did not fit.
+    // Changing that record or inserting before it can move the preceding boundary.
+    if index > 0
+        && first_path <= leaves[index].min_path.as_str()
+        && leaves[index - 1].serialized_bytes as usize
+            + leaf_record_len_for_path(&leaves[index].min_path)
+            > MAX_NODE_BYTES
+    {
+        index - 1
+    } else {
+        index
+    }
+}
+
 fn align_range_windows(from: &[RangeRef], to: &[RangeRef]) -> Vec<(Vec<RangeRef>, Vec<RangeRef>)> {
     let mut output = Vec::new();
     let mut i = 0usize;
@@ -1547,7 +1563,11 @@ fn validate_root_id(kind: &str, value: &str, allow_empty: bool) -> Result<(), Ch
 }
 
 pub(crate) fn leaf_record_len(entry: &FileEntry) -> usize {
-    2 + entry.path.len() + 32 + 8 + 8
+    leaf_record_len_for_path(&entry.path)
+}
+
+fn leaf_record_len_for_path(path: &str) -> usize {
+    2 + path.len() + 32 + 8 + 8
 }
 
 pub(crate) fn range_record_len(range: &RangeRef) -> usize {
