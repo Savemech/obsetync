@@ -451,6 +451,13 @@ pub enum HarnessError {
     Json(#[from] serde_json::Error),
 }
 
+pub fn write_json_file(path: &Path, value: &impl Serialize) -> Result<(), HarnessError> {
+    let mut writer = BufWriter::new(File::create(path)?);
+    serde_json::to_writer_pretty(&mut writer, value)?;
+    writer.flush()?;
+    Ok(())
+}
+
 pub fn materialize(
     plan: &WorkloadPlan,
     output: &Path,
@@ -513,8 +520,7 @@ pub fn materialize(
         dataset_digest: dataset_hasher.finalize().to_hex().to_string(),
         operations_digest: operations_hasher.finalize().to_hex().to_string(),
     };
-    let manifest_file = File::create(output.join("manifest.json"))?;
-    serde_json::to_writer_pretty(BufWriter::new(manifest_file), &manifest)?;
+    write_json_file(&output.join("manifest.json"), &manifest)?;
     Ok(manifest)
 }
 
@@ -1640,6 +1646,13 @@ fn percentile(sorted: &[u64], percentile: usize) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn small_json_report_propagates_final_write_failure() {
+        let error = write_json_file(Path::new("/dev/full"), &true).unwrap_err();
+        assert!(matches!(error, HarnessError::Io(e) if e.kind() == std::io::ErrorKind::StorageFull));
+    }
 
     #[test]
     fn full_workload_plans_match_rfc_cardinality() {

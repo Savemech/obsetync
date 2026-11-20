@@ -44,8 +44,8 @@ pending	crates/e2e-tests/tests/transport_security.rs	tests	Not reviewed
 reviewed	crates/e2e-tests/tests/two_device_sync.rs	tests	All four native-server cases pass: cross-device readback, fast-forward, divergent merge and vault isolation
 pending	crates/e2e-tests/tests/ws_data.rs	tests	Not reviewed
 read	crates/perf-harness/Cargo.toml	tooling	Entry-point/build inventory; behavior/callers still under review
-pending	crates/perf-harness/src/lib.rs	tooling	Not reviewed
-pending	crates/perf-harness/src/main.rs	tooling	Not reviewed
+read	crates/perf-harness/src/lib.rs	tooling	Reviewed materialize and manifest publication, traced shared report writer. Small final flush failure regression and nine package tests pass. Remaining plan/benchmark methods pending.
+reviewed	crates/perf-harness/src/main.rs	tooling	Traced all CLI branches and file/stdout report contracts. All file reports share explicit final flush; verified successful JSON and failing /dev/full exits via actual diff-page-bench.
 read	crates/sync-core/Cargo.toml	configuration/schema	Entry-point/build inventory; behavior/callers still under review
 read	crates/sync-core/src/candidate_mutation_v1.rs	production	Traced sorted append and merged-row inputs to leaf staging; borrowed encoding passes native mutation parity tests; remaining cursor phases pending
 pending	crates/sync-core/src/candidate_mutation_v2.rs	production	Not reviewed

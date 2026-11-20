@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use perf_harness::{
     apply_operation, benchmark, benchmark_diff_pages, benchmark_prefix_merge, benchmark_tree_v2,
-    materialize, verify, MaterializeOptions, Scale, WorkloadId, WorkloadPlan,
+    materialize, verify, write_json_file, MaterializeOptions, Scale, WorkloadId, WorkloadPlan,
 };
 use std::path::PathBuf;
 
@@ -112,12 +112,15 @@ enum Command {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let value = match cli.command {
+    match cli.command {
         Command::Describe {
             workload,
             seed,
             scale,
-        } => serde_json::to_value(WorkloadPlan::build(workload, seed, scale)?.summary()?)?,
+        } => report(
+            None,
+            &WorkloadPlan::build(workload, seed, scale)?.summary()?,
+        ),
         Command::Generate {
             workload,
             output,
@@ -126,32 +129,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             allow_large,
         } => {
             let plan = WorkloadPlan::build(workload, seed, scale)?;
-            serde_json::to_value(materialize(
-                &plan,
-                &output,
-                MaterializeOptions {
-                    allow_large,
-                    ..MaterializeOptions::default()
-                },
-            )?)?
+            report(
+                None,
+                &materialize(
+                    &plan,
+                    &output,
+                    MaterializeOptions {
+                        allow_large,
+                        ..MaterializeOptions::default()
+                    },
+                )?,
+            )
         }
-        Command::Verify { input, deep } => serde_json::to_value(verify(&input, deep)?)?,
-        Command::Apply { input, operation } => {
-            serde_json::to_value(apply_operation(&input, operation)?)?
-        }
+        Command::Verify { input, deep } => report(None, &verify(&input, deep)?),
+        Command::Apply { input, operation } => report(None, &apply_operation(&input, operation)?),
         Command::Bench {
             input,
             iterations,
             max_operations,
             output,
         } => {
-            let report = benchmark(&input, iterations, max_operations).await?;
-            if let Some(path) = output {
-                let file = std::fs::File::create(path)?;
-                serde_json::to_writer_pretty(std::io::BufWriter::new(file), &report)?;
-                return Ok(());
-            }
-            serde_json::to_value(report)?
+            let result = benchmark(&input, iterations, max_operations).await?;
+            report(output, &result)
         }
         Command::PrefixBench {
             entries,
@@ -161,14 +160,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             seed,
             output,
         } => {
-            let report =
+            let result =
                 benchmark_prefix_merge(entries, upserts, deletes, iterations, seed).await?;
-            if let Some(path) = output {
-                let file = std::fs::File::create(path)?;
-                serde_json::to_writer_pretty(std::io::BufWriter::new(file), &report)?;
-                return Ok(());
-            }
-            serde_json::to_value(report)?
+            report(output, &result)
         }
         Command::DiffPageBench {
             records,
@@ -176,28 +170,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             page_records,
             output,
         } => {
-            let report = benchmark_diff_pages(records, page_bytes, page_records)?;
-            if let Some(path) = output {
-                let file = std::fs::File::create(path)?;
-                serde_json::to_writer_pretty(std::io::BufWriter::new(file), &report)?;
-                return Ok(());
-            }
-            serde_json::to_value(report)?
+            let result = benchmark_diff_pages(records, page_bytes, page_records)?;
+            report(output, &result)
         }
         Command::TreeV2Bench {
             entries,
             iterations,
             output,
         } => {
-            let report = benchmark_tree_v2(entries, iterations).await?;
-            if let Some(path) = output {
-                let file = std::fs::File::create(path)?;
-                serde_json::to_writer_pretty(std::io::BufWriter::new(file), &report)?;
-                return Ok(());
-            }
-            serde_json::to_value(report)?
+            let result = benchmark_tree_v2(entries, iterations).await?;
+            report(output, &result)
         }
-    };
-    println!("{}", serde_json::to_string_pretty(&value)?);
+    }
+}
+
+fn report(
+    output: Option<PathBuf>,
+    value: &impl serde::Serialize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(path) = output {
+        write_json_file(&path, value)?;
+    } else {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::to_value(value)?)?
+        );
+    }
     Ok(())
 }
