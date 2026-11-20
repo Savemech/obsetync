@@ -257,7 +257,7 @@ pub fn decode_upload_pack<'a>(
     Ok(UploadPack { records })
 }
 
-pub fn encoded_pack_len(records: &[UploadRecord<'_>]) -> Result<usize, CodecError> {
+fn encoded_pack_len(records: &[UploadRecord<'_>]) -> Result<usize, CodecError> {
     let mut total = PACK_HEADER_BYTES;
     for record in records {
         total = total
@@ -268,10 +268,19 @@ pub fn encoded_pack_len(records: &[UploadRecord<'_>]) -> Result<usize, CodecErro
     Ok(total)
 }
 
+#[cfg(test)]
 pub fn encode_upload_pack(records: &[UploadRecord<'_>]) -> Result<Vec<u8>, CodecError> {
+    let mut output = Vec::with_capacity(encoded_pack_len(records)?);
+    append_upload_pack(&mut output, records)?;
+    Ok(output)
+}
+
+fn append_upload_pack(
+    output: &mut Vec<u8>,
+    records: &[UploadRecord<'_>],
+) -> Result<(), CodecError> {
     let count =
         u32::try_from(records.len()).map_err(|_| CodecError::new("upload pack count overflow"))?;
-    let mut output = Vec::with_capacity(encoded_pack_len(records)?);
     output.extend_from_slice(PACK_MAGIC);
     output.extend_from_slice(&0u16.to_le_bytes());
     output.extend_from_slice(&count.to_le_bytes());
@@ -285,7 +294,7 @@ pub fn encode_upload_pack(records: &[UploadRecord<'_>]) -> Result<Vec<u8>, Codec
         output.extend_from_slice(&stored_len.to_le_bytes());
         output.extend_from_slice(record.bytes);
     }
-    Ok(output)
+    Ok(())
 }
 
 pub fn encode_upload_ack(statuses: &[UploadStatus]) -> Result<Vec<u8>, CodecError> {
@@ -388,17 +397,17 @@ pub fn encode_download_response(
         .map_err(|_| CodecError::new("download request count overflow"))?;
     let cursor =
         u32::try_from(next_cursor).map_err(|_| CodecError::new("download cursor overflow"))?;
-    let pack = encode_upload_pack(records)?;
+    let pack_len = encoded_pack_len(records)?;
     let capacity = DOWNLOAD_HEADER_BYTES
         .checked_add(remaining.len())
-        .and_then(|value| value.checked_add(pack.len()))
+        .and_then(|value| value.checked_add(pack_len))
         .ok_or_else(|| CodecError::new("download response length overflow"))?;
     let mut output = Vec::with_capacity(capacity);
     output.extend_from_slice(DOWNLOAD_MAGIC);
     output.extend_from_slice(&count.to_le_bytes());
     output.extend_from_slice(&cursor.to_le_bytes());
     output.extend_from_slice(remaining);
-    output.extend_from_slice(&pack);
+    append_upload_pack(&mut output, records)?;
     Ok(output)
 }
 
