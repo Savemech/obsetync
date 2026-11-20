@@ -13,6 +13,7 @@ import { HashWorkerFileDriftError } from "../../src/desktop-hash-workers";
 import { BulkObjectKind } from "../../src/bulk-codec";
 import { ObsetyncSyncBase } from "../../src/sync-base";
 import { ObsetyncJournal } from "../../src/journal";
+import { settleRuntimeOwners, startRuntimeOwner } from "../../src/runtime-retirement";
 import { RootIntentStore } from "../../src/root-intent";
 import { captureRootStreamScope } from "../../src/root-stream-scope";
 import { rebuildRootTreeFromBase } from "../../src/root-tree-repair";
@@ -38,6 +39,10 @@ const VERIFY_PATH = `${STATE_DIR}/native-benchmark-verify.json`;
 const pathAt = index => `notes/p-${String(Math.floor(index / 256)).padStart(3, "0")}/n-${String(index).padStart(5, "0")}.md`;
 const livePath = index => `live/n-${String(index).padStart(3, "0")}.md`;
 const round = value => Math.round(value * 1000) / 1000;
+function closeStores(...stores) {
+    return settleRuntimeOwners(stores.map(store => startRuntimeOwner(() => store?.closeAndDrain())));
+}
+
 function assertRunning() {
     if (globalThis.__nativeRootStopRequested) throw new Error("native benchmark interrupted");
 }
@@ -822,7 +827,7 @@ export async function measureNativeRoot(options, phase) {
             try { await liveWork; } catch (error) { cleanupErrors.push(error); }
         }
         try { await engine?.stopAndDrain(); engineDrained = true; } catch (error) { cleanupErrors.push(error); }
-        try { await Promise.all([base?.closeAndDrain(), journal?.closeAndDrain()]); } catch (error) { cleanupErrors.push(error); }
+        try { await closeStores(base, journal); } catch (error) { cleanupErrors.push(error); }
         try { api?.closeDataLane(); } catch (error) { cleanupErrors.push(error); }
         try { await writer?.closeAndDrain(); } catch (error) { cleanupErrors.push(error); }
         try { metrics.restore(); if (engineDrained) tree?.free(); } catch (error) { cleanupErrors.push(error); }
@@ -859,17 +864,28 @@ export async function coldVerifyNativeRoot(options, phase) {
             for (let i = 0; i < 70; i++) assert.equal(base.getHash(livePath(i)),
                 wasm.wasm_hash(corpus(i, i === 69 ? 4 : 1, true)));
         }
-        phase("cold-wasm-rebuild"); metrics.wrapSync(tree, ["rebuild_from_entries_in_version"], "tree");
+        phase("cold-wasm-rebuild");
+        const rebuildMethods = ["begin_replacement_rebuild_job", "append_replacement_rebuild_job",
+            "start_replacement_rebuild_job", "step_replacement_rebuild_output_memory_v1_job",
+            "replacement_rebuild_output_memory_plan_v1_job", "resume_replacement_rebuild_output_memory_v1_job",
+            "finish_replacement_rebuild_job_deferred", "step_tree_retirement"];
+        metrics.wrapSync(tree, rebuildMethods, "tree");
         metrics.sampleMemory(memory); const rebuildStarted = performance.now();
         await rebuildRootTreeFromBase(base, tree, 1);
         const rebuildWallMs = performance.now() - rebuildStarted; metrics.sampleMemory(memory);
         assert.equal(tree.root_hash_hex(), manifest.root); assert.equal(tree.total_files(), manifest.expectedCount);
+        const rebuildMetrics = metrics.snapshot();
+        for (const method of rebuildMethods) {
+            const sample = rebuildMetrics.methods[`tree.${method}`];
+            assert(sample.timedCompletions > 0, `cold rebuild recorded no duration for ${method}`);
+            assert.equal(sample.errors, 0);
+        }
         return { freshProcess: true, sourceHashesVerified: verified, exactRebuiltRoot: true,
             pendingJournal: 0, pendingRootIntent: false, lastSequence: intents.lastSequence,
-            transportReserved: transport.lastOutgoingSeq, rebuildWallMs, rebuildMetrics: metrics.snapshot(), io: f.native.snapshot() };
+            transportReserved: transport.lastOutgoingSeq, rebuildWallMs, rebuildMetrics, io: f.native.snapshot() };
     } finally {
         try {
-            await Promise.all([intents.closeAndDrain(), base.closeAndDrain(), journal.closeAndDrain()]);
+            await closeStores(intents, base, journal);
         } finally { metrics.restore(); tree.free(); disposeWorkScheduler(); }
     }
 }
