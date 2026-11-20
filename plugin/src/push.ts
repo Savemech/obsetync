@@ -2822,29 +2822,6 @@ async function hashAdmittedRange(
     }
 }
 
-/**
- * Hash file bytes via the streaming WASM Hasher. Feed size is selected for the
- * active platform and adapts between 64 KiB and its platform cap. WASM linear
- * memory therefore follows the feed budget, never the full file size.
- */
-export function streamingHash(wasm: WasmModule, data: Uint8Array): string {
-    const hasher = new wasm.Hasher();
-    try {
-        let offset = 0;
-        while (offset < data.length) {
-            const feedBytes = getHashTuning().feedBytes;
-            const end = Math.min(data.length, offset + feedBytes);
-            const started = monotonicNow();
-            hasher.update(data.subarray(offset, end));
-            observeHashStep(end - offset, started);
-            offset = end;
-        }
-        return hasher.finalize();
-    } finally {
-        hasher.free();
-    }
-}
-
 /** Plan FastCDC chunks through small WASM bridge slices. The source buffer is
  *  necessarily whole-file on Obsidian mobile, but WASM never receives a
  *  second whole-file copy and retains a bounded ~4 MiB window. */
@@ -2950,6 +2927,40 @@ export async function runDesktopRendererRangePass(
     }
 }
 
+async function feedMobileRanges(
+    processor: WasmHasher | WasmChunker, reader: MobileRangeReader, memory: TransientWorkScope,
+    perf: PerfOperation | undefined, signal: AbortSignal | undefined, admittedFeedCeiling: number,
+): Promise<void> {
+    let offset = 0;
+    let lastYieldAt = monotonicNow();
+    while (offset < reader.size) {
+        throwIfWorkAborted(signal);
+        const rangeSize = Math.min(MAX_FASTCDC_CHUNK_BYTES, reader.size - offset);
+        const readStarted = monotonicNow();
+        const data = await reader.readBorrowed(offset, rangeSize, memory, signal);
+        perf?.addPhase("read", Math.max(0, monotonicNow() - readStarted));
+        if (data.byteLength !== rangeSize) {
+            throw new MobileRangeReadError("PROTOCOL");
+        }
+        for (let rangeOffset = 0; rangeOffset < data.byteLength;) {
+            throwIfWorkAborted(signal);
+            const feedBytes = Math.min(getHashTuning().feedBytes, admittedFeedCeiling);
+            const end = Math.min(data.byteLength, rangeOffset + feedBytes);
+            const started = monotonicNow();
+            processor.update(data.subarray(rangeOffset, end));
+            observeHashStep(end - rangeOffset, started);
+            rangeOffset = end;
+            const now = monotonicNow();
+            if (now - lastYieldAt >= getHashTuning().yieldBudgetMs) {
+                await yieldWork({ perf, signal });
+                lastYieldAt = monotonicNow();
+            }
+        }
+        offset += data.byteLength;
+    }
+    await reader.verify();
+}
+
 /** Mobile FastCDC preparation from a runtime-qualified public resource URL.
  * Source ranges belong to the caller's already-admitted upload scope; no
  * whole-file DataAdapter read or nested global reservation is permitted. */
@@ -2963,35 +2974,8 @@ export async function chunkMobileRangedSource(
 ): Promise<any> {
     throwIfWorkAborted(signal);
     const chunker = new wasm.WasmChunker();
-    let offset = 0;
-    let lastYieldAt = monotonicNow();
     try {
-        while (offset < reader.size) {
-            throwIfWorkAborted(signal);
-            const rangeSize = Math.min(MAX_FASTCDC_CHUNK_BYTES, reader.size - offset);
-            const readStarted = monotonicNow();
-            const data = await reader.readBorrowed(offset, rangeSize, memory, signal);
-            perf?.addPhase("read", Math.max(0, monotonicNow() - readStarted));
-            if (data.byteLength !== rangeSize) {
-                throw new MobileRangeReadError("PROTOCOL");
-            }
-            for (let rangeOffset = 0; rangeOffset < data.byteLength;) {
-                throwIfWorkAborted(signal);
-                const feedBytes = Math.min(getHashTuning().feedBytes, admittedFeedCeiling);
-                const end = Math.min(data.byteLength, rangeOffset + feedBytes);
-                const started = monotonicNow();
-                chunker.update(data.subarray(rangeOffset, end));
-                observeHashStep(end - rangeOffset, started);
-                rangeOffset = end;
-                const now = monotonicNow();
-                if (now - lastYieldAt >= getHashTuning().yieldBudgetMs) {
-                    await yieldWork({ perf, signal });
-                    lastYieldAt = monotonicNow();
-                }
-            }
-            offset += data.byteLength;
-        }
-        await reader.verify();
+        await feedMobileRanges(chunker, reader, memory, perf, signal, admittedFeedCeiling);
         throwIfWorkAborted(signal);
         return chunker.finish();
     } finally {
@@ -3012,33 +2996,8 @@ export async function hashMobileRangedSource(
 ): Promise<string> {
     throwIfWorkAborted(signal);
     const hasher = new wasm.Hasher();
-    let offset = 0;
-    let lastYieldAt = monotonicNow();
     try {
-        while (offset < reader.size) {
-            throwIfWorkAborted(signal);
-            const rangeSize = Math.min(MAX_FASTCDC_CHUNK_BYTES, reader.size - offset);
-            const readStarted = monotonicNow();
-            const data = await reader.readBorrowed(offset, rangeSize, memory, signal);
-            perf?.addPhase("read", Math.max(0, monotonicNow() - readStarted));
-            if (data.byteLength !== rangeSize) throw new MobileRangeReadError("PROTOCOL");
-            for (let rangeOffset = 0; rangeOffset < data.byteLength;) {
-                throwIfWorkAborted(signal);
-                const feedBytes = Math.min(getHashTuning().feedBytes, admittedFeedCeiling);
-                const end = Math.min(data.byteLength, rangeOffset + feedBytes);
-                const started = monotonicNow();
-                hasher.update(data.subarray(rangeOffset, end));
-                observeHashStep(end - rangeOffset, started);
-                rangeOffset = end;
-                const now = monotonicNow();
-                if (now - lastYieldAt >= getHashTuning().yieldBudgetMs) {
-                    await yieldWork({ perf, signal });
-                    lastYieldAt = monotonicNow();
-                }
-            }
-            offset += data.byteLength;
-        }
-        await reader.verify();
+        await feedMobileRanges(hasher, reader, memory, perf, signal, admittedFeedCeiling);
         throwIfWorkAborted(signal);
         return hasher.finalize();
     } finally { hasher.free(); }
@@ -3050,9 +3009,6 @@ export async function hashMobileRangedSource(
  * regardless of file size.
  * Falls back to a whole-file read followed by cooperatively yielded hash feeds
  * on mobile (no Node.js fs); this does not make the source read streaming.
- *
- * This is the nproc-ready path: each Web Worker calls this independently,
- * giving true parallel hashing across cores with zero data crossing thread boundaries.
  */
 export async function hashFileStreaming(
     path: string,

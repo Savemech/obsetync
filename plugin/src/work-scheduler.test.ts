@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import type { PerfOperation } from "./perf-trace";
 import type { PlatformIO } from "./platform";
-import { chunkFileStreaming, hashFileStreaming, streamingHash, type WasmModule } from "./push";
+import { chunkFileStreaming, hashFileStreaming, type WasmModule } from "./push";
 import { WorkScheduler, type WorkSchedulerRuntime } from "./work-scheduler";
 
 class FakeHost implements WorkSchedulerRuntime {
@@ -391,15 +391,15 @@ async function cooperativeHashPreservesBytesAndFreesOnAbort(): Promise<void> {
         stat: async () => ({ size: bytes.byteLength, mtime: 1 }),
         readFile: async () => bytes,
     } as unknown as PlatformIO;
-    const expected = streamingHash(wasm, bytes);
+    const expected = String(bytes.length * 7);
     assert.equal(await hashFileStreaming("note.md", io, wasm), expected);
-    assert.equal(freed, 2);
+    assert.equal(freed, 1);
     abortOnFeed = new AbortController();
     await assert.rejects(
         hashFileStreaming("note.md", io, wasm, undefined, 1, abortOnFeed.signal),
         { name: "AbortError" },
     );
-    assert.equal(freed, 3);
+    assert.equal(freed, 2);
 
     let chunkerFreed = 0;
     const abortChunk = new AbortController();

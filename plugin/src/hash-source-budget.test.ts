@@ -11,7 +11,7 @@ import {
     ResourceBudgetClosedError,
     ResourceBudgetOversizedError,
 } from "./resource-budget";
-import { hashAdmittedBytesWithBrowserWorker, hashFileStreaming, streamingHash,
+import { hashAdmittedBytesWithBrowserWorker, hashFileStreaming,
     type WasmModule } from "./push";
 import { BrowserHashWorkerError, type BrowserHashWorkerRuntime } from "./browser-hash-workers";
 import { reserveTransientWorkset, transientMemorySnapshot } from "./transient-memory";
@@ -319,8 +319,7 @@ async function productionBrowserWorkerHashingAndFallbackFences(): Promise<void> 
         free(): void {}
     }
     const wasm = { Hasher } as unknown as WasmModule;
-    const expected = streamingHash(wasm, source);
-    rendererConstructions = 0;
+    const expected = "23"; // Sum of the six fixture bytes.
     const makeIo = () => {
         let reads = 0;
         const io = {
