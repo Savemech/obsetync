@@ -765,6 +765,28 @@ async function downloadHashesStopAtTheDistinctObjectLimit(): Promise<void> {
     finally { owned.release(); }
 }
 
+async function onlyOpenedResponsesCanReportMissingOrUnchangedTree(): Promise<void> {
+    const f = fakeApi(new ResourceBudget({ capacityBytes: 32 * MIB }));
+    f.internal.negotiateTreeVersion = async () => undefined;
+    f.internal.diffPageLimits = { maxBytes: 65536, maxRecords: 128, maxPathBytes: 4096 };
+    for (const [status, read] of [
+        [404, () => f.api.getRoot("vault")],
+        [404, () => f.api.getRootAt("vault", hash(1))],
+        [404, () => f.api.getDiff("vault", hash(1))],
+        [304, () => f.api.getDiff("vault", hash(1))],
+        [404, () => f.api.getDiffPage("vault", hash(1), null, null)],
+    ] as const) {
+        f.reply(() => ({ wireStatus: status, body: new Uint8Array() }));
+        await assert.rejects(read, new RegExp(String(status)));
+        f.reply(() => ({ status, body: new Uint8Array() }));
+        assert.equal(await read(), null);
+    }
+    const decrypts = f.counts.decrypt;
+    f.reply(() => ({ body: new Uint8Array(65536 + 128) }));
+    await assert.rejects(f.api.getDiffPage("vault", hash(1), null, null), /admitted byte bound/);
+    assert.equal(f.counts.decrypt, decrypts, "oversized diff page reached decryption");
+}
+
 async function changedFrameLimitReplacesDataLane(): Promise<void> {
     const { internal } = fakeApi(new ResourceBudget({ capacityBytes: 32 * MIB }));
     const offer = (bytes: number) => internal.applyCapabilityBundle({
@@ -826,8 +848,9 @@ void (async () => {
         });
         await legacyHashChecksRespectBatchAndResponseLimits();
         await downloadHashesStopAtTheDistinctObjectLimit();
+        await onlyOpenedResponsesCanReportMissingOrUnchangedTree();
         await desktopOwnedReceiveFitsARecoverySizedPool();
-        console.log("api-memory.test: 22 ownership/transport regression scenarios passed");
+        console.log("api-memory.test: 23 ownership/transport regression scenarios passed");
     } finally {
         delete (globalThis as any).__obsetyncTestRequestUrl;
     }

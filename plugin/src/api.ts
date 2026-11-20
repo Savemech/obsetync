@@ -168,6 +168,7 @@ export interface TransportPersistence {
 }
 
 interface FetchLike {
+    authenticated: boolean;
     status: number;
     ok: boolean;
     /** Present only for the server's explicit pre-decrypt memory refusal. */
@@ -822,10 +823,11 @@ export class ObsetyncApi {
         body: Uint8Array,
         perf?: PerfOperation,
         options?: ReplaySafeSealedOptions,
+        maxResponseBytes?: number,
     ): Promise<FetchLike> {
         await this.negotiateTreeVersion(vaultId, perf);
         try {
-            return await this.sealed(method, path, body, perf, undefined, options);
+            return await this.sealed(method, path, body, perf, maxResponseBytes, options);
         } catch (error) {
             if (!isUpgradeRequiredError(error)) throw error;
             // The server may have restarted and intentionally forgotten its
@@ -834,7 +836,7 @@ export class ObsetyncApi {
             // format mismatch still returns 426 on the one retry.
             this.treeNegotiations.delete(vaultId);
             await this.negotiateTreeVersion(vaultId, perf, true);
-            return await this.sealed(method, path, body, perf, undefined, options);
+            return await this.sealed(method, path, body, perf, maxResponseBytes, options);
         }
     }
 
@@ -843,7 +845,7 @@ export class ObsetyncApi {
         const res = await this.treeSealed(
             vaultId, "GET", path, new Uint8Array(), perf, REPLAY_SAFE_SEALED_OPTIONS,
         );
-        if (res.status === 404) return null;
+        if (res.authenticated && res.status === 404) return null;
         if (!res.ok) throw new Error(`getRoot failed: ${res.status}`);
         return new Uint8Array(await res.arrayBuffer());
     }
@@ -858,7 +860,7 @@ export class ObsetyncApi {
         const res = await this.treeSealed(
             vaultId, "GET", path, new Uint8Array(), perf, REPLAY_SAFE_SEALED_OPTIONS,
         );
-        if (res.status === 404) return null;
+        if (res.authenticated && res.status === 404) return null;
         if (!res.ok) throw new Error(`getRootAt failed: ${res.status}`);
         return new Uint8Array(await res.arrayBuffer());
     }
@@ -930,11 +932,11 @@ export class ObsetyncApi {
         const res = await this.treeSealed(
             vaultId, "POST", path, body, perf, REPLAY_SAFE_SEALED_OPTIONS,
         );
-        if (res.status === 304) return null;
+        if (res.authenticated && res.status === 304) return null;
         // 404 = vault has no root on the server yet (fresh server, first
         // push hasn't landed). Treat as "nothing to pull" and let the push
         // path seed the vault.
-        if (res.status === 404) return null;
+        if (res.authenticated && res.status === 404) return null;
         if (!res.ok) throw new Error(`getDiff failed: ${res.status}`);
         return validateFileDeltas(await res.json());
     }
@@ -956,9 +958,9 @@ export class ObsetyncApi {
         const path = `/api/v1/diff-page/${vaultId}`;
         const request = encodeDiffPageRequest(fromRootHash, toRootHash, cursor, limits);
         const response = await this.treeSealed(
-            vaultId, "POST", path, request, perf, REPLAY_SAFE_SEALED_OPTIONS,
+            vaultId, "POST", path, request, perf, REPLAY_SAFE_SEALED_OPTIONS, limits.maxBytes,
         );
-        if (response.status === 404) return null;
+        if (response.authenticated && response.status === 404) return null;
         if (!response.ok) throw new Error(`getDiffPage failed: ${response.status}`);
         const bytes = new Uint8Array(await response.arrayBuffer());
         perf?.observePeakBatchBytes(bytes.byteLength);
@@ -2113,6 +2115,7 @@ export class ObsetyncApi {
             // Reverse proxies can still emit their own plaintext failures;
             // the application server itself always responds with wire 200.
             return {
+                authenticated: false,
                 status: wireResponse.status,
                 ok: false,
                 receiveBackpressureRetryAfterMs: parseHttpReceiveBackpressureDelay(
@@ -2142,6 +2145,7 @@ export class ObsetyncApi {
         }
         perf?.increment({ plaintextBytesReceived: plaintext.length });
         return {
+            authenticated: true,
             status: opened.status,
             ok: opened.status >= 200 && opened.status < 300,
             arrayBuffer: async () => exactArrayBuffer(plaintext),
