@@ -184,8 +184,10 @@ export class NativeResidentLedger {
     }
 
     /** Existing live charges survive a shrink, even when now overcommitted. */
-    setCapacity(capacityBytes: number): void {
+    setCapacity(capacityBytes: number): boolean {
+        if (capacityBytes === this.capacityBytes) return false;
         this.capacityBytes = positiveSafeInteger(capacityBytes, "capacityBytes");
+        return true;
     }
 
     /** Reject future reservations/growth, retaining every live charge. */

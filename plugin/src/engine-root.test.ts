@@ -1172,6 +1172,8 @@ async function initialPushAdmitsTheEmptyCommittedGraphBeforeFileWork() {
             "CANDIDATE_MUTATION_OUTPUT_ADMISSION_DENIED");
         assert.deepEqual([mutationBegins, mutationResumes, mutationFinishes, mutationRetirements], [2, 1, 1, 2]);
         const refusedReads = sourceReads(), refusedPreflights = f.server.preflights;
+        // A network-only governor update reapplies the current memory target.
+        admission.setCapacity(snapshot.residentBytes + mutationPlan.peakAdmissionBytes - 1);
         await a.engine.pushPending();
         assert.deepEqual([mutationBegins, mutationResumes, mutationFinishes, mutationRetirements], [2, 1, 1, 2],
             "unchanged automatic refusal repeated native mutation planning");

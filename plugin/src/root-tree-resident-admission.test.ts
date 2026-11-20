@@ -676,6 +676,10 @@ function mutationEpochFencesEqualLookingAdmissionAba(): void {
     assert.equal(owner.mutationEpoch, 1, "refused reserve did not advance the admission witness");
     owner.setCapacity(20);
     assert.equal(owner.mutationEpoch, 2);
+    owner.setCapacity(20);
+    assert.equal(owner.mutationEpoch, 2, "reapplying the same profile invalidated the admission witness");
+    assert.throws(() => owner.setCapacity(0), RangeError);
+    assert.equal(owner.mutationEpoch, 2, "invalid capacity changed the admission witness");
     const attempt = reserve(owner, tree, 10, 5);
     const reserved = owner.mutationEpoch;
     owner.ready(attempt);

@@ -648,7 +648,9 @@ export class RootTreeResidentAdmission {
         record.residentBytes = target;
     }
 
-    setCapacity(capacityBytes: number): void { this.changing(); this.ledger.setCapacity(capacityBytes); }
+    setCapacity(capacityBytes: number): void {
+        if (this.ledger.setCapacity(capacityBytes)) this.changing();
+    }
     close(): void { this.changing(); this.ledger.close(); }
 
     /** Aggregate and O(1); no tree identity, path, hash or token is exposed. */
