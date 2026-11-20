@@ -1482,6 +1482,38 @@ mod tests {
         units
     }
 
+    #[test]
+    fn replacement_v1_can_retire_unadmitted_input_one_row_at_a_time() {
+        let entries = corpus(3, false);
+        let memory = ReplacementInputMemory::new(&entries);
+        let mut job = ReplacementRebuildV1::new_metered_with_output_plan(
+            entries, memory, "vault", "device", 1024,
+        );
+        let plan = job.output_memory_plan_v1().unwrap();
+        assert!(job
+            .resume_after_output_memory_plan_v1(
+                plan.node_payload_bytes + 1,
+                plan.range_endpoint_peak_requested_bytes,
+                plan.range_endpoint_resident_requested_bytes,
+                "vault",
+                "device",
+            )
+            .is_err());
+        assert_eq!(job.step(256).unwrap().units, 0);
+        assert_eq!(job.input.as_ref().unwrap().len(), 3);
+        assert_eq!(job.graph_memory(), ReplacementV1GraphMemory::default());
+
+        for remaining in (0..3).rev() {
+            assert!(job.retire_one());
+            assert_eq!(job.input.as_ref().unwrap().len(), remaining);
+            assert_eq!(job.entry_memory().paths.strings, remaining);
+            assert!(job.entry_memory().counters_valid);
+        }
+        assert!(job.output_memory_plan_v1().is_err());
+        retire_to_empty(&mut job);
+        assert_eq!(job.entry_memory(), ReplacementV1EntriesMemory::default());
+    }
+
     #[tokio::test]
     async fn replacement_v1_retirement_at_every_phase_and_failed_owner_is_private() {
         let live = live_candidate().await;
