@@ -1156,8 +1156,7 @@ export class ResourceVisibilityGate {
         }
         this.composites = new WeakMap();
         this.resumeListeners.clear();
-        for (const resolve of this.quiescenceWaiters) resolve();
-        this.quiescenceWaiters.clear();
+        // Active owners settle quiescence when their final native tail releases.
         this.release();
     }
 

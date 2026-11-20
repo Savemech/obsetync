@@ -570,7 +570,19 @@ async function visibilityGateStopsOnlyNewMobileWork(): Promise<void> {
     engine.abort(new Error("old engine retired"));
     assert.equal(replacementWork.signal.aborted, false,
         "plugin-lifetime gate pinned or leaked the replaced engine signal");
-    replacementWork.release(); epochGate.dispose();
+    const concurrentWork = epochGate.beginHeavyWork(replacementEngine.signal);
+    let drainsCompleted = 0;
+    const beforeDispose = epochGate.waitForQuiescence().then(() => drainsCompleted++);
+    epochGate.dispose();
+    assert.equal(replacementWork.signal.aborted, true);
+    const afterDispose = epochGate.waitForQuiescence().then(() => drainsCompleted++);
+    replacementWork.release();
+    await Promise.resolve();
+    assert.equal(drainsCompleted, 0, "dispose reported quiescence with a native operation outstanding");
+    concurrentWork.release();
+    await Promise.resolve();
+    assert.equal(drainsCompleted, 2, "last release did not resolve both drain waiters");
+    await Promise.all([beforeDispose, afterDispose]);
 
     const desktopWork = desktop.beginHeavyWork(new AbortController().signal);
     desktop.setVisible(false, "pagehide");

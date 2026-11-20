@@ -311,8 +311,8 @@ reviewed	plugin/src/resident-memory.ts	production	Traced positive reservation in
 reviewed	plugin/src/resource-budget.test.ts	tests	Ran 91 assertions including mixed oversized and fitting waiters on resize, grant order, accounting, abort, closure and repeated release. Added unfinished-suite guard.
 reviewed	plugin/src/resource-budget.ts	production	Traced FIFO grants, shrink/release, abort listeners, queue bounds and live profile updates. Skip unchanged capacity and compact surviving waiters in one pass on shrink.
 reviewed	plugin/src/resource-governor.bench.ts	tooling	Traced fixed-profile worker comparison, hash consistency, timer sampling, throughput/UI gates and cleanup. Injected scratch creation and worker-close failures: no early pool creation and no leftover source directory. Full six-run worker benchmark passed both gates.
-pending	plugin/src/resource-governor.test.ts	tests	Not reviewed
-pending	plugin/src/resource-governor.ts	production	Not reviewed
+read	plugin/src/resource-governor.test.ts	tests	Traced mobile and desktop visibility cases. Verified drain waiters registered before and after disposal both wait for the final concurrent owner. Remaining controller scenarios pending.
+read	plugin/src/resource-governor.ts	production	Reviewed mobile visibility transitions, epoch cancellation and quiescence during disposal. Only the final work release resolves drain waiters. Remaining controller review pending.
 reviewed	plugin/src/root-batch-drain.test.ts	tests	1068 assertions cover 257 sequential batches, progress gates, errors, held cleanup and closure
 reviewed	plugin/src/root-batch-drain.ts	production	Traced serial pushPendingInner, real host yield, both continuation checks and tracked cleanup into sync.ts
 reviewed	plugin/src/root-batch-plan.test.ts	tests	Ran 141175 assertions covering plan equivalence, ordering, mutation/cancellation fences, memory admission and 25k-row fixtures.
