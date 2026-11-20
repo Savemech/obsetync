@@ -11,14 +11,10 @@ export class JournalRecoveryError extends Error {
 }
 
 export interface ParsedJournal {
-    entries: JournalEntry[];
-    /** Physical legacy mutations and durable ACKs, before the compatibility
-     * projection. Migration needs both rename endpoints' independent state. */
     mutations: JournalEntry[];
-    acknowledgements: Array<{ path: string; throughId: number }>;
+    acknowledgements: ReadonlyMap<string, number>;
     nextId: number;
     generation: number;
-    recordsRead: number;
     tornTail: boolean;
     checkpointIdentity: string | null;
 }
@@ -87,12 +83,11 @@ export function validateJournalEntry(value: unknown, fallbackId?: number): Journ
 
 /** Strict forward-only replay. Only malformed JSON at an unterminated EOF
  * may be an incomplete append; invalid complete rows are never skipped. */
-function* parseJournalSteps(raw: string): Generator<void, ParsedJournal> {
+export async function parseJournalCooperatively(raw: string): Promise<ParsedJournal> {
     const loaded: JournalEntry[] = [];
     const acknowledgements = new Map<string, number>();
     let nextId = 1;
     let generation = 0;
-    let recordsRead = 0;
     let snapshotRows = 0;
     let sawHeader = false;
     let sawSeal = false;
@@ -107,7 +102,7 @@ function* parseJournalSteps(raw: string): Generator<void, ParsedJournal> {
         const line = raw.slice(offset, end);
         const rawLine = terminated ? `${line}\n` : line;
         offset = terminated ? end + 1 : end;
-        if (++linesRead % 256 === 0) yield;
+        if (++linesRead % 256 === 0) await yieldWork();
         // The whole legacy input is separately capped by its reader. Yielding
         // only between rows still needs a bound on one JSON.parse operation.
         if (line.length > 128 * 1024) throw new JournalRecoveryError("LIMIT", "legacy journal row exceeds portable parse limit");
@@ -124,12 +119,11 @@ function* parseJournalSteps(raw: string): Generator<void, ParsedJournal> {
         if (!row || typeof row !== "object" || Array.isArray(row)) corrupt("invalid journal record");
         if (row.schema !== undefined && row.schema !== 1) throw new JournalRecoveryError("UNKNOWN_SCHEMA", "unsupported journal schema");
         if (row.op === "journal-meta") {
-            if (recordsRead !== 0 || sawHeader || row.schema !== 1 || !integer(row.generation) || !integer(row.nextId)) corrupt("invalid journal checkpoint header");
+            if (sawHeader || loaded.length !== 0 || acknowledgements.size !== 0 || row.schema !== 1 || !integer(row.generation) || !integer(row.nextId)) corrupt("invalid journal checkpoint header");
             generation = row.generation;
             nextId = row.nextId;
             sawHeader = true;
             checksum.add(rawLine);
-            recordsRead++;
             continue;
         }
         if (row.op === "journal-seal") {
@@ -137,7 +131,6 @@ function* parseJournalSteps(raw: string): Generator<void, ParsedJournal> {
                 row.bytes !== checksum.bytes || row.crc32 !== checksum.hex()) corrupt("journal checkpoint checksum or boundary mismatch");
             sawSeal = true;
             checkpointIdentity = `${generation}:${row.records}:${row.bytes}:${row.crc32}`;
-            recordsRead++;
             continue;
         }
         if (row.op === "ack") {
@@ -152,40 +145,9 @@ function* parseJournalSteps(raw: string): Generator<void, ParsedJournal> {
             nextId = Math.max(nextId, entry.id + 1);
             if (sawHeader && !sawSeal) { snapshotRows++; checksum.add(rawLine); }
         }
-        recordsRead++;
     }
     if (sawHeader && !sawSeal) throw new JournalRecoveryError("INCOMPLETE_CHECKPOINT", "journal checkpoint is incomplete");
-    const entries: JournalEntry[] = [];
-    let projected = 0;
-    for (const entry of loaded) {
-        const destinationPending = entry.id > (acknowledgements.get(entry.path) ?? 0);
-        if (entry.action === "renamed" && entry.oldPath) {
-            const sourcePending = entry.id > (acknowledgements.get(entry.oldPath) ?? 0);
-            if (sourcePending && destinationPending) entries.push(entry);
-            else if (sourcePending) entries.push({ id: entry.id, action: "deleted", path: entry.oldPath, ts: entry.ts, synced: false });
-            else if (destinationPending) entries.push({ id: entry.id, action: "modified", path: entry.path, ts: entry.ts, synced: false });
-        } else if (destinationPending) entries.push(entry);
-        if (++projected % 256 === 0) yield;
-    }
-    return { entries, mutations: loaded,
-        acknowledgements: [...acknowledgements].map(([path, throughId]) => ({ path, throughId })),
-        nextId, generation, recordsRead, tornTail, checkpointIdentity };
-}
-
-/** Small/pure compatibility entry point. Production migration uses the
- * cooperative decoder; neither API claims streaming native legacy reads. */
-export function parseJournal(raw: string): ParsedJournal {
-    const steps = parseJournalSteps(raw);
-    for (;;) { const step = steps.next(); if (step.done) return step.value; }
-}
-
-export async function parseJournalCooperatively(raw: string): Promise<ParsedJournal> {
-    const steps = parseJournalSteps(raw);
-    for (;;) {
-        const step = steps.next();
-        if (step.done) return step.value;
-        await yieldWork();
-    }
+    return { mutations: loaded, acknowledgements, nextId, generation, tornTail, checkpointIdentity };
 }
 
 export function encodeJournalCheckpoint(entries: readonly JournalEntry[], nextId: number, generation: number): string {

@@ -207,7 +207,7 @@ export class ObsetyncJournal {
                 state.index = state.index.append(entry);
                 if (++processed % 256 === 0) await yieldWork();
             }
-            for (const { path, throughId } of imported.parsed.acknowledgements) {
+            for (const [path, throughId] of imported.parsed.acknowledgements) {
                 await applyAcknowledgement(state, path, throughId);
             }
             const metadata = { schema: 1, kind: "journal", nextId: state.nextId };

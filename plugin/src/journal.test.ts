@@ -2,7 +2,7 @@ import { utf8Bytes } from "./utf8-bytes";
 import { strict as assert } from "node:assert";
 import { ObsetyncJournal, JOURNAL_PATHS, JOURNAL_STORE_PATH, JournalRecoveryError,
     type JournalEntry, type NewJournalEntry } from "./journal";
-import { checksumJournalUtf8, encodeJournalCheckpoint, parseJournal } from "./journal-format";
+import { checksumJournalUtf8, encodeJournalCheckpoint, parseJournalCooperatively } from "./journal-format";
 import { STORE_LIMITS, segmentedMigrationPaths } from "./segmented-store";
 import { MemorySegmentedIO, readStoreTestFrame, storeTestIOError, type StoreTestBoundary,
     type StoreTestDisk } from "./segmented-store-test-io";
@@ -90,7 +90,7 @@ async function legacyTailCoalescesWithoutTouchingSource(): Promise<void> {
     const io = legacy(raw); const before = originals(io); const journal = await restart(io);
     check(journal.unsyncedCount() === 1 && journal.unsynced()[0].id === 2,
         "legacy repeated path did not coalesce to its latest stable generation");
-    check(parseJournal(raw).tornTail, "fixture does not contain an unterminated torn legacy tail");
+    check((await parseJournalCooperatively(raw)).tornTail, "fixture does not contain an unterminated torn legacy tail");
     check(readStoreTestFrame(io, HEAD).snapshot.metadata.nextId === 3, "migration lost the watermark of coalesced rows");
     const events = io.events.length;
     check(await appendNote(journal, "other.md") === 3, "new append reused a coalesced legacy ID");

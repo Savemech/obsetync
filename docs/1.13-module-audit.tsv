@@ -244,7 +244,7 @@ pending	plugin/src/incremental-tree-test-abi.ts	production	Not reviewed
 reviewed	plugin/src/index-upload.test.ts	tests	Ran nine suites covering admission, export size, paging, ACK, cancellation and cleanup; exercised full local pool while compact spool remains held.
 reviewed	plugin/src/index-upload.ts	production	Traced push and repair callers, compact spool, bounded paged/legacy exports, ACK and error cleanup. Recompute headroom per pack and avoid nested waits with a retained spool.
 pending	plugin/src/journal-concurrency.test.ts	tests	Not reviewed
-pending	plugin/src/journal-format.ts	production	Not reviewed
+reviewed	plugin/src/journal-format.ts	production	Traced checksums, sealed and append-only replay, row limits, EOF and half-ACKs into legacy import. Removed unused compatibility projection and synchronous parser; migration consumes physical rows and ACK map directly.
 reviewed	plugin/src/journal-index.test.ts	tests	Checked generation ordering, Unicode ties, immutable captured iterators, linked renames, 10k edits and 3000 reference operations. Native journal recovery passed three runs.
 reviewed	plugin/src/journal-index.ts	production	Traced generation keys, duplicate replay, endpoint acknowledgements and sealed snapshots to journal load/append/compact. Build immutable roots directly without throwaway indexes or intermediate replacement state.
 reviewed	plugin/src/journal-legacy.ts	production	Reviewed staged/backup selection, torn-tail recovery, fingerprint and read caps. Size-only admission uses allocation-free UTF-8 counts.

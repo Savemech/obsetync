@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { createHash } from "node:crypto";
 import { fingerprintLegacyCopies } from "./legacy-source";
-import { parseJournalCooperatively, parseJournal } from "./journal-format";
+import { parseJournalCooperatively } from "./journal-format";
 
 type Copy = { role: string; raw: string | null };
 function reference(copies: Copy[]): string {
@@ -53,17 +53,17 @@ async function run(): Promise<void> {
         const raw = "\n".repeat(3000) + Array.from({ length: 600 }, (_, index) => JSON.stringify({
             id: index + 1, action: "modified", path: "note-" + index + ".md", ts: 1,
         })).join("\n") + "\n";
-        assert.deepEqual(await parseJournalCooperatively(raw), parseJournal(raw));
+        const parsed = await parseJournalCooperatively(raw);
+        assert.equal(parsed.mutations.length, 600);
+        assert.equal(parsed.nextId, 601);
+        assert.equal(parsed.mutations[599].path, "note-599.md");
         assert(timerRan, "cooperative legacy parser did not yield through blank rows");
     } finally { clearTimeout(parserTimer); }
     const rename = JSON.stringify({ id: 1, action: "renamed", oldPath: "old.md", path: "new.md", ts: 1 }) + "\n";
-    for (const [path, expectedPath, expectedAction] of [["old.md", "new.md", "modified"], ["new.md", "old.md", "deleted"]]) {
+    for (const path of ["old.md", "new.md"]) {
         const parsed = await parseJournalCooperatively(rename + JSON.stringify({ op: "ack", path, throughId: 1 }) + "\n");
-        assert.equal(parsed.entries.length, 1);
-        assert.equal(parsed.entries[0].path, expectedPath);
-        assert.equal(parsed.entries[0].action, expectedAction);
         assert.equal(parsed.mutations[0].action, "renamed");
-        assert.deepEqual(parsed.acknowledgements, [{ path, throughId: 1 }]);
+        assert.deepEqual([...parsed.acknowledgements], [[path, 1]]);
     }
     console.log("legacy-source.test: lossless bounded fingerprints, role/absence identity and cooperative parser regressions passed");
 }
