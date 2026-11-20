@@ -240,7 +240,7 @@ reviewed	plugin/src/host-runtime.test.ts	tests	Both desktop and mobile hosts tes
 reviewed	plugin/src/host-runtime.ts	production	Traced host selection through startup, persistence, memory budgets, worker initialization and desktop/mobile adapter selection. Layout flag is diagnostic only.
 reviewed	plugin/src/ignore.test.ts	tests	Checked built-in and custom patterns, legacy settings migration, anchored file/directory matches and nested negative cases
 reviewed	plugin/src/ignore.ts	production	Traced matcher through event capture, scans, legacy and paged pulls; rooted single-segment patterns and directory-only anchored paths corrected
-pending	plugin/src/incremental-tree-test-abi.ts	production	Not reviewed
+reviewed	plugin/src/incremental-tree-test-abi.ts	tests	Compared job tokens, reachability, retirement, export stages and revision with prepared-push fixture; both suites now use this test ABI
 reviewed	plugin/src/index-upload.test.ts	tests	Ran nine suites covering admission, export size, paging, ACK, cancellation and cleanup; exercised full local pool while compact spool remains held.
 reviewed	plugin/src/index-upload.ts	production	Traced push and repair callers, compact spool, bounded paged/legacy exports, ACK and error cleanup. Recompute headroom per pack and avoid nested waits with a retained spool.
 reviewed	plugin/src/journal-concurrency.test.ts	tests	Reviewed real journal/store with a gated 300-group hot-endpoint ACK. Ran 11 assertions covering cooperative steps, captured visibility and newer append across compaction/reload.
