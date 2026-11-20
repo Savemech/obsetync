@@ -306,8 +306,8 @@ reviewed	plugin/src/reconcile-content.ts	production	Read index, byte totals and 
 reviewed	plugin/src/reconcile-status.test.ts	tests	Traced force sync, reconcile summary, pending status, cancellation and recovery; reproduced returned-result alias changing idle warning; 27 status assertions and engine/root plus startup replay suites passed
 reviewed	plugin/src/reconcile-upload.test.ts	tests	Reviewed source drift, sibling drain, range close and fallback coverage; 211 repair assertions passed alongside range selection and desktop repair suites
 reviewed	plugin/src/reconcile-upload.ts	production	Reviewed drift detection, admission, worker fallback and range repair; normalize manifest chunk hashes before presence checks and selection
-pending	plugin/src/resident-memory.test.ts	tests	Not reviewed
-pending	plugin/src/resident-memory.ts	production	Not reviewed
+reviewed	plugin/src/resident-memory.test.ts	tests	Checked foreign and consumed leases, shrink/close, overflow and detached snapshots; six ledger, thirty root admission and five settlement groups passed
+reviewed	plugin/src/resident-memory.ts	production	Traced positive reservation invariant through resize, split, transfer, absorb and release; removed redundant active flag; validated with root admission and settlement callers
 reviewed	plugin/src/resource-budget.test.ts	tests	Ran 91 assertions including mixed oversized and fitting waiters on resize, grant order, accounting, abort, closure and repeated release. Added unfinished-suite guard.
 reviewed	plugin/src/resource-budget.ts	production	Traced FIFO grants, shrink/release, abort listeners, queue bounds and live profile updates. Skip unchanged capacity and compact surviving waiters in one pass on shrink.
 pending	plugin/src/resource-governor.bench.ts	tooling	Not reviewed

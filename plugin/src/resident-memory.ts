@@ -52,8 +52,8 @@ export class NativeResidentLeaseReleasedError extends Error {
 }
 
 interface LeaseState {
+    /** Active reservations are positive. Zero marks a consumed or released lease. */
     bytes: number;
-    active: boolean;
 }
 
 const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
@@ -154,7 +154,6 @@ export class NativeResidentLedger {
         const state = this.activeState(lease);
         const result = this.createLease(state.bytes);
         state.bytes = 0;
-        state.active = false;
         return result;
     }
 
@@ -172,18 +171,16 @@ export class NativeResidentLedger {
         }
         targetState.bytes = combined;
         sourceState.bytes = 0;
-        sourceState.active = false;
         this.activeLeases--;
     }
 
     /** Idempotent for a known lease; foreign/forged capabilities are rejected. */
     release(lease: NativeResidentLease): void {
         const state = this.ownedState(lease);
-        if (!state.active) return;
+        if (state.bytes === 0) return;
         this.usedBytes -= state.bytes;
         this.activeLeases--;
         state.bytes = 0;
-        state.active = false;
     }
 
     /** Existing live charges survive a shrink, even when now overcommitted. */
@@ -242,16 +239,16 @@ export class NativeResidentLedger {
 
     private activeState(lease: NativeResidentLease): LeaseState {
         const state = this.ownedState(lease);
-        if (!state.active) throw new NativeResidentLeaseReleasedError();
+        if (state.bytes === 0) throw new NativeResidentLeaseReleasedError();
         return state;
     }
 
     private createLease(bytes: number): NativeResidentLease {
-        const state: LeaseState = { bytes, active: true };
+        const state: LeaseState = { bytes };
         let lease!: NativeResidentLease;
         lease = Object.freeze(Object.defineProperties({}, {
             [leaseBrand]: { value: true },
-            bytes: { enumerable: true, get: () => state.active ? state.bytes : 0 },
+            bytes: { enumerable: true, get: () => state.bytes },
             release: { enumerable: true, value: () => this.release(lease) },
         })) as NativeResidentLease;
         this.leases.set(lease, state);
