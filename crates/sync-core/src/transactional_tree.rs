@@ -1308,6 +1308,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v1_settlement_can_retry_after_a_corrupt_target_is_restored() {
+        for commit in [false, true] {
+            let mut tree = TransactionalTree::new("vault", "device");
+            tree.rebuild(vec![entry("a/file.md", 1)]).await.unwrap();
+            tree.begin_candidate().unwrap();
+            tree.apply_candidate(&[entry("a/file.md", 2)], &[])
+                .await
+                .unwrap();
+            let committed = tree.committed_root_hash();
+            let candidate = tree.candidate_root_hash();
+            assert_ne!(committed, candidate);
+            let target = if commit {
+                tree.candidate_root().unwrap()
+            } else {
+                tree.committed_root().unwrap()
+            };
+            let hash = target.children[0].1;
+            let bytes = tree.store.get_chunk(&hash).unwrap();
+            tree.store.insert_chunk(hash, b"corrupt".to_vec());
+            let metadata = tree.metadata_memory();
+            let chunks = tree.store_len();
+            let settle = if commit {
+                TransactionalTree::commit_candidate
+            } else {
+                TransactionalTree::abort_candidate
+            };
+            assert!(settle(&mut tree).is_err());
+            assert_eq!(tree.committed_root_hash(), committed);
+            assert_eq!(tree.candidate_root_hash(), candidate);
+            assert_eq!(tree.metadata_memory(), metadata);
+            assert_eq!(tree.store_len(), chunks);
+
+            tree.store.insert_chunk(hash, bytes);
+            let stats = settle(&mut tree).unwrap();
+            assert_eq!(stats.removed, 1);
+            let expected = if commit { candidate } else { committed };
+            assert_eq!(tree.committed_root_hash(), expected);
+            assert!(!tree.has_candidate());
+        }
+    }
+
+    #[tokio::test]
     async fn candidate_abort_restores_root_and_sweeps_candidate_chunks() {
         let mut tree = TransactionalTree::new("vault", "device");
         tree.rebuild(vec![entry("a/file.md", 1), entry("b/file.md", 1)])
