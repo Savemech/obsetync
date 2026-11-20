@@ -77,10 +77,10 @@ function checkedProof(value: unknown): MigrationProof {
 
 function metadataJSON(metadata: unknown): string {
     let raw: string | undefined;
-    try { raw = JSON.stringify(metadata); } catch { fail("migration metadata cannot be encoded"); }
-    if (raw === undefined) fail("migration metadata cannot be encoded");
+    try { raw = JSON.stringify(metadata); } catch { fail("storage metadata cannot be encoded"); }
+    if (raw === undefined) fail("storage metadata cannot be encoded");
     if (utf8Bytes(raw) > STORE_LIMITS.headBytes) {
-        throw new StoreRecoveryError("LIMIT", "migration metadata exceeds bounded proof size");
+        throw new StoreRecoveryError("LIMIT", "storage metadata exceeds head size limit");
     }
     return raw;
 }
@@ -370,7 +370,8 @@ export class SegmentedStore {
         });
     }
 
-    initialize(rows: Iterable<unknown>, metadata: unknown): Promise<void> {
+    async initialize(rows: Iterable<unknown>, metadata: unknown): Promise<void> {
+        const capturedMetadata = JSON.parse(metadataJSON(metadata));
         return this.enqueue(async () => {
             if (!this.absent || this.head) throw new StoreRecoveryError("RECOVERY_REQUIRED", "initialize requires confirmed absent storage");
             try {
@@ -383,7 +384,7 @@ export class SegmentedStore {
                 globalThis.crypto.getRandomValues(bytes);
                 const epoch = [...bytes].map(byte => byte.toString(16).padStart(2, "0")).join("");
                 const head: StoreHead = { schema: 1, kind: "head", epoch, generation: 1, sequence: 0,
-                    snapshot: { id: 1, pages: 0, cut: 0, metadata }, walStart: 1, walEnd: 0, nextSegment: 1 };
+                    snapshot: { id: 1, pages: 0, cut: 0, metadata: capturedMetadata }, walStart: 1, walEnd: 0, nextSegment: 1 };
                 await this.writeSnapshot(head, rows);
                 await this.publish(head);
                 this.absent = false; this.writable = true;
@@ -452,7 +453,7 @@ export class SegmentedStore {
                 if (retry) await this.writeInitialVerified(this.headPath(".next"), encoded, STORE_LIMITS.headBytes);
                 else await this.writeVerified(this.headPath(".next"), encoded, STORE_LIMITS.headBytes);
                 await this.promote(encoded);
-                this.head = validateHead(unseal(encoded)); this.writable = true;
+                this.head = head; this.writable = true;
             } catch (error) { this.writable = false; throw error; }
         });
     }
@@ -480,14 +481,15 @@ export class SegmentedStore {
         });
     }
 
-    snapshot(rows: Iterable<unknown>, metadata: unknown): Promise<void> {
+    async snapshot(rows: Iterable<unknown>, metadata: unknown): Promise<void> {
+        const capturedMetadata = JSON.parse(metadataJSON(metadata));
         return this.enqueue(async () => {
             this.assertWritable();
             try {
                 const current = this.head!;
                 await this.ensureAdvanceFence();
                 const next: StoreHead = { ...current, generation: current.generation + 1,
-                    snapshot: { id: current.generation + 1, pages: 0, cut: current.sequence, metadata },
+                    snapshot: { id: current.generation + 1, pages: 0, cut: current.sequence, metadata: capturedMetadata },
                     walStart: current.nextSegment, walEnd: current.nextSegment - 1 };
                 await this.writeSnapshot(next, rows);
                 await this.publish(next);
@@ -611,9 +613,7 @@ export class SegmentedStore {
         const encoded = seal(head, STORE_LIMITS.headBytes);
         await this.writeVerified(this.headPath(".next"), encoded, STORE_LIMITS.headBytes);
         await this.promote(encoded);
-        // Keep only the exact serialized publication, not caller-owned metadata
-        // that might mutate while a later transaction is awaiting native IO.
-        this.head = validateHead(unseal(encoded));
+        this.head = head;
         if (oldBackup && predecessor) {
             try {
                 // Do not prune against only a cached predecessor if an external

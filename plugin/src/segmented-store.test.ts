@@ -99,7 +99,11 @@ async function boundedPagesSnapshotAppendAndStableIterator(): Promise<void> {
             firstWriteTraversed = traversed;
         }
     };
-    await store.initialize(source, { cursor: 1 });
+    const metadata = { cursor: 1 };
+    const initializing = store.initialize(source, metadata);
+    metadata.cursor = 99;
+    await initializing;
+    assert.equal((await recover(io.clone())).cursor, 1);
     io.onBoundary = undefined;
     assert.equal(traversed, stableRows.length);
     assert.ok(firstWriteTraversed <= STORE_LIMITS.rowsPerPage + 1, "snapshot was eagerly materialized before the first page write");
@@ -118,7 +122,11 @@ async function boundedPagesSnapshotAppendAndStableIterator(): Promise<void> {
     assert.equal(new Map(afterAppend.entries).has("note-1.md"), false);
     assert.equal(afterAppend.cursor, 2);
 
-    await store.snapshot(afterAppend.entries.map(([path, value]) => entry(path, value)), { cursor: 2 });
+    metadata.cursor = 2;
+    const snapshotting = store.snapshot(afterAppend.entries.map(([path, value]) => entry(path, value)), metadata);
+    metadata.cursor = 99;
+    await snapshotting;
+    assert.equal((await recover(io.clone())).cursor, 2);
     const snapshotHead = readStoreTestFrame(io, HEAD);
     assert.equal(snapshotHead.snapshot.cut, changes.length);
     assert.equal(snapshotHead.sequence, changes.length);
