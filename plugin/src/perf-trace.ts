@@ -1176,9 +1176,12 @@ export class TypingLatencyProbe {
             return;
         }
         const now = host.monotonicNow();
-        const eventTime = Number(event.timeStamp);
-        const startedAt = Number.isFinite(eventTime) && eventTime >= 0 && eventTime <= now &&
-            now - eventTime <= TYPING_LATENCY_MAX_DURATION_MS ? eventTime : now;
+        const startedAt = event.timeStamp;
+        if (!Number.isFinite(startedAt) || startedAt < 0 || startedAt > now ||
+            now - startedAt > TYPING_LATENCY_MAX_DURATION_MS) {
+            this.discarded++;
+            return;
+        }
         const token = ++this.nextToken;
         const first = host.requestFrame(() => {
             if (!this.pending.has(token)) return;

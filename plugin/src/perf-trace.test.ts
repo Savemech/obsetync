@@ -498,8 +498,8 @@ function testWindows(): void {
         for (const [handle] of ready) frames.delete(handle);
         for (const [, callback] of ready) callback();
     };
-    const input = (target: EventTarget, trusted = true, queuedMs = 0) =>
-        beforeInput?.({ target, isTrusted: trusted, timeStamp: typingNow - queuedMs } as Event);
+    const input = (target: EventTarget, trusted = true, timeStamp = typingNow) =>
+        beforeInput?.({ target, isTrusted: trusted, timeStamp } as Event);
     const typing = new TypingLatencyProbe();
     assert.equal(typing.snapshot().state, "not-run");
     typing.start(typingHost);
@@ -507,7 +507,7 @@ function testWindows(): void {
     input(editor, false);
     assert.equal(frames.size, 0, "non-editor or synthetic input was measured");
     for (const duration of [10, 20, 30, 40, 50]) {
-        input(editor, true, 2);
+        input(editor, true, typingNow - 2);
         flushFrame((duration - 2) / 2);
         flushFrame((duration - 2) / 2);
     }
@@ -538,6 +538,12 @@ function testWindows(): void {
     assert.equal(typing.stop("manual").qualificationEligible, true,
         "long foreground capture was not qualification-eligible");
     typing.start(typingHost);
+    typingNow += 300_001;
+    for (const timeStamp of [NaN, Infinity, -1, typingNow + 1, 1]) {
+        input(editor, true, timeStamp);
+    }
+    assert.equal(frames.size, 0, "input without a usable start time scheduled a latency sample");
+    assert.equal(typing.snapshot().discarded, 5);
     const fireTimeout = timeoutCallback as unknown as (() => void);
     assert.equal(typeof fireTimeout, "function");
     fireTimeout();
