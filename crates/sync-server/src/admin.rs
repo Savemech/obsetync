@@ -108,7 +108,8 @@ async fn dashboard(State(state): State<SharedState>) -> Html<String> {
     let (content_all_bytes, content_all_files) = dir_stats(&content_root);
     let blob_bytes = content_all_bytes.saturating_sub(manifest_bytes + chunk_bytes);
     let blob_files = content_all_files.saturating_sub(manifest_files + chunk_files);
-    let total_bytes = idx_bytes + content_all_bytes;
+    let (pack_bytes, pack_files) = dir_stats(&state.layout.object_segments_dir());
+    let total_bytes = pack_bytes + idx_bytes + content_all_bytes;
 
     let uptime = format_duration(state.started_at.elapsed());
 
@@ -178,13 +179,14 @@ async fn dashboard(State(state): State<SharedState>) -> Html<String> {
   <div class="kpi"><div class="kpi-label">Devices</div>
     <div class="kpi-val">{} <span class="kpi-sub">({} online, {} revoked)</span></div></div>
   <div class="kpi"><div class="kpi-label">Vaults</div><div class="kpi-val">{}</div></div>
-  <div class="kpi"><div class="kpi-label">Total storage</div><div class="kpi-val">{}</div></div>
+  <div class="kpi"><div class="kpi-label">Object storage</div><div class="kpi-val">{}</div></div>
 </div>
 
 <h2>Storage breakdown</h2>
 <table>
 <tr><th>Category</th><th>Files</th><th>Bytes</th></tr>
-<tr><td>Index (Merkle tree)</td><td>{}</td><td>{}</td></tr>
+<tr><td>Packed segments and indexes</td><td>{}</td><td>{}</td></tr>
+<tr><td>Loose index (Merkle tree)</td><td>{}</td><td>{}</td></tr>
 <tr><td>Small-file blobs</td><td>{}</td><td>{}</td></tr>
 <tr><td>Large-file manifests</td><td>{}</td><td>{}</td></tr>
 <tr><td>Large-file sub-chunks</td><td>{}</td><td>{}</td></tr>
@@ -209,6 +211,8 @@ async fn dashboard(State(state): State<SharedState>) -> Html<String> {
         revoked,
         vaults.len(),
         format_bytes(total_bytes),
+        pack_files,
+        format_bytes(pack_bytes),
         idx_files,
         format_bytes(idx_bytes),
         blob_files,
@@ -1472,6 +1476,29 @@ mod tests {
     fn dir_stats_empty_dir_zero() {
         let dir = tempdir().unwrap();
         assert_eq!(dir_stats(dir.path()), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn dashboard_counts_packed_and_loose_object_storage() {
+        let dir = tempdir().unwrap();
+        let layout = StorageLayout::new(dir.path());
+        layout.init_directories().unwrap();
+        crate::box_key::init_box_keypair(&layout).unwrap();
+        let state = Arc::new(AppState::new(ServerConfig::new(dir.path().to_path_buf())));
+        let (initial_bytes, initial_files) = dir_stats(&layout.object_segments_dir());
+        std::fs::write(layout.object_segment_path(91), [0; 64]).unwrap();
+        std::fs::write(layout.object_segment_index_path(91), [0; 16]).unwrap();
+        std::fs::write(dir.path().join("content/legacy"), [0; 20]).unwrap();
+        let Html(page) = dashboard(State(state)).await;
+        assert!(page.contains(&format!(
+            "Packed segments and indexes</td><td>{}</td><td>{}",
+            initial_files + 2,
+            format_bytes(initial_bytes + 80)
+        )));
+        assert!(page.contains(&format!(
+            "Object storage</div><div class=\"kpi-val\">{}</div>",
+            format_bytes(initial_bytes + 100)
+        )));
     }
 
     fn current_root_fixture() -> (tempfile::TempDir, SharedState, sync_core::hash::FileHash) {
