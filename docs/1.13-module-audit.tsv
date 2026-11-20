@@ -135,7 +135,7 @@ read	plugin/scripts/diagnose-root-drain.mjs	tooling	Removed obsolete debounce mo
 reviewed	plugin/scripts/lib/native-root-audit-diagnostic.mjs	tooling	Traced review start, injection and return timestamps through fixture and report; reject wait exceeding enclosing review
 reviewed	plugin/scripts/lib/native-root-auto-diagnostic.mjs	tooling	Traced 70 paths plus three superseding callbacks through fixture and report; reject impossible exact and superseded counts
 reviewed	plugin/scripts/lib/native-root-child.mjs	tooling	Traced bounded output delivery, graceful and forced termination, group inspection and caller cleanup; ten Linux process tests passed
-pending	plugin/scripts/lib/native-root-crash-fixture.mjs	tooling	Not reviewed
+reviewed	plugin/scripts/lib/native-root-crash-fixture.mjs	tooling	Both native SIGKILL boundaries passed with debug server; fresh process matches exact pre-crash mutation ID and request hash; zero reuploads and empty journal
 pending	plugin/scripts/lib/native-root-fixture.mjs	tooling	Not reviewed
 pending	plugin/scripts/lib/native-root-instrumentation.mjs	tooling	Not reviewed
 reviewed	plugin/scripts/lib/native-root-io.mjs	tooling	Traced handle open, validation, write, close and counter settlement; return exact whole-file backing directly and normalize binary input once
@@ -155,7 +155,7 @@ read	plugin/scripts/run-tests.mjs	tooling	Removed obsolete debounce mocks or unu
 read	plugin/scripts/run-tests.test.mjs	tests	Updated build/installer contracts and verified 26 targeted cases; full runner fixture semantics still under review
 reviewed	plugin/scripts/settings-fence.test.mjs	tests	Read bundled settings controls and fixture; eight cases pass, including all 13 settings mutation controls and recovery UI after a failed credential save
 read	plugin/scripts/test-main-lifecycle.mjs	tooling	Read bundle fixture/owner/IO ports and enrollment regressions; actual main has 40 passing scenarios / 411 assertions; entire runner and all scenario bodies still require review
-reviewed	plugin/scripts/test-native-root-crash-recovery.mjs	tooling	Validated exact phase records across stderr chunks; both crash and fresh-process recovery scenarios passed on local native debug server
+reviewed	plugin/scripts/test-native-root-crash-recovery.mjs	tooling	CLI, private fixture ownership, process signal and recovery result assertions traced; both live debug-server scenarios passed
 pending	plugin/scripts/test-native-root-mutation-complexity.mjs	tooling	Not reviewed
 pending	plugin/scripts/test-native-root-server.mjs	tooling	Not reviewed
 pending	plugin/scripts/test-native-ws-data.mjs	tooling	Not reviewed

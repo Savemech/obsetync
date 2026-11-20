@@ -27,7 +27,7 @@ const WITNESS_PATH = `${STATE_DIR}/native-crash-witness.json`;
 const COUNT = 32;
 const CHANGE_INDEX = 7;
 
-function settings(api, enrollment, serverUrl) {
+function settings(enrollment, serverUrl) {
     return { serverUrl, serverBoxPub: enrollment.server_box_pub,
         vaultId: NATIVE_ROOT_FIXTURE_VAULT, deviceId: enrollment.device_id,
         enrolled: true, bearerToken: enrollment.bearer_token };
@@ -54,9 +54,9 @@ async function transportOwner(f, enrollment, serverUrl, initialize) {
         get: () => ({ ...transport }),
         update: patch => { transport = { ...transport, ...patch }; return writer.save(transport); },
     }, "desktop");
-    const rootSettings = settings(api, enrollment, serverUrl);
+    const rootSettings = settings(enrollment, serverUrl);
     const captured = captureRootStreamScope(rootSettings, api, api.baseUrl);
-    return { api, writer, rootSettings, captured, transport: () => ({ ...transport }) };
+    return { api, writer, captured, transport: () => ({ ...transport }) };
 }
 
 function engineFor(f, wasm, api, base, journal, tree, root, enrollment, captured) {
@@ -66,7 +66,7 @@ function engineFor(f, wasm, api, base, journal, tree, root, enrollment, captured
             vaultId: NATIVE_ROOT_FIXTURE_VAULT,
             deviceId: enrollment.device_id,
             scopeHash: captured.scopeHash,
-            assertApiScope: () => captured.assertCurrent(settings(api, enrollment, api.baseUrl), api, api.baseUrl),
+            assertApiScope: () => captured.assertCurrent(settings(enrollment, api.baseUrl), api, api.baseUrl),
         });
 }
 
@@ -175,6 +175,7 @@ async function crashAtRootBoundary(options, phase, afterAcceptedResponse) {
                 candidateChunks: chunks.length, scopeHash: await captured.scopeHash,
                 deviceId: options.enrollment.device_id,
                 serverIncarnation: capabilities.serverIncarnation, sequence: 1,
+                mutationId: pending.intent.request.mutation_id, requestHash: pending.intent.request.request_hash,
                 transportReserved: owner.transport().lastOutgoingSeq };
             await f.adapter.write(WITNESS_PATH, JSON.stringify(witness));
             assert.equal(JSON.parse(await f.adapter.read(WITNESS_PATH)).candidateRoot, candidateRoot);
@@ -250,6 +251,8 @@ async function recoverRootBoundary(options, phase, expectedBoundary) {
         assert.equal(preflightIntents.lastSequence, 1);
         const expected = { sequence: pending.intent.request.sequence,
             mutation_id: pending.intent.request.mutation_id, request_hash: pending.intent.request.request_hash };
+        assert.equal(expected.mutation_id, witness.mutationId);
+        assert.equal(expected.request_hash, witness.requestHash);
         const observed = await api.queryRootOutcome(NATIVE_ROOT_FIXTURE_VAULT, expected);
         if (expectedBoundary === "objects-acked-before-root") {
             assert.equal(observed.status, "unknown"); assert.equal(observed.last_sequence, 0);
