@@ -249,10 +249,16 @@ async function partialListenerFailureRetriesCleanly(): Promise<void> {
 }
 
 async function failedPreparationCanRetryWithoutDuplicateListeners(): Promise<void> {
-    const f = fixture([]);
-    const replay = f.engine.journal.unsyncedCount;
-    let fail = true;
-    f.engine.journal.unsyncedCount = () => { if (fail) throw new Error("retryable local metadata failure"); return replay(); };
+    const rows = [
+        { id: 1, action: "deleted", path: "edited.md", ts: 1, synced: false },
+        { id: 2, action: "modified", path: "remaining.md", ts: 2, synced: false },
+    ];
+    const f = fixture(rows);
+    const iterate = f.engine.journal.iterateUnsynced;
+    f.engine.journal.iterateUnsynced = function* () {
+        yield rows[0];
+        throw new Error("retryable journal iteration failure");
+    };
     let selections = 0;
     const activate = () => withUiStubs(() => activatePreparedSync({
         engine: f.engine, negotiation: Promise.resolve(), isCurrent: () => true,
@@ -262,11 +268,20 @@ async function failedPreparationCanRetryWithoutDuplicateListeners(): Promise<voi
     try { await activate(); } catch { failed = true; }
     check(failed && selections === 0 && f.network() === 0 && f.registrations() === 4,
         "failed preparation activated a tree or discarded local capture");
-    fail = false;
+    await f.callbacks.get("modify")!(Object.assign(new TFile(), {
+        path: "edited.md", stat: { mtime: 7, size: 9 },
+    }));
+    f.engine.journal.iterateUnsynced = iterate;
     await f.engine.prepareLocal();
     await f.engine.prepareLocal();
     check(f.registrations() === 4 && f.engine.localPrepared && f.engine.getLastError() === null,
         "successful preparation retry duplicated listeners or retained replay error");
+    const hints = f.engine.pendingChanges.take();
+    check(hints.length === 2 && hints.some((hint: any) => hint.path === "remaining.md" && hint.journalId === 2) &&
+        hints.some((hint: any) => hint.path === "edited.md" && hint.action === "modified" &&
+            hint.mtime === 7 && hint.journalId === rows[2].id),
+        "retry after partial replay lost the unread row or replaced the newer live edit");
+    f.engine.pendingChanges.restore(hints);
     await assertSyncGated(f);
     f.engine.stop();
 }
