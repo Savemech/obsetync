@@ -330,6 +330,16 @@ fn hello_v2_payload() -> Vec<u8> {
     output
 }
 
+async fn socket_io<T>(
+    operation: &'static str,
+    work: impl std::future::Future<Output = Result<T, tokio_tungstenite::tungstenite::Error>>,
+) -> T {
+    tokio::time::timeout(std::time::Duration::from_secs(5), work)
+        .await
+        .unwrap_or_else(|_| panic!("WebSocket {operation} timed out"))
+        .unwrap_or_else(|error| panic!("WebSocket {operation} failed: {error}"))
+}
+
 async fn open_authenticated_data_socket(env: &E2eEnv, client: &WireClient) -> (WsStream, WsCrypto) {
     use rand::RngCore;
     let mut private_bytes = [0u8; 32];
@@ -359,15 +369,16 @@ async fn open_authenticated_data_socket(env: &E2eEnv, client: &WireClient) -> (W
         "{}/api/v1/ws-data",
         env.base_url.replace("http://", "ws://")
     );
-    let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
-    socket
-        .send(Message::Text(
+    let (mut socket, _) = socket_io("handshake", tokio_tungstenite::connect_async(url)).await;
+    socket_io(
+        "send",
+        socket.send(Message::Text(
             serde_json::json!({"v":2,"t":"auth","ticket":ticket})
                 .to_string()
                 .into(),
-        ))
-        .await
-        .unwrap();
+        )),
+    )
+    .await;
     (socket, crypto)
 }
 
@@ -440,10 +451,11 @@ async fn open_data_session_v2(env: &E2eEnv, client: &WireClient) -> (WsStream, W
 }
 
 async fn send_plaintext(socket: &mut WsStream, crypto: &mut WsCrypto, plaintext: &[u8]) {
-    socket
-        .send(Message::Binary(crypto.seal(plaintext).into()))
-        .await
-        .unwrap();
+    socket_io(
+        "send",
+        socket.send(Message::Binary(crypto.seal(plaintext).into())),
+    )
+    .await;
 }
 
 async fn send_frame(
@@ -729,9 +741,9 @@ async fn sealed_data_lane_multiplexes_and_recovers_unknown_put_results() {
     // Socket loss is safe at both handshake boundaries: after one-time auth
     // and after HELLO_ACK. Reconnect always mints independent session keys.
     let (mut auth_only, _auth_crypto) = open_authenticated_data_socket(&env, &client).await;
-    auth_only.close(None).await.unwrap();
+    socket_io("close", auth_only.close(None)).await;
     let (mut hello_only, _hello_crypto) = open_data_session(&env, &client).await;
-    hello_only.close(None).await.unwrap();
+    socket_io("close", hello_only.close(None)).await;
 
     // Losing a CHECK response has no durable side effect. A fresh session can
     // repeat the same content-address query without retaining RPC state.
@@ -746,7 +758,7 @@ async fn sealed_data_lane_multiplexes_and_recovers_unknown_put_results() {
         &check_request(&never_stored),
     )
     .await;
-    interrupted_check.close(None).await.unwrap();
+    socket_io("close", interrupted_check.close(None)).await;
     let (mut checked_again, mut checked_again_crypto) = open_data_session(&env, &client).await;
     send_frame(
         &mut checked_again,
@@ -761,7 +773,7 @@ async fn sealed_data_lane_multiplexes_and_recovers_unknown_put_results() {
         1,
         true,
     );
-    checked_again.close(None).await.unwrap();
+    socket_io("close", checked_again.close(None)).await;
 
     let bytes = b"multiplexed websocket object";
     let hash = hash_bytes(bytes);
@@ -813,7 +825,7 @@ async fn sealed_data_lane_multiplexes_and_recovers_unknown_put_results() {
     // A lost GET result is likewise replay-free: no apply checkpoint moves
     // until the client has consumed and verified the returned object bytes.
     send_frame(&mut socket, &mut crypto, GET_PACK, 5, &get_request(&hash)).await;
-    socket.close(None).await.unwrap();
+    socket_io("close", socket.close(None)).await;
     let (mut socket, mut crypto) = open_data_session(&env, &client).await;
     send_frame(&mut socket, &mut crypto, GET_PACK, 1, &get_request(&hash)).await;
     assert_get(
@@ -836,7 +848,7 @@ async fn sealed_data_lane_multiplexes_and_recovers_unknown_put_results() {
     )
     .await;
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    socket.close(None).await.unwrap();
+    socket_io("close", socket.close(None)).await;
 
     let (mut recovered_socket, mut recovered_crypto) = open_data_session(&env, &client).await;
     send_frame(
@@ -896,17 +908,19 @@ async fn sealed_data_lane_multiplexes_and_recovers_unknown_put_results() {
     let (mut malformed_socket, mut malformed_crypto) = open_data_session(&env, &client).await;
     let mut malformed = encode_frame(CHECK_OBJECTS, 1, &check_request(&hash));
     malformed[0] = b'X';
-    malformed_socket
-        .send(Message::Binary(malformed_crypto.seal(&malformed).into()))
-        .await
-        .unwrap();
+    socket_io(
+        "send",
+        malformed_socket.send(Message::Binary(malformed_crypto.seal(&malformed).into())),
+    )
+    .await;
     assert_socket_ends(&mut malformed_socket).await;
 
     let (mut plaintext_socket, _plaintext_crypto) = open_data_session(&env, &client).await;
-    plaintext_socket
-        .send(Message::Text("post-auth plaintext".into()))
-        .await
-        .unwrap();
+    socket_io(
+        "send",
+        plaintext_socket.send(Message::Text("post-auth plaintext".into())),
+    )
+    .await;
     assert_socket_ends(&mut plaintext_socket).await;
 }
 
@@ -1126,7 +1140,7 @@ async fn sealed_data_lane_obw2_fragments_interleaved_puts_and_gets() {
     let (checked, fragments) = checked.pop().unwrap();
     assert_eq!(fragments, 1);
     assert_check(&checked, check_id, true);
-    socket.close(None).await.unwrap();
+    socket_io("close", socket.close(None)).await;
 }
 
 #[tokio::test]
@@ -1198,5 +1212,5 @@ async fn sealed_data_lane_obw2_rejects_fragment_limits_and_downgrades_freshly_to
     )
     .await;
     assert_check(&receive_frame(&mut socket, &mut crypto).await, 1, true);
-    socket.close(None).await.unwrap();
+    socket_io("close", socket.close(None)).await;
 }
