@@ -9,6 +9,7 @@ use crate::seq_tracker::SequenceTracker;
 use crate::storage::{StorageLayout, VaultStore};
 use crate::storage_writer::StorageWriter;
 use crate::transport_memory::TransportMemoryBudget;
+use axum::extract::ws::Utf8Bytes;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
@@ -64,7 +65,7 @@ pub struct AppState {
     /// sessions subscribe per vault. Send is sync and non-blocking; a
     /// receiver that lags past the 16-message buffer just misses frames and
     /// falls back to its regular poll (data never depends on this channel).
-    notifiers: StdMutex<HashMap<String, tokio::sync::broadcast::Sender<String>>>,
+    notifiers: StdMutex<HashMap<String, broadcast::Sender<Utf8Bytes>>>,
     /// Ephemeral presence: vault → device → (name, file, state). Ph3. Never
     /// persisted; refreshed by clients, expired by TTL, cleared on close.
     presence: StdMutex<HashMap<String, HashMap<String, PresenceEntry>>>,
@@ -141,7 +142,7 @@ impl AppState {
             .cloned();
         if let Some(tx) = sender {
             // Err just means nobody is listening right now — fine.
-            let _ = tx.send(frame_json);
+            let _ = tx.send(frame_json.into());
         }
     }
 
@@ -316,13 +317,13 @@ impl Drop for VaultLock<'_> {
 }
 
 pub struct VaultSubscription {
-    receiver: Option<broadcast::Receiver<String>>,
+    receiver: Option<broadcast::Receiver<Utf8Bytes>>,
     state: SharedState,
     vault_id: String,
 }
 
 impl VaultSubscription {
-    pub async fn recv(&mut self) -> Result<String, broadcast::error::RecvError> {
+    pub async fn recv(&mut self) -> Result<Utf8Bytes, broadcast::error::RecvError> {
         self.receiver
             .as_mut()
             .expect("live subscription")
@@ -331,7 +332,7 @@ impl VaultSubscription {
     }
 
     #[cfg(test)]
-    pub fn try_recv(&mut self) -> Result<String, broadcast::error::TryRecvError> {
+    pub fn try_recv(&mut self) -> Result<Utf8Bytes, broadcast::error::TryRecvError> {
         self.receiver
             .as_mut()
             .expect("live subscription")
@@ -441,8 +442,12 @@ mod tests {
         layout.init_directories().unwrap();
         box_key::init_box_keypair(&layout).unwrap();
         let state = Arc::new(AppState::new(ServerConfig::new(dir.path().to_path_buf())));
-        let old = state.subscribe_roots("vault");
+        let mut old = state.subscribe_roots("vault");
         let mut new = state.subscribe_roots("vault");
+        state.publish_frame("vault", "shared".into());
+        let first = old.try_recv().unwrap();
+        let second = new.try_recv().unwrap();
+        assert_eq!(first.as_ptr(), second.as_ptr());
         drop(old);
         state.publish_frame("vault", "still live".into());
         assert_eq!(new.try_recv().unwrap(), "still live");
@@ -511,13 +516,13 @@ mod tests {
             Some("late-old.md".into()),
             "active",
         );
-        assert_eq!(state.presence_snapshot("vault"), vec![latest.clone()]);
+        assert_eq!(state.presence_snapshot("vault"), [latest.as_str()]);
         assert!(
             events.try_recv().is_err(),
             "late old frames must not replace the new session"
         );
         state.clear_presence("vault", "device", old_session);
-        assert_eq!(state.presence_snapshot("vault"), vec![latest]);
+        assert_eq!(state.presence_snapshot("vault"), [latest.as_str()]);
         assert!(
             events.try_recv().is_err(),
             "old close must not broadcast offline"

@@ -28,7 +28,7 @@ use crate::secure;
 use crate::state::SharedState;
 use crate::ws_ticket;
 use axum::{
-    extract::ws::{Message, WebSocket, WebSocketUpgrade},
+    extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
     extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -254,7 +254,7 @@ async fn session_v2(
         .unwrap_or_else(|| device_short.clone());
 
     // Fan-in: per-vault forwarders → one outbound queue.
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(32);
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Utf8Bytes>(32);
     let mut forwarders = tokio::task::JoinSet::new();
     for vault in &vaults {
         let mut rx = state.subscribe_roots(vault);
@@ -448,7 +448,7 @@ async fn session(
     };
     tracing::info!(device = %device_short, vaults = ?vaults, "ws: v1 subscribed");
 
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(32);
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Utf8Bytes>(32);
     let mut forwarders = tokio::task::JoinSet::new();
     for vault in &vaults {
         let mut rx = state.subscribe_roots(vault);
@@ -484,7 +484,7 @@ async fn session(
             frame = out_rx.recv() => {
                 match frame {
                     Some(f) => {
-                        if sink.send(Message::Text(f.into())).await.is_err() {
+                        if sink.send(Message::Text(f)).await.is_err() {
                             break;
                         }
                     }
