@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use sync_core::chunk::{FileEntry, InternalNode, LeafChunk, RootNode};
 use sync_core::hash::{hash_bytes, hash_to_hex, hex_to_hash, FileHash};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -86,23 +86,19 @@ impl E2eEnv {
 
     /// Block until /health responds 200 or timeout elapses.
     pub async fn wait_for_health(&self, timeout: Duration) -> Result<()> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Ok(resp) = self
-                .http
-                .get(format!("{}/health", self.base_url))
-                .send()
-                .await
-            {
-                if resp.status().is_success() {
-                    return Ok(());
+        let health = format!("{}/health", self.base_url);
+        tokio::time::timeout(timeout, async {
+            loop {
+                if let Ok(response) = self.http.get(&health).send().await {
+                    if response.status() == StatusCode::OK {
+                        return;
+                    }
                 }
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            if Instant::now() >= deadline {
-                bail!("server did not become healthy within {:?}", timeout);
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
+        })
+        .await
+        .with_context(|| format!("server did not become healthy within {timeout:?}"))
     }
 
     /// Create an unclaimed code through the same form used by the operator.
@@ -915,6 +911,36 @@ pub async fn pull_vault_snapshot(
 mod tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+    #[tokio::test]
+    async fn health_wait_rejects_no_content_and_bounds_a_stalled_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let env = E2eEnv {
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            admin_url: String::new(),
+            http: reqwest::Client::builder().no_proxy().build().unwrap(),
+        };
+        let peer = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            // Keep the listener open so a retry can connect but receives no reply.
+        };
+        let (_, result) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(peer, env.wait_for_health(Duration::from_millis(500)))
+        })
+        .await
+        .expect("a stalled request exceeded the health deadline");
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("did not become healthy"));
+    }
 
     #[tokio::test]
     async fn snapshot_stops_after_first_content_upload_failure() {
