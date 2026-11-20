@@ -1382,6 +1382,10 @@ async function applyDeltas(
         }
         onWritesKnown?.([{ path: delta.path, action: "delete" }]);
         await io.deleteFile(delta.path);
+        if (shouldSkip(delta)) {
+            deferLocal(delta);
+            continue;
+        }
         syncBase.removeEntry(delta.path);
         appliedDeletions++;
         perf?.increment({ filesCompleted: 1 });

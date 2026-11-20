@@ -867,7 +867,8 @@ async function offlineEditSurvivesRemoteDelete(): Promise<void> {
     check(result.localDeferredCount === 1, "offline delete deferral lost its local reason");
 }
 
-async function unchangedBaseAllowsRemoteDelete(): Promise<void> {
+async function remoteDeleteChecksLocalRecreation(recreated: boolean): Promise<void> {
+    const dirty = new Set<string>();
     let diskDeletes = 0;
     let baseRemovals = 0;
     let treeDeletes = 0;
@@ -877,7 +878,10 @@ async function unchangedBaseAllowsRemoteDelete(): Promise<void> {
     } as any;
     const io = {
         stat: async () => ({ mtime: 1, size: 4 }),
-        deleteFile: async () => { diskDeletes++; },
+        deleteFile: async () => {
+            diskDeletes++;
+            if (recreated) dirty.add("doc.md");
+        },
     } as any;
     const syncBase = {
         getEntry: () => ({ hash: "base-hash", mtime: 1, size: 4 }),
@@ -896,8 +900,14 @@ async function unchangedBaseAllowsRemoteDelete(): Promise<void> {
         wasm_root_hash_from_bytes: () => "server-root",
     } as any;
 
-    const result = await pull(api, io, syncBase, "vault", "base-root", wasm, tree);
+    const result = await pull(api, io, syncBase, "vault", "base-root", wasm, tree, undefined, undefined, dirty);
     check(diskDeletes === 1, "unchanged synced file was not deleted");
+    if (recreated) {
+        check(baseRemovals === 0, "recreated file lost its merge base");
+        check(treeDeletes === 0, "recreated file was removed from the tree");
+        check(result.applied === 0 && result.localDeferredCount === 1, "recreation was not deferred");
+        return;
+    }
     check(baseRemovals === 1, "applied delete did not update sync-base");
     check(treeDeletes === 1, "applied delete did not update the Merkle tree");
     check(result.applied === 1, "applied delete was not counted");
@@ -1646,7 +1656,8 @@ void boundedApplyNeverExceedsTheSelectedLaneCount()
     .then(untrackedLocalCollisionIsPreservedBeforePullWrite)
     .then(unchangedBaseIsReplacedWithoutConflictCopy)
     .then(offlineEditSurvivesRemoteDelete)
-    .then(unchangedBaseAllowsRemoteDelete)
+    .then(() => remoteDeleteChecksLocalRecreation(false))
+    .then(() => remoteDeleteChecksLocalRecreation(true))
     .then(failedTreeRebaseAbortsCandidate)
     .then(admittedV2RebaseRefusalRetiresAndRetriesFromCapacity)
     .then(admittedPullExactSettlementReleasesEmptyGraph)
