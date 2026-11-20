@@ -299,27 +299,37 @@ pub(crate) fn diff_entries(
 pub(crate) fn detect_renames(deltas: Vec<FileDelta>) -> Vec<FileDelta> {
     use std::collections::{HashMap, HashSet};
 
-    let mut deleted: HashMap<FileHash, Vec<usize>> = HashMap::new();
-    let mut added: HashMap<FileHash, Vec<usize>> = HashMap::new();
+    let mut deleted = HashMap::new();
     for (index, delta) in deltas.iter().enumerate() {
-        match delta {
-            FileDelta::Deleted { hash, .. } => deleted.entry(*hash).or_default().push(index),
-            FileDelta::Added { hash, .. } => added.entry(*hash).or_default().push(index),
-            _ => {}
+        if let FileDelta::Deleted { hash, .. } = delta {
+            deleted
+                .entry(*hash)
+                .and_modify(|slot| *slot = None)
+                .or_insert(Some(index));
+        }
+    }
+    if deleted.is_empty() {
+        return deltas;
+    }
+
+    let mut added = HashMap::new();
+    for (index, delta) in deltas.iter().enumerate() {
+        if let FileDelta::Added { hash, .. } = delta {
+            if let Some(&Some(delete_index)) = deleted.get(hash) {
+                added
+                    .entry(*hash)
+                    .and_modify(|slot| *slot = None)
+                    .or_insert(Some((delete_index, index)));
+            }
         }
     }
 
     let mut replacements = HashMap::new();
     let mut consumed_additions = HashSet::new();
-    for (hash, deleted_indices) in deleted {
-        let Some(added_indices) = added.get(&hash) else {
+    for (hash, pair) in added {
+        let Some((delete_index, add_index)) = pair else {
             continue;
         };
-        if deleted_indices.len() != 1 || added_indices.len() != 1 {
-            continue;
-        }
-        let delete_index = deleted_indices[0];
-        let add_index = added_indices[0];
         let old_path = match &deltas[delete_index] {
             FileDelta::Deleted { path, .. } => path.clone(),
             _ => unreachable!(),
@@ -346,6 +356,9 @@ pub(crate) fn detect_renames(deltas: Vec<FileDelta>) -> Vec<FileDelta> {
         consumed_additions.insert(add_index);
     }
 
+    if replacements.is_empty() {
+        return deltas;
+    }
     deltas
         .into_iter()
         .enumerate()
@@ -537,6 +550,27 @@ mod tests {
                 mtime_ms: 2000,
             }] if path == "new.md" && old_path == "old.md" && actual_hash == &hash
         ));
+    }
+
+    #[test]
+    fn duplicate_sources_or_destinations_stay_separate() {
+        let hash = hash_bytes(b"same");
+        let addition = |path: &str| FileDelta::Added {
+            path: path.into(),
+            hash,
+            size: 4,
+            mtime_ms: 2,
+        };
+        let deletion = |path: &str| FileDelta::Deleted {
+            path: path.into(),
+            hash,
+        };
+        for deltas in [
+            vec![deletion("a"), addition("b"), addition("c")],
+            vec![addition("b"), deletion("a"), deletion("c")],
+        ] {
+            assert_eq!(detect_renames(deltas.clone()), deltas);
+        }
     }
 
     #[tokio::test]
