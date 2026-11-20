@@ -401,14 +401,17 @@ async function legacyRenameAndNewerDestinationRemainDurableAcrossRestart(): Prom
 
 async function ackFailureLeavesAllGenerationsAvailableForRetry(): Promise<void> {
     const adapter = new MemoryAdapter();
-    const journal = new ObsetyncJournal({ vault: { adapter } } as any);
+    const app = { vault: { adapter } } as any;
+    const journal = new ObsetyncJournal(app);
     await journal.load();
     const largeId = await journal.append({ action: "created", path: large.path, ts: 1, synced: false });
     const smallId = await journal.append({ action: "created", path: small.path, ts: 2, synced: false });
-    const queued = [{ ...large, journalId: largeId }, { ...small, journalId: smallId }];
+    const dirty = new DirtyPathSet();
+    dirty.add(large, largeId);
+    dirty.add(small, smallId);
+    const queued = dirty.take();
     const tracker = new DeferredChangeTracker();
     const settled = tracker.settle(queued, queued, [deferredLarge], "mobile:320", 0);
-    const dirty = new DirtyPathSet();
     dirty.restore(settled.retained);
     adapter.failAppend = true;
     await assert.rejects(journal.acknowledge(settled.acknowledged), /WAL append failure/);
@@ -416,6 +419,14 @@ async function ackFailureLeavesAllGenerationsAvailableForRetry(): Promise<void> 
     assert.equal(dirty.size, 2);
     assert.equal(journal.unsynced().length, 2);
     assert.equal(tracker.hasRunnable(dirty.take(), "mobile:320", 1), true);
+    const restarted = new ObsetyncJournal(app);
+    await restarted.load();
+    assert.deepEqual(restarted.unsynced().map(row => row.id), [largeId, smallId]);
+    adapter.failAppend = false;
+    await restarted.acknowledge(settled.acknowledged);
+    const afterRetry = new ObsetyncJournal(app);
+    await afterRetry.load();
+    assert.deepEqual(afterRetry.unsynced().map(row => row.id), [largeId]);
 }
 
 function chainedLegacyRenamesHoldTransitively(): void {
