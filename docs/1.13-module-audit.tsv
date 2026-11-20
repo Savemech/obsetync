@@ -157,7 +157,7 @@ reviewed	plugin/scripts/settings-fence.test.mjs	tests	Read bundled settings cont
 read	plugin/scripts/test-main-lifecycle.mjs	tooling	Read bundle fixture/owner/IO ports and enrollment regressions; actual main has 40 passing scenarios / 411 assertions; entire runner and all scenario bodies still require review
 reviewed	plugin/scripts/test-native-root-crash-recovery.mjs	tooling	CLI, private fixture ownership, process signal and recovery result assertions traced; both live debug-server scenarios passed
 pending	plugin/scripts/test-native-root-mutation-complexity.mjs	tooling	Not reviewed
-pending	plugin/scripts/test-native-root-server.mjs	tooling	Not reviewed
+reviewed	plugin/scripts/test-native-root-server.mjs	tooling	Live sealed HTTP smoke passed with 16 requests and zero active on close; injected failure before held response propagated through the bridge within 15s
 pending	plugin/scripts/test-native-ws-data.mjs	tooling	Not reviewed
 read	plugin/scripts/test-wasm-memory.mjs	tooling	Checked allocator snapshot against native counter semantics, including contradictory live allocation counts; tree component review pending
 reviewed	plugin/src/adaptive-batches.test.ts	tests	Checked eager grouping parity, refreshed limits, singleton boundaries, timed batches, cancellation by early exit and invalid inputs. Untimed batches also skip clock reads.

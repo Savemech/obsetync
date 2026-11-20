@@ -13,7 +13,7 @@ const directory = await mkdtemp("/tmp/obsetync-native-api-smoke-");
 let server, api, done = false, releaseHeldFetch = () => {};
 const originalFetch = globalThis.fetch, originalSocket = globalThis.WebSocket;
 const previousBridge = globalThis.__nativeRootRequestUrl;
-const watchdog = setTimeout(() => { throw new Error("native API smoke exceeded60s"); }, 60000);
+const watchdog = setTimeout(() => { throw new Error("native API smoke exceeded 60s"); }, 60000);
 process.once("beforeExit", () => { if (!done && !process.exitCode) process.exitCode = 1; });
 try {
     const output = join(directory, "api.cjs");
@@ -98,8 +98,10 @@ try {
             const response = await originalFetch(...parameters); enter(); await held; return response;
         };
         const pending = server.requestUrl(`${server.syncUrl}/health`);
-        await entered; let closed = false;
-        const closing = server.close(); void closing.then(() => { closed = true; });
+        // Surface transport failure even when fetch never reaches the held response.
+        await Promise.race([entered, pending]);
+        let closed = false;
+        const closing = server.close(); void closing.then(() => { closed = true; }, () => {});
         assert.equal(server.close(), closing); await Promise.resolve();
         assert.equal(closed, false); assert.equal(server.snapshot().activeRequests, 1);
         await assert.rejects(server.requestUrl(`${server.syncUrl}/health`), /REQUEST_AFTER_CLOSE/);
