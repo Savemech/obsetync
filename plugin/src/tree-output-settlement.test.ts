@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import {
-    captureV2CandidateSettlementWitness,
+    captureCandidateSettlementWitness,
     settleTreeCandidateOutput,
     takeV2TreeOutputSettlementProof,
     type V2TreeOutputSettlementOutcome,
@@ -58,8 +58,8 @@ function exactCommitAndAbortProofsAreOneUseAndOwnerLocal(): void {
     for (const version of [1, 2] as const) for (const outcome of ["commit", "abort"] as const) {
         const tree = new SettlementTree();
         tree.version = version;
-        const witness = captureV2CandidateSettlementWitness(tree);
-        assert.equal(witness !== null, version === 2);
+        const witness = captureCandidateSettlementWitness(tree);
+        assert(witness);
         const result = settleTreeCandidateOutput(tree, outcome, witness);
         assert.equal(result.atomicV2, version === 2);
         assert.deepEqual(result.gcStats, {
@@ -89,7 +89,7 @@ function postSuccessParsingFailureNeverReclassifiesNativeOutcome(): void {
     const tree = new SettlementTree();
     tree.malformed = true;
     const result = settleTreeCandidateOutput(tree, "commit",
-        captureV2CandidateSettlementWitness(tree));
+        captureCandidateSettlementWitness(tree));
     assert.equal(result.atomicV2, true);
     assert.equal(result.gcStats, null);
     assert.equal(result.proof, null);
@@ -148,7 +148,7 @@ function malformedAuthorityReportsNeverCreateProofs(): void {
         tree.version = version;
         tree.reportMutation = test.mutate;
         const result = settleTreeCandidateOutput(tree, outcome,
-            captureV2CandidateSettlementWitness(tree));
+            captureCandidateSettlementWitness(tree));
         assert.equal(result.atomicV2, version === 2, `${outcome}/${test.name}: lost atomic outcome`);
         assert.equal(result.gcStats, null, `${outcome}/${test.name}: malformed GC stats escaped`);
         assert.equal(result.proof, null, `${outcome}/${test.name}: malformed report created authority`);
@@ -165,19 +165,38 @@ function nativeFailureAndStaleWitnessRemainPreMutationErrors(): void {
     const failed = new SettlementTree();
     failed.throwNative = true;
     assert.throws(() => settleTreeCandidateOutput(failed, "abort",
-        captureV2CandidateSettlementWitness(failed)), /native refused before sweep/);
+        captureCandidateSettlementWitness(failed)), /native refused before sweep/);
     assert.equal(failed.open, true);
     assert.deepEqual([failed.committed, failed.candidate], [4, 7]);
 
     const stale = new SettlementTree();
-    const witness = captureV2CandidateSettlementWitness(stale)!;
+    const witness = captureCandidateSettlementWitness(stale)!;
     stale.candidate++;
     assert.throws(() => settleTreeCandidateOutput(stale, "commit", witness), /stale/);
     assert.equal(stale.atomicCalls, 0);
     assert.equal(stale.open, true);
 
+    for (const version of [1, 2] as const) {
+        const changed = new SettlementTree();
+        changed.version = version;
+        const captured = captureCandidateSettlementWitness(changed);
+        changed.version = version === 2 ? 1 : 2;
+        assert.throws(() => settleTreeCandidateOutput(changed, "abort", captured), /stale/);
+        assert.equal(changed.atomicCalls, 0);
+
+        const unobserved = new SettlementTree();
+        unobserved.version = version;
+        unobserved.has_candidate = () => {
+            if (unobserved.open) throw new Error("unavailable before transition");
+            return false;
+        };
+        const result = settleTreeCandidateOutput(unobserved, "abort");
+        assert.equal(unobserved.atomicCalls, 1);
+        assert.equal(result.proof, null, "unobserved candidate authorized a memory release");
+    }
+
     const reentrant = new SettlementTree();
-    const reentrantWitness = captureV2CandidateSettlementWitness(reentrant)!;
+    const reentrantWitness = captureCandidateSettlementWitness(reentrant)!;
     const ownerChanged = new Error("outer owner changed during final fence");
     let fences = 0;
     assert.throws(() => settleTreeCandidateOutput(reentrant, "abort", reentrantWitness, () => {

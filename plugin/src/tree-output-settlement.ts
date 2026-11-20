@@ -20,14 +20,9 @@ export interface CandidateSettlementGcStats {
     bytes_removed: number;
 }
 
-export interface V2CandidateSettlementWitness {
+export interface CandidateSettlementWitness {
     readonly tree: object;
-    readonly treeVersion: 2;
-    readonly committedRevision: number;
-    readonly candidateRevision: number;
-}
-
-interface CandidateRootSettlementWitness {
+    readonly treeVersion: 1 | 2;
     readonly committedRevision: number;
     readonly candidateRevision: number;
 }
@@ -112,33 +107,18 @@ function readRevision(reader: (() => number) | undefined, tree: CandidateSettlem
 }
 
 /** Best-effort pre-native witness. Null simply disables accounting shrink. */
-export function captureV2CandidateSettlementWitness(
+export function captureCandidateSettlementWitness(
     tree: CandidateSettlementTree,
-): V2CandidateSettlementWitness | null {
+): CandidateSettlementWitness | null {
     try {
-        if (tree.tree_version() !== 2 || tree.has_candidate() !== true) return null;
+        const treeVersion = tree.tree_version();
+        if ((treeVersion !== 1 && treeVersion !== 2) || tree.has_candidate() !== true) return null;
         return Object.freeze({
             tree,
-            treeVersion: 2 as const,
+            treeVersion,
             committedRevision: readRevision(tree.committed_revision, tree),
             candidateRevision: readRevision(tree.candidate_revision, tree),
         });
-    } catch {
-        return null;
-    }
-}
-
-/** Best-effort revision fence, also used by legacy wrappers without receipts. */
-function captureCandidateRootSettlementWitness(
-    tree: CandidateSettlementTree,
-): CandidateRootSettlementWitness | null {
-    try {
-        const version = tree.tree_version();
-        if ((version !== 1 && version !== 2) || tree.has_candidate() !== true) return null;
-        return {
-            committedRevision: readRevision(tree.committed_revision, tree),
-            candidateRevision: readRevision(tree.candidate_revision, tree),
-        };
     } catch {
         return null;
     }
@@ -160,7 +140,7 @@ function parseLegacyGcStats(value: unknown, target: CandidateSettlementGcStats):
 export function settleTreeCandidateOutput(
     tree: CandidateSettlementTree,
     outcome: V2TreeOutputSettlementOutcome,
-    witness: V2CandidateSettlementWitness | null = null,
+    witness: CandidateSettlementWitness | null = null,
     assertBeforeNative?: () => void,
 ): CandidateSettlementCall {
     if (outcome !== "commit" && outcome !== "abort") {
@@ -173,6 +153,9 @@ export function settleTreeCandidateOutput(
         throw new TypeError("WASM tree exposes an incomplete V2 output settlement API");
     }
     const version = tree.tree_version();
+    if (witness && (witness.tree !== tree || witness.treeVersion !== version)) {
+        throw new TypeError("candidate settlement witness is stale");
+    }
     if ((version !== 1 && version !== 2) || !claimed) {
         const result = { atomicV2: false, gcStats: null, proof: null } as {
             atomicV2: boolean; gcStats: CandidateSettlementGcStats | null;
@@ -187,16 +170,11 @@ export function settleTreeCandidateOutput(
         return result;
     }
 
-    let beforeCommitted: number | null = null, beforeCandidate: number | null = null;
-    try {
-        beforeCommitted = readRevision(tree.committed_revision, tree);
-        beforeCandidate = readRevision(tree.candidate_revision, tree);
-        if (tree.has_candidate() !== true || (witness && (witness.tree !== tree ||
-            witness.committedRevision !== beforeCommitted || witness.candidateRevision !== beforeCandidate))) {
-            throw new TypeError("V2 output settlement witness is stale");
-        }
-    } catch (error) {
-        if (witness) throw error;
+    const before = captureCandidateSettlementWitness(tree);
+    if (witness && (!before || before.treeVersion !== version ||
+        witness.committedRevision !== before.committedRevision ||
+        witness.candidateRevision !== before.candidateRevision)) {
+        throw new TypeError("candidate settlement witness is stale");
     }
 
     // Allocate every host capability/result owner before the irreversible
@@ -207,8 +185,8 @@ export function settleTreeCandidateOutput(
         tree,
         treeVersion: version,
         outcome,
-        beforeCommittedRevision: beforeCommitted ?? -1,
-        beforeCandidateRevision: beforeCandidate ?? -1,
+        beforeCommittedRevision: before?.committedRevision ?? -1,
+        beforeCandidateRevision: before?.candidateRevision ?? -1,
         committedRevision: -1,
         candidateRevision: -1,
         residentAdmissionBytes: -1,
@@ -234,8 +212,12 @@ export function settleTreeCandidateOutput(
     }
 
     try {
+        if (!before || before.treeVersion !== version) {
+            proofs.delete(token);
+            return result;
+        }
         const row = exactRecord(raw, REPORT_KEYS);
-        const before = count(row.before), reachable = count(row.reachable);
+        const beforeCount = count(row.before), reachable = count(row.reachable);
         const removed = count(row.removed), after = count(row.after);
         const bytesRemoved = count(row.bytesRemoved);
         const committedRevision = count(row.committedRevision);
@@ -243,18 +225,18 @@ export function settleTreeCandidateOutput(
         const nodePayload = count(row.nodePayloadBytes);
         const endpoint = count(row.rangeEndpointResidentRequestedBytes);
         const resident = count(row.residentAdmissionBytes);
-        const expectedCommitted = outcome === "commit" ? (beforeCommitted ?? -2) + 1 : beforeCommitted;
-        const expectedCandidate = (beforeCandidate ?? -2) + 1;
+        const expectedCommitted = outcome === "commit" ? before.committedRevision + 1 : before.committedRevision;
+        const expectedCandidate = before.candidateRevision + 1;
         if (row.schema !== 1 || row.scope !== `v${version}-stable-tree-output` || row.outcome !== outcome ||
             row.treeVersion !== version || row.countersValid !== true || after !== reachable ||
-            removed !== before - after || resident !== nodePayload + endpoint ||
+            removed !== beforeCount - after || resident !== nodePayload + endpoint ||
             committedRevision !== expectedCommitted || candidateRevision !== expectedCandidate ||
             tree.tree_version() !== version || tree.has_candidate() !== false ||
             readRevision(tree.committed_revision, tree) !== committedRevision ||
             readRevision(tree.candidate_revision, tree) !== candidateRevision) {
             throw new TypeError("inconsistent V2 output settlement report");
         }
-        gc.before = before; gc.reachable = reachable; gc.removed = removed;
+        gc.before = beforeCount; gc.reachable = reachable; gc.removed = removed;
         gc.after = after; gc.bytes_removed = bytesRemoved;
         Object.assign(state, { committedRevision, candidateRevision, residentAdmissionBytes: resident,
             rootRequestedBytes: endpoint });
@@ -276,11 +258,10 @@ export function settleTreeCandidateOutputWithAdmission(
     admission?: ResidentSettlementAdmission,
     assertBeforeNative?: () => void,
 ): CandidateSettlementCall {
-    const witness = admission ? captureV2CandidateSettlementWitness(tree) : null;
-    const rootWitness = admission ? witness ?? captureCandidateRootSettlementWitness(tree) : null;
-    const ticket = rootWitness && admission
+    const witness = admission ? captureCandidateSettlementWitness(tree) : null;
+    const ticket = witness && admission
         ? admission.prepareV2Settlement(tree, outcome,
-            rootWitness.committedRevision, rootWitness.candidateRevision)
+            witness.committedRevision, witness.candidateRevision)
         : null;
     let result: CandidateSettlementCall;
     try {

@@ -7,7 +7,7 @@ import {
     type RootTreeResidentRetirement,
 } from "./root-tree-resident-admission";
 import {
-    captureV2CandidateSettlementWitness,
+    captureCandidateSettlementWitness,
     settleTreeCandidateOutput,
     settleTreeCandidateOutputWithAdmission,
 } from "./tree-output-settlement";
@@ -735,7 +735,7 @@ function stableV2SettlementIsExactOneUseAndFailClosed(): void {
     assert.equal(admitted.advanceV2CandidateRevision(tree, tree.committed, tree.candidate), true);
     assert.equal(admitted.snapshot().ledger.activeLeases, 1,
         "attached output was not absorbed into one aggregate lease");
-    const witness = captureV2CandidateSettlementWitness(tree)!;
+    const witness = captureCandidateSettlementWitness(tree)!;
     const ticket = admitted.prepareV2Settlement(tree, "commit",
         witness.committedRevision, witness.candidateRevision)!;
     const result = settleTreeCandidateOutput(tree, "commit", witness);
@@ -753,7 +753,7 @@ function stableV2SettlementIsExactOneUseAndFailClosed(): void {
     oversizedTree.target = 120;
     resident(oversized, oversizedTree, 100);
     oversized.markV2GraphComplete(oversizedTree, 5, 7);
-    const oversizedWitness = captureV2CandidateSettlementWitness(oversizedTree)!;
+    const oversizedWitness = captureCandidateSettlementWitness(oversizedTree)!;
     const oversizedTicket = oversized.prepareV2Settlement(oversizedTree, "abort", 5, 7)!;
     const oversizedResult = settleTreeCandidateOutput(oversizedTree, "abort", oversizedWitness);
     assert(oversizedResult.proof);
@@ -769,7 +769,7 @@ function stableV2SettlementIsExactOneUseAndFailClosed(): void {
     malformedTree.malformed = true;
     resident(malformed, malformedTree, 100);
     malformed.markV2GraphComplete(malformedTree, 5, 7);
-    const malformedWitness = captureV2CandidateSettlementWitness(malformedTree)!;
+    const malformedWitness = captureCandidateSettlementWitness(malformedTree)!;
     const malformedTicket = malformed.prepareV2Settlement(malformedTree, "commit", 5, 7)!;
     const malformedResult = settleTreeCandidateOutput(malformedTree, "commit", malformedWitness);
     assert.equal(malformedResult.proof, null);
@@ -783,12 +783,12 @@ function stableV2SettlementIsExactOneUseAndFailClosed(): void {
     retriedTree.fail = true;
     resident(retried, retriedTree, 100);
     retried.markV2GraphComplete(retriedTree, 5, 7);
-    let retryWitness = captureV2CandidateSettlementWitness(retriedTree)!;
+    let retryWitness = captureCandidateSettlementWitness(retriedTree)!;
     let retryTicket = retried.prepareV2Settlement(retriedTree, "commit", 5, 7)!;
     assert.throws(() => settleTreeCandidateOutput(retriedTree, "commit", retryWitness), /refused/);
     retried.cancelV2SettlementBeforeSweep(retryTicket);
     retriedTree.fail = false;
-    retryWitness = captureV2CandidateSettlementWitness(retriedTree)!;
+    retryWitness = captureCandidateSettlementWitness(retriedTree)!;
     retryTicket = retried.prepareV2Settlement(retriedTree, "commit", 5, 7)!;
     const retryResult = settleTreeCandidateOutput(retriedTree, "commit", retryWitness);
     assert(retryResult.proof);
@@ -800,7 +800,7 @@ function stableV2SettlementIsExactOneUseAndFailClosed(): void {
     const interferedTree = new SettlementTree();
     resident(interfered, interferedTree, 100);
     interfered.markV2GraphComplete(interferedTree, 5, 7);
-    const interferedWitness = captureV2CandidateSettlementWitness(interferedTree)!;
+    const interferedWitness = captureCandidateSettlementWitness(interferedTree)!;
     const interferedTicket = interfered.prepareV2Settlement(interferedTree, "abort", 5, 7)!;
     interferedTree.duringNative = () => interfered.setCapacity(199);
     const interferedResult = settleTreeCandidateOutput(interferedTree, "abort", interferedWitness);
@@ -822,7 +822,7 @@ function rootClone(owner: RootTreeResidentAdmission, tree: object,
 
 function terminalRoot(owner: RootTreeResidentAdmission, tree: SettlementTree,
     outcome: "commit" | "abort"): boolean {
-    const witness = captureV2CandidateSettlementWitness(tree)!;
+    const witness = captureCandidateSettlementWitness(tree)!;
     const ticket = owner.prepareV2Settlement(tree, outcome,
         witness.committedRevision, witness.candidateRevision);
     assert(ticket, "attached root must receive a terminal ticket even without exact graph provenance");
@@ -997,7 +997,7 @@ function rootSettlementRejectionAndNativeErrorPreserveProperOwners(): void {
     const tree = new SettlementTree();
     resident(owner, tree, 100);
     rootClone(owner, tree, 30, 7);
-    const witness = captureV2CandidateSettlementWitness(tree)!;
+    const witness = captureCandidateSettlementWitness(tree)!;
     const ticket = owner.prepareV2Settlement(tree, "abort", tree.committed, tree.candidate)!;
     assert(ticket);
     tree.fail = true;

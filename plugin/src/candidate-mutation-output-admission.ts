@@ -74,8 +74,8 @@ type State = "private" | "ready" | "published" | "detached" | "released" | "reti
 
 /** Bind the generic mutation driver to one engine-owned resident ledger. The
  * returned callbacks are deliberately synchronous and idempotent for cleanup
- * replay. Candidate output remains conservatively resident after publication;
- * only whole-tree replacement/retirement or proven wrapper free releases it. */
+ * replay. Published output belongs to the tree. A validated sweep can shrink
+ * its charge before whole-tree replacement, retirement or wrapper free. */
 export function admitCandidateMutationOutput(
     admission: RootTreeResidentAdmission,
     tree: object,
