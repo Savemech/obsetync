@@ -1,4 +1,5 @@
 import { strict as assert } from "node:assert";
+import { getEventListeners } from "node:events";
 import {
     AdaptiveResourceGovernor,
     coveredResourceAxesForWindow,
@@ -565,9 +566,24 @@ async function visibilityGateStopsOnlyNewMobileWork(): Promise<void> {
     const resumedWork = epochGate.beginHeavyWork(engine.signal);
     assert.equal(resumedWork.epoch, 2); assert.equal(resumedWork.signal.aborted, false);
     resumedWork.release();
+    assert.equal(getEventListeners(engine.signal, "abort").length, 0,
+        "completed mobile work retained its parent abort listener");
+    const previousEpoch = epochGate.beginHeavyWork(engine.signal);
+    epochGate.setVisible(false);
+    epochGate.setVisible(true);
+    const overlapping = epochGate.beginHeavyWork(engine.signal);
+    previousEpoch.release();
+    const sibling = epochGate.beginHeavyWork(engine.signal);
+    assert.equal(overlapping.signal, sibling.signal);
+    assert.equal(getEventListeners(engine.signal, "abort").length, 1);
+    overlapping.release();
+    overlapping.release();
+    assert.equal(getEventListeners(engine.signal, "abort").length, 1);
     const replacementEngine = new AbortController();
     const replacementWork = epochGate.beginHeavyWork(replacementEngine.signal);
     engine.abort(new Error("old engine retired"));
+    assert.equal(sibling.signal.reason, engine.signal.reason);
+    sibling.release();
     assert.equal(replacementWork.signal.aborted, false,
         "plugin-lifetime gate pinned or leaked the replaced engine signal");
     const concurrentWork = epochGate.beginHeavyWork(replacementEngine.signal);

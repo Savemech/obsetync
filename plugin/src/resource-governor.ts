@@ -1018,7 +1018,7 @@ export class ResourceVisibilityGate {
     private epochAbort = new AbortController();
     private activeWork = 0;
     private lastQuiesceReason: MobileLifecycleQuiesceReason | null = null;
-    private composites = new WeakMap<AbortSignal, { epoch: number; signal: AbortSignal }>();
+    private readonly composites = new WeakMap<AbortSignal, { epoch: number; signal: AbortSignal; owners: number; cleanup(): void }>();
     private resumeListeners = new Set<() => void>();
     private quiescenceWaiters = new Set<() => void>();
 
@@ -1098,7 +1098,6 @@ export class ResourceVisibilityGate {
                 cleaned = true;
                 parentSignal.removeEventListener("abort", abortFromParent);
                 lifecycle.removeEventListener("abort", abortFromLifecycle);
-                this.composites.delete(parentSignal);
             };
             const abortFromParent = () => { controller.abort(parentSignal.reason); cleanup(); };
             const abortFromLifecycle = () => { controller.abort(lifecycle.reason); cleanup(); };
@@ -1108,11 +1107,12 @@ export class ResourceVisibilityGate {
                 parentSignal.addEventListener("abort", abortFromParent, { once: true });
                 lifecycle.addEventListener("abort", abortFromLifecycle, { once: true });
             }
-            composite = { epoch: this.epoch, signal: controller.signal };
+            composite = { epoch: this.epoch, signal: controller.signal, owners: 0, cleanup };
             // Do not cache an already-aborted parent: a replacement engine in
             // the same visible epoch receives its own independent composite.
-            if (!parentSignal.aborted) this.composites.set(parentSignal, composite);
+            if (!controller.signal.aborted) this.composites.set(parentSignal, composite);
         }
+        composite.owners++;
         const epoch = this.epoch, signal = composite.signal;
         this.activeWork++;
         let released = false;
@@ -1122,6 +1122,10 @@ export class ResourceVisibilityGate {
             release: () => {
                 if (released) return;
                 released = true;
+                if (--composite.owners === 0) {
+                    composite.cleanup();
+                    if (this.composites.get(parentSignal) === composite) this.composites.delete(parentSignal);
+                }
                 this.activeWork--;
                 if (this.activeWork === 0) {
                     for (const resolve of this.quiescenceWaiters) resolve();
@@ -1154,7 +1158,6 @@ export class ResourceVisibilityGate {
             this.lastQuiesceReason = "disposed";
             this.epochAbort.abort(new MobileLifecycleQuiesceError(this.epoch, "disposed"));
         }
-        this.composites = new WeakMap();
         this.resumeListeners.clear();
         // Active owners settle quiescence when their final native tail releases.
         this.release();
