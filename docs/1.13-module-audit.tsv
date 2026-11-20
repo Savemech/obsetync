@@ -329,8 +329,8 @@ reviewed	plugin/src/root-outcome.test.ts	tests	Checked Rust digest vectors, post
 reviewed	plugin/src/root-outcome.ts	production	Reviewed canonical request capture/digest, strict receipt identity, status, capability and wire limits; decoded root directly into its final hash input
 reviewed	plugin/src/root-publication-memory.test.ts	tests	Reviewed independent BigInt quota and arena bounds, exact maximum-root BLAKE3 framing, async source ownership, padding and refusal cases; aligned owner charge with direct decoding
 reviewed	plugin/src/root-publication-memory.ts	production	Traced owner and hash preparation estimates and arena bounds to push and root runtime. Four publication memory suites pass including maximum root and rejected admission.
-pending	plugin/src/root-recovery.test.ts	tests	Not reviewed
-pending	plugin/src/root-recovery.ts	production	Not reviewed
+reviewed	plugin/src/root-recovery.test.ts	tests	Ran 440 recovery assertions with real client stores and injected network/IO faults, including reentrant close, expired outcomes and failed ACK restart
+reviewed	plugin/src/root-recovery.ts	production	Traced runtime prepare, exclusive dispatch, durable receipt replay and quiesce; lost-response recovery queries original identity and preserves later journal cuts
 read	plugin/src/root-reviewed-queue.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
 reviewed	plugin/src/root-reviewed-queue.ts	production	Traced creation, review, overlay, dependency checks, claim, settlement and dispose; takeLocal uses the actual retirement limit; distant linked omissions tested through next()
 reviewed	plugin/src/root-settlement.test.ts	tests	Restart cuts, cancellation, shared owner and full 256-copy permutation/hash mismatch covered; 44 assertions passed
