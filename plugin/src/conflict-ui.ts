@@ -138,7 +138,7 @@ export class ObsetyncConflictModal extends Modal {
     }
 }
 
-const CONFLICT_COPY_RE = /^(.*) \(conflict [^)]+\)(\.[^./]+)?$/;
+const CONFLICT_COPY_RE = /^(.*) \(conflict (?:[^()/]+ [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{4}|sync [a-f0-9]{64})\)(\.[^./]+)?$/;
 
 /** Scan the vault for conflict-copy files and return conflict info. */
 export function findConflicts(io: PlatformIO): ConflictInfo[] {

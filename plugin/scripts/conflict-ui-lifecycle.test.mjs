@@ -49,7 +49,7 @@ const bundled = await build({
 
 globalThis.__conflictFence = { Element, Button };
 const source = Buffer.from(bundled.outputFiles[0].contents).toString("base64");
-const { ObsetyncConflictModal } = await import(`data:text/javascript;base64,${source}`);
+const { ObsetyncConflictModal, conflictCopyPath, findConflicts } = await import(`data:text/javascript;base64,${source}`);
 
 function deferred() {
     let resolve, reject;
@@ -118,3 +118,14 @@ test("handler failure releases ownership and normal completion preserves UI beha
     await normal.modal.closeAndDrain();
 });
 
+
+test("discovery only recognizes generated conflict filename formats", () => {
+    const original = "notes (archive)/черновик.v2.md";
+    const legacy = conflictCopyPath(original, "iPad (local)", new Date(2026, 9, 28, 12, 34));
+    const digest = "notes (archive)/черновик.v2 (conflict sync " + "a".repeat(64) + ").md";
+    const files = [legacy, digest, "Design (conflict resolution).md", "memo (conflict sync abc).md",
+        "folder (conflict plan/note).md"];
+    assert.deepEqual(findConflicts({ listFiles: () => files }), [
+        { original, preservedAs: legacy }, { original, preservedAs: digest },
+    ]);
+});
