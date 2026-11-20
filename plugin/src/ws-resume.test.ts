@@ -64,11 +64,14 @@ test("foreground resume invalidates an apparently-connected stale session exactl
     };
     const documentEvents = new FakeEvents();
     const windowEvents = new FakeEvents();
+    let tick: (() => void) | undefined;
     FakeSocket.sockets.length = 0;
     Object.defineProperty(globalThis, "crypto", { configurable: true, value: webcrypto });
     Object.defineProperty(globalThis, "document", { configurable: true, value: documentEvents });
     Object.defineProperty(globalThis, "window", { configurable: true, value: Object.assign(windowEvents, {
-        setTimeout, clearTimeout, setInterval, clearInterval,
+        setTimeout, clearTimeout,
+        setInterval(callback: () => void) { tick = callback; return 1; },
+        clearInterval() { tick = undefined; },
     }) });
     Object.defineProperty(globalThis, "WebSocket", { configurable: true, value: FakeSocket });
 
@@ -145,6 +148,31 @@ test("foreground resume invalidates an apparently-connected stale session exactl
         await (channel as any).txChain;
         assert.deepEqual(encrypted, ["initial.md", "note-99.md"]);
         assert.equal(live.sends, 2);
+
+        let releasePing!: () => void;
+        const heldPing = new Promise<void>(resolve => { releasePing = resolve; });
+        const controls: string[] = [];
+        (channel as any).session.open = async () => JSON.stringify({ t: "ready" });
+        (channel as any).session.seal = async (json: string) => {
+            const type = JSON.parse(json).t;
+            controls.push(type);
+            if (type === "ping") await heldPing;
+            return new Uint8Array([1]);
+        };
+        live.onmessage!({ data: new ArrayBuffer(0) } as MessageEvent);
+        await (channel as any).rxChain;
+        assert.ok(tick);
+        tick();
+        await eventually(() => controls.includes("ping"), "heartbeat did not start");
+        live.onmessage!({ data: new ArrayBuffer(0) } as MessageEvent);
+        await (channel as any).rxChain;
+        for (let i = 0; i < 10; i++) tick();
+        releasePing();
+        await (channel as any).txChain;
+        assert.deepEqual(controls, ["sub", "ping"]);
+        tick();
+        await (channel as any).txChain;
+        assert.deepEqual(controls, ["sub", "ping", "ping"]);
 
         windowEvents.dispatch("pagehide");
         windowEvents.dispatch("pageshow");

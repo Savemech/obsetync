@@ -274,16 +274,20 @@ export class ObsetyncWsChannel {
                     };
                     switch (frame.t) {
                         case "ready": {
+                            if (ready) break;
                             ready = true;
                             this.setState("connected");
                             this.backoffMs = BACKOFF_START_MS;
                             console.log("[obsetync] ws: sealed session ready");
                             this.sendSealed({ v: 2, t: "sub", vaults: [this.vaultId] });
                             if (this.pingTimer !== null) window.clearInterval(this.pingTimer);
-                            this.pingTimer = window.setInterval(
-                                () => this.sendSealed({ v: 2, t: "ping" }),
-                                PING_INTERVAL_MS,
-                            );
+                            let pingPending = false;
+                            this.pingTimer = window.setInterval(() => {
+                                if (pingPending || this.ws !== ws) return;
+                                pingPending = true;
+                                this.sendSealed({ v: 2, t: "ping" });
+                                void this.txChain.then(() => { pingPending = false; });
+                            }, PING_INTERVAL_MS);
                             break;
                         }
                         case "root": {
