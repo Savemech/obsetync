@@ -26,6 +26,7 @@ export async function verifyConflictFile(io: PlatformIO, wasm: Pick<WasmModule, 
     if (!/^[0-9a-f]{64}$/.test(hash) || !Number.isSafeInteger(size) || size < 0) throw new Error("invalid conflict verification identity");
     throwIfWorkAborted(signal);
     const observed = await io.stat(path);
+    throwIfWorkAborted(signal);
     if (!observed) return "missing";
     const before = { size: observed.size, mtime: observed.mtime };
     if (before.size !== size) return "different";
@@ -34,6 +35,7 @@ export async function verifyConflictFile(io: PlatformIO, wasm: Pick<WasmModule, 
     let fs: typeof import("node:fs/promises") | undefined;
     if (absolute) { try { fs = requireNode?.("node:fs/promises"); } catch { /* no qualified native reader */ } }
     let actual: string;
+    let verifyFinalNativePath: (() => Promise<void>) | undefined;
     if (absolute) {
         // A desktop path without a qualified lstat must not silently use an
         // adapter read that follows links and calls an alias a preserved copy.
@@ -68,13 +70,13 @@ export async function verifyConflictFile(io: PlatformIO, wasm: Pick<WasmModule, 
                     await yieldWork({ signal });
                 }
                 await reader.verify();
-                await verifyIndependentPath();
                 throwIfWorkAborted(signal);
                 return hasher.finalize();
             } finally {
                 try { await reader.close(); } finally { hasher?.free(); }
             }
         } });
+        verifyFinalNativePath = verifyIndependentPath;
     } else {
         if (size > CONFLICT_WHOLE_READ_LIMIT) return "reader-unavailable";
         actual = await withHashSource({ sourceBytes: size, feedBytes: FEED, signal, budget: options.budget,
@@ -103,5 +105,9 @@ export async function verifyConflictFile(io: PlatformIO, wasm: Pick<WasmModule, 
     const after = await io.stat(path);
     throwIfWorkAborted(signal);
     if (!after || after.size !== before.size || after.mtime !== before.mtime) return "different";
+    if (verifyFinalNativePath) {
+        await verifyFinalNativePath();
+        throwIfWorkAborted(signal);
+    }
     return actual === hash ? "verified" : "different";
 }

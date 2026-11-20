@@ -188,10 +188,10 @@ reviewed	plugin/src/bulk-planner.bench.ts	tooling	Traced bench:bulk entry and pr
 read	plugin/src/cached-root-export.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
 reviewed	plugin/src/candidate-mutation-output-admission.test.ts	tests	Ran all four bridge scenarios covering refusal epochs, replay, cancellation and V1 root replacement.
 reviewed	plugin/src/candidate-mutation-output-admission.ts	production	Traced private, ready, attached and retiring owners, refusal epoch and exact-cut provenance through push, pull and engine. Verified V1 root replacement and V2 retained charges.
-pending	plugin/src/candidate-open-root-admission.test.ts	tests	Not reviewed
-pending	plugin/src/candidate-open-root-admission.ts	production	Not reviewed
-pending	plugin/src/conflict-file-verification.test.ts	tests	Not reviewed
-pending	plugin/src/conflict-file-verification.ts	production	Not reviewed
+reviewed	plugin/src/candidate-open-root-admission.test.ts	tests	Six groups verify exact capacity, zero-byte ownership, denial, cleanup replay and failed transitions.
+reviewed	plugin/src/candidate-open-root-admission.ts	production	Traced V1/V2 parsed plans and shared push/pull policy through private, attached and retiring root charges.
+reviewed	plugin/src/conflict-file-verification.test.ts	tests	55 assertions with native files and BLAKE3 include acquiring a hardlink during final adapter stat, bounded feeds, cancellation, queued drift and handle cleanup.
+reviewed	plugin/src/conflict-file-verification.ts	production	Traced native independent-file proof and admitted portable reads to root conflict handling. Native pathname proof now follows final adapter stat.
 read	plugin/src/conflict-path.ts	production	Legacy timestamp naming traced through pull and push to UI discovery. Round-trip with nested directory, Unicode and sanitized device label tested; path length limits remain open.
 read	plugin/src/conflict-ui.ts	production	Traced both filename producers, modal actions and lifecycle; discovery now rejects unrelated parentheticals. Digest names may shorten the original. Discovery returns an unknown original and the modal displays these rows read-only; covered by a colliding-stem fixture.
 reviewed	plugin/src/current-host-work.test.ts	tests	Read all four groups; actual admission bounds, synchronous lease revocation, sibling drain, failure aggregation and late-close behavior pass in full plugin suite

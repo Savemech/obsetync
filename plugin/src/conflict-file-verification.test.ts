@@ -137,6 +137,18 @@ async function nativeAliases() {
         check(linkedDuringRead.counts.created === 1 && linkedDuringRead.counts.freed === 1,
             "new hardlink rejection leaked a hasher");
         await unlink(hard);
+        const finalStatIO = ioFor(original);
+        const statPath = finalStatIO.stat;
+        let observations = 0;
+        finalStatIO.stat = async path => {
+            const result = await statPath(path);
+            if (++observations === 2) await link(original, hard);
+            return result;
+        };
+        await rejected(verifyConflictFile(finalStatIO, instrumentedHasher(), "original.bin", hash(bytes), bytes.length),
+            "link acquired during final adapter stat was accepted as an independent copy");
+        check(observations === 2, "verification missed the final adapter observation");
+        await unlink(hard);
         check(wholeReads === 0 && (await readFile(original)).equals(Buffer.from(bytes)), "alias verification read through fallback or changed original content");
         const descriptors = await openHandles(directory);
         if (descriptors !== null) check(descriptors === 0, "alias rejection leaked a native descriptor");
