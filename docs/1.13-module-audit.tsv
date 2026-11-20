@@ -266,7 +266,7 @@ read	plugin/src/local-events.test.ts	tests	Removed obsolete debounce mocks or un
 read	plugin/src/main.ts	production	Legacy endpoint migration and enrollment owner traced; duplicate requests rejected before dispatch; credential/address changes fence response and saved continuation; 38 bundled-main scenarios pass, including two failed credential writes followed by successful retry without a second claim; full host audit remains
 reviewed	plugin/src/max-latency-coalescer.test.ts	tests	Read quiet/max-latency, failure and closure coverage; npm test passes
 reviewed	plugin/src/max-latency-coalescer.ts	production	Read timer, rerun, flush and close paths with production sync.ts callers and dedicated tests; npm test passes
-pending	plugin/src/mobile-ranged-source.ts	production	Not reviewed
+reviewed	plugin/src/mobile-ranged-source.ts	production	Traced range qualification, body bounds, workset ownership and pre/post-fetch verification through mobile IO and push. After final stat, changed URL, close and abort reject without publishing bytes or retaining the lease.
 pending	plugin/src/object-confirmation-store.test.ts	tests	Not reviewed
 pending	plugin/src/object-confirmation-store.ts	production	Not reviewed
 reviewed	plugin/src/operation-checkpoint.test.ts	tests	Reviewed progress coalescing, barrier ordering, cancellation by replacement and IO errors; injected promotion/cleanup failures and invalid persisted timestamps across restarts

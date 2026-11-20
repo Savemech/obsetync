@@ -221,10 +221,11 @@ export async function openQualifiedMobileRangeReader(options: {
 
     const verify = async (): Promise<void> => {
         if (closed) throw new MobileRangeReadError("CLOSED");
+        const current = await options.stat();
+        if (closed) throw new MobileRangeReadError("CLOSED");
         let currentUrl: string;
         try { currentUrl = options.currentResourceUrl(); }
         catch { throw new MobileRangeReadError("SOURCE_CHANGED"); }
-        const current = await options.stat();
         if (currentUrl !== options.resourceUrl || !sameStat(options.expected, current)) {
             throw new MobileRangeReadError("SOURCE_CHANGED");
         }
@@ -247,6 +248,7 @@ export async function openQualifiedMobileRangeReader(options: {
             throw error;
         }
         await verify();
+        throwIfAborted(signal);
         return bytes;
     };
     const reader: MobileRangeReader = {

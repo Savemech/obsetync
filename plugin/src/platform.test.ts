@@ -188,6 +188,32 @@ async function capabilityAndSourceDriftStayDistinct(): Promise<void> {
     "post-read source drift returned bytes or leaked their admission");
 }
 
+async function finalStatCannotPublishStaleBytes(): Promise<void> {
+    for (const change of ["url", "close", "abort"] as const) {
+        const f = fixture();
+        const reader = await f.io.openMobileRangeReader("large.bin", { size: 8, mtime: 7 });
+        assert(reader);
+        const controller = new AbortController();
+        const stat = f.io.stat.bind(f.io);
+        let calls = 0;
+        f.io.stat = async path => {
+            const metadata = await stat(path);
+            if (++calls === 2) {
+                if (change === "url") f.remap();
+                else if (change === "close") reader.close();
+                else controller.abort();
+            }
+            return metadata;
+        };
+        const before = transientMemorySnapshot().usedBytes;
+        await assert.rejects(reader.read(0, 2, controller.signal), error => change === "abort"
+            ? error === controller.signal.reason
+            : error instanceof MobileRangeReadError && error.code === (change === "url" ? "SOURCE_CHANGED" : "CLOSED"));
+        assert.equal(transientMemorySnapshot().usedBytes, before);
+        reader.close();
+    }
+}
+
 async function boundsAbortAndDesktopIsolation(): Promise<void> {
     const invalid = fixture();
     await assert.rejects(invalid.io.openMobileRangeReader("large.bin", { size: Number.NaN, mtime: 7 }), RangeError);
@@ -323,6 +349,7 @@ async function run(): Promise<void> {
     await qualifiedReaderIsStrictAndOwned();
     await invalidHostResponsesFailClosed();
     await capabilityAndSourceDriftStayDistinct();
+    await finalStatCannotPublishStaleBytes();
     await boundsAbortAndDesktopIsolation();
     await writesAvoidExistingFolderMutations();
     await interruptedMobileReplacementKeepsItsBackup();
