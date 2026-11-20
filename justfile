@@ -252,16 +252,7 @@ e2e: build-image e2e-up
 # Bring up the e2e stack and block until /health responds.
 e2e-up:
     docker compose -p obsetync-e2e -f docker-compose.e2e.yml up -d
-    @echo "waiting for sync API health on http://127.0.0.1:27282/health ..."
-    @for i in $(seq 1 60); do \
-        if curl -fsS http://127.0.0.1:27282/health >/dev/null 2>&1; then \
-            echo "ready"; exit 0; \
-        fi; \
-        sleep 1; \
-     done; \
-     echo "server failed to become healthy"; \
-     docker compose -p obsetync-e2e -f docker-compose.e2e.yml logs --tail=80 e2e-server; \
-     exit 1
+    @bash scripts/wait-e2e-health.sh || { docker compose -p obsetync-e2e -f docker-compose.e2e.yml logs --tail=80 e2e-server; exit 1; }
 
 # Tear down the e2e stack and wipe its volume so the next run is a fresh install.
 e2e-down:

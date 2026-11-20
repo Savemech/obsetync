@@ -430,4 +430,5 @@ reviewed	scripts/release-provenance.mjs	tooling	Traced executable and JSON serve
 reviewed	scripts/release-provenance.test.mjs	tests	Removed simulated subprocess output. Four suites exercise real CLI creation/rejection, server identity, immutable container references and workflow invocation.
 read	scripts/verify-wasm-memory.mjs	tooling	Reviewed qualification entrypoint and completed packaged scalar/SIMD allocator lifecycle run, both prefix corpora and tree formats, three cycles each. Individual qualification helper review pending.
 read	scripts/verify-wasm-parity.mjs	tooling	Reviewed hash, streaming, batch and chunk comparisons; batch results now verified against individual slice hashes; tree ABI sections pending
+reviewed	scripts/wait-e2e-health.sh	tooling	Shared host-port readiness check for just, CI and release; requires completed HTTP 200, bounds each request and overall retry time.
 reviewed	versions.json	configuration/schema	Current compatibility entry passed shared release checker; verified minimums against 21 available tagged root manifests
