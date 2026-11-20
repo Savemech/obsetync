@@ -268,8 +268,8 @@ read	plugin/src/main.ts	production	Legacy endpoint migration and enrollment owne
 reviewed	plugin/src/max-latency-coalescer.test.ts	tests	Read quiet/max-latency, failure and closure coverage; npm test passes
 reviewed	plugin/src/max-latency-coalescer.ts	production	Read timer, rerun, flush and close paths with production sync.ts callers and dedicated tests; npm test passes
 reviewed	plugin/src/mobile-ranged-source.ts	production	Traced range qualification, body bounds, workset ownership and pre/post-fetch verification through mobile IO and push. After final stat, changed URL, close and abort reject without publishing bytes or retaining the lease.
-pending	plugin/src/object-confirmation-store.test.ts	tests	Not reviewed
-pending	plugin/src/object-confirmation-store.ts	production	Not reviewed
+reviewed	plugin/src/object-confirmation-store.test.ts	tests	Verified concurrent reads at durable head promotion, restart, limits and generation replacement; 30 assertions passed
+reviewed	plugin/src/object-confirmation-store.ts	production	Removed full-set copies during same-generation retention; traced serialized writer and push consumers; store, prepared push and transaction suites passed
 reviewed	plugin/src/operation-checkpoint.test.ts	tests	Reviewed progress coalescing, barrier ordering, cancellation by replacement and IO errors; injected promotion/cleanup failures and invalid persisted timestamps across restarts
 reviewed	plugin/src/operation-checkpoint.ts	production	Traced serialized marker lifecycle, startup hold and governor use; preserve sole copy on failed archive, deduplicate successful promotion after failed cleanup, distinguish caught failures and validate renderable timestamps
 reviewed	plugin/src/paged-pull.test.ts	tests	Checked renderer restart, torn or unpublished WAL data, immutable root verification and retirement before cursor persistence. All 56 fixture assertions passed.

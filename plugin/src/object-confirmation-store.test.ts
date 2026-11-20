@@ -36,8 +36,21 @@ async function restartAndGenerationFence(): Promise<void> {
     check(!store.has(h(3), GENERATION, content(10)) && !store.has(SCOPE, h(4), content(10)),
         "scope or server generation did not fence a positive hint");
 
+    let observedCommit = false;
+    io.onBoundary = event => {
+        if (event.method === "rename" && event.phase === "before" && event.to === `${OBJECT_CONFIRMATION_PATH}/head.json`) {
+            observedCommit = true;
+            check(store.has(SCOPE, GENERATION, content(10)), "pending WAL append hid a previous durable hint");
+            check(!store.has(SCOPE, GENERATION, content(13)), "uncommitted hint was visible to a concurrent reader");
+        }
+    };
+    check(await store.retain(SCOPE, GENERATION, [content(13), content(13)]), "same-generation append failed");
+    io.onBoundary = undefined;
+    check(observedCommit && store.has(SCOPE, GENERATION, content(13)), "committed hint was not visible");
+
     const cold = await opened(new MemorySegmentedIO(io.snapshot()));
-    check(cold.store.has(SCOPE, GENERATION, content(10)) && cold.store.has(SCOPE, GENERATION, chunk(11)),
+    check(cold.store.has(SCOPE, GENERATION, content(10)) && cold.store.has(SCOPE, GENERATION, chunk(11)) &&
+        cold.store.has(SCOPE, GENERATION, content(13)),
         "cold recovery lost confirmed object presence");
     check(await cold.store.retain(SCOPE, h(5), [content(12)]), "new server generation was not admitted");
     check(!cold.store.has(SCOPE, GENERATION, content(10)) && cold.store.has(SCOPE, h(5), content(12)),

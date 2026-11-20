@@ -148,33 +148,37 @@ export class ObjectConfirmationStore {
                 seen.add(key); owned.push(value); bytes += estimate(value);
             }
             if (!owned.length) return Promise.resolve(true);
-            if (bytes > this.limits.queuedBytes || !this.hasQueueRoom(bytes)) return Promise.resolve(false);
+            if (!this.hasQueueRoom(bytes)) return Promise.resolve(false);
             return this.enqueue(bytes, async () => {
                 this.assertReady();
                 const sameGeneration = this.state.scopeHash === scopeHash &&
                     this.state.serverGeneration === serverGeneration;
-                const candidate: State = sameGeneration ? { ...this.state, values: new Set(this.state.values) } : {
+                const candidate: State = sameGeneration ? this.state : {
                     scopeHash, serverGeneration, values: new Set(), retainedBytes: 0,
                 };
+                let retainedBytes = candidate.retainedBytes;
                 const additions: Row[] = [];
                 for (const value of owned) {
                     const key = keyOf(value);
                     if (candidate.values.has(key)) continue;
                     const cost = estimate(value);
-                    if (candidate.values.size >= this.limits.records ||
-                        candidate.retainedBytes > this.limits.retainedBytes - cost) return false;
-                    candidate.values.add(key); candidate.retainedBytes += cost;
+                    if (candidate.values.size + additions.length >= this.limits.records ||
+                        retainedBytes > this.limits.retainedBytes - cost) return false;
+                    retainedBytes += cost;
                     additions.push({ schema: 1, op: "confirm", ...value });
                 }
                 if (!additions.length) return true;
                 try {
-                    if (!sameGeneration) await this.store.snapshot(rows(candidate), metadata(candidate));
-                    else {
+                    if (sameGeneration) {
                         if (this.store.walSegments >= STORE_LIMITS.compactAfterSegments) {
                             await this.store.snapshot(rows(this.state), metadata(this.state));
                         }
                         await this.store.commit(additions);
                     }
+                    // Existing hints remain readable while this batch awaits its durable head.
+                    for (const row of additions) candidate.values.add(keyOf(row));
+                    candidate.retainedBytes = retainedBytes;
+                    if (!sameGeneration) await this.store.snapshot(rows(candidate), metadata(candidate));
                     this.state = candidate;
                     return true;
                 } catch (error) { this.ready = false; throw this.error(error); }
