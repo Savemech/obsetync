@@ -927,17 +927,10 @@ async function rebaseTree(
         for (const d of deltas) {
             if (d.action === "deleted") {
                 deletePaths.push(d.path);
-            } else if (d.action === "renamed") {
-                if (d.old_path) deletePaths.push(d.old_path);
-                if (d.hash) {
-                    upserts.push({
-                        path: d.path,
-                        hash: d.hash,
-                        mtime_ms: d.mtime_ms ?? syncBase.getTreeMtime(d.path) ?? Date.now(),
-                        size: d.size ?? syncBase.getEntry(d.path)?.size ?? 0,
-                    });
-                }
-            } else if (d.hash) {
+                continue;
+            }
+            if (d.action === "renamed" && d.old_path) deletePaths.push(d.old_path);
+            if (d.hash) {
                 upserts.push({
                     path: d.path,
                     hash: d.hash,
@@ -2282,13 +2275,12 @@ export async function applyLargeFile(
     }
     validateLargeTransferScope(effectiveScope);
     const endManifestDownload = perf?.phase("download");
-    let rawManifest: FileManifest;
+    let manifest: FileManifest;
     try {
-        rawManifest = await getManifestForPull(api, hash, expectedSize, perf);
+        manifest = await getManifestForPull(api, hash, expectedSize, perf);
     } finally {
         endManifestDownload?.();
     }
-    const manifest = validateManifest(rawManifest, hash, expectedSize);
     const manifestGeneration = await largeManifestGeneration(wasm, manifest, perf, shouldAbort);
     const endPathHash = perf?.phase("hash");
     let pathHash: string;
@@ -2357,7 +2349,6 @@ export async function applyLargeFile(
             if (stagingStat || checkpointStat) {
                 await deleteValidatedInternalPair(io, stagingPath, checkpointPath);
             }
-            await io.writeFile(stagingPath, new Uint8Array());
             checkpoint = {
                 version: 2,
                 ...effectiveScope,
@@ -2374,6 +2365,8 @@ export async function applyLargeFile(
             } finally {
                 endCheckpoint?.();
             }
+            // A checkpoint without a part can restart; a part without its checkpoint is opaque.
+            await io.writeFile(stagingPath, new Uint8Array());
         }
 
     // A fresh transfer can prove the manifest's ordered concatenation while

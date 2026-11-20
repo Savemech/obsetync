@@ -105,6 +105,24 @@ async function resumeInterruptedDownload(): Promise<void> {
         },
     } as any;
 
+    const writeFile = io.writeFile;
+    io.writeFile = async (path: string, data: Uint8Array) => {
+        if (path.endsWith(".checkpoint.json")) throw new Error("checkpoint write interrupted");
+        await writeFile(path, data);
+    };
+    await assert.rejects(applyLargeFile(api, io, "media/video.bin", fileHash, 5, wasm),
+        /checkpoint write interrupted/);
+    check(files.size === 0, "first checkpoint failure stranded an unowned staging file");
+    io.writeFile = async (path: string, data: Uint8Array) => {
+        if (path.endsWith(".part")) throw new Error("part creation interrupted");
+        await writeFile(path, data);
+    };
+    await assert.rejects(applyLargeFile(api, io, "media/video.bin", fileHash, 5, wasm),
+        /part creation interrupted/);
+    check(files.size === 1 && [...files.keys()][0].endsWith(".checkpoint.json"),
+        "interrupted part creation lost its restart checkpoint");
+    io.writeFile = writeFile;
+
     let interrupted = false;
     try {
         await applyLargeFile(api, io, "media/video.bin", fileHash, 5, wasm,
