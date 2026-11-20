@@ -487,24 +487,25 @@ export class AdaptiveResourceGovernor {
 
     recordSimdAvailability(available: boolean): void {
         if (this.environment.simdAvailable === available) return;
-        this.environment.simdAvailable = available;
-        if (this.windowTuning) {
-            if (!available) {
-                const next = { ...this.windowTuning };
-                next.hashConcurrency = Math.min(next.hashConcurrency, 2);
-                next.feedBytes = Math.min(next.feedBytes, 256 * KIB);
-                this.resetWindowProbe();
-                this.applyWindowTuning(next, "scalar WASM CPU fallback");
+        if (!available && this.windowTuning) {
+            const limits = concurrencyLimits(this.windowTuning);
+            if (this.windowProbe) {
+                const { axis, from } = this.windowProbe;
+                limits[axis] = Math.min(limits[axis], from);
             }
-            return;
-        }
-        if (!available && this.index > 1) {
+            limits.hash = Math.min(limits.hash, 2);
+            const next = withConcurrency(this.windowTuning, limits);
+            next.feedBytes = Math.min(next.feedBytes, 256 * KIB);
+            this.applyWindowTuning(next, "scalar WASM CPU fallback");
+            this.resetWindowProbe();
+        } else if (!available && this.index > 1) {
+            this.changeProfile(this.index - 1, "scalar WASM conservative fallback");
             this.growthWindows = 0;
             this.growthKey = null;
             this.probe = null;
             this.lastBottleneck = "SIMD unavailable";
-            this.changeProfile(this.index - 1, "scalar WASM conservative fallback");
         }
+        this.environment.simdAvailable = available;
     }
 
     recordInterruption(phase: string): void {

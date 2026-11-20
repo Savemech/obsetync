@@ -460,6 +460,27 @@ function capabilityChangesAndUnobservedGapsInvalidateProbes(): void {
     assert.equal(governor.snapshot().probeAxis, null);
 }
 
+function scalarFallbackRetiresTheProbeOnlyAfterApplyingLimits(): void {
+    let rejectFallback = true;
+    const governor = new AdaptiveResourceGovernor({ ...SNAPDRAGON }, {
+        onProfileChange: (_profile, reason) => {
+            if (rejectFallback && reason === "scalar WASM CPU fallback") throw new Error("fallback refused");
+        },
+    });
+    const initial = governor.current().tuning;
+    for (let sequence = 1; sequence <= 3; sequence++) {
+        governor.observeWindow(windowMeasurement(sequence, { demand: { network: 8 } }));
+    }
+    assert.equal(governor.snapshot().probeAxis, "network");
+    assert.throws(() => governor.recordSimdAvailability(false), /fallback refused/);
+    assert.equal(governor.snapshot().probeAxis, "network", "failed transition lost the pending probe");
+    rejectFallback = false;
+    governor.recordSimdAvailability(false);
+    assert.equal(governor.snapshot().probeAxis, null);
+    assert.equal(governor.current().tuning.networkConcurrency, initial.networkConcurrency);
+    assert.ok(governor.current().tuning.feedBytes <= 256 * 1024);
+}
+
 function recoveryOneAutomaticallyProbesAfterCleanActiveWindows(): void {
     const hint: ResourceRecoveryHint = {
         schema: 1,
@@ -643,6 +664,7 @@ async function run(): Promise<void> {
     overlappingWindowsNeverDoubleCountControlEvidence();
     partialByteBudgetCannotAuthorizeOtherStages();
     capabilityChangesAndUnobservedGapsInvalidateProbes();
+    scalarFallbackRetiresTheProbeOnlyAfterApplyingLimits();
     recoveryOneAutomaticallyProbesAfterCleanActiveWindows();
     pressureCooldownPreventsWindowByWindowOscillation(false);
     pressureCooldownPreventsWindowByWindowOscillation(true);
