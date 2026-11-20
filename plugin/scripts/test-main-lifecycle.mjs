@@ -581,7 +581,12 @@ function fixture({ workers = false, mobile = false, legacyState = "none", enroll
             if (!mobile) throw new Error("Unexpected browser worker on desktop fixture");
             return new BrowserPool();
         },
-        runBrowserCapabilityProbe: () => { throw new Error("Unexpected automatic browser probe"); },
+        runBrowserCapabilityProbe: async ({ signal }) => {
+            if (!gates.has("probe:cleanup")) throw new Error("Unexpected automatic browser probe");
+            signal.addEventListener("abort", () => record("probe:abort"), { once: true });
+            await step("probe:cleanup");
+            return { code: "CANCELLED" };
+        },
         PROBE_FIXTURE_HASH: "fixture", runtimeForHost: () => mobile ? "mobile" : "desktop", ObsetyncDebugModal: class {},
         AdaptiveResourceGovernor: Governor, ResourceVisibilityGate: Visibility,
         coveredResourceAxesForWindow: () => [],
@@ -814,6 +819,20 @@ test("status refresh owns one bounded interval and releases it on unload", async
     f.before("memory:close", "arbiter:close");
 });
 
+test("unload waits for explicit probe cleanup before retiring shared memory", async () => {
+    const f = fixture({ mobile: true }), plugin = await f.loaded();
+    const cleanup = f.block("probe:cleanup");
+    const probe = plugin.showBrowserCapabilityProbe();
+    await f.waitFor("probe:cleanup");
+    plugin.onunload();
+    await nextTurn();
+    equal(f.count("probe:abort"), 1, "Unload must cancel the active probe");
+    f.absent("memory:close", "Shared memory retired before probe cleanup");
+    cleanup.resolve();
+    await Promise.all([probe, plugin.retirement]);
+    f.before("probe:cleanup:done", "memory:close");
+});
+
 test("persistence replacement drains old maintenance owners before opening new stores", async () => {
     const f = fixture(), plugin = await f.loaded();
     const base = f.block("base:maintenance-drained");
@@ -839,6 +858,18 @@ test("persistence replacement drains old maintenance owners before opening new s
             `Replacement opened storage before ${owner} maintenance drained`);
     }
     await f.unload(plugin);
+});
+
+test("unload during maintenance drain prevents replacement storage reads", async () => {
+    const f = fixture(), plugin = await f.loaded();
+    const base = f.block("base:maintenance-drained");
+    const replacing = plugin.loadCurrentPersistence("desktop", true);
+    await f.waitFor("base:maintenance-drained");
+    plugin.onunload();
+    base.resolve();
+    await Promise.all([replacing, plugin.retirement]);
+    equal(f.count("base:new"), 1, "Retired plugin reopened the sync base");
+    equal(f.count("journal:new"), 1, "Retired plugin reopened the journal");
 });
 
 test("failed persistence retirement waits for sibling storage work", async () => {

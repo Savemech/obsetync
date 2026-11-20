@@ -529,6 +529,7 @@ export default class ObsetyncPlugin extends Plugin {
                 await this.closePersistenceOwners([
                     this.preparedTransfers, this.objectConfirmations, this.syncBase, this.journal,
                 ]);
+                if (this.unloaded) return;
             }
             const syncBase = new ObsetyncSyncBase(this.app);
             let journal: ObsetyncJournal | undefined;
@@ -669,6 +670,7 @@ export default class ObsetyncPlugin extends Plugin {
         const owner = this.currentHostWork;
         const modal = this.conflictModal;
         modal?.revoke();
+        this.browserProbeAbort?.abort();
         const results = await Promise.allSettled([
             owner.closeAndDrain(),
             this.drainAdmittedSettings(),
@@ -967,7 +969,6 @@ export default class ObsetyncPlugin extends Plugin {
         this.statusRefreshTimer = null;
         this.rootTreeResidentAdmission.close();
         this.syncInitGeneration++;
-        this.browserProbeAbort?.abort();
         this.typingLatency.stop("unload");
         this.hashWorkerGeneration++;
         // Stop admission synchronously, but leave services needed by accepted
@@ -1012,14 +1013,16 @@ export default class ObsetyncPlugin extends Plugin {
     /** Explicit diagnostic only. Passing never enables production workers or
      * resource-URL reads; unsupported hosts retain their existing safe path. */
     async showBrowserCapabilityProbe(): Promise<void> {
-        this.legacyDowngradeHost?.authorize("sync").assertCurrent();
-        const loading = new Notice("Testing synthetic worker/WASM capabilities…", 0);
-        try {
-            const text = await this.testBrowserCapabilities();
-            if (!this.unloaded) new ObsetyncDebugModal(this.app, text).open();
-        } catch (error) {
-            new Notice((error as Error).message);
-        } finally { loading.hide(); }
+        return this.runCurrentHostWork("sync", async lease => {
+            const loading = new Notice("Testing synthetic worker/WASM capabilities…", 0);
+            try {
+                const text = await this.testBrowserCapabilities();
+                lease.assertCurrent();
+                new ObsetyncDebugModal(this.app, text).open();
+            } catch (error) {
+                if (!lease.signal.aborted) new Notice((error as Error).message);
+            } finally { loading.hide(); }
+        });
     }
 
     private async testBrowserCapabilities(): Promise<string> {

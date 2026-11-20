@@ -10699,18 +10699,9 @@ pub fn wasm_hash_batch(data: &[u8], offsets: &[u32], sizes: &[u32]) -> Vec<Strin
         .collect()
 }
 
-/// Streaming Blake3 hasher — feed the file in 64 KB chunks.
-///
-/// WASM linear memory grows to the largest single `&[u8]` slice it receives and
-/// never shrinks back. Calling `wasm_hash(entireFile)` on a 500 MB PDF grows the
-/// WASM heap to 500 MB for the entire session. Using this Hasher with 64 KB
-/// chunks keeps the WASM heap bounded to ~64 KB per file.
-///
-/// Usage (TypeScript):
-///   const h = new wasm.Hasher();
-///   for each chunk: h.update(chunk);   // chunk ≤ 64 KB
-///   const hex = h.finalize();
-///   h.free();
+/// Streaming BLAKE3 hasher. Feeding bounded slices limits the input copy per
+/// call. The module's linear memory also serves other allocations and can
+/// retain its high-water mark after the hasher is freed.
 #[wasm_bindgen]
 pub struct Hasher {
     inner: blake3::Hasher,

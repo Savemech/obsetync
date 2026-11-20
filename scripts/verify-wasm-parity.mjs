@@ -98,6 +98,17 @@ for (const chunk of manifest.chunks) {
 }
 assert.equal(coveredBytes, large.length);
 assert.deepEqual(simd.wasm_chunk_file(large), manifest);
+for (const module of [scalar, simd]) {
+    const hasher = new module.Hasher();
+    try {
+        for (const { offset, size, hash } of manifest.chunks) {
+            assert.equal(hasher.update_and_hash(large.subarray(offset, offset + size)), hash);
+        }
+        assert.equal(hasher.finalize(), manifest.file_hash);
+    } finally {
+        hasher.free();
+    }
+}
 const baselineManifest = JSON.stringify(manifest);
 const chunkFeedSizes = [...feedSizes, 4 * 1024 * 1024 - 1, 4 * 1024 * 1024,
     4 * 1024 * 1024 + 1, large.length];
