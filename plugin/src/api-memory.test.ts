@@ -765,6 +765,25 @@ async function downloadHashesStopAtTheDistinctObjectLimit(): Promise<void> {
     finally { owned.release(); }
 }
 
+async function changedFrameLimitReplacesDataLane(): Promise<void> {
+    const { internal } = fakeApi(new ResourceBudget({ capacityBytes: 32 * MIB }));
+    const offer = (bytes: number) => internal.applyCapabilityBundle({
+        capabilities: ["ws-data-v1"], limits: { ws_frame_bytes: bytes },
+    });
+    offer(2 * MIB);
+    const original = await internal.getDataLane();
+    assert.ok(original);
+    offer(2 * MIB);
+    assert.equal(await internal.getDataLane(), original);
+    offer(MIB);
+    const smaller = await internal.getDataLane();
+    assert.ok(smaller && smaller !== original, "lower frame limit retained the old data lane");
+    offer(2 * MIB);
+    const larger = await internal.getDataLane();
+    assert.ok(larger && larger !== smaller, "higher frame limit retained the old data lane");
+    internal.closeDataLane();
+}
+
 async function desktopOwnedReceiveFitsARecoverySizedPool(): Promise<void> {
     const budget = new ResourceBudget({ capacityBytes: 32 * MIB });
     const fake = fakeApi(budget, "desktop");
@@ -795,6 +814,7 @@ void (async () => {
         await ownedDownloadRetainsAdmissionThroughApplyAndRejectsOversizeBeforeDecrypt();
         await legacyLargeObjectFitsMobileAndCumulativeRetentionIsBounded();
         await withAvailableWebSocket(async () => {
+            await changedFrameLimitReplacesDataLane();
             await oversizedWsPayloadHasAnExplicitRouteReason();
             await ownedUploadStillUsesTheAutomaticWsLane();
             await productionRouterOwnsFallbackAndStopsWsPingPong();
@@ -807,7 +827,7 @@ void (async () => {
         await legacyHashChecksRespectBatchAndResponseLimits();
         await downloadHashesStopAtTheDistinctObjectLimit();
         await desktopOwnedReceiveFitsARecoverySizedPool();
-        console.log("api-memory.test: 21 ownership/transport regression scenarios passed");
+        console.log("api-memory.test: 22 ownership/transport regression scenarios passed");
     } finally {
         delete (globalThis as any).__obsetyncTestRequestUrl;
     }

@@ -511,6 +511,21 @@ export class ObsetyncWsSession {
         private readonly protocol: ObsetyncWsProtocol,
     ) {}
 
+    static async mint(
+        requestTicket: (publicKey: string) => Promise<{ ticket: string; server_eph_pub?: string }>,
+        protocol: ObsetyncWsProtocol,
+    ): Promise<{ ticket: string; session: ObsetyncWsSession }> {
+        const keys = generateWsEphKeypair();
+        try {
+            const { ticket, server_eph_pub } = await requestTicket(keys.pubB64);
+            if (!server_eph_pub) throw new Error("server omitted the WS ephemeral key");
+            const session = await ObsetyncWsSession.create(keys.priv, server_eph_pub, ticket, protocol);
+            return { ticket, session };
+        } finally {
+            keys.priv.fill(0);
+        }
+    }
+
     /** Derive both directional keys from the mint exchange. Zeroes the
      *  ephemeral private key once the shared secret is established. */
     static async create(

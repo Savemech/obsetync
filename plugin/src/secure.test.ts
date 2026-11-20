@@ -1,4 +1,5 @@
 import { strict as assert } from "node:assert";
+import { mock } from "node:test";
 import { x25519 } from "@noble/curves/ed25519";
 import {
     HTTP_WIRE_VERSION,
@@ -40,6 +41,20 @@ async function aesKey(material: Uint8Array, nonce: Uint8Array, info: string): Pr
 }
 
 async function run(): Promise<void> {
+    const random = mock.method(crypto, "getRandomValues");
+    try {
+        const offline = new Error("ticket service offline");
+        await assert.rejects(ObsetyncWsSession.mint(async () => { throw offline; }, "data-v1"),
+            error => error === offline);
+        await assert.rejects(ObsetyncWsSession.mint(async () => ({ ticket: "unused" }), "realtime-v2"),
+            /omitted the WS ephemeral key/);
+        assert.equal(random.mock.calls.length, 2);
+        for (const call of random.mock.calls) {
+            assert.deepEqual(call.arguments[0], new Uint8Array(32), "failed ticket mint retained the private key");
+        }
+    } finally {
+        random.mock.restore();
+    }
     const staticPrivate = crypto.getRandomValues(new Uint8Array(32));
     const ephemeralPrivate = crypto.getRandomValues(new Uint8Array(32));
     const staticPublic = x25519.getPublicKey(staticPrivate);

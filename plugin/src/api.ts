@@ -5,7 +5,6 @@ import {
     ObsetyncSessionStaleError,
     ObsetyncWsSession,
     extractRequestNonce,
-    generateWsEphKeypair,
 } from "./secure";
 import { DurableSequenceAllocator } from "./transport-sequence";
 import { validateFileDeltas } from "./delta-validation";
@@ -1696,13 +1695,11 @@ export class ObsetyncApi {
         const wsData = negotiateWsDataCapability(bundle);
         const frameBytes = wsData?.maxPayloadBytes ?? null;
         const wireVersion = wsData?.preferredWireVersion ?? 1;
-        if (this.wsDataLane && (frameBytes === null || wireVersion !== this.wsDataWireVersion)) {
-            this.closeDataLane();
-        }
         this.wsDataFrameBytes = frameBytes;
         this.wsDataWireVersion = wireVersion;
         if (previousFrameBytes !== undefined &&
             (previousFrameBytes !== frameBytes || previousWireVersion !== wireVersion)) {
+            this.closeDataLane();
             this.transportRouter.resetMeasurements();
         }
     }
@@ -1724,23 +1721,9 @@ export class ObsetyncApi {
                 preferredWireVersion: this.wsDataWireVersion,
                 localRequestLimit: () => getHashTuning().networkConcurrency,
                 memoryBudget: this.memoryBudget,
-                openSession: async () => {
-                    const keys = generateWsEphKeypair();
-                    const minted = await this.mintWsTicket(keys.pubB64);
-                    if (!minted.server_eph_pub) {
-                        keys.priv.fill(0);
-                        throw new Error("server omitted the WS data ephemeral key");
-                    }
-                    return {
-                        ticket: minted.ticket,
-                        session: await ObsetyncWsSession.create(
-                            keys.priv,
-                            minted.server_eph_pub,
-                            minted.ticket,
-                            "data-v1",
-                        ),
-                    };
-                },
+                openSession: () => ObsetyncWsSession.mint(
+                    publicKey => this.mintWsTicket(publicKey), "data-v1",
+                ),
             });
         }
         return this.wsDataLane;

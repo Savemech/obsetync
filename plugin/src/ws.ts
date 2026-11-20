@@ -18,7 +18,7 @@
  * frames are ephemeral awareness. Socket down = plain polling, nothing lost.
  */
 import { ObsetyncApi } from "./api";
-import { generateWsEphKeypair, ObsetyncWsSession } from "./secure";
+import { ObsetyncWsSession } from "./secure";
 
 export type WsState = "off" | "connecting" | "connected" | "backoff";
 
@@ -207,17 +207,9 @@ export class ObsetyncWsChannel {
         let ticket: string;
         let session: ObsetyncWsSession;
         try {
-            const keys = generateWsEphKeypair();
-            const minted = await this.api.mintWsTicket(keys.pubB64);
-            if (!minted.server_eph_pub) {
-                throw new Error("server did not return an ephemeral pubkey (server < 1.8.0?)");
-            }
-            ticket = minted.ticket;
-            session = await ObsetyncWsSession.create(
-                keys.priv,
-                minted.server_eph_pub,
-                ticket,
-            );
+            ({ ticket, session } = await ObsetyncWsSession.mint(
+                publicKey => this.api.mintWsTicket(publicKey), "realtime-v2",
+            ));
         } catch (e) {
             console.warn("[obsetync] ws: ticket/keys failed, backing off:", e);
             this.scheduleReconnect(generation);
