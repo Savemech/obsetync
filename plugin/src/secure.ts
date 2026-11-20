@@ -227,11 +227,6 @@ export class ObsetyncSecureChannel {
             );
         }
 
-        // Ephemeral X25519 keypair via noble. The private key is a 32-byte
-        // Uint8Array held in memory for the channel's lifetime; there's no
-        // non-extractable CryptoKey handle on platforms lacking Web Crypto
-        // X25519, and pre-existing attacks on our process can read it either
-        // way — TLS session keys have the same property.
         const ephPrivBytes = new Uint8Array(PUBKEY_LEN);
         crypto.getRandomValues(ephPrivBytes);
         let staticShared: Uint8Array | null = null;
@@ -261,11 +256,11 @@ export class ObsetyncSecureChannel {
                             "server ephemeral public key is a non-contributory X25519 point",
                         );
                     }
-                    keyMaterial = concat(staticShared, ephemeralShared);
                     const digest = new Uint8Array(
                         await crypto.subtle.digest("SHA-256", bs(serverEphBytes)),
                     );
                     fingerprint = digest.slice(0, FINGERPRINT_LEN);
+                    keyMaterial = concat(staticShared, ephemeralShared);
                 } finally {
                     ephemeralShared.fill(0);
                 }
@@ -524,17 +519,15 @@ export class ObsetyncWsSession {
         ticketHex: string,
         protocol: ObsetyncWsProtocol = "realtime-v2",
     ): Promise<ObsetyncWsSession> {
-        if (clientEphPriv.length !== PUBKEY_LEN || !/^[0-9a-f]{64}$/i.test(ticketHex)) {
-            clientEphPriv.fill(0);
-            throw new ObsetyncSecureTransportError("invalid WS key exchange inputs");
-        }
-        const serverPub = decodeBase64(serverEphPubB64);
-        if (serverPub.length !== PUBKEY_LEN) {
-            clientEphPriv.fill(0);
-            throw new ObsetyncSecureTransportError("server_eph_pub must be 32 bytes");
-        }
         let shared: Uint8Array;
         try {
+            if (clientEphPriv.length !== PUBKEY_LEN || !/^[0-9a-f]{64}$/i.test(ticketHex)) {
+                throw new ObsetyncSecureTransportError("invalid WS key exchange inputs");
+            }
+            const serverPub = decodeBase64(serverEphPubB64);
+            if (serverPub.length !== PUBKEY_LEN) {
+                throw new ObsetyncSecureTransportError("server_eph_pub must be 32 bytes");
+            }
             shared = x25519.getSharedSecret(clientEphPriv, serverPub);
         } finally {
             clientEphPriv.fill(0);

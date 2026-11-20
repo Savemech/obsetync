@@ -348,8 +348,8 @@ reviewed	plugin/src/runtime-retirement.test.ts	tests	Checked sibling failure, va
 reviewed	plugin/src/runtime-retirement.ts	production	Traced same-vault registry, synchronous shutdown and all-settled owner barrier through plugin load, unload and storage replacement. Persistence retirement now uses the same barrier on failure.
 reviewed	plugin/src/scan-planner.test.ts	tests	Checked inclusion, unchanged and regressed metadata, missing tracked files, workload totals and bulk review cutoffs.
 reviewed	plugin/src/scan-planner.ts	production	Traced startup and full rescan. Both use one metadata planner; workload totals collected alongside size/mtime comparisons. Shared review thresholds retained.
-pending	plugin/src/secure.test.ts	tests	Not reviewed
-pending	plugin/src/secure.ts	production	Not reviewed
+reviewed	plugin/src/secure.test.ts	tests	Independent peer verifies request, response, bootstrap and WS data domains. Added private-key cleanup on malformed peer encoding. Bundled Node transport suite and plugin tsc passed.
+reviewed	plugin/src/secure.ts	production	Traced HTTP bootstrap/dual-DH envelopes and WS ticket consumers in api.ts and ws.ts. Moved fallible decoding inside private-key cleanup and delayed HTTP shared-material copy until fingerprint is ready.
 reviewed	plugin/src/segmented-store-gc.test.ts	tests	Traced guard, close and drain scenarios; tested synchronous reentry from automatic and explicit lane admission and abort listeners; verified exact predecessor replay, bounded cleanup retries and interruptions
 reviewed	plugin/src/segmented-store-migration.test.ts	tests	Read initialization/retry cuts, marker mismatch, advance fence and async replay cases; validate cold disk per boundary and exact persisted WAL order after queued writer resumes
 reviewed	plugin/src/segmented-store-test-io.ts	tests	Traced adapter boundaries, isolated disk clones, frame resealing and fixture consumers; stat distinguishes folders from absent files

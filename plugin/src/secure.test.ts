@@ -155,6 +155,9 @@ async function run(): Promise<void> {
     const wsServerPrivate = crypto.getRandomValues(new Uint8Array(32));
     const wsServerPublic = x25519.getPublicKey(wsServerPrivate);
     const wsTicket = "cd".repeat(32);
+    const rejectedPrivate = wsClientPrivate.slice();
+    await assert.rejects(ObsetyncWsSession.create(rejectedPrivate, "!", wsTicket));
+    assert.ok(rejectedPrivate.every(byte => byte === 0), "failed exchange retained the private key");
     const wsShared = x25519.getSharedSecret(wsServerPrivate, wsClientPublic);
     const wsSession = await ObsetyncWsSession.create(
         wsClientPrivate,
@@ -216,7 +219,7 @@ async function run(): Promise<void> {
     keyMaterial.fill(0);
     wsServerPrivate.fill(0);
     wsShared.fill(0);
-    console.log("secure.test: 16 assertions passed");
+    console.log("secure.test: HTTP and WebSocket transport checks passed");
 }
 
 void run();
