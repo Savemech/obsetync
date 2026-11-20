@@ -292,8 +292,8 @@ reviewed	plugin/src/priority-sort.test.ts	tests	Checked direction for all five d
 reviewed	plugin/src/priority-sort.ts	production	Traced synchronous and reviewed upload paths, shared deterministic comparator, preserved legacy random and sequential behavior
 pending	plugin/src/pull-echo.test.ts	tests	Not reviewed
 pending	plugin/src/pull-echo.ts	production	Not reviewed
-pending	plugin/src/pull.test.ts	tests	Not reviewed
-read	plugin/src/pull.ts	production	Traced paged snapshot ordering, filtering, deferred-page checkpoints and final root verification. Recovery after a pinned snapshot expires and remaining apply paths need review.
+read	plugin/src/pull.test.ts	tests	Checked crash-resumed rename and same-size target fixtures. Added two live edits during adapter lookups and ran the pull suite. Other scenarios remain under review.
+read	plugin/src/pull.ts	production	Traced paged snapshot ordering, deferred checkpoints and final root verification. Checked live rename guards across target lookup and post-move stat. Expired snapshots and remaining apply paths need review.
 pending	plugin/src/push-memory.test.ts	tests	Not reviewed
 pending	plugin/src/push-memory.ts	production	Not reviewed
 pending	plugin/src/push-prepared.test.ts	tests	Not reviewed

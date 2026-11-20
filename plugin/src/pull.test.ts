@@ -415,6 +415,47 @@ async function renameAfterCrashIsIdempotent(): Promise<void> {
     check(checkpoints === 1, "rename was not checkpointed immediately");
 }
 
+async function editDuringRenameTargetCheckIsDeferred(): Promise<void> {
+    const hash = "a".repeat(64);
+    const dirty = new Set<string>();
+    let marker = false, moves = 0, echoes = 0, baseChanges = 0;
+    let editBeforeMove = true;
+    const api = {
+        getDiff: async () => [{ action: "renamed", old_path: "old.md", path: "new.md", hash, size: 4 }],
+        getRoot: async () => new Uint8Array([1]),
+    } as any;
+    const io = {
+        exists: async (path: string) => {
+            if (path === "new.md" && marker && editBeforeMove) dirty.add("old.md");
+            return path === "old.md";
+        },
+        stat: async (path: string) => {
+            if (path === "new.md" && !editBeforeMove) dirty.add(path);
+            return { mtime: 3, size: 4 };
+        },
+        writeFile: async () => { marker = true; },
+        deleteFile: async () => { marker = false; },
+        renameFile: async () => { moves++; },
+    } as any;
+    const base = {
+        getEntry: () => ({ hash, mtime: 3, size: 4 }),
+        setEntry: () => { baseChanges++; }, removeEntry: () => { baseChanges++; },
+        checkpoint: async () => {}, save: async () => {}, setLastSyncTimestamp: () => {},
+    } as any;
+    const wasm = { wasm_hash: () => hash, wasm_root_hash_from_bytes: () => "server-root" } as any;
+    const result = await pull(api, io, base, "vault", "base-root", wasm, null,
+        undefined, () => { echoes++; }, dirty);
+    check(moves === 0 && echoes === 0 && baseChanges === 0, "edit during target lookup was lost");
+    check(!marker && result.localDeferredCount === 1, "deferred rename retained an unapplied intent");
+    editBeforeMove = false;
+    dirty.clear();
+    const afterMove = await pull(api, io, base, "vault", "base-root", wasm, null,
+        undefined, () => { echoes++; }, dirty);
+    check(moves === 1 && echoes === 1, "fixture did not reach rename completion");
+    check(afterMove.localDeferredCount === 1 && baseChanges === 0 && marker,
+        "edit during post-rename stat advanced the base or removed the recovery intent");
+}
+
 async function sameSizeUnverifiedRenameTargetIsDeferred(): Promise<void> {
     let removed = 0;
     let installed = 0;
@@ -1551,6 +1592,7 @@ void boundedApplyNeverExceedsTheSelectedLaneCount()
     .then(locallyEditedDeltaKeepsHonestBase)
     .then(renameAfterCrashIsIdempotent)
     .then(sameSizeUnverifiedRenameTargetIsDeferred)
+    .then(editDuringRenameTargetCheckIsDeferred)
     .then(firstSyncAdoptsAnExistingEmptyServerRoot)
     .then(ignoredUpsertsRemainExplicitRemoteOmissions)
     .then(editArrivingDuringDownloadDefersRemoteWrite)

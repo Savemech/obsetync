@@ -1284,7 +1284,7 @@ async function applyDeltas(
                     deferLocal(delta);
                     continue;
                 }
-                if (shouldSkip(delta) || await io.exists(delta.path)) {
+                if (await io.exists(delta.path) || shouldSkip(delta)) {
                     await safeDelete(io, markerPath);
                     deferLocal(delta);
                     continue;
@@ -1336,17 +1336,13 @@ async function applyDeltas(
                     continue;
                 }
             }
-            syncBase.removeEntry(delta.old_path);
-            if (delta.hash) {
-                const stat = await io.stat(delta.path);
-                syncBase.setEntry(
-                    delta.path,
-                    delta.hash,
-                    stat?.mtime ?? Date.now(),
-                    stat?.size ?? 0,
-                    delta.mtime_ms,
-                );
+            const stat = await io.stat(delta.path);
+            if (!stat || shouldSkip(delta)) {
+                deferLocal(delta);
+                continue;
             }
+            syncBase.removeEntry(delta.old_path);
+            syncBase.setEntry(delta.path, delta.hash, stat.mtime, stat.size, delta.mtime_ms);
             // Rename is the only non-idempotent metadata operation. Persist it
             // immediately so a renderer kill never asks the next run to rename
             // an already-moved source again.
