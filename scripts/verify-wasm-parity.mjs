@@ -23,6 +23,7 @@ const simd = await import(simdModuleUrl);
 const scalarBytes = await readFile(resolve(outputDir, "sync_core_bg.wasm"));
 const simdBytes = await readFile(resolve(outputDir, "sync_core_simd_bg.wasm"));
 
+assert(!scalarBytes.equals(simdBytes), "scalar and SIMD packages contain identical WASM binaries");
 if (!WebAssembly.validate(scalarBytes)) {
     throw new Error("scalar module did not validate");
 }

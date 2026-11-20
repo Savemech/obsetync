@@ -406,6 +406,19 @@ async function scopedRestartRejectsStaleRootAndLocalGeneration(): Promise<void> 
         manifestGeneration: "f".repeat(64), totalSize: 1, nextChunk: 1, bytesWritten: 1,
     })));
 
+    const deleteFile = io.deleteFile;
+    io.deleteFile = async (path: string) => {
+        if (path === staleCheckpoint) throw new Error("checkpoint is busy");
+        await deleteFile(path);
+    };
+    let cleanupDenied = false;
+    try { await applyLargeFile(api, io, target, fileHash, 5, wasm,
+        undefined, false, undefined, undefined, scopeA); }
+    catch (error) { cleanupDenied = error instanceof LargeTransferStagingQuotaError; }
+    check(cleanupDenied && files.has(staleCheckpoint) && files.has(stalePart),
+        "failed checkpoint retirement discarded its staged bytes");
+    io.deleteFile = deleteFile;
+
     let interrupted = false;
     try { await applyLargeFile(api, io, target, fileHash, 5, wasm,
         undefined, false, undefined, undefined, scopeA); }

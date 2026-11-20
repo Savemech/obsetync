@@ -2572,13 +2572,11 @@ async function deleteValidatedInternalPair(
 ): Promise<void> {
     // Retire authority first: if deleting the part subsequently fails, an
     // orphan temp file is quota-counted but can never look resumable.
-    let failed = false;
     for (const path of [checkpointPath, stagingPath]) {
-        try { await io.deleteFile(path); }
-        catch { if (await io.stat(path)) failed = true; }
-    }
-    if (failed || await io.stat(stagingPath) || await io.stat(checkpointPath)) {
-        throw new LargeTransferStagingQuotaError("obsolete staging cleanup did not retire its pair");
+        await safeDelete(io, path);
+        if (await io.stat(path)) {
+            throw new LargeTransferStagingQuotaError("obsolete staging cleanup did not retire its pair");
+        }
     }
 }
 

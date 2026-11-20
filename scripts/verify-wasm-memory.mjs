@@ -3197,8 +3197,14 @@ async function qualifyCandidateChunkPlans(variant) {
 
             for (let cycle = 0; cycle < 3; cycle++) {
                 token = tokenValue(tree.begin_candidate_chunks_job());
+                const beforeTraversal = version === 1 && context.sample(`candidate-chunk/v1/cycle${cycle}/before-traversal`);
                 const ready = stepCandidateOpenToReady(tree, token,
                     `${context.label}/v${version}/cycle${cycle}/traversal`);
+                if (version === 1) {
+                    const after = context.sample(`candidate-chunk/v1/cycle${cycle}/after-traversal`);
+                    assert(after.successful_allocations - beforeTraversal.successful_allocations <= expectedAll.length,
+                        `${context.label}: V1 graph traversal allocated more often than its node count`);
+                }
                 assert.equal(ready.reachable, expectedAll.length,
                     `${context.label}/v${version}/cycle${cycle}: traversal count`);
                 const plan = candidateChunkSortMemoryPlan(
