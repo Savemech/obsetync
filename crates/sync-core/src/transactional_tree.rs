@@ -1,12 +1,13 @@
 #[cfg(any(feature = "wasm", test))]
 use crate::candidate_mutation_v1::{CandidateMutationProgress, CandidateMutationV1};
-use crate::chunk::{ChunkError, FileEntry, InternalNode, LeafChunk, RootNode};
+use crate::chunk::{ChunkError, FileEntry, RootNode};
 use crate::hash::{hash_bytes, FileHash};
 use crate::store::{ChunkRetirement, ChunkStoreMemory, MemoryChunkStore};
 use crate::tree_metadata::{
     CandidateBaselineMemory, OwnedRootV1, RootMetadataMemory, StringMemory, TreeMetadataMemory,
 };
 use std::collections::HashSet;
+use sync_schema::sync_chunk::ChunkEnvelope;
 
 const MAX_MARKED_NODES: usize = 1_000_000;
 const MAX_MARKED_ENTRIES: usize = 10_000_000;
@@ -54,7 +55,7 @@ pub(crate) struct ReachabilityCursor {
 }
 
 struct ChildExpansion {
-    children: Vec<(String, FileHash)>,
+    children: Vec<FileHash>,
     depth: usize,
 }
 
@@ -121,7 +122,7 @@ impl ReachabilityCursor {
         let mut units = 0usize;
         while units < max_units {
             if let Some(expanding) = &mut self.expanding {
-                let (_, hash) = expanding
+                let hash = expanding
                     .children
                     .pop()
                     .expect("an empty child expansion is never retained");
@@ -145,7 +146,7 @@ impl ReachabilityCursor {
                 }
 
                 let bytes = store
-                    .get_chunk(&hash)
+                    .borrow_chunk(&hash)
                     .ok_or_else(|| ChunkError::NotFound(crate::hash::hash_to_hex(&hash)))?;
                 if hash_bytes(&bytes) != hash {
                     return Err(ChunkError::Deserialize(format!(
@@ -154,21 +155,34 @@ impl ReachabilityCursor {
                     )));
                 }
 
-                if let Ok(leaf) = LeafChunk::deserialize(&bytes) {
-                    let entries = self.entries.saturating_add(leaf.entries.len());
+                let envelope = flatbuffers::root::<ChunkEnvelope>(&bytes)
+                    .map_err(|error| ChunkError::Deserialize(error.to_string()))?;
+                if let Some(leaf) = envelope.node_as_leaf_chunk() {
+                    let rows = leaf.entries();
+                    let entries = self.entries.saturating_add(rows.len());
                     if entries > MAX_MARKED_ENTRIES {
                         return Err(ChunkError::Deserialize("tree has too many entries".into()));
                     }
+                    if rows.iter().any(|row| row.hash().len() != 32) {
+                        return Err(ChunkError::Deserialize(
+                            "invalid leaf entry hash length".into(),
+                        ));
+                    }
                     self.entries = entries;
-                } else if let Ok(node) = InternalNode::deserialize(&bytes) {
-                    if (self.pending.len() - 1).saturating_add(node.children.len())
-                        > MAX_MARKED_NODES
-                    {
+                } else if let Some(node) = envelope.node_as_internal_node() {
+                    let children = node.children();
+                    if (self.pending.len() - 1).saturating_add(children.len()) > MAX_MARKED_NODES {
                         return Err(ChunkError::Deserialize("tree has too many nodes".into()));
                     }
-                    if !node.children.is_empty() {
+                    if !children.is_empty() {
+                        let mut hashes = Vec::with_capacity(children.len());
+                        for child in children {
+                            hashes.push(child.hash().bytes().try_into().map_err(|_| {
+                                ChunkError::Deserialize("invalid child hash length".into())
+                            })?);
+                        }
                         self.expanding = Some(ChildExpansion {
-                            children: node.children,
+                            children: hashes,
                             depth: depth + 1,
                         });
                     }
@@ -599,7 +613,7 @@ mod retirement_tests {
         }
         cursor.expanding = Some(ChildExpansion {
             children: (0u32..1_000)
-                .map(|index| (format!("prefix/{index}"), hash_bytes(&index.to_le_bytes())))
+                .map(|index| hash_bytes(&index.to_le_bytes()))
                 .collect(),
             depth: 1,
         });
@@ -1493,6 +1507,39 @@ mod tests {
         assert_eq!(stats.reachable, 3);
         assert_eq!(stats.removed, 1);
         assert!(reachable.iter().all(|hash| store.get_chunk(hash).is_some()));
+    }
+
+    #[test]
+    fn reachability_rejects_short_leaf_and_child_hashes_without_consuming_the_edge() {
+        use crate::chunk::{InternalNode, LeafChunk};
+
+        let leaf = LeafChunk::new(vec![entry("a", 1)]).serialize();
+        let internal = InternalNode::new(vec![("a/".into(), [7; 32])]).serialize();
+        for mut bytes in [leaf, internal] {
+            let envelope = flatbuffers::root::<ChunkEnvelope>(&bytes).unwrap();
+            let hash = match envelope.node_as_leaf_chunk() {
+                Some(leaf) => leaf.entries().get(0).hash(),
+                None => envelope
+                    .node_as_internal_node()
+                    .unwrap()
+                    .children()
+                    .get(0)
+                    .hash(),
+            };
+            // Change only the FlatBuffers vector length so structural verification still passes.
+            let offset = hash.bytes().as_ptr() as usize - bytes.as_ptr() as usize;
+            bytes[offset - 4..offset].copy_from_slice(&31u32.to_le_bytes());
+            assert!(flatbuffers::root::<ChunkEnvelope>(&bytes).is_ok());
+            let digest = hash_bytes(&bytes);
+            let store = MemoryChunkStore::new();
+            store.insert_chunk(digest, bytes);
+            let mut cursor = ReachabilityCursor::new();
+            cursor.seed_root_child(digest).unwrap();
+            cursor.finish_seeding();
+            let before = cursor.progress(0);
+            assert!(cursor.step(&store, 1).is_err());
+            assert_eq!(cursor.progress(0), before);
+        }
     }
 
     #[test]

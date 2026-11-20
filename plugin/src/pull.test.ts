@@ -1655,6 +1655,10 @@ async function longFreshPullReportsLiveProgressAndRegistersOnlyActualWrites(): P
     } finally { configureHashTuning(originalTuning); }
 }
 
+function unfinishedPullSuite(): void {
+    throw new Error("pull.test exited before all pull scenarios settled");
+}
+process.once("beforeExit", unfinishedPullSuite);
 void boundedApplyNeverExceedsTheSelectedLaneCount()
     .then(locallyEditedDeltaKeepsHonestBase)
     .then(renameAfterCrashIsIdempotent)
@@ -1680,6 +1684,7 @@ void boundedApplyNeverExceedsTheSelectedLaneCount()
     .then(() => ownedSmallBatchRetainsAllNativeSiblingsAndCheckpoint(true))
     .then(longFreshPullReportsLiveProgressAndRegistersOnlyActualWrites)
     .then(() => console.log("pull.test: regression scenarios passed"))
+    .finally(() => process.off("beforeExit", unfinishedPullSuite))
     .catch((error) => {
         console.error(error);
         process.exitCode = 1;

@@ -10908,21 +10908,9 @@ fn run_local<F, T>(future: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
-    // In WASM, we can poll the future to completion since all I/O is synchronous
-    // (MemoryChunkStore has no real async). Use a simple executor.
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use std::task::{Context, Poll, Waker};
 
-    fn dummy_raw_waker() -> RawWaker {
-        fn no_op(_: *const ()) {}
-        fn clone(data: *const ()) -> RawWaker {
-            RawWaker::new(data, &VTABLE)
-        }
-        const VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
-        RawWaker::new(std::ptr::null(), &VTABLE)
-    }
-
-    let waker = unsafe { Waker::from_raw(dummy_raw_waker()) };
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(Waker::noop());
     let mut future = Box::pin(future);
 
     match future.as_mut().poll(&mut cx) {
