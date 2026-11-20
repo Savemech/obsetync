@@ -30,7 +30,7 @@ use crate::tree_work_memory::{
     ReplacementInputMemory, ReplacementSortMemory, ReplacementV2PlanningMemory,
     ReplacementV2RangesMemory, V2RangeVector,
 };
-use std::collections::{hash_map, hash_set, HashMap, HashSet};
+use std::collections::{hash_map, HashMap};
 use std::vec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,7 +157,6 @@ impl ReplacementBuildPlanV2 {
 struct ClosureValidation {
     pending: Vec<RangeRef>,
     expanding: Option<vec::IntoIter<RangeRef>>,
-    reachable: HashSet<FileHash>,
     descriptors: HashMap<FileHash, RangeRef>,
     visited_nodes: usize,
     visited_entries: usize,
@@ -182,7 +181,6 @@ impl ClosureValidation {
         Ok(Self {
             pending,
             expanding: None,
-            reachable: HashSet::new(),
             descriptors: HashMap::new(),
             visited_nodes: 0,
             visited_entries: 0,
@@ -241,7 +239,7 @@ impl ClosureValidation {
             return Err(invalid("Tree v2 exceeds the node limit"));
         }
         let bytes = store
-            .get_chunk(&range.hash)
+            .borrow_chunk(&range.hash)
             .ok_or_else(|| invalid("private Tree v2 replacement chunk is missing"))?;
         match validate_loaded_node(&range, &bytes)? {
             V2Node::Leaf(entries) => {
@@ -262,7 +260,6 @@ impl ClosureValidation {
                 }
             }
         }
-        self.reachable.insert(range.hash);
         range_memory.add_descriptor(slot.insert(range));
         Ok(true)
     }
@@ -336,7 +333,6 @@ impl RootBuildRetirement {
 struct ClosureRetirement {
     pending: Option<vec::IntoIter<RangeRef>>,
     expanding: Option<vec::IntoIter<RangeRef>>,
-    reachable: hash_set::IntoIter<FileHash>,
     descriptors: hash_map::IntoIter<FileHash, RangeRef>,
 }
 
@@ -345,14 +341,12 @@ impl ClosureRetirement {
         let ClosureValidation {
             pending,
             expanding,
-            reachable,
             descriptors,
             ..
         } = closure;
         Self {
             pending: (pending.capacity() != 0).then(|| pending.into_iter()),
             expanding,
-            reachable: reachable.into_iter(),
             descriptors: descriptors.into_iter(),
         }
     }
@@ -374,9 +368,6 @@ impl ClosureRetirement {
             }
             self.expanding = None;
             range_memory.release_vector(V2RangeVector::ClosureExpanding);
-            return true;
-        }
-        if self.reachable.next().is_some() {
             return true;
         }
         if let Some((_, range)) = self.descriptors.next() {

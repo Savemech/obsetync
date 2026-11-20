@@ -1252,7 +1252,7 @@ function formatRanges(value) {
 }
 function rangesLimitations(lines) {
     assert(lines.some(line => /retained RangeRef Vec backing \+ vector\/map endpoint Strings.*already included in WASM instance memory; do not add/.test(line)));
-    assert(lines.some(line => /descriptor count is logical, not map bytes.*root endpoints stay in metadata.*excludes HashMap\/HashSet buckets, entries\/sort\/planning, codec scratch, allocator overhead, total heap\/RSS and admission/.test(line)));
+    assert(lines.some(line => /descriptor count is logical, not map bytes.*root endpoints stay in metadata.*excludes descriptor map buckets, entries\/sort\/planning, codec scratch, allocator overhead, total heap\/RSS and admission/.test(line)));
 }
 function invalidRanges(lines) {
     assert.match(lines[0], /^Replacement V2 ranges: invalid \(/);

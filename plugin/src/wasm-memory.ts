@@ -277,7 +277,7 @@ const RANGES_FIELDS = ["schema", "scope", "replacement", "retiring", "other_rang
 const RANGES_VECTORS = ["ranges", "next_ranges", "closure_pending", "closure_expanding"] as const;
 const RANGES_MEMORY_FIELDS = [...RANGES_VECTORS, "vector_paths", "descriptor_ranges", "descriptor_paths", "counters_valid"] as const;
 const RANGES_SCOPE = "Replacement V2 ranges scope: retained RangeRef Vec backing + vector/map endpoint Strings · already included in WASM instance memory; do not add";
-const RANGES_LIMITS = "Replacement V2 ranges limits: descriptor count is logical, not map bytes · root endpoints stay in metadata · excludes HashMap/HashSet buckets, entries/sort/planning, codec scratch, allocator overhead, total heap/RSS and admission";
+const RANGES_LIMITS = "Replacement V2 ranges limits: descriptor count is logical, not map bytes · root endpoints stay in metadata · excludes descriptor map buckets, entries/sort/planning, codec scratch, allocator overhead, total heap/RSS and admission";
 
 interface StringMemory {
     strings: number;

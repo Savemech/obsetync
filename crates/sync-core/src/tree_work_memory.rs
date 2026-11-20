@@ -1286,7 +1286,7 @@ impl ReplacementSortMemory {
 }
 
 /// Exact backing for the six POD descriptor Vecs used by the V2 replacement
-/// planner/emitter. File entries, RangeRef strings, closure sets/maps and codec
+/// planner/emitter. File entries, RangeRef strings, closure map storage and codec
 /// scratch are intentionally outside this additive component.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct ReplacementV2PlanningMemory {

@@ -13,7 +13,7 @@
 //! residuals, not a wall-clock slice or a native-heap/RSS budget guarantee.
 
 use crate::chunk::{ChunkError, FileEntry};
-use crate::hash::{hash_bytes, hash_to_hex, FileHash};
+use crate::hash::{hash_bytes, FileHash};
 use crate::store::MemoryChunkStore;
 use crate::tree_v2::{
     self, copy_path_with_exact_request, copy_range_with_exact_request, RangeRef, TreeV2Root,
@@ -614,9 +614,7 @@ impl V2CandidateMutation {
                 .ok_or_else(|| invalid("Tree v2 file count overflow"))?;
             self.leaves.push(range);
         } else {
-            let bytes = load_bytes(store, &range)?;
-            let V2Node::Internal { children, .. } = tree_v2::validate_loaded_node(&range, &bytes)?
-            else {
+            let V2Node::Internal { children, .. } = load_node(store, &range)? else {
                 return Err(invalid("Tree v2 internal descriptor names a leaf"));
             };
             if self.pending.len().saturating_add(children.len()) > MAX_VISITED_NODES {
@@ -652,8 +650,7 @@ impl V2CandidateMutation {
     fn load_leaf(&mut self, store: &MemoryChunkStore, index: usize) -> Result<(), ChunkError> {
         self.visit(0)?;
         let range = &self.leaves[index];
-        let bytes = load_bytes(store, range)?;
-        let V2Node::Leaf(entries) = tree_v2::validate_loaded_node(range, &bytes)? else {
+        let V2Node::Leaf(entries) = load_node(store, range)? else {
             return Err(invalid("Tree v2 leaf descriptor names an internal node"));
         };
         self.loaded_entries = self.loaded_entries.saturating_add(entries.len());
@@ -1446,16 +1443,12 @@ fn release_vec_backing<T>(values: &mut Vec<T>) -> bool {
     true
 }
 
-fn load_bytes(store: &MemoryChunkStore, range: &RangeRef) -> Result<Vec<u8>, ChunkError> {
-    // Refuse malformed/native oversized buffers before get_chunk clones them.
-    if store.chunk_byte_length(&range.hash) != Some(range.serialized_bytes as usize) {
-        return Err(invalid(
-            "Tree v2 mutation child is missing or has the wrong length",
-        ));
-    }
-    store
-        .get_chunk(&range.hash)
-        .ok_or_else(|| ChunkError::NotFound(hash_to_hex(&range.hash)))
+fn load_node(store: &MemoryChunkStore, range: &RangeRef) -> Result<V2Node, ChunkError> {
+    let bytes = store
+        .borrow_chunk(&range.hash)
+        .filter(|bytes| bytes.len() == range.serialized_bytes as usize)
+        .ok_or_else(|| invalid("Tree v2 mutation child is missing or has the wrong length"))?;
+    tree_v2::validate_loaded_node(range, &bytes)
 }
 
 fn validate_next_range(
