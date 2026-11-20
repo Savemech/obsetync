@@ -67,7 +67,7 @@ reviewed	crates/sync-core/src/sync_rules.rs	production	Traced text eligibility t
 pending	crates/sync-core/src/transactional_tree.rs	production	Not reviewed
 pending	crates/sync-core/src/transactional_tree_v2.rs	production	Not reviewed
 read	crates/sync-core/src/tree.rs	production	Initial group build, normalization and leaf rebuild call sites traced; borrowed sorted leaf encoding and prefix-key reuse verified by allocation comparison and legacy parity tests; remaining paths pending
-pending	crates/sync-core/src/tree_metadata.rs	production	Not reviewed
+reviewed	crates/sync-core/src/tree_metadata.rs	production	Traced scalar baseline and root metadata owners through V1, V2 and WASM diagnostics; removed obsolete test-only set and root operations, asserted actual serialized baseline; 384 feature-enabled host tests passed
 pending	crates/sync-core/src/tree_v2.rs	production	Not reviewed
 pending	crates/sync-core/src/tree_work_memory.rs	production	Not reviewed
 reviewed	crates/sync-core/src/versioned_root.rs	production	Traced format dispatch, history fields, canonical rebuild and complete-inventory checks; v1 totals now checked per loaded subtree without speculatively reserving the entire declared count; dual-format and overrun tests pass

@@ -10,8 +10,6 @@
 use crate::chunk::RootNode;
 use crate::hash::FileHash;
 use crate::tree_v2::RootNodeV2;
-#[cfg(test)]
-use std::collections::HashSet;
 
 fn add_usize(value: &mut usize, amount: usize, valid: &mut bool) {
     match value.checked_add(amount) {
@@ -249,37 +247,13 @@ impl RootMetadataMemory {
             &mut self.counters_valid,
         );
     }
-
-    #[cfg(test)]
-    pub(crate) fn subtract(&mut self, other: Self) {
-        self.counters_valid &= other.counters_valid;
-        self.strings.subtract_memory(other.strings);
-        self.counters_valid &= self.strings.counters_valid;
-        subtract_usize(&mut self.roots, other.roots, &mut self.counters_valid);
-        subtract_usize(
-            &mut self.v1_children_length,
-            other.v1_children_length,
-            &mut self.counters_valid,
-        );
-        subtract_usize(
-            &mut self.v1_children_capacity,
-            other.v1_children_capacity,
-            &mut self.counters_valid,
-        );
-        subtract_u64(
-            &mut self.v1_children_backing_capacity_bytes,
-            other.v1_children_backing_capacity_bytes,
-            &mut self.counters_valid,
-        );
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct CandidateBaselineMemory {
     pub present: bool,
     pub hashes: usize,
-    /// HashSet's reported element capacity, not bucket allocation size. Keep
-    /// this observation with an IntoIter until its backing is actually freed.
+    /// Logical key slots. Generation-based baselines own no key container.
     pub capacity_slots: usize,
     /// Logical key bytes only, not an additional allocation to add to buckets.
     pub logical_hash_bytes: u64,
@@ -307,20 +281,6 @@ impl CandidateBaselineMemory {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_set(value: &HashSet<FileHash>) -> Self {
-        let mut valid = true;
-        let logical_hash_bytes =
-            backing_bytes(value.len(), std::mem::size_of::<FileHash>(), &mut valid);
-        Self {
-            present: true,
-            hashes: value.len(),
-            capacity_slots: value.capacity(),
-            logical_hash_bytes,
-            counters_valid: valid,
-        }
-    }
-
     /// Aggregate disjoint owners. `present` means at least one owner, not a
     /// container count. Capacity sums remain logical observations only.
     pub(crate) fn combine(mut self, other: Self) -> Self {
@@ -338,19 +298,6 @@ impl CandidateBaselineMemory {
             &mut self.counters_valid,
         );
         self
-    }
-
-    /// Call only after an iterator actually yields a key. Empty iteration
-    /// does not authorize dropping `present` or the retained backing capacity.
-    #[cfg(test)]
-    pub(crate) fn retire_hash(&mut self) {
-        self.counters_valid &= self.present;
-        subtract_usize(&mut self.hashes, 1, &mut self.counters_valid);
-        subtract_u64(
-            &mut self.logical_hash_bytes,
-            std::mem::size_of::<FileHash>() as u64,
-            &mut self.counters_valid,
-        );
     }
 }
 
@@ -433,36 +380,6 @@ impl OwnedRootV1 {
         self.metadata
     }
 
-    #[cfg(test)]
-    pub(crate) fn into_parts(self) -> (RootNode, RootMetadataMemory) {
-        (self.value, self.metadata)
-    }
-
-    /// Measure the new allocations while cloning. Source spare capacity and
-    /// cached counters are never copied as proof of destination ownership.
-    #[cfg(test)]
-    pub(crate) fn measured_clone(&self) -> Self {
-        let mut child_strings = StringMemory::default();
-        let mut children = Vec::with_capacity(self.value.children.len());
-        for (prefix, hash) in &self.value.children {
-            let prefix = prefix.clone();
-            child_strings.add(&prefix);
-            children.push((prefix, *hash));
-        }
-        Self::metered(
-            RootNode {
-                vault_id: self.value.vault_id.clone(),
-                created_ms: self.value.created_ms,
-                version: self.value.version,
-                children,
-                total_files: self.value.total_files,
-                parent_hash: self.value.parent_hash,
-                device_id: self.value.device_id.clone(),
-            },
-            child_strings,
-        )
-    }
-
     pub(crate) fn retire_child(&mut self) -> bool {
         let Some((prefix, _)) = self.value.children.pop() else {
             return false;
@@ -504,38 +421,6 @@ impl OwnedRootV1 {
     #[cfg(test)]
     pub(crate) fn retire_one(&mut self) -> bool {
         self.retire_child() || self.retire_vault() || self.retire_device()
-    }
-}
-
-/// Immutable candidate-history ownership, measured without collecting keys.
-#[derive(Debug)]
-#[cfg(test)]
-pub(crate) struct OwnedBaseline {
-    value: HashSet<FileHash>,
-    metadata: CandidateBaselineMemory,
-}
-
-#[cfg(test)]
-impl OwnedBaseline {
-    pub(crate) fn new(value: HashSet<FileHash>) -> Self {
-        let metadata = CandidateBaselineMemory::from_set(&value);
-        Self { value, metadata }
-    }
-
-    pub(crate) fn value(&self) -> &HashSet<FileHash> {
-        &self.value
-    }
-    pub(crate) fn metadata(&self) -> CandidateBaselineMemory {
-        self.metadata
-    }
-
-    pub(crate) fn into_parts(self) -> (HashSet<FileHash>, CandidateBaselineMemory) {
-        (self.value, self.metadata)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn measured_clone(&self) -> Self {
-        Self::new(self.value.clone())
     }
 }
 
@@ -627,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_measured_metered_clone_and_move_keep_actual_capacity_and_canonical_bytes() {
+    fn v1_metered_move_keeps_actual_capacity_and_canonical_bytes() {
         let root = root();
         let wire = root.serialize();
         let children_pointer = root.children.as_ptr();
@@ -644,26 +529,7 @@ mod tests {
         let owner = OwnedRootV1::metered(root, children);
         assert_eq!(owner.metadata(), expected);
         assert_eq!(owner.value().children.as_ptr(), children_pointer);
-        let cloned = owner.measured_clone();
-        assert_eq!(cloned.value().serialize(), wire);
-        assert_eq!(
-            cloned.metadata(),
-            RootMetadataMemory::from_v1(cloned.value())
-        );
-        assert_ne!(
-            cloned.value().children.as_ptr(),
-            owner.value().children.as_ptr()
-        );
-        for ((copy, _), (source, _)) in cloned.value().children.iter().zip(&owner.value().children)
-        {
-            if !copy.is_empty() {
-                assert_ne!(copy.as_ptr(), source.as_ptr());
-            }
-        }
-        let (moved, moved_metadata) = owner.into_parts();
-        assert_eq!(moved.children.as_ptr(), children_pointer);
-        assert_eq!(moved_metadata, expected);
-        assert_eq!(moved.serialize(), wire);
+        assert_eq!(owner.value().serialize(), wire);
     }
 
     #[test]
@@ -755,58 +621,20 @@ mod tests {
     }
 
     #[test]
-    fn baseline_move_retains_logical_capacity_until_owner_drop() {
-        let mut hashes = HashSet::with_capacity(37);
-        hashes.insert([1; 32]);
-        hashes.insert([2; 32]);
-        let expected = CandidateBaselineMemory::from_set(&hashes);
-        let owner = OwnedBaseline::new(hashes);
-        assert!(owner.value().contains(&[1; 32]));
-        assert_eq!(owner.metadata(), expected);
-        let cloned = owner.measured_clone();
-        assert_eq!(
-            cloned.metadata(),
-            CandidateBaselineMemory::from_set(cloned.value())
-        );
-        let (value, mut meter) = owner.into_parts();
-        let mut iter = value.into_iter();
-        while iter.next().is_some() {
-            meter.retire_hash();
-            assert!(meter.counters_valid);
-            assert_eq!(meter.hashes, iter.len());
-            assert_eq!(meter.capacity_slots, expected.capacity_slots);
-        }
-        assert_eq!(meter.logical_hash_bytes, 0);
-        assert!(meter.present && meter.capacity_slots > 0);
-        meter.retire_hash();
-        assert!(!meter.counters_valid);
-        let empty = HashSet::with_capacity(13);
-        let empty = CandidateBaselineMemory::from_set(&empty);
-        assert!(empty.present && empty.capacity_slots >= 13);
-        assert_ne!(empty, CandidateBaselineMemory::default());
-    }
-
-    #[test]
     fn root_and_tree_aggregates_are_disjoint_checked_and_path_free() {
         let root = root();
         let metadata = RootMetadataMemory::from_v1(&root);
-        let mut total = metadata.combine(metadata);
+        let total = metadata.combine(metadata);
         assert_eq!(total.roots, 2);
         assert_eq!(
             total.strings.capacity_bytes,
             2 * metadata.strings.capacity_bytes
         );
-        total.subtract(metadata);
-        assert_eq!(total, metadata);
-        total.subtract(metadata);
-        assert_eq!(total, RootMetadataMemory::default());
-        total.subtract(metadata);
-        assert!(!total.counters_valid);
         let tree = TreeMetadataMemory::new(
             metadata,
             metadata,
             StringMemory::of(&root.vault_id),
-            CandidateBaselineMemory::from_set(&HashSet::new()),
+            CandidateBaselineMemory::scalar(),
         );
         let combined = tree.combine(tree);
         assert_eq!(combined.committed.roots, 2);
@@ -814,6 +642,13 @@ mod tests {
         assert!(combined.counters_valid && combined.candidate_baseline.present);
         let json = serde_json::to_value(combined).unwrap();
         assert_eq!(json["committed"]["strings"]["strings"], 8);
+        assert_eq!(
+            json["candidate_baseline"],
+            serde_json::json!({
+                "present": true, "hashes": 0, "capacity_slots": 0,
+                "logical_hash_bytes": 0, "counters_valid": true
+            })
+        );
         assert!(!serde_json::to_string(&json).unwrap().contains("vault"));
         let mut invalid = tree;
         invalid.counters_valid = false;
