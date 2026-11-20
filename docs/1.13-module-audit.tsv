@@ -320,7 +320,7 @@ reviewed	plugin/src/root-batch-plan.ts	production	Traced preflight, shared admis
 reviewed	plugin/src/root-batch.test.ts	tests	Ran 167 assertions covering coverage of both partitions, priority, rename closure, exact count/byte limits and detached input provenance.
 reviewed	plugin/src/root-batch.ts	production	Traced shared graph validation, generations, rename edges, grouping and bounded selection through the reviewed queue. Removed redundant per-component queue arrays and the second ordering pass for fully ready graphs.
 read	plugin/src/root-conflicts.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
-pending	plugin/src/root-conflicts.ts	production	Not reviewed
+reviewed	plugin/src/root-conflicts.ts	production	Traced accepted-intent ownership, bounded staging, exclusive copy, receipt and drain; use original staging digest and one bounded UTF-8 stem pass
 pending	plugin/src/root-intent.test.ts	tests	Not reviewed
 pending	plugin/src/root-intent.ts	production	Not reviewed
 removed	plugin/src/root-local-omissions.test.ts	tests	Tests of retired selector; moved backlog-limit and distant shared-ID coverage to the live queue alongside its classification and provenance cases

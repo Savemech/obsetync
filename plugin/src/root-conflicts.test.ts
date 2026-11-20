@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { createHash } from "node:crypto";
 import { legacyConflictStagingKey, preserveVerifiedConflictCopy,
-    RootConflictPreserver, rootConflictCopyPath } from "./root-conflicts";
+    RootConflictPreserver, rootConflictCopyTarget } from "./root-conflicts";
 import { conflictCopyPath } from "./conflict-path";
 import { RootIntentStore, type StoredRootIntent } from "./root-intent";
 import { RootSettlementCoordinator } from "./root-settlement";
@@ -126,7 +126,7 @@ async function fixture(size = 10) {
         return { objects: values, memory, release: () => { if (!released) { released = true; releases++; values.clear(); memory.close(); } } };
     } };
     const preserver = new RootConflictPreserver(loaded.intents, api, files.io, { Hasher });
-    const destination = await rootConflictCopyPath(intent.publication.identity, "note.md", digest);
+    const { copyPath: destination } = await rootConflictCopyTarget(intent.publication.identity, "note.md", digest);
     return { ...loaded, disk, files, intent, content, digest, destination, api, preserver,
         counters: () => ({ requests, releases, used: budget.snapshot().usedBytes }) };
 }
@@ -205,9 +205,10 @@ async function copyOwnerRacesAndFailure() {
 }
 async function pathsAndCapabilities() {
     const f = await fixture();
-    const long = await rootConflictCopyPath(f.intent.publication.identity, `${"😀".repeat(100)}.md`, f.digest);
+    const { copyPath: long, stagingKey } = await rootConflictCopyTarget(f.intent.publication.identity, `${"😀".repeat(100)}.md`, f.digest);
     check(new TextEncoder().encode(long).length <= 255 && long.endsWith(".md"), "new conflict basename exceeded portable bound");
-    const changed = await rootConflictCopyPath({ ...f.intent.publication.identity, scopeHash: h(8) }, "note.md", f.digest);
+    same(long, `${"😀".repeat(20)} (conflict sync ${stagingKey}).md`, "conflict basename and staging owner diverged");
+    const { copyPath: changed } = await rootConflictCopyTarget({ ...f.intent.publication.identity, scopeHash: h(8) }, "note.md", f.digest);
     check(changed !== f.destination, "another owner reused deterministic destination");
     const large = await fixture(1100000); large.files.nativeAppend = false;
     await rejects(large.preserver.preserve(), "large conflict used prefix-copy append fallback");

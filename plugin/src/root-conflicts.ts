@@ -22,8 +22,8 @@ export class RootConflictError extends Error {
  * Full digest binds the complete operation identity, path and losing content.
  * A short conservative stem keeps this new basename below common 255-byte
  * limits without merging Unicode-normalization/case-sensitive source paths. */
-export async function rootConflictCopyPath(identity: RootPublicationIdentity, path: string, hash: string): Promise<string> {
-    if (!isSafeVaultPath(path) || path.length > 4096 || !/^[0-9a-f]{64}$/.test(hash) ||
+export async function rootConflictCopyTarget(identity: RootPublicationIdentity, path: string, hash: string): Promise<{ copyPath: string; stagingKey: string }> {
+    if (!isSafeVaultPath(path) || !/^[0-9a-f]{64}$/.test(hash) ||
         !/^[0-9a-f]{64}$/.test(identity.scopeHash) || !/^[0-9a-f]{64}$/.test(identity.requestHash) ||
         !/^[0-9a-f]{32}$/.test(identity.mutationId) || !Number.isSafeInteger(identity.sequence) || identity.sequence < 1) {
         throw new RootConflictError("IDENTITY", "invalid root conflict path identity");
@@ -36,22 +36,18 @@ export async function rootConflictCopyPath(identity: RootPublicationIdentity, pa
     const dot = name.lastIndexOf(".");
     const extension = dot > 0 && /^\.[a-zA-Z0-9]{1,16}$/.test(name.slice(dot)) ? name.slice(dot) : "";
     const sourceStem = extension ? name.slice(0, dot) : name;
-    let stem = "";
-    for (const character of sourceStem) {
-        if (new TextEncoder().encode(stem + character).byteLength > 80) break;
-        stem += character;
-    }
-    stem = stem.replace(/[. ]+$/, "") || "file";
+    const { read } = new TextEncoder().encodeInto(sourceStem, new Uint8Array(80));
+    const stem = sourceStem.slice(0, read).replace(/[. ]+$/, "") || "file";
     const result = `${parent}${stem} (conflict sync ${suffix})${extension}`;
-    if (result.length > 4096 || !isSafeVaultPath(result)) throw new RootConflictError("IDENTITY", "conflict destination exceeds safe path bound");
-    return result;
+    if (!isSafeVaultPath(result)) throw new RootConflictError("IDENTITY", "conflict destination exceeds safe path bound");
+    return { copyPath: result, stagingKey: suffix };
 }
 
 /** Stable local staging owner for the legacy conflict path. It is not a
  * publication identity or receipt; it only prevents unrelated paths with the
  * same content hash from sharing the retained-attempt ceiling. */
 export async function legacyConflictStagingKey(path: string, hash: string): Promise<string> {
-    if (!isSafeVaultPath(path) || path.length > 4096 || !/^[0-9a-f]{64}$/.test(hash)) {
+    if (!isSafeVaultPath(path) || !/^[0-9a-f]{64}$/.test(hash)) {
         throw new RootConflictError("IDENTITY", "invalid legacy conflict staging identity");
     }
     const source = new TextEncoder().encode(JSON.stringify({
@@ -230,15 +226,14 @@ export class RootConflictPreserver {
             }
             const saved = pending.conflictCopies.find(copy => copy.path === conflict.path);
             if (saved) continue;
-            const copyPath = await rootConflictCopyPath(identity, conflict.path, conflict.side_b_hash);
+            const { copyPath, stagingKey } = await rootConflictCopyTarget(identity, conflict.path, conflict.side_b_hash);
             const receipt = { path: conflict.path, copyPath, hash: row.hash, size: row.size };
-            const key = copyPath.match(/ \(conflict sync ([a-f0-9]{64})\)(?:\.[a-zA-Z0-9]{1,16})?$/)![1];
             await preserveVerifiedConflictCopy(this.api, this.io, this.wasm, {
                 path: conflict.path,
                 copyPath,
                 hash: row.hash,
                 size: row.size,
-                stagingKey: key,
+                stagingKey,
             }, { ...this.options, signal });
             await this.intents.recordConflictCopy(identity, receipt);
         }
