@@ -6,7 +6,6 @@ import {
 } from "./segmented-store";
 import {
     MemorySegmentedIO, readStoreTestFrame, sealStoreTestFrame, storeTestIOError,
-    type StoreTestDisk, type StoreTestBoundary,
 } from "./segmented-store-test-io";
 
 const DIRECTORY = "migration-store";
@@ -121,19 +120,18 @@ async function initializationAndRetryAtEveryBoundary(proof: MigrationProof): Pro
         const baseline = new MemorySegmentedIO(initial);
         const writer = retry ? storeFor(baseline) : (await load(baseline)).store;
         baseline.events.length = 0;
-        const checkpoints: Array<{ event: StoreTestBoundary; disk: StoreTestDisk }> = [];
-        baseline.onBoundary = (event, io) => { checkpoints.push({ event, disk: io.snapshot() }); };
+        baseline.onBoundary = async (_event, io) => {
+            await recoverOrRetry(io.clone(), proof);
+            restartBoundaries++;
+        };
         const operation = (store: SegmentedStore) => retry ? store.retryInitialization(rows, metadata, proof) :
             store.initializeMigration(rows, metadata, proof);
         await operation(writer);
         baseline.onBoundary = undefined;
+        const boundaries = baseline.events.slice();
         await assertInitial(baseline);
 
-        for (const { disk } of checkpoints) {
-            await recoverOrRetry(new MemorySegmentedIO(disk), proof);
-            restartBoundaries++;
-        }
-        for (const { event } of checkpoints) {
+        for (const event of boundaries) {
             const io = new MemorySegmentedIO(initial);
             const failed = retry ? storeFor(io) : (await load(io)).store;
             io.events.length = 0;
@@ -148,7 +146,7 @@ async function initializationAndRetryAtEveryBoundary(proof: MigrationProof): Pro
             await recoverOrRetry(io, proof);
             rejectedBoundaries++;
         }
-        for (const { event } of checkpoints) {
+        for (const event of boundaries) {
             if (event.method !== "write" || event.phase !== "before") continue;
             const io = new MemorySegmentedIO(initial);
             const failed = retry ? storeFor(io) : (await load(io)).store;
@@ -342,6 +340,14 @@ async function asyncReplayCallbacksAreAwaitedAndRemainProvisional(proof: Migrati
     await queued;
     assert.equal(snapshotRows, rows.length);
     assert.equal(mutationRows, 1);
+    const restored = await load(io.clone());
+    assert.deepEqual(restored.snapshot, rows);
+    assert.deepEqual(restored.metadata, metadata);
+    assert.deepEqual(restored.mutations, [
+        { id: 901, path: "newer.md" },
+        { id: 902, path: "after-replay.md" },
+    ]);
+    assert.equal(restored.store.sequence, 2);
     const failed = storeFor(io);
     await assert.rejects(failed.load(() => {}, async () => { await Promise.resolve(); throw new Error("async row rejected"); }, () => {}), /async row rejected/);
     await assert.rejects(failed.commit([]), codeIs("RECOVERY_REQUIRED"));

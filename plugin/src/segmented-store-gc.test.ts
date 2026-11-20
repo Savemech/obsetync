@@ -78,7 +78,7 @@ async function manyCyclesRetainOnlyTwoCompleteReachableClosures(): Promise<void>
     for (let index = 0; index < 601; index++) live.set(`note-${index}.md`, `initial-${index}`);
     let cursor = 0;
     await store.initialize([...live].map(([path, value]) => entry(path, value)), { cursor });
-    const historical = new Map<number, State>();
+    let previous: State | undefined;
     let candidates = new Set<string>();
     let removed = 0;
     io.onBoundary = (event, adapter) => {
@@ -90,15 +90,12 @@ async function manyCyclesRetainOnlyTwoCompleteReachableClosures(): Promise<void>
     };
     const verify = async () => {
         await store.runMaintenance();
-        const current = readStoreTestFrame(io, HEAD);
         const expected: State = { entries: [...live].sort(([left], [right]) => left.localeCompare(right)),
             cursor, sequence: store.sequence };
-        historical.set(current.generation, expected);
         assert.deepEqual(await replay(io), expected);
-        if (io.files.has(`${HEAD}.bak`)) {
-            const backup = readStoreTestFrame(io, `${HEAD}.bak`);
-            assert.deepEqual(await replay(io, ".bak"), historical.get(backup.generation));
-        }
+        assert.equal(io.files.has(`${HEAD}.bak`), previous !== undefined);
+        if (previous) assert.deepEqual(await replay(io, ".bak"), previous);
+        previous = expected;
         const reachable = retainedClosure(io);
         for (const path of reachable) assert.ok(io.files.has(path), "retained closure contains a missing page");
         assert.deepEqual(new Set([...io.files.keys()].filter(isData)), reachable,
@@ -244,7 +241,8 @@ async function nonClosingDrainJoinsAutomaticNativeIO(): Promise<void> {
     await entered;
     let drained = false;
     const drain = store.drainMaintenance().then(() => { drained = true; });
-    while (store.pendingCleanupJobs > 0) await Promise.resolve();
+    await store.runMaintenance();
+    assert.equal(store.pendingCleanupJobs, 0);
     assert.ok(laneTurns > 1, "explicit maintenance did not pass the held automatic lane wait");
     assert.equal(drained, false, "non-closing drain returned before the automatic flight completed");
     release(); await drain;
