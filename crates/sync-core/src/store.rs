@@ -15,7 +15,7 @@ pub trait ChunkStore {
 }
 
 /// Disk-based chunk store.
-/// Layout: `<base>/<first2hex>/<remaining60hex>`
+/// Layout: `<base>/<first2hex>/<remaining62hex>`
 pub struct DiskChunkStore {
     base: std::path::PathBuf,
 }
@@ -128,35 +128,10 @@ pub(crate) fn atomic_write(path: &std::path::Path, data: &[u8]) -> Result<(), st
     drop(file);
 
     if let Err(rename_error) = std::fs::rename(&tmp, path) {
-        if std::fs::read(path).is_ok_and(|existing| existing == data) {
-            let _ = std::fs::remove_file(&tmp);
-            return Ok(());
-        }
-
-        // Windows cannot rename over an existing destination. Keep the old
-        // object recoverable until the new one has reached the final name.
-        let mut backup_name = tmp.as_os_str().to_os_string();
-        backup_name.push(".backup");
-        let backup = std::path::PathBuf::from(backup_name);
-        let had_existing = path.exists();
-        if had_existing {
-            if let Err(error) = std::fs::rename(path, &backup) {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(error);
-            }
-        }
-        if let Err(error) = std::fs::rename(&tmp, path) {
-            if had_existing {
-                let _ = std::fs::rename(&backup, path);
-            }
-            let _ = std::fs::remove_file(&tmp);
-            return Err(std::io::Error::new(
-                error.kind(),
-                format!("chunk promotion failed after rename error {rename_error}: {error}"),
-            ));
-        }
-        if had_existing {
-            let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(&tmp);
+        // A concurrent writer may already have published the exact object.
+        if !std::fs::read(path).is_ok_and(|existing| existing == data) {
+            return Err(rename_error);
         }
     }
 
@@ -1649,6 +1624,27 @@ mod tests {
                 .unwrap()
                 .count(),
             1,
+        );
+    }
+
+    #[tokio::test]
+    async fn disk_store_put_preserves_directory_at_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DiskChunkStore::new(dir.path());
+        let data = b"index node".to_vec();
+        let hash = hash_bytes(&data);
+        let destination = store.chunk_path(&hash);
+        std::fs::create_dir_all(&destination).unwrap();
+        let marker = destination.join("existing");
+        std::fs::write(&marker, b"keep").unwrap();
+
+        assert!(store.put(hash, data).await.is_err());
+        assert_eq!(std::fs::read(marker).unwrap(), b"keep");
+        assert_eq!(
+            std::fs::read_dir(destination.parent().unwrap())
+                .unwrap()
+                .count(),
+            1
         );
     }
 

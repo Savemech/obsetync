@@ -62,7 +62,7 @@ reviewed	crates/sync-core/src/replacement_rebuild.rs	production	Traced shared pr
 pending	crates/sync-core/src/replacement_rebuild_v1.rs	production	Not reviewed
 pending	crates/sync-core/src/replacement_rebuild_v2.rs	production	Not reviewed
 reviewed	crates/sync-core/src/root_export_v1.rs	production	Checked plan, build, page reads, cancellation and WASM callers. Account for fixed child costs in the first planning step. Tests cover exact budget, one byte short, 25k children and byte parity.
-pending	crates/sync-core/src/store.rs	production	Not reviewed
+read	crates/sync-core/src/store.rs	production	Audited native disk chunk publication shared with content store; regression reproduced directory displacement on Linux; remaining in-memory store audit pending
 reviewed	crates/sync-core/src/sync_rules.rs	production	Traced text eligibility to server merges and binary strategy selection to the public Rust helper. Fixed bare extension names, Unicode question marks and literal stars in filenames. Compared 116,281 pattern/name pairs to a reference matcher.
 pending	crates/sync-core/src/transactional_tree.rs	production	Not reviewed
 pending	crates/sync-core/src/transactional_tree_v2.rs	production	Not reviewed
