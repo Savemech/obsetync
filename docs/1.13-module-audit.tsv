@@ -4,7 +4,7 @@ read	.github/workflows/ci.yml	configuration/schema	Read full CI DAG; shared veri
 read	.github/workflows/release.yml	configuration/schema	Read plugin/native/Nix gate sections; shared installer removes duplicated pins; full workflow provenance/publication review pending
 reviewed	Cargo.lock	generated/lock	Checked five workspace versions and 225 checksummed registry packages; locked offline Cargo resolution passed on x86 Linux
 reviewed	Cargo.toml	configuration/schema	Workspace members/features and release settings traced to crate manifests and test commands; corrected --workspace/default-members comment; workspace tests pass
-read	Dockerfile	configuration/schema	Read production pinned WASM toolchain and artifact stages; remaining container/runtime validation pending
+reviewed	Dockerfile	configuration/schema	Traced Compose, CI and release targets. Split native and WASM compilation. Built server, binary-dist and seven-file plugin-dist on x86-64. Isolated read-only container initialized and passed healthcheck; exported binary reports identity in Bookworm. Both exported WASM variants passed parity.
 reviewed	Dockerfile.dev	configuration/schema	Read complete toolchain; shared pinned x86/ARM installer; replaced absent apt just with Cargo; actual just build-dev and all tool versions pass on x86
 reviewed	benchmarks/after-1.11.1/Tree-v1-prefix-slice2.json	historical evidence	Archived legacy/linear v1 update comparison; seven matching final roots
 reviewed	benchmarks/after-1.11.1/W1-bulk-http-slice5.json	historical evidence	Archived W1-bulk-http-slice5; parsed workload, runtime and recorded invariants: production_planner_imported, order_preserved

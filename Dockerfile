@@ -13,8 +13,7 @@
 
 
 # ------------------------------------------------------------------------------
-# Stage: rust-builder
-# Compiles `sync-server` (native) and `sync-core` (wasm32-unknown-unknown).
+# Shared Rust workspace for the independent server and WASM builds.
 # Uses BuildKit cache mounts so repeated builds don't refetch crates or redo
 # unchanged dependency compilation.
 # ------------------------------------------------------------------------------
@@ -26,7 +25,7 @@ ARG OBSETYNC_BUILD_REQUIRE_CLEAN=0
 ARG OBSETYNC_BUILD_EXPECTED_VERSION=
 ARG TARGETARCH
 
-FROM rust:1.95-bookworm AS rust-builder
+FROM rust:1.95-bookworm AS rust-workspace
 
 ARG OBSETYNC_BUILD_GIT_COMMIT
 ARG OBSETYNC_BUILD_SOURCE_STATE
@@ -57,13 +56,6 @@ RUN apt-get update && \
         ca-certificates \
         curl \
         && rm -rf /var/lib/apt/lists/*
-
-# Share the same architecture-checked tools with development and CI.
-COPY scripts/install-wasm-tools.sh /tmp/install-wasm-tools.sh
-RUN bash /tmp/install-wasm-tools.sh "${TARGETARCH}" && rm /tmp/install-wasm-tools.sh
-
-# Add WASM target (also declared in rust-toolchain.toml so this is idempotent).
-RUN rustup target add wasm32-unknown-unknown
 
 WORKDIR /build
 
@@ -98,6 +90,13 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
     cargo fetch --locked
 
+FROM rust-workspace AS wasm-tools
+# Share the same architecture-checked tools with development and CI.
+COPY scripts/install-wasm-tools.sh /tmp/install-wasm-tools.sh
+RUN bash /tmp/install-wasm-tools.sh "${TARGETARCH}" && rm /tmp/install-wasm-tools.sh
+
+FROM rust-workspace AS rust-source
+
 # ------------------------------------------------------------------------------
 # Real source + real build:
 # Bring in the actual crate sources and compile.
@@ -105,8 +104,10 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
 COPY crates ./crates
 COPY scripts ./scripts
 
-# Overwrite the stubs so cargo recompiles with the real code.
+# Cached Cargo targets use mtimes to detect edited sources across checkouts.
 RUN find crates -name '*.rs' -exec touch {} +
+
+FROM rust-source AS server-builder
 
 # Server: release build, symbols stripped (via profile.release in Cargo.toml).
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
@@ -123,6 +124,13 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
     mkdir -p /out && \
     cp /build/target/release/sync-server /out/sync-server && \
     chmod 0755 /out/sync-server
+
+FROM rust-source AS wasm-builder
+
+COPY --from=wasm-tools /usr/local/bin/wasm-pack /usr/local/bin/wasm-opt /usr/local/bin/
+
+# Add WASM target (also declared in rust-toolchain.toml so this is idempotent).
+RUN rustup target add wasm32-unknown-unknown
 
 # Universal scalar + SIMD WASM modules for the Obsidian plugin. The plugin
 # validates SIMD at runtime and falls back to scalar on older WebViews.
@@ -160,11 +168,11 @@ COPY plugin/package.json plugin/package-lock.json ./
 RUN --mount=type=cache,id=npm-cache,target=/root/.npm \
     npm ci --no-audit --no-fund
 
-# Bring in sources + the WASM produced by the rust-builder stage.
+# Bring in sources + the WASM produced by the wasm-builder stage.
 COPY plugin/tsconfig.json plugin/esbuild.config.mjs plugin/manifest.json plugin/styles.css ./
 COPY plugin/scripts/build-identity-config.mjs ./scripts/build-identity-config.mjs
 COPY plugin/src ./src
-COPY --from=rust-builder /build/plugin/wasm ./wasm
+COPY --from=wasm-builder /build/plugin/wasm ./wasm
 
 # The helper narrows this exception to commit=unknown + source_state=local-unknown.
 # Exact release SHA/version/clean requirements are still passed through unchanged.
@@ -201,7 +209,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=rust-builder /out/sync-server /usr/local/bin/sync-server
+COPY --from=server-builder /out/sync-server /usr/local/bin/sync-server
 
 # Data directory — bind mount from the host via docker-compose. Writable by
 # the configured container UID (root by default in this image). Compose adds
@@ -245,11 +253,11 @@ COPY --from=plugin-builder /build/plugin/wasm/sync_core_simd_bg.wasm /sync_core_
 
 # ------------------------------------------------------------------------------
 # Stage: binary-dist (scratch, artifact-only)
-# Extract just the server binary to the host for bare-metal deployment:
+# Extract the Bookworm-linked server binary for a glibc-compatible Linux host:
 #   docker build --target binary-dist -o type=local,dest=./dist/bin .
 # produces:
 #   ./dist/bin/sync-server
 # ------------------------------------------------------------------------------
 FROM scratch AS binary-dist
 
-COPY --from=rust-builder /out/sync-server /sync-server
+COPY --from=server-builder /out/sync-server /sync-server
