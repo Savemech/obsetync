@@ -246,9 +246,12 @@ impl WorkloadPlan {
     }
 
     pub fn digest(&self) -> Result<String, HarnessError> {
-        Ok(blake3::hash(&serde_json::to_vec(self)?)
-            .to_hex()
-            .to_string())
+        let mut hasher = blake3::Hasher::new();
+        let mut writer = BufWriter::new(&mut hasher);
+        serde_json::to_writer(&mut writer, self)?;
+        writer.flush()?;
+        drop(writer);
+        Ok(hasher.finalize().to_hex().to_string())
     }
 
     pub fn summary(&self) -> Result<PlanSummary, HarnessError> {
@@ -532,7 +535,7 @@ pub fn materialize(
     Ok(manifest)
 }
 
-pub fn verify(input: &Path, deep: bool) -> Result<VerificationReport, HarnessError> {
+fn load_plan(input: &Path) -> Result<(WorkloadManifest, WorkloadPlan), HarnessError> {
     let manifest: WorkloadManifest =
         serde_json::from_reader(BufReader::new(File::open(input.join("manifest.json"))?))?;
     if manifest.schema_version != 1 {
@@ -552,6 +555,20 @@ pub fn verify(input: &Path, deep: bool) -> Result<VerificationReport, HarnessErr
         ));
     }
 
+    Ok((manifest, plan))
+}
+
+pub fn verify(input: &Path, deep: bool) -> Result<VerificationReport, HarnessError> {
+    let (manifest, plan) = load_plan(input)?;
+    verify_files(input, &manifest, &plan, deep)
+}
+
+fn verify_files(
+    input: &Path,
+    manifest: &WorkloadManifest,
+    plan: &WorkloadPlan,
+    deep: bool,
+) -> Result<VerificationReport, HarnessError> {
     let vault = input.join("vault");
     let mut total_bytes = 0u64;
     let mut dataset_hasher = deep.then(blake3::Hasher::new);
@@ -608,9 +625,7 @@ pub fn verify(input: &Path, deep: bool) -> Result<VerificationReport, HarnessErr
 }
 
 pub fn apply_operation(input: &Path, index: usize) -> Result<ScenarioOperation, HarnessError> {
-    let manifest: WorkloadManifest =
-        serde_json::from_reader(BufReader::new(File::open(input.join("manifest.json"))?))?;
-    let plan = WorkloadPlan::build(manifest.workload, manifest.seed, manifest.scale)?;
+    let (_, plan) = load_plan(input)?;
     let operation = plan.operations.get(index).cloned().ok_or_else(|| {
         HarnessError::ManifestMismatch(format!(
             "operation {index} is out of range 0..{}",
@@ -658,10 +673,8 @@ pub async fn benchmark(
             "benchmark iterations must be positive".into(),
         ));
     }
-    let manifest: WorkloadManifest =
-        serde_json::from_reader(BufReader::new(File::open(input.join("manifest.json"))?))?;
-    let plan = WorkloadPlan::build(manifest.workload, manifest.seed, manifest.scale)?;
-    verify(input, false)?;
+    let (manifest, plan) = load_plan(input)?;
+    verify_files(input, &manifest, &plan, false)?;
 
     let mut results = Vec::with_capacity(iterations);
     for _ in 0..iterations {
@@ -1805,6 +1818,29 @@ mod tests {
             .collect();
         assert_eq!(intervals.len(), 16);
         assert!(intervals.iter().all(|seconds| (5..=20).contains(seconds)));
+    }
+
+    #[test]
+    fn apply_validates_the_manifest_before_modifying_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("w7");
+        let plan = WorkloadPlan::build(WorkloadId::W7, 42, "0.00002".parse().unwrap()).unwrap();
+        assert_eq!(
+            plan.digest().unwrap(),
+            blake3::hash(&serde_json::to_vec(&plan).unwrap())
+                .to_hex()
+                .as_str()
+        );
+        let mut manifest = materialize(&plan, &output, MaterializeOptions::default()).unwrap();
+        let source = output.join("vault").join(&plan.files[0].path);
+        let bytes = fs::read(&source).unwrap();
+        manifest.seed += 1;
+        write_json_file(&output.join("manifest.json"), &manifest).unwrap();
+        assert!(matches!(
+            apply_operation(&output, 0),
+            Err(HarnessError::ManifestMismatch(_))
+        ));
+        assert_eq!(fs::read(source).unwrap(), bytes);
     }
 
     #[test]
