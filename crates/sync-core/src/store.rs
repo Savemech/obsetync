@@ -626,21 +626,19 @@ impl MemoryChunkStore {
             insertion_generation,
             ..
         } = &mut *state;
+        let mut missing = 0;
         for (hash, bytes) in &staged {
-            if resident
-                .get(hash)
-                .is_some_and(|existing| &existing.bytes != bytes)
-            {
-                return Err(ChunkError::Deserialize(format!(
-                    "resident index object {} has conflicting bytes",
-                    hash_to_hex(hash),
-                )));
+            match resident.get(hash) {
+                None => missing += 1,
+                Some(existing) if &existing.bytes == bytes => {}
+                Some(_) => {
+                    return Err(ChunkError::Deserialize(format!(
+                        "resident index object {} has conflicting bytes",
+                        hash_to_hex(hash),
+                    )));
+                }
             }
         }
-        let missing = staged
-            .keys()
-            .filter(|hash| !resident.contains_key(*hash))
-            .count();
         resident.try_reserve(missing).map_err(|_| {
             ChunkError::Deserialize("could not reserve staged index promotion".into())
         })?;
@@ -758,11 +756,7 @@ impl ChunkStore for MemoryChunkStore {
     }
 
     async fn get(&self, hash: &FileHash) -> Result<Vec<u8>, ChunkError> {
-        self.data
-            .borrow()
-            .map
-            .get(hash)
-            .map(|chunk| chunk.bytes.clone())
+        self.get_chunk(hash)
             .ok_or_else(|| ChunkError::NotFound(hash_to_hex(hash)))
     }
 
