@@ -180,8 +180,8 @@ async function execute(job: HashWorkerJob, wasm: WasmModule): Promise<HashWorker
             hash_ms: hashMs,
         };
     } finally {
-        processor?.free();
-        await handle.close();
+        try { processor?.free(); }
+        finally { await handle.close(); }
     }
 }
 
@@ -206,7 +206,9 @@ async function main(): Promise<void> {
         acceptedJobs.add(message.job_id);
         chain = chain.then(async () => {
             try {
-                workerPort.postMessage(await execute(message, wasm));
+                const result = await execute(message, wasm);
+                assertNotCancelled(message.job_id);
+                workerPort.postMessage(result);
             } catch (error) {
                 workerPort.postMessage(serializeFailure(message.job_id, error));
             } finally {
