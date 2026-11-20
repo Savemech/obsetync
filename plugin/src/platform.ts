@@ -228,7 +228,11 @@ export class ObsetyncDesktopIO implements PlatformIO {
         // Mobile mkdir also queues native creation and host reconciliation
         // for existing folders. A fresh stat avoids those mutations without
         // retaining a directory cache that can outlive an external deletion.
-        if ((await this.app.vault.adapter.stat(path))?.type === "folder") return;
+        try {
+            if ((await this.app.vault.adapter.stat(path))?.type === "folder") return;
+        } catch (error) {
+            if (!isMissingPathError(error)) throw error;
+        }
         try {
             await this.app.vault.adapter.mkdir(path);
         } catch (error) {

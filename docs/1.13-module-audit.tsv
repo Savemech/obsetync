@@ -279,7 +279,7 @@ pending	plugin/src/perf-trace.test.ts	tests	Not reviewed
 pending	plugin/src/perf-trace.ts	production	Not reviewed
 pending	plugin/src/persistent-path-index.test.ts	tests	Not reviewed
 pending	plugin/src/persistent-path-index.ts	production	Not reviewed
-pending	plugin/src/platform-conflict-copy.test.ts	tests	Not reviewed
+reviewed	plugin/src/platform-conflict-copy.test.ts	tests	Traced exclusive adapter copy, collisions, partial failure, parent races, feature probes and native promise ownership on both platform classes. Added ENOENT parent creation and EACCES propagation cases.
 read	plugin/src/platform.test.ts	tests	Added regression using the real mobile IO wrapper and a simulated interrupted adapter. Checked failure restores the original and successful retries finish with only the replacement. Existing range and write suites pass.
 read	plugin/src/platform.ts	production	Traced folder checks, adapter writes, staged large-file promotion and desktop rename fallback. Fixed loss of the prior target when promotion fails after an interrupted adapter replacement. Other platform operations remain under review.
 pending	plugin/src/plugin.test.ts	tests	Not reviewed

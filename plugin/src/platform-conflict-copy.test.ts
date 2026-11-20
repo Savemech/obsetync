@@ -131,6 +131,16 @@ async function missingCopyAndDirectoryErrors(Implementation: typeof ObsetyncDesk
     await exists.io.copyFileExclusive(source, target);
     assert.deepEqual(exists.calls, [["stat", directory], ["copy", source, target]],
         "existing directory check inspected destination or added replacement fallback");
+    const absent = fixture(Implementation);
+    absent.setStat(async () => { throw errno("ENOENT"); });
+    await absent.io.copyFileExclusive(source, target);
+    assert.deepEqual(absent.calls, [["stat", directory], ["mkdir", directory], ["copy", source, target]]);
+
+    const unavailable = fixture(Implementation), denied = errno("EACCES");
+    unavailable.setStat(async () => { throw denied; });
+    assert.equal(await rejection(unavailable.io.copyFileExclusive(source, target)), denied);
+    assert.deepEqual(unavailable.calls, [["stat", directory]]);
+
     const raced = fixture(Implementation);
     let stats = 0;
     raced.setStat(async () => ++stats === 1 ? null : { type: "folder" });
