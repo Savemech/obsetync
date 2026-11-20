@@ -48,7 +48,23 @@ async function run(): Promise<void> {
         assert.deepEqual(state.writes, [16_384]);
     }
 
-    console.log("transport-sequence.test: 10 assertions passed");
+    {
+        const state = new MemoryPersistence();
+        const allocator = new DurableSequenceAllocator(state);
+        assert.equal(await allocator.next(), 1);
+        const persist = state.persistReservedThrough.bind(state);
+        state.persistReservedThrough = async () => {
+            state.persistReservedThrough = persist;
+            throw new Error("temporary save failure");
+        };
+        const recovery = allocator.recover(12_288);
+        const queued = allocator.next();
+        await assert.rejects(recovery, /temporary save failure/);
+        assert.equal(await queued, 12_289);
+        assert.deepEqual(state.writes, [4096, 16_384]);
+    }
+
+    console.log("transport-sequence.test: concurrency, restart and recovery persistence checks passed");
 }
 
 void run();

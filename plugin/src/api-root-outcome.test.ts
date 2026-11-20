@@ -251,6 +251,18 @@ async function exactRequestsSurviveRetriesAndCallerMutation(): Promise<void> {
     } finally { f.close(); }
 }
 
+async function repeatedReplayStopsWithoutInvalidatingEnrollment(): Promise<void> {
+    const f = fixture();
+    try {
+        f.reply(call => call.path.endsWith("capabilities") ? { body: bytes(offer()) } :
+            { status: 401, body: bytes({ error: "replay", last_seen_seq: 8192 }) });
+        await assert.rejects(f.api.commitRootOutcome("vault", intent()), /sequence rejected after recovery/);
+        assert.equal(f.calls.filter(call => call.path.includes("root-commit")).length, 2);
+        assert.equal(f.counts.recover, 2);
+        assert.equal(f.memoryBudget.snapshot().usedBytes, 0);
+    } finally { f.close(); }
+}
+
 async function staleSessionStillUsesOriginalIncarnationAndCancellationIdentity(): Promise<void> {
     const f = fixture();
     try {
@@ -365,9 +377,10 @@ void (async () => {
     await bootstrapResponseBoundPrecedesRootDispatch();
     await negotiationAndFreshness();
     await exactRequestsSurviveRetriesAndCallerMutation();
+    await repeatedReplayStopsWithoutInvalidatingEnrollment();
     await staleSessionStillUsesOriginalIncarnationAndCancellationIdentity();
     await queryAndFailuresNeverBecomeLegacyAcceptance();
     await actualWireAndJSONBoundsPrecedeDecryptAndAcceptance();
     await treeRefreshOwnsItsChannelAndCache();
-    console.log("api-root-outcome.test: 9 admitted sealed HTTP/capability/retry regression scenarios passed");
+    console.log("api-root-outcome.test: admitted sealed HTTP/capability/retry regression scenarios passed");
 })().catch(error => { setTimeout(() => { throw error; }, 0); });

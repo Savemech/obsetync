@@ -379,8 +379,8 @@ pending	plugin/src/transient-memory.ts	production	Not reviewed
 pending	plugin/src/transport-errors.ts	production	Not reviewed
 pending	plugin/src/transport-router.test.ts	tests	Not reviewed
 pending	plugin/src/transport-router.ts	production	Not reviewed
-pending	plugin/src/transport-sequence.test.ts	tests	Not reviewed
-pending	plugin/src/transport-sequence.ts	production	Not reviewed
+reviewed	plugin/src/transport-sequence.test.ts	tests	Verified 5k concurrent allocations, restart gap, server recovery and queued allocation following a failed recovery save.
+reviewed	plugin/src/transport-sequence.ts	production	Traced API persistence and recovery. Retire stale range before a fallible reservation so queued requests remain above the observed server floor.
 pending	plugin/src/tree-candidate-job.test.ts	tests	Not reviewed
 pending	plugin/src/tree-candidate-job.ts	production	Not reviewed
 pending	plugin/src/tree-candidate-mutation-job.test.ts	tests	Not reviewed

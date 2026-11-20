@@ -27,17 +27,7 @@ export class DurableSequenceAllocator {
 
     next(): Promise<number> {
         return this.exclusive(async () => {
-            if (this.nextValue <= this.reservedThrough) return this.nextValue++;
-
-            const durable = this.validHighWater(this.persistence.readReservedThrough());
-            const previousEnd = Math.max(durable, this.reservedThrough);
-            const newEnd = this.checkedAdd(previousEnd, this.blockSize, "space exhausted");
-
-            // Persist BEFORE publishing any value from the block. A crash at
-            // any later point leaves only a harmless gap.
-            await this.persistence.persistReservedThrough(newEnd);
-            this.nextValue = previousEnd + 1;
-            this.reservedThrough = newEnd;
+            if (this.nextValue > this.reservedThrough) await this.reserveBlock("space exhausted");
             return this.nextValue++;
         });
     }
@@ -46,13 +36,21 @@ export class DurableSequenceAllocator {
     recover(serverReservedThrough: number): Promise<void> {
         return this.exclusive(async () => {
             const server = this.validHighWater(serverReservedThrough);
-            const durable = this.validHighWater(this.persistence.readReservedThrough());
-            const previousEnd = Math.max(server, durable, this.reservedThrough);
-            const newEnd = this.checkedAdd(previousEnd, this.blockSize, "recovery overflow");
-            await this.persistence.persistReservedThrough(newEnd);
-            this.nextValue = previousEnd + 1;
-            this.reservedThrough = newEnd;
+            // Once the server rejects this range, even a failed local save
+            // must not let queued requests consume its unused tail.
+            this.reservedThrough = Math.max(server, this.reservedThrough);
+            this.nextValue = this.reservedThrough + 1;
+            await this.reserveBlock("recovery overflow");
         });
+    }
+
+    private async reserveBlock(reason: string): Promise<void> {
+        const durable = this.validHighWater(this.persistence.readReservedThrough());
+        const previousEnd = Math.max(durable, this.reservedThrough);
+        const newEnd = this.checkedAdd(previousEnd, this.blockSize, reason);
+        await this.persistence.persistReservedThrough(newEnd);
+        this.reservedThrough = newEnd;
+        this.nextValue = previousEnd + 1;
     }
 
     private validHighWater(value: number): number {

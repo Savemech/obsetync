@@ -2046,12 +2046,13 @@ export class ObsetyncApi {
 
             throwIfBulkCancelled(options?.signal);
 
-            if (response.status === 401 && !replayRecovered) {
+            if (response.status === 401) {
                 const error = await response.json().catch(() => null);
                 if (error?.error === "replay" && Number.isSafeInteger(error.last_seen_seq)) {
+                    await this.recoverSequence(error.last_seen_seq);
+                    if (replayRecovered) throw new Error("transport sequence rejected after recovery; retry sync");
                     replayRecovered = true;
                     perf?.increment({ retries: 1 });
-                    await this.recoverSequence(error.last_seen_seq);
                     continue;
                 }
             }
