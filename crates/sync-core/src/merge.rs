@@ -349,15 +349,6 @@ async fn try_text_merge<C: ContentStore>(
         _ => return Ok(false),
     };
 
-    // three_way_text_merge decodes with from_utf8_lossy — merging non-UTF-8
-    // input would silently corrupt bytes. Require strict UTF-8 on all three.
-    if std::str::from_utf8(&base_bytes).is_err()
-        || std::str::from_utf8(&a_bytes).is_err()
-        || std::str::from_utf8(&b_bytes).is_err()
-    {
-        return Ok(false);
-    }
-
     let merged = match three_way_text_merge(&base_bytes, &a_bytes, &b_bytes) {
         TextMergeResult::Merged { content } => content,
         TextMergeResult::Overlap => return Ok(false),

@@ -39,7 +39,7 @@ reviewed	crates/e2e-tests/tests/realtime_ws.rs	tests	All six scenarios read and 
 reviewed	crates/e2e-tests/tests/single_device.rs	tests	All six native-server cases pass; zero-root inventory now checks every path, content hash and size
 pending	crates/e2e-tests/tests/smoke.rs	tests	Not reviewed
 pending	crates/e2e-tests/tests/stale_tree_revert.rs	tests	Not reviewed
-pending	crates/e2e-tests/tests/text_merge.rs	tests	Not reviewed
+reviewed	crates/e2e-tests/tests/text_merge.rs	tests	Read both two-device tests and helpers; mixed insert and EOF edit pulled byte-for-byte on both clients; invalid UTF-8 retained as conflict on native server
 pending	crates/e2e-tests/tests/transport_security.rs	tests	Not reviewed
 reviewed	crates/e2e-tests/tests/two_device_sync.rs	tests	All four native-server cases pass: cross-device readback, fast-forward, divergent merge and vault isolation
 pending	crates/e2e-tests/tests/ws_data.rs	tests	Not reviewed
@@ -50,8 +50,8 @@ read	crates/sync-core/Cargo.toml	configuration/schema	Entry-point/build inventor
 read	crates/sync-core/src/candidate_mutation_v1.rs	production	Traced sorted append and merged-row inputs to leaf staging; borrowed encoding passes native mutation parity tests; remaining cursor phases pending
 pending	crates/sync-core/src/candidate_mutation_v2.rs	production	Not reviewed
 read	crates/sync-core/src/chunk.rs	production	Traced v1 table layout and sorted leaf encoder, decode and root-parent paths; invalid parent hash lengths now rejected; path-only Ord/Eq discrepancy remains for follow-up
-pending	crates/sync-core/src/conflict.rs	production	Not reviewed
-pending	crates/sync-core/src/content_store.rs	production	Not reviewed
+reviewed	crates/sync-core/src/conflict.rs	production	Read classification, diff collection, byte assembly and serialized resolution types; replaced insert-skipping merge logic; exact CRLF, insertion, same-position conflict and terminal-newline tests; native two-client wire test
+reviewed	crates/sync-core/src/content_store.rs	production	Traced memory/disk trait versus server StorageWriter and merge callers; both test stores reject incorrect blob addresses; corrupt JSON, directory IO, missing and valid manifests tested
 pending	crates/sync-core/src/diff.rs	production	Not reviewed
 pending	crates/sync-core/src/diff_page.rs	production	Not reviewed
 pending	crates/sync-core/src/fastcdc_chunker.rs	production	Not reviewed

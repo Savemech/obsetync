@@ -48,9 +48,9 @@ async fn nonoverlapping_same_file_edits_auto_merge() {
     let (a, b, vault) = pair(&env, "textmerge-clean").await;
 
     let base = b"# Title\n\nsection one\n\nsection two\n".to_vec();
-    // A rewrites section one; B rewrites section two — disjoint line ranges.
-    let a_ver = b"# Title\n\nsection one EDITED BY A\n\nsection two\n".to_vec();
-    let b_ver = b"# Title\n\nsection one\n\nsection two EDITED BY B\n".to_vec();
+    // A inserts before section one; B edits the end and removes its newline.
+    let a_ver = b"# Title\n\ninserted by A\nsection one\n\nsection two\n".to_vec();
+    let b_ver = b"# Title\n\nsection one\n\nsection two EDITED BY B".to_vec();
 
     let resp = diverge(
         &a,
@@ -74,7 +74,7 @@ async fn nonoverlapping_same_file_edits_auto_merge() {
     );
 
     // Both devices converge onto the SAME merged bytes with both edits.
-    let expected = b"# Title\n\nsection one EDITED BY A\n\nsection two EDITED BY B\n";
+    let expected = b"# Title\n\ninserted by A\nsection one\n\nsection two EDITED BY B";
     for (who, client) in [("A", &a), ("B", &b)] {
         let map: HashMap<_, _> = pull_vault_snapshot(client, &vault)
             .await

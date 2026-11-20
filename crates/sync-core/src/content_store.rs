@@ -75,6 +75,23 @@ impl DiskContentStore {
     }
 }
 
+fn read_object(path: &std::path::Path, hash: &FileHash) -> Result<Vec<u8>, ChunkError> {
+    std::fs::read(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => ChunkError::NotFound(hash_to_hex(hash)),
+        _ => ChunkError::Io(error),
+    })
+}
+
+fn validate_blob(hash: &FileHash, data: &[u8]) -> Result<(), ChunkError> {
+    if hash_bytes(data) != *hash {
+        return Err(ChunkError::Deserialize(format!(
+            "refusing content bytes that do not match {}",
+            hash_to_hex(hash),
+        )));
+    }
+    Ok(())
+}
+
 #[async_trait::async_trait(?Send)]
 impl ContentStore for DiskContentStore {
     async fn has(&self, hash: &FileHash) -> bool {
@@ -83,13 +100,7 @@ impl ContentStore for DiskContentStore {
 
     async fn get(&self, hash: &FileHash) -> Result<Vec<u8>, ChunkError> {
         let path = self.blob_path(hash);
-        let data = match std::fs::read(&path) {
-            Ok(data) => data,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(ChunkError::NotFound(hash_to_hex(hash)));
-            }
-            Err(error) => return Err(ChunkError::Io(error)),
-        };
+        let data = read_object(&path, hash)?;
         if hash_bytes(&data) != *hash {
             return Err(ChunkError::Deserialize(format!(
                 "content object {} failed content-address validation",
@@ -100,12 +111,7 @@ impl ContentStore for DiskContentStore {
     }
 
     async fn put(&self, hash: FileHash, data: Vec<u8>) -> Result<(), ChunkError> {
-        if hash_bytes(&data) != hash {
-            return Err(ChunkError::Deserialize(format!(
-                "refusing content bytes that do not match {}",
-                hash_to_hex(&hash),
-            )));
-        }
+        validate_blob(&hash, &data)?;
         let path = self.blob_path(&hash);
         atomic_write(&path, &data)?;
         Ok(())
@@ -117,8 +123,7 @@ impl ContentStore for DiskContentStore {
 
     async fn get_manifest(&self, file_hash: &FileHash) -> Result<FileManifest, ChunkError> {
         let path = self.manifest_path(file_hash);
-        let data =
-            std::fs::read(&path).map_err(|_| ChunkError::NotFound(hash_to_hex(file_hash)))?;
+        let data = read_object(&path, file_hash)?;
         let manifest: FileManifest = serde_json::from_slice(&data)
             .map_err(|e| ChunkError::Deserialize(format!("manifest: {}", e)))?;
         if manifest.file_hash != *file_hash {
@@ -174,6 +179,7 @@ impl ContentStore for MemoryContentStore {
     }
 
     async fn put(&self, hash: FileHash, data: Vec<u8>) -> Result<(), ChunkError> {
+        validate_blob(&hash, &data)?;
         self.blobs.borrow_mut().insert(hash, data);
         Ok(())
     }
@@ -351,12 +357,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_content_store_put_overwrites_blob() {
-        let store = MemoryContentStore::new();
-        let h = hash_bytes(b"k");
-        store.put(h, b"first".to_vec()).await.unwrap();
-        store.put(h, b"second".to_vec()).await.unwrap();
-        assert_eq!(store.get(&h).await.unwrap(), b"second".to_vec());
+    async fn invalid_content_cannot_replace_a_valid_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = DiskContentStore::new(dir.path());
+        let memory = MemoryContentStore::new();
+        for store in [&disk as &dyn ContentStore, &memory] {
+            let hash = hash_bytes(b"first");
+            store.put(hash, b"first".to_vec()).await.unwrap();
+            assert!(matches!(
+                store.put(hash, b"second".to_vec()).await,
+                Err(ChunkError::Deserialize(_))
+            ));
+            assert_eq!(store.get(&hash).await.unwrap(), b"first");
+        }
+    }
+
+    #[tokio::test]
+    async fn disk_manifest_read_failure_is_distinct_from_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DiskContentStore::new(dir.path());
+        let hash = hash_bytes(b"unreadable manifest");
+        std::fs::create_dir_all(store.manifest_path(&hash)).unwrap();
+        assert!(matches!(
+            store.get_manifest(&hash).await,
+            Err(ChunkError::Io(_))
+        ));
     }
 
     #[test]

@@ -197,7 +197,9 @@ which gives the client everything it needs to materialize a resolution.
 For known text extensions below the 1 MiB blob threshold, the server fetches
 strict UTF-8 base/A/B bytes and runs
 `sync_core::conflict::three_way_text_merge`. Non-overlapping line edits produce
-one merged content-addressed blob and no conflict. Overlap, invalid UTF-8,
+one merged content-addressed blob. Insertions preserve the adjacent base line,
+and the output keeps each selected line’s original terminator, including a
+missing final newline. Overlap, invalid UTF-8,
 missing blobs, binary files, and chunked large files stay unresolved; side A
 remains at the original tree path and the response carries all three hashes.
 

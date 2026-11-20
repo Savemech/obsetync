@@ -4,7 +4,7 @@ use similar::TextDiff;
 /// Result of classifying a file's sync state using three hashes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncAction {
-    /// All three hashes match — nothing to do.
+    /// Local and remote hashes match — nothing to do.
     NoChange,
     /// Local matches base, remote differs — accept remote (fast-forward).
     FastForward,
@@ -48,242 +48,44 @@ pub enum TextMergeResult {
 /// Takes base, local, and remote as UTF-8 byte slices.
 /// Returns merged content if changes don't overlap, or Overlap if they do.
 pub fn three_way_text_merge(base: &[u8], local: &[u8], remote: &[u8]) -> TextMergeResult {
-    let base_str = String::from_utf8_lossy(base);
-    let local_str = String::from_utf8_lossy(local);
-    let remote_str = String::from_utf8_lossy(remote);
-
-    // Compute diffs: base→local and base→remote.
-    let diff_local = TextDiff::from_lines(&base_str, &local_str);
-    let diff_remote = TextDiff::from_lines(&base_str, &remote_str);
-
-    // Collect changed line ranges for each side.
-    let local_changes = collect_changed_ranges(&diff_local);
-    let remote_changes = collect_changed_ranges(&diff_remote);
-
-    // Check for overlapping changes.
-    if ranges_overlap(&local_changes, &remote_changes) {
+    let (Ok(base), Ok(local), Ok(remote)) = (
+        std::str::from_utf8(base),
+        std::str::from_utf8(local),
+        std::str::from_utf8(remote),
+    ) else {
         return TextMergeResult::Overlap;
-    }
-
-    // No overlap — apply both sets of changes to the base.
-    // Strategy: apply remote changes first (they have higher line numbers after local edits),
-    // but since we're working from the base, we interleave both diffs.
-    let merged = apply_non_overlapping_changes(
-        &base_str,
-        &local_str,
-        &remote_str,
-        &diff_local,
-        &diff_remote,
-    );
-
-    match merged {
-        Some(content) => TextMergeResult::Merged {
-            content: content.into_bytes(),
-        },
-        None => TextMergeResult::Overlap,
-    }
-}
-
-/// A range of lines that were changed (in the base's line numbering).
-#[derive(Debug, Clone)]
-struct ChangeRange {
-    start: usize, // inclusive
-    end: usize,   // exclusive
-}
-
-fn collect_changed_ranges(diff: &TextDiff<str>) -> Vec<ChangeRange> {
-    let mut ranges = Vec::new();
-
-    for op in diff.ops() {
-        match op {
-            similar::DiffOp::Equal { .. } => {}
-            similar::DiffOp::Delete {
-                old_index, old_len, ..
-            }
-            | similar::DiffOp::Replace {
-                old_index, old_len, ..
-            } => {
-                ranges.push(ChangeRange {
-                    start: *old_index,
-                    end: old_index + old_len,
-                });
-            }
-            similar::DiffOp::Insert { old_index, .. } => {
-                ranges.push(ChangeRange {
-                    start: *old_index,
-                    end: *old_index,
-                });
+    };
+    let local_diff = TextDiff::from_lines(base, local);
+    let remote_diff = TextDiff::from_lines(base, remote);
+    let mut edits = Vec::new();
+    for diff in [&local_diff, &remote_diff] {
+        for op in diff.ops() {
+            if !matches!(op, similar::DiffOp::Equal { .. }) {
+                edits.push((op.old_range(), &diff.new_slices()[op.new_range()]));
             }
         }
     }
+    edits.sort_unstable_by_key(|(range, _)| range.start);
 
-    ranges
-}
-
-fn ranges_overlap(a: &[ChangeRange], b: &[ChangeRange]) -> bool {
-    for ra in a {
-        for rb in b {
-            // Two ranges overlap if they share any line.
-            // For insert points (start == end), they overlap if they're at the same position
-            // and the other range covers that position.
-            let a_start = ra.start;
-            let a_end = if ra.start == ra.end {
-                ra.end + 1
-            } else {
-                ra.end
-            };
-            let b_start = rb.start;
-            let b_end = if rb.start == rb.end {
-                rb.end + 1
-            } else {
-                rb.end
-            };
-
-            if a_start < b_end && b_start < a_end {
-                return true;
-            }
+    let lines = local_diff.old_slices();
+    let mut merged = Vec::new();
+    let mut cursor = 0;
+    let mut previous_start = None;
+    for (range, inserted) in edits {
+        if range.start < cursor || previous_start == Some(range.start) {
+            return TextMergeResult::Overlap;
         }
-    }
-    false
-}
-
-/// Apply non-overlapping changes from both sides.
-/// This is a simplified merge that works when changes don't overlap.
-fn apply_non_overlapping_changes(
-    base: &str,
-    _local: &str,
-    _remote: &str,
-    diff_local: &TextDiff<str>,
-    diff_remote: &TextDiff<str>,
-) -> Option<String> {
-    let base_lines: Vec<&str> = base.lines().collect();
-
-    // Collect which base lines are replaced/deleted by each side,
-    // and what new lines are inserted.
-    let local_ops = collect_ops(diff_local);
-    let remote_ops = collect_ops(diff_remote);
-
-    let mut result = Vec::new();
-    let mut i = 0;
-
-    while i < base_lines.len() {
-        let local_op = local_ops.get(&i);
-        let remote_op = remote_ops.get(&i);
-
-        match (local_op, remote_op) {
-            (Some(op), None) => {
-                // Local changed this region.
-                for line in &op.new_lines {
-                    result.push(*line);
-                }
-                i += op.old_len.max(1);
-            }
-            (None, Some(op)) => {
-                // Remote changed this region.
-                for line in &op.new_lines {
-                    result.push(*line);
-                }
-                i += op.old_len.max(1);
-            }
-            (None, None) => {
-                // Neither side changed — keep base line.
-                result.push(base_lines[i]);
-                i += 1;
-            }
-            (Some(_), Some(_)) => {
-                // Both sides changed the same region — should have been caught by overlap check.
-                return None;
-            }
+        for line in lines[cursor..range.start].iter().chain(inserted) {
+            merged.extend_from_slice(line.as_bytes());
         }
+        // An insertion consumes no base lines. Diff slices retain their terminators.
+        cursor = range.end;
+        previous_start = Some(range.start);
     }
-
-    // Handle trailing inserts after the last base line.
-    if let Some(op) = local_ops.get(&base_lines.len()) {
-        for line in &op.new_lines {
-            result.push(*line);
-        }
+    for line in &lines[cursor..] {
+        merged.extend_from_slice(line.as_bytes());
     }
-    if let Some(op) = remote_ops.get(&base_lines.len()) {
-        for line in &op.new_lines {
-            result.push(*line);
-        }
-    }
-
-    let mut merged = result.join("\n");
-    // Preserve trailing newline if base had one.
-    if base.ends_with('\n') {
-        merged.push('\n');
-    }
-
-    Some(merged)
-}
-
-#[derive(Debug)]
-struct MergeOp<'a> {
-    old_len: usize,
-    new_lines: Vec<&'a str>,
-}
-
-fn collect_ops<'a>(
-    diff: &'a TextDiff<'_, '_, 'a, str>,
-) -> std::collections::HashMap<usize, MergeOp<'a>> {
-    let mut ops = std::collections::HashMap::new();
-
-    for op in diff.ops() {
-        match op {
-            similar::DiffOp::Delete {
-                old_index, old_len, ..
-            } => {
-                ops.insert(
-                    *old_index,
-                    MergeOp {
-                        old_len: *old_len,
-                        new_lines: vec![],
-                    },
-                );
-            }
-            similar::DiffOp::Replace {
-                old_index,
-                old_len,
-                new_index,
-                new_len,
-            } => {
-                let new_text = diff.new_slices();
-                let new_lines: Vec<&str> = new_text[*new_index..*new_index + *new_len]
-                    .iter()
-                    .map(|s| s.trim_end_matches('\n'))
-                    .collect();
-                ops.insert(
-                    *old_index,
-                    MergeOp {
-                        old_len: *old_len,
-                        new_lines,
-                    },
-                );
-            }
-            similar::DiffOp::Insert {
-                old_index,
-                new_index,
-                new_len,
-            } => {
-                let new_text = diff.new_slices();
-                let new_lines: Vec<&str> = new_text[*new_index..*new_index + *new_len]
-                    .iter()
-                    .map(|s| s.trim_end_matches('\n'))
-                    .collect();
-                ops.insert(
-                    *old_index,
-                    MergeOp {
-                        old_len: 0,
-                        new_lines,
-                    },
-                );
-            }
-            _ => {}
-        }
-    }
-
-    ops
+    TextMergeResult::Merged { content: merged }
 }
 
 /// How a file-level conflict was resolved.
@@ -385,13 +187,24 @@ mod tests {
     }
 
     #[test]
-    fn merge_identical_changes() {
-        let _base = b"line1\nline2\n";
-        let _changed = b"line1\nline2-same\n";
-
-        // Both sides made the same change — local == remote, so classify_sync
-        // would return NoChange. This function shouldn't be called in that case,
-        // but if it is, both sides have the same content so it shouldn't matter.
+    fn merge_preserves_insertions_and_line_terminators() {
+        let base = b"title\r\nkeep\r\nend\r\n";
+        let insert = b"title\r\ninsert\r\nkeep\r\nend\r\n";
+        let edit = b"title\r\nkeep\r\nchanged";
+        for (local, remote) in [
+            (insert.as_slice(), edit.as_slice()),
+            (edit.as_slice(), insert.as_slice()),
+        ] {
+            let TextMergeResult::Merged { content } = three_way_text_merge(base, local, remote)
+            else {
+                panic!("disjoint edits must merge");
+            };
+            assert_eq!(content, b"title\r\ninsert\r\nkeep\r\nchanged");
+        }
+        assert!(matches!(
+            three_way_text_merge(base, insert, b"title\r\nother\r\nkeep\r\nend\r\n"),
+            TextMergeResult::Overlap
+        ));
     }
 
     #[test]
@@ -421,13 +234,10 @@ mod tests {
 
     #[test]
     fn merge_empty_inputs() {
-        // Empty base, empty sides — must not panic and must produce some merged result.
-        let result = three_way_text_merge(b"", b"", b"");
-        // Either Merged (with empty content) or Overlap is acceptable; just must not panic.
-        match result {
-            TextMergeResult::Merged { content } => assert!(content.is_empty() || content == b"\n"),
-            TextMergeResult::Overlap => {}
-        }
+        let TextMergeResult::Merged { content } = three_way_text_merge(b"", b"", b"") else {
+            panic!("identical empty inputs must merge");
+        };
+        assert!(content.is_empty());
     }
 
     #[test]
