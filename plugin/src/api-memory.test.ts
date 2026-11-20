@@ -7,6 +7,7 @@ import {
 } from "./api";
 import {
     BULK_MAX_OBJECT_BYTES,
+    BULK_MAX_OBJECTS,
     bulkPackEncodedLength,
     decodeBulkUploadPack,
     encodeBulkUploadPack,
@@ -748,6 +749,27 @@ async function legacyHashChecksRespectBatchAndResponseLimits(): Promise<void> {
     assert.equal(fake.counts.decrypt, before);
 }
 
+async function downloadHashesStopAtTheDistinctObjectLimit(): Promise<void> {
+    const budget = new ResourceBudget({ capacityBytes: 32 * MIB });
+    const fake = fakeApi(budget);
+    const oversized = Array.from({ length: BULK_MAX_OBJECTS + 1 }, (_, i) => hash(i));
+    Object.defineProperty(oversized, oversized.length, {
+        get() { throw new Error("read beyond the distinct download limit"); },
+    });
+    for (const method of ["getObjectsOwned", "getObjects"] as const) {
+        await assert.rejects(fake.api[method](BulkObjectKind.Content, oversized), /bounded apply object cap/);
+    }
+    assert.equal(fake.counts.request, 0);
+    assert.equal(budget.snapshot().usedBytes, 0);
+
+    const repeated = Array.from({ length: BULK_MAX_OBJECTS + 1 }, (_, i) =>
+        i % 2 ? hash(15).toUpperCase() : hash(15));
+    fake.reply(() => ({ body: page([record(15)], 1, 1) }));
+    const owned = await fake.api.getObjectsOwned(BulkObjectKind.Content, repeated);
+    try { assert.deepEqual([...owned.objects.keys()], [hash(15)]); }
+    finally { owned.release(); }
+}
+
 async function desktopOwnedReceiveFitsARecoverySizedPool(): Promise<void> {
     const budget = new ResourceBudget({ capacityBytes: 32 * MIB });
     const fake = fakeApi(budget, "desktop");
@@ -788,8 +810,9 @@ void (async () => {
             await urgentFilePriorityIsBoundedExplicitAndReplaySafe();
         });
         await legacyHashChecksRespectBatchAndResponseLimits();
+        await downloadHashesStopAtTheDistinctObjectLimit();
         await desktopOwnedReceiveFitsARecoverySizedPool();
-        console.log("api-memory.test: 20 ownership/transport regression scenarios passed");
+        console.log("api-memory.test: 21 ownership/transport regression scenarios passed");
     } finally {
         delete (globalThis as any).__obsetyncTestRequestUrl;
     }

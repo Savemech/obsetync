@@ -431,6 +431,17 @@ async function withTransportSampleVisibility<T>(
     }
 }
 
+function uniqueDownloadHashes(hashes: readonly string[]): string[] {
+    const unique = new Set<string>();
+    for (const hash of hashes) {
+        unique.add(hash.toLowerCase());
+        if (unique.size > BULK_MAX_OBJECTS) {
+            throw new RangeError("bulk get caller exceeded the bounded apply object cap");
+        }
+    }
+    return [...unique];
+}
+
 /**
  * HTTP client for the ObsetyNC sync server.
  *
@@ -1102,10 +1113,7 @@ export class ObsetyncApi {
         signal?: AbortSignal,
     ): Promise<OwnedObjects> {
         throwIfBulkCancelled(signal);
-        const unique = [...new Set(hashes.map((hash) => hash.toLowerCase()))];
-        if (unique.length > BULK_MAX_OBJECTS) {
-            throw new RangeError("bulk get caller exceeded the bounded apply object cap");
-        }
+        const unique = uniqueDownloadHashes(hashes);
         const capacityBytes = this.memoryBudget?.snapshot?.().capacityBytes ??
             transientMemorySnapshot().capacityBytes;
         // The estimator is linear: retained plaintext plus six transport
@@ -1162,23 +1170,20 @@ export class ObsetyncApi {
     ): Promise<Map<string, Uint8Array>> {
         // Compatibility API: bare maps have no release boundary. Do not grant
         // and immediately release an admission behind this naked return type.
-        return this.getObjectsInternal(kind, hashes, perf, undefined, signal);
+        throwIfBulkCancelled(signal);
+        return this.getObjectsInternal(kind, uniqueDownloadHashes(hashes), perf, undefined, signal);
     }
 
     private async getObjectsInternal(
         kind: BulkObjectKind,
-        hashes: readonly string[],
+        unique: readonly string[],
         perf?: PerfOperation,
         memory?: { work: TransientWorkContext; retentionBytes: number },
         signal?: AbortSignal,
     ): Promise<Map<string, Uint8Array>> {
         throwIfBulkCancelled(signal);
-        const unique = [...new Set(hashes.map((hash) => hash.toLowerCase()))];
         const output = new Map<string, Uint8Array>();
         if (unique.length === 0) return output;
-        if (unique.length > BULK_MAX_OBJECTS) {
-            throw new RangeError("bulk get caller exceeded the bounded apply object cap");
-        }
         const localRetentionBytes = memory?.retentionBytes ?? (this.runtime === "mobile"
             ? BULK_MOBILE_MAX_BYTES
             : BULK_SERVER_MAX_BYTES);
