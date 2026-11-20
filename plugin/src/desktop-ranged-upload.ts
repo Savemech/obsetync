@@ -228,6 +228,7 @@ export async function openQualifiedDesktopRangeSource(
 function validateRanges(
     sourceSize: number,
     ranges: readonly DesktopMissingRange[],
+    maxBufferedBytes: number,
 ): void {
     if (!Number.isSafeInteger(sourceSize) || sourceSize < 0) throw new RangeError("invalid range source size");
     let previousEnd = 0;
@@ -237,7 +238,7 @@ function validateRanges(
             !range || !validHash(range.hash) || hashes.has(range.hash) ||
             !Number.isSafeInteger(range.offset) || range.offset < previousEnd ||
             !Number.isSafeInteger(range.size) || range.size <= 0 ||
-            range.size > MAX_FASTCDC_CHUNK_BYTES ||
+            range.size > MAX_FASTCDC_CHUNK_BYTES || range.size > maxBufferedBytes ||
             range.offset > sourceSize - range.size
         ) {
             throw new RangeError("invalid or overlapping desktop upload ranges");
@@ -247,12 +248,6 @@ function validateRanges(
     }
 }
 
-export interface BoundedRangeReader {
-    read(offset: number, size: number): Promise<Uint8Array>;
-    verify(): Promise<void>;
-    close(): Promise<void>;
-}
-
 /** Shared bounded queue/ACK discipline for an already-qualified ranged
  * reader. Source qualification remains platform-specific. */
 export async function uploadMissingRangesWithReader(
@@ -260,19 +255,8 @@ export async function uploadMissingRangesWithReader(
     ranges: readonly DesktopMissingRange[],
     putRecords: (records: readonly BulkUploadRecord[]) => Promise<void>,
     finalize: () => Promise<void>,
-    openReader: () => Promise<BoundedRangeReader>,
+    openReader: () => Promise<DesktopRangeReader>,
     options: DesktopRangedUploadOptions = {},
-): Promise<DesktopRangedUploadResult> {
-    validateRanges(sourceSize, ranges);
-    return uploadValidatedMissingRanges(ranges, putRecords, finalize, openReader, options);
-}
-
-async function uploadValidatedMissingRanges(
-    ranges: readonly DesktopMissingRange[],
-    putRecords: (records: readonly BulkUploadRecord[]) => Promise<void>,
-    finalize: () => Promise<void>,
-    openReader: () => Promise<BoundedRangeReader>,
-    options: DesktopRangedUploadOptions,
 ): Promise<DesktopRangedUploadResult> {
     const maxBufferedBytes = options.maxBufferedBytes ?? DESKTOP_RANGE_QUEUE_BYTES;
     const maxBufferedRecords = options.maxBufferedRecords ?? DESKTOP_RANGE_QUEUE_RECORDS;
@@ -285,6 +269,7 @@ async function uploadValidatedMissingRanges(
         throw new RangeError("invalid desktop range queue bounds");
     }
 
+    validateRanges(sourceSize, ranges, maxBufferedBytes);
     const reader = await openReader();
     let primaryError: unknown;
     let pending: BulkUploadRecord[] = [];
@@ -318,8 +303,8 @@ async function uploadValidatedMissingRanges(
             await reader.verify();
             const data = await reader.read(range.offset, range.size);
             readMs += Math.max(0, now() - readStarted);
-            if (data.byteLength !== range.size) {
-                throw driftError("ranged upload returned a truncated chunk");
+            if (data.byteLength !== range.size || data.buffer.byteLength > range.size) {
+                throw driftError("range bytes differ from the admitted source size");
             }
             if (options.verifyRange) await options.verifyRange(data, range.hash);
             pending.push({

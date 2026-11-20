@@ -1,5 +1,5 @@
 import { BulkObjectKind, type BulkUploadRecord } from "./bulk-codec";
-import { HashWorkerFileDriftError, type DesktopHashWorkerPool } from "./desktop-hash-workers";
+import type { DesktopHashWorkerPool } from "./desktop-hash-workers";
 import {
     uploadDesktopMissingRanges,
     openDesktopRangeReader,
@@ -127,9 +127,6 @@ export async function reconcileDesktopLargeFile(
                         throwIfWorkAborted(signal);
                         const data = await reader.read(offset, size);
                         throwIfWorkAborted(signal);
-                        if (data.byteLength !== size || data.buffer.byteLength > size) {
-                            throw new HashWorkerFileDriftError("range exceeded admitted source bytes");
-                        }
                         return data;
                     },
                     close: () => reader.close(),

@@ -204,9 +204,9 @@ reviewed	plugin/src/delta-validation.test.ts	tests	60 assertions including dot a
 reviewed	plugin/src/delta-validation.ts	production	Reviewed legacy JSON actions, path/rename uniqueness and bounds; shared path predicate no longer expands code points or splits segments; differential parity over 131966 inputs
 pending	plugin/src/desktop-hash-workers.test.ts	tests	Not reviewed
 read	plugin/src/desktop-hash-workers.ts	production	Traced worker result fingerprint validation; exact result timestamp agrees with native observation; pool lifecycle review pending
-pending	plugin/src/desktop-ranged-upload.bench.ts	tooling	Not reviewed
-pending	plugin/src/desktop-ranged-upload.test.ts	tests	Not reviewed
-read	plugin/src/desktop-ranged-upload.ts	production	Traced range source qualification, native handle/path checks and fingerprint sharing; exact native timestamp regression; complete queue audit pending
+reviewed	plugin/src/desktop-ranged-upload.bench.ts	tooling	Ran bench:ranged against 256 MiB and 20 GiB sparse files; observed positional offsets/lengths and delayed ACK before manifest; benchmark rejects both wrong-offset and omitted-await mutations
+reviewed	plugin/src/desktop-ranged-upload.test.ts	tests	Traced queue bounds, drift, ordered retry, asynchronous verification, failed cleanup, empty bitmap and native path replacement cases; added rejection before open and oversized backing with close
+reviewed	plugin/src/desktop-ranged-upload.ts	production	Read source qualification, reader, input validation, queue, ACK and close paths; traced desktop push/repair and mobile borrowed ranges; oversized singleton and backing-store regressions; W4 real sparse reads and finalization order
 pending	plugin/src/desktop-reconcile-upload.test.ts	tests	Not reviewed
 pending	plugin/src/desktop-reconcile-upload.ts	production	Not reviewed
 pending	plugin/src/desktop-verified-read.test.ts	tests	Not reviewed

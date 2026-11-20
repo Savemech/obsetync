@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import {
     DESKTOP_RANGE_QUEUE_BYTES,
+    openDesktopRangeReader,
     uploadDesktopMissingRanges,
 } from "./desktop-ranged-upload";
 
@@ -38,6 +39,8 @@ async function runSparseCase(directory: string, label: string, size: number) {
     let transportCalls = 0;
     let transportBytes = 0;
     let manifests = 0;
+    let acknowledgedBytes = 0;
+    let nextRange = 0;
     const started = performance.now();
     const result = await uploadDesktopMissingRanges(
         source,
@@ -52,13 +55,33 @@ async function runSparseCase(directory: string, label: string, size: number) {
                 peakArrayBuffers,
                 process.memoryUsage().arrayBuffers,
             );
+            await new Promise<void>(resolve => setImmediate(resolve));
+            acknowledgedBytes = transportBytes;
         },
-        async () => { manifests++; },
+        async () => {
+            if (acknowledgedBytes !== 8 * MIB) throw new Error("manifest preceded chunk ACK");
+            manifests++;
+        },
+        {
+            openReader: async source => {
+                const reader = await openDesktopRangeReader(source);
+                return {
+                    ...reader,
+                    read: (offset, length) => {
+                        const range = ranges[nextRange++];
+                        if (range?.offset !== offset || range.size !== length) {
+                            throw new Error("unexpected sparse file range");
+                        }
+                        return reader.read(offset, length);
+                    },
+                };
+            },
+        },
     );
     const elapsedMs = performance.now() - started;
     if (
         result.uploadedBytes !== 8 * MIB ||
-        result.uploadedRanges !== 2 ||
+        result.uploadedRanges !== 2 || nextRange !== ranges.length ||
         result.peakBufferedBytes > DESKTOP_RANGE_QUEUE_BYTES ||
         transportCalls !== 1 || transportBytes !== 8 * MIB || manifests !== 1
     ) {

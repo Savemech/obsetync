@@ -369,6 +369,22 @@ async function noMissingRangesNeverReadOrValidateBytes(): Promise<void> {
         "empty missing bitmap changed source/finalization guards");
 }
 
+async function oversizedBackingCannotEnterQueue(): Promise<void> {
+    const events: string[] = [];
+    let failure: unknown;
+    try {
+        await uploadDesktopMissingRanges(source(4), [{ hash: hash("e"), offset: 0, size: 4 }],
+            async () => { events.push("upload"); }, async () => { events.push("manifest"); },
+            { openReader: async () => ({
+                verify: async () => {},
+                read: async () => new Uint8Array(32).subarray(4, 8),
+                close: async () => { events.push("close"); },
+            }) });
+    } catch (error) { failure = error; }
+    check(failure instanceof HashWorkerFileDriftError, "oversized range backing was accepted");
+    check(events.join(",") === "close", "oversized backing entered the queue or leaked the reader");
+}
+
 async function hostileRangesAreRejectedBeforeOpening(): Promise<void> {
     let opened = 0;
     const openReader = async (): Promise<DesktopRangeReader> => {
@@ -402,6 +418,14 @@ async function hostileRangesAreRejectedBeforeOpening(): Promise<void> {
         }
         check(rejected, "hostile range metadata was accepted");
     }
+    let rejectedOversize = false;
+    try {
+        await uploadDesktopMissingRanges(source(8), [{ hash: hash("e"), offset: 0, size: 8 }],
+            async () => {}, async () => {}, { maxBufferedBytes: 4, openReader });
+    } catch (error) {
+        rejectedOversize = error instanceof RangeError;
+    }
+    check(rejectedOversize, "single range exceeded the configured queue limit");
     check(opened === 0, "invalid ranges reached the filesystem");
 
     const original = source(10).fingerprint;
@@ -464,6 +488,7 @@ void twentyGiBSourceKeepsAnEightMiBQueue()
     .then(asynchronousValidationPrecedesQueueAndNextRead)
     .then(lateVerificationFailureRetainsReaderAndAdmittedWork)
     .then(noMissingRangesNeverReadOrValidateBytes)
+    .then(oversizedBackingCannotEnterQueue)
     .then(hostileRangesAreRejectedBeforeOpening)
     .then(pathnameReplacementIsDetectedByTheRealReader)
     .then(() => {
