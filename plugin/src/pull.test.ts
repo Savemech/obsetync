@@ -655,6 +655,23 @@ async function editArrivingDuringDownloadDefersRemoteWrite(): Promise<void> {
     check(writes === 0, "remote bytes overwrote an edit that arrived during download");
     check(result.deferredCount === 1, "mid-download local edit was not deferred");
     check(result.localDeferredCount === 1, "mid-download deferral lost its local reason");
+
+    api.getContent = async () => new Uint8Array([1, 2, 3, 4]);
+    let baseUpdates = 0;
+    syncBase.setEntry = () => { baseUpdates++; };
+    for (const change of ["edited", "removed", "resized"]) {
+        writes = 0;
+        dirty = false;
+        io.stat = async () => {
+            if (!writes || change === "removed") return null;
+            dirty = change === "edited";
+            return { mtime: 8, size: change === "resized" ? 9 : 4 };
+        };
+        const raced = await pull(api, io, syncBase, "vault", "base-root", wasm, tree,
+            undefined, undefined, { has: () => dirty });
+        check(writes === 1 && raced.localDeferredCount === 1 && baseUpdates === 0,
+            `post-write ${change} file was recorded as a verified download`);
+    }
 }
 
 async function untrackedLocalCollisionIsPreservedBeforePullWrite(): Promise<void> {

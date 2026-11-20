@@ -1929,11 +1929,12 @@ async function finishContentDownload(
         if (!applied) return false;
     }
     const postStat = await io.stat(delta.path);
+    if (!postStat || shouldDefer?.() || (delta.size != null && postStat.size !== delta.size)) return false;
     syncBase.setEntry(
         delta.path,
         delta.hash,
-        postStat?.mtime ?? Date.now(),
-        postStat?.size ?? size,
+        postStat.mtime,
+        postStat.size,
         delta.mtime_ms,
     );
     stats.downloaded++;
