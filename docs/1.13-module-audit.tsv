@@ -53,7 +53,7 @@ read	crates/sync-core/src/chunk.rs	production	Traced v1 table layout and sorted 
 reviewed	crates/sync-core/src/conflict.rs	production	Read classification, diff collection, byte assembly and serialized resolution types; replaced insert-skipping merge logic; exact CRLF, insertion, same-position conflict and terminal-newline tests; native two-client wire test
 reviewed	crates/sync-core/src/content_store.rs	production	Traced memory/disk trait versus server StorageWriter and merge callers; both test stores reject incorrect blob addresses; corrupt JSON, directory IO, missing and valid manifests tested
 pending	crates/sync-core/src/diff.rs	production	Not reviewed
-pending	crates/sync-core/src/diff_page.rs	production	Not reviewed
+reviewed	crates/sync-core/src/diff_page.rs	production	Traced sorted delta paging through the server and performance harness. Encode a single continuation directly into each nonfinal page. Validated exact byte cap for a multibyte rename and resume identity.
 reviewed	crates/sync-core/src/fastcdc_chunker.rs	production	Checked streaming and one-shot parity, fixed window, empty files and public reassembly helper. Validate offsets, actual chunk hashes and total before reserving output.
 reviewed	crates/sync-core/src/hash.rs	production	Traced hash conversions through WASM, HTTP, storage and E2E callers; fixed-array hex decode preserves results and exact errors on 24,897 inputs; zero allocations for 10,000 valid hashes
 reviewed	crates/sync-core/src/lib.rs	production	Checked public exports, feature graph and native dependencies. Four private plugin-only modules now compile only for WASM bindings and unit tests.
@@ -271,7 +271,7 @@ pending	plugin/src/object-confirmation-store.test.ts	tests	Not reviewed
 pending	plugin/src/object-confirmation-store.ts	production	Not reviewed
 reviewed	plugin/src/operation-checkpoint.test.ts	tests	Reviewed progress coalescing, barrier ordering, cancellation by replacement and IO errors; injected promotion/cleanup failures and invalid persisted timestamps across restarts
 reviewed	plugin/src/operation-checkpoint.ts	production	Traced serialized marker lifecycle, startup hold and governor use; preserve sole copy on failed archive, deduplicate successful promotion after failed cleanup, distinguish caught failures and validate renderable timestamps
-pending	plugin/src/paged-pull.test.ts	tests	Not reviewed
+reviewed	plugin/src/paged-pull.test.ts	tests	Checked renderer restart, torn or unpublished WAL data, immutable root verification and retirement before cursor persistence. All 56 fixture assertions passed.
 pending	plugin/src/perf-governor.test.ts	tests	Not reviewed
 pending	plugin/src/perf-overhead.bench.ts	tooling	Not reviewed
 pending	plugin/src/perf-trace.test.ts	tests	Not reviewed
@@ -293,7 +293,7 @@ reviewed	plugin/src/priority-sort.ts	production	Traced synchronous and reviewed 
 pending	plugin/src/pull-echo.test.ts	tests	Not reviewed
 pending	plugin/src/pull-echo.ts	production	Not reviewed
 pending	plugin/src/pull.test.ts	tests	Not reviewed
-pending	plugin/src/pull.ts	production	Not reviewed
+read	plugin/src/pull.ts	production	Traced paged snapshot ordering, filtering, deferred-page checkpoints and final root verification. Recovery after a pinned snapshot expires and remaining apply paths need review.
 pending	plugin/src/push-memory.test.ts	tests	Not reviewed
 pending	plugin/src/push-memory.ts	production	Not reviewed
 pending	plugin/src/push-prepared.test.ts	tests	Not reviewed

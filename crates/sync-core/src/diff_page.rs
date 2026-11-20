@@ -21,7 +21,8 @@ pub const MIN_PAGE_BYTES: usize = 64 * 1024;
 pub const MAX_PAGE_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_PAGE_RECORDS: usize = 8_192;
 pub const MAX_PATH_BYTES: usize = 4_096;
-pub const MAX_CURSOR_BYTES: usize = 4 + 1 + 32 + 32 + 1 + 2 + 2 + 2 * MAX_PATH_BYTES;
+const CURSOR_HEADER_BYTES: usize = 4 + 1 + 32 + 32 + 1 + 2 + 2;
+pub const MAX_CURSOR_BYTES: usize = CURSOR_HEADER_BYTES + 2 * MAX_PATH_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodecError(String);
@@ -126,7 +127,7 @@ pub fn decode_request(bytes: &[u8]) -> Result<DiffPageRequest, CodecError> {
     })
 }
 
-/// Deterministically order a materialized Tree v1 delta for cursor paging.
+/// Deterministically order a materialized tree delta for cursor paging.
 /// Duplicate target paths are rejected rather than relying on action order to
 /// make an invalid semantic delta appear well-formed.
 pub fn sort_and_validate_deltas(deltas: &mut [FileDelta]) -> Result<(), CodecError> {
@@ -139,9 +140,6 @@ pub fn sort_and_validate_deltas(deltas: &mut [FileDelta]) -> Result<(), CodecErr
             return Err(CodecError::new(
                 "diff touches one target path more than once",
             ));
-        }
-        if compare_deltas(&pair[0], &pair[1]) != Ordering::Less {
-            return Err(CodecError::new("diff records are not strictly ordered"));
         }
     }
     Ok(())
@@ -179,20 +177,20 @@ pub fn encode_page(
 
     let mut record_bytes = 0usize;
     let mut end = start;
-    let mut next_cursor = Vec::new();
+    let mut cursor_len = 0;
     while end < deltas.len() && end - start < request.max_records {
         let encoded_len = encoded_record_len(&deltas[end])?;
         let candidate_record_bytes = record_bytes
             .checked_add(encoded_len)
             .ok_or_else(|| CodecError::new("diff page length overflow"))?;
         let candidate_end = end + 1;
-        let candidate_cursor = if candidate_end < deltas.len() {
-            encode_cursor(from_root, to_root, &deltas[end])?
+        let candidate_cursor_len = if candidate_end < deltas.len() {
+            CURSOR_HEADER_BYTES + delta_path(&deltas[end]).len() + old_path(&deltas[end]).len()
         } else {
-            Vec::new()
+            0
         };
         let candidate_total = PAGE_HEADER_BYTES
-            .checked_add(candidate_cursor.len())
+            .checked_add(candidate_cursor_len)
             .and_then(|size| size.checked_add(candidate_record_bytes))
             .ok_or_else(|| CodecError::new("diff page length overflow"))?;
         if candidate_total > request.max_plain_bytes {
@@ -204,33 +202,29 @@ pub fn encode_page(
             break;
         }
         record_bytes = candidate_record_bytes;
-        next_cursor = candidate_cursor;
+        cursor_len = candidate_cursor_len;
         end = candidate_end;
     }
 
     let record_count = end - start;
     let has_more = end < deltas.len();
-    if has_more && next_cursor.is_empty() {
-        let previous = end
-            .checked_sub(1)
-            .ok_or_else(|| CodecError::new("diff page made no cursor progress"))?;
-        next_cursor = encode_cursor(from_root, to_root, &deltas[previous])?;
+    if has_more && record_count == 0 {
+        return Err(CodecError::new("diff page made no cursor progress"));
     }
-    if !has_more {
-        next_cursor.clear();
-    }
-    let cursor_len = u16::try_from(next_cursor.len())
-        .map_err(|_| CodecError::new("diff cursor length overflow"))?;
+    let cursor_len =
+        u16::try_from(cursor_len).map_err(|_| CodecError::new("diff cursor length overflow"))?;
     let count =
         u32::try_from(record_count).map_err(|_| CodecError::new("diff record count overflow"))?;
-    let capacity = PAGE_HEADER_BYTES + next_cursor.len() + record_bytes;
+    let capacity = PAGE_HEADER_BYTES + usize::from(cursor_len) + record_bytes;
     let mut output = Vec::with_capacity(capacity);
     output.extend_from_slice(PAGE_MAGIC);
     output.extend_from_slice(&from_root);
     output.extend_from_slice(&to_root);
     output.extend_from_slice(&count.to_le_bytes());
     output.extend_from_slice(&cursor_len.to_le_bytes());
-    output.extend_from_slice(&next_cursor);
+    if has_more {
+        encode_cursor(from_root, to_root, &deltas[end - 1], &mut output)?;
+    }
     for delta in &deltas[start..end] {
         encode_record(delta, &mut output)?;
     }
@@ -321,14 +315,14 @@ fn encode_cursor(
     from_root: FileHash,
     to_root: FileHash,
     delta: &FileDelta,
-) -> Result<Vec<u8>, CodecError> {
+    output: &mut Vec<u8>,
+) -> Result<(), CodecError> {
     let path = delta_path(delta).as_bytes();
     let old_path = old_path(delta).as_bytes();
     let path_len =
         u16::try_from(path.len()).map_err(|_| CodecError::new("cursor path length overflow"))?;
     let old_path_len = u16::try_from(old_path.len())
         .map_err(|_| CodecError::new("cursor old path length overflow"))?;
-    let mut output = Vec::with_capacity(4 + 1 + 32 + 32 + 1 + 2 + 2 + path.len() + old_path.len());
     output.extend_from_slice(CURSOR_MAGIC);
     output.push(CURSOR_VERSION);
     output.extend_from_slice(&from_root);
@@ -338,12 +332,11 @@ fn encode_cursor(
     output.extend_from_slice(&old_path_len.to_le_bytes());
     output.extend_from_slice(path);
     output.extend_from_slice(old_path);
-    Ok(output)
+    Ok(())
 }
 
 fn decode_cursor(bytes: &[u8]) -> Result<DiffCursor, CodecError> {
-    const FIXED: usize = 4 + 1 + 32 + 32 + 1 + 2 + 2;
-    if bytes.len() < FIXED || bytes.len() > MAX_CURSOR_BYTES {
+    if bytes.len() < CURSOR_HEADER_BYTES || bytes.len() > MAX_CURSOR_BYTES {
         return Err(CodecError::new("diff cursor length is invalid"));
     }
     if bytes.get(..4) != Some(CURSOR_MAGIC.as_slice()) || bytes[4] != CURSOR_VERSION {
@@ -363,15 +356,15 @@ fn decode_cursor(bytes: &[u8]) -> Result<DiffCursor, CodecError> {
     if action == 4 && old_path_len == 0 || action != 4 && old_path_len != 0 {
         return Err(CodecError::new("diff cursor fields do not match action"));
     }
-    let expected = FIXED
+    let expected = CURSOR_HEADER_BYTES
         .checked_add(path_len)
         .and_then(|size| size.checked_add(old_path_len))
         .ok_or_else(|| CodecError::new("diff cursor length overflow"))?;
     if bytes.len() != expected {
         return Err(CodecError::new("diff cursor has trailing or missing bytes"));
     }
-    let path_end = FIXED + path_len;
-    let path = std::str::from_utf8(&bytes[FIXED..path_end])
+    let path_end = CURSOR_HEADER_BYTES + path_len;
+    let path = std::str::from_utf8(&bytes[CURSOR_HEADER_BYTES..path_end])
         .map_err(|_| CodecError::new("diff cursor path is not UTF-8"))?
         .to_owned();
     let old_path = std::str::from_utf8(&bytes[path_end..])
@@ -554,7 +547,8 @@ mod tests {
         let huge_page = request_bytes(root(1), [0; 32], 1, (MAX_PAGE_BYTES + 1) as u32, &[]);
         assert!(decode_request(&huge_page).is_err());
 
-        let cursor = encode_cursor(root(1), root(2), &added("a.md", 7)).unwrap();
+        let mut cursor = Vec::new();
+        encode_cursor(root(1), root(2), &added("a.md", 7), &mut cursor).unwrap();
         let substituted = request_bytes(root(1), root(3), 1, MIN_PAGE_BYTES as u32, &cursor);
         assert!(decode_request(&substituted).is_err());
 
@@ -565,7 +559,8 @@ mod tests {
             size: 9,
             mtime_ms: 9,
         };
-        let cursor = encode_cursor(root(1), root(2), &self_rename).unwrap();
+        cursor.clear();
+        encode_cursor(root(1), root(2), &self_rename, &mut cursor).unwrap();
         let invalid = request_bytes(root(1), root(2), 1, MIN_PAGE_BYTES as u32, &cursor);
         assert!(decode_request(&invalid).is_err());
     }
@@ -601,6 +596,40 @@ mod tests {
             u16::from_le_bytes(second.bytes[72..74].try_into().unwrap()),
             0
         );
+    }
+
+    #[test]
+    fn rename_cursor_fits_the_exact_byte_cap() {
+        let from = root(1);
+        let to = root(2);
+        let rename = FileDelta::Renamed {
+            path: "é.md".into(),
+            old_path: "資料.md".into(),
+            hash: root(9),
+            size: 12,
+            mtime_ms: 8,
+        };
+        let cap = PAGE_HEADER_BYTES
+            + CURSOR_HEADER_BYTES
+            + "é.md".len()
+            + "資料.md".len()
+            + encoded_record_len(&rename).unwrap();
+        let deltas = [rename, added("終.md", 3)];
+        let first = encode_page(from, to, &deltas, &request(from, 1, cap)).unwrap();
+        assert_eq!(first.bytes.len(), cap);
+        assert!(encode_page(from, to, &deltas, &request(from, 1, cap - 1)).is_err());
+        let len = usize::from(read_u16(&first.bytes, 72).unwrap());
+        let cursor =
+            decode_cursor(&first.bytes[PAGE_HEADER_BYTES..PAGE_HEADER_BYTES + len]).unwrap();
+        let continuation = DiffPageRequest {
+            to_root: Some(to),
+            cursor: Some(cursor),
+            ..request(from, 1, cap)
+        };
+        let last = encode_page(from, to, &deltas, &continuation).unwrap();
+        assert_eq!(last.record_count, 1);
+        assert!(!last.has_more);
+        assert_eq!(read_u16(&last.bytes, 72).unwrap(), 0);
     }
 
     #[test]
