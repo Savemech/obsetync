@@ -65,14 +65,14 @@ function fixture() {
         free() { assert.equal(++this.state.frees, 1, "WASM owner freed more than once"); this.inner.destroy(); }
     }
     const api: VerifyConflictContentOptions["api"] = {
-        async getObjectsOwned(kind, hashes) {
+        async getObjectsOwned(kind, hashes, _perf, signal) {
             assert.equal(hashes.length, 1, "download was not a bounded single-object pack");
             assert.equal(active, 0, "new global admission while earlier download owner still retained");
             calls.push({ kind, hash: hashes[0] });
             const data = objects.get(`${kind}:${hashes[0]}`);
             const ownerBytes = data?.byteLength ?? 0;
             const workBytes = estimateTransportWorkset(ownerBytes);
-            const memory = await reserveTransientScope({ ownerBytes, workBytes }, { budget });
+            const memory = await reserveTransientScope({ ownerBytes, workBytes }, { budget, signal });
             owners.push(memory); active++;
             let map = new Map<string, Uint8Array>(data ? [[hashes[0], data]] : []);
             map = replaceMap ? replaceMap(map) : map;
@@ -116,7 +116,7 @@ function fixture() {
         drained() {
             assert.equal(active, 0); assert.equal(budget.snapshot().usedBytes, 0);
             assert.equal(budget.snapshot().queuedRequests, 0);
-            assert.equal(releases, calls.length);
+            assert.equal(releases, owners.length);
             for (const state of states) assert.equal(state.frees, 1, "WASM verifier leaked on a terminal path");
             for (const owner of owners) assert.equal(owner.snapshot().parentReleased, true);
         },
@@ -316,6 +316,21 @@ async function failedConsumerRetainsAlreadyStartedNativeTask() {
 }
 
 async function downloadAndFeedCancellation() {
+    const queued = fixture(), abortQueued = new AbortController();
+    const blocker = await queued.budget.reserve(queued.budget.snapshot().capacityBytes);
+    const waiting = rejection(queued.run(hash(bytes(0)), 0, { signal: abortQueued.signal }));
+    await turns();
+    assert.equal(queued.budget.snapshot().queuedRequests, 1);
+    const cancelled = new Error("cancel before download admission");
+    abortQueued.abort(cancelled);
+    try {
+        assert.equal(queued.budget.snapshot().queuedRequests, 0, "cancelled download still waiting for memory");
+        assert.equal(await waiting, cancelled);
+        assert.equal(queued.active, 0);
+        assert.equal(queued.owners.length, 0);
+    } finally { blocker.release(); }
+    queued.drained();
+
     const f = fixture(), data = bytes(20), digest = hash(data);
     f.put(BulkObjectKind.Content, digest, data);
     const ready = deferred<void>(), native = deferred<void>(), controller = new AbortController();

@@ -138,9 +138,8 @@ async function parseManifest(data: Uint8Array, expectedHash: string, expectedSiz
 /** Fetches/verifies only the immutable losing side, never current local data.
  * Sequential one-object packs keep ownership bounded even for legal 4 MiB
  * chunks. There is no resume-by-size/stat shortcut and no destination publish.
- * The caller must join this promise on shutdown: getObjectsOwned presently
- * has no cancellation/per-request-size parameter, so its actual native request
- * must settle before we can release the returned owner or WASM state.
+ * Cancellation reaches download admission and transport. The caller must
+ * still join this promise on shutdown before releasing verification state.
  *
  * API receive allocation is bounded by that API (single manifest/chunk up to
  * 4 MiB), not by our tighter manifest parse cap. Initial native requestUrl
@@ -167,7 +166,7 @@ export async function verifyConflictContent(options: VerifyConflictContentOption
         await options.beforeBatch?.();
         abort();
         const end = perf?.phase("download");
-        try { return await api.getObjectsOwned(kind, [hash], perf); }
+        try { return await api.getObjectsOwned(kind, [hash], perf, signal); }
         finally { end?.(); }
     };
     abort();
