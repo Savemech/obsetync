@@ -129,6 +129,7 @@ export function summarizeNativeRootResults(results) {
         if (callbackPresence[0] && runs.some(run => {
             const callback = run.callback, exact = callback.callbackToExactAccepted;
             const opportunity = callback.callbackToExactAcceptedRootOpportunity;
+            const count = opportunity?.rootAdmissionOpportunities?.p95;
             return callback.probes !== NATIVE_ROOT_EXPECTED_CALLBACK_PROBES ||
                 !Number.isSafeInteger(callback.exactPublished) ||
                 callback.exactPublished < NATIVE_ROOT_MIN_EXACT_CALLBACK_PROBES ||
@@ -139,7 +140,7 @@ export function summarizeNativeRootResults(results) {
                 exact?.samples !== callback.exactPublished || !Number.isFinite(exact.p95Ms) ||
                 opportunity?.samples !== callback.exactPublished ||
                 opportunity.rootAdmissionOpportunities?.samples !== callback.exactPublished ||
-                !Number.isFinite(opportunity.rootAdmissionOpportunities.p95);
+                !Number.isSafeInteger(count) || count < 1;
         })) throw new Error("native root exact callback samples are incomplete");
         const drain = distribution(runs.map(run => run.durationMs));
         const throughput = distribution(runs.map(run => run.bulkFilesPerSecond));

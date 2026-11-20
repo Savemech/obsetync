@@ -84,6 +84,13 @@ test("qualification fails closed when callback placement escapes three root oppo
     assert.match(status.reasons.join("\n"), /exact callback root opportunities exceed 3/);
 });
 
+test("a valid aggregate cannot hide an impossible per-run opportunity count", () => {
+    for (const invalid of [0, 1.5]) {
+        assert.throws(() => qualificationSummary({ opportunities: [invalid, 2, 2, 2, 3] }),
+            /exact callback samples are incomplete/);
+    }
+});
+
 test("qualification rejects missing, incomplete and non-finite exact result evidence", () => {
     const missing = nativeRootQualificationStatus("all", 5, 25000);
     assert.equal(missing.localSamplingEligible, false);
