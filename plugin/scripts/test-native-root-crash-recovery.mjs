@@ -154,16 +154,19 @@ try {
             adminUrl: server.adminUrl, enrollment, scenario: options.scenario };
         const expectedBoundary = options.scenario === "root-accepted-before-response"
             ? "root-accepted-before-local-receipt" : "objects-acked-before-root";
-        let boundarySeen = false, crashError;
+        const crashStderr = []; // runNativeRootChild bounds stderr before delivery.
+        let crashError;
         try {
             await runChild(bundle, { ...params, mode: "crash" }, {
-                onStderr: chunk => { if (chunk.includes(`"phase":"${expectedBoundary}"`)) boundarySeen = true; },
+                onStderr: chunk => crashStderr.push(chunk),
             });
         } catch (error) { crashError = error; }
         assert(crashError instanceof NativeRootChildError); assert.equal(crashError.code, "CHILD_FAILED");
         assert.equal(crashError.outcome.signal, "SIGKILL"); assert.equal(crashError.outcome.exitCode, null);
         assert.equal(crashError.outcome.forcedGroupKill, false); assert.equal(crashError.outcome.safeToCleanup, true);
-        assert.equal(crashError.outcome.groupExecutableMembers, 0); assert.equal(boundarySeen, true);
+        assert.equal(crashError.outcome.groupExecutableMembers, 0);
+        const boundaryLine = JSON.stringify({ phase: expectedBoundary, mode: "crash" });
+        assert(crashStderr.join("").split("\n").includes(boundaryLine), "missing crash boundary record");
         const recovered = await runChild(bundle, { ...params, mode: "recover" }, {
             onStderr: chunk => { process.stderr.write(chunk); },
         });

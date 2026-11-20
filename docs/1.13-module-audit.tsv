@@ -134,7 +134,7 @@ reviewed	plugin/scripts/conflict-ui-lifecycle.test.mjs	tests	Read and ran stale 
 read	plugin/scripts/diagnose-root-drain.mjs	tooling	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
 pending	plugin/scripts/lib/native-root-audit-diagnostic.mjs	tooling	Not reviewed
 pending	plugin/scripts/lib/native-root-auto-diagnostic.mjs	tooling	Not reviewed
-pending	plugin/scripts/lib/native-root-child.mjs	tooling	Not reviewed
+reviewed	plugin/scripts/lib/native-root-child.mjs	tooling	Traced bounded output delivery, graceful and forced termination, group inspection and caller cleanup; ten Linux process tests passed
 pending	plugin/scripts/lib/native-root-crash-fixture.mjs	tooling	Not reviewed
 pending	plugin/scripts/lib/native-root-fixture.mjs	tooling	Not reviewed
 pending	plugin/scripts/lib/native-root-instrumentation.mjs	tooling	Not reviewed
@@ -145,7 +145,7 @@ reviewed	plugin/scripts/lib/native-root-qualification.mjs	tooling	Traced fixture
 reviewed	plugin/scripts/lib/native-root-server.mjs	tooling	Read complete fixture ownership, explicit binary, random loopback ports, origin allowlist, request caps and teardown; reused for old/fixed realtime regression without production data
 pending	plugin/scripts/native-root-audit-diagnostic.test.mjs	tests	Not reviewed
 pending	plugin/scripts/native-root-auto-diagnostic.test.mjs	tests	Not reviewed
-pending	plugin/scripts/native-root-child.test.mjs	tests	Not reviewed
+reviewed	plugin/scripts/native-root-child.test.mjs	tests	Reviewed process, timeout, orphan, observer and output-limit cases; all ten passed outside restricted sandbox
 pending	plugin/scripts/native-root-instrumentation.test.mjs	tests	Not reviewed
 pending	plugin/scripts/native-root-io.test.mjs	tests	Not reviewed
 reviewed	plugin/scripts/native-root-metrics.test.mjs	tests	Reproduced stale group cleanup overwriting caller assignment; metrics, qualification and instrumentation suites pass (28 tests)
@@ -155,7 +155,7 @@ read	plugin/scripts/run-tests.mjs	tooling	Removed obsolete debounce mocks or unu
 read	plugin/scripts/run-tests.test.mjs	tests	Updated build/installer contracts and verified 26 targeted cases; full runner fixture semantics still under review
 reviewed	plugin/scripts/settings-fence.test.mjs	tests	Read bundled settings controls and fixture; eight cases pass, including all 13 settings mutation controls and recovery UI after a failed credential save
 read	plugin/scripts/test-main-lifecycle.mjs	tooling	Read bundle fixture/owner/IO ports and enrollment regressions; actual main has 40 passing scenarios / 411 assertions; entire runner and all scenario bodies still require review
-read	plugin/scripts/test-native-root-crash-recovery.mjs	tooling	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
+reviewed	plugin/scripts/test-native-root-crash-recovery.mjs	tooling	Validated exact phase records across stderr chunks; both crash and fresh-process recovery scenarios passed on local native debug server
 pending	plugin/scripts/test-native-root-mutation-complexity.mjs	tooling	Not reviewed
 pending	plugin/scripts/test-native-root-server.mjs	tooling	Not reviewed
 pending	plugin/scripts/test-native-ws-data.mjs	tooling	Not reviewed
