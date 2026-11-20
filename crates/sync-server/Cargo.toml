@@ -21,8 +21,7 @@ http-body = "1"
 # broadcast frames while another reads client subs/pings.
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 clap = { version = "4", features = ["derive"] }
-tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors"] }
+tower-http = { version = "0.6", features = ["cors"] }
 # Vault export: tar assembled into an anonymous tempfile (auto-reclaimed by
 # the OS on close), streamed out via tokio-util's ReaderStream — bounded
 # memory regardless of vault size.
@@ -45,6 +44,5 @@ aes-gcm = { version = "0.10", default-features = false, features = ["aes", "allo
 zeroize = { version = "1", features = ["zeroize_derive"] }
 
 [dev-dependencies]
-tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

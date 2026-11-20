@@ -1,4 +1,6 @@
+#[cfg(any(feature = "wasm", test))]
 pub(crate) mod candidate_mutation_v1;
+#[cfg(any(feature = "wasm", test))]
 pub(crate) mod candidate_mutation_v2;
 pub mod chunk;
 pub mod conflict;

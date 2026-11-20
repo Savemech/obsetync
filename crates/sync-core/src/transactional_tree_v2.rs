@@ -1,3 +1,4 @@
+#[cfg(any(feature = "wasm", test))]
 use crate::candidate_mutation_v2::{V2CandidateMutation, V2MutationProgress};
 use crate::chunk::{ChunkError, FileEntry};
 use crate::hash::FileHash;
@@ -418,6 +419,7 @@ impl TransactionalTreeV2 {
         Ok(())
     }
 
+    #[cfg(any(feature = "wasm", test))]
     pub(crate) fn begin_candidate_mutation(
         &self,
         changed: Vec<FileEntry>,
@@ -433,6 +435,7 @@ impl TransactionalTreeV2 {
         V2CandidateMutation::new(root.tree.clone(), changed, deleted).map(Some)
     }
 
+    #[cfg(any(feature = "wasm", test))]
     pub(crate) fn step_candidate_mutation(
         &self,
         cursor: &mut V2CandidateMutation,
@@ -441,6 +444,7 @@ impl TransactionalTreeV2 {
         cursor.step(&self.store, max_units)
     }
 
+    #[cfg(any(feature = "wasm", test))]
     pub(crate) fn finish_candidate_mutation(
         &mut self,
         cursor: &mut V2CandidateMutation,

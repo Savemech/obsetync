@@ -1,3 +1,4 @@
+#[cfg(any(feature = "wasm", test))]
 use crate::candidate_mutation_v1::{CandidateMutationProgress, CandidateMutationV1};
 use crate::chunk::{ChunkError, FileEntry, InternalNode, LeafChunk, RootNode};
 use crate::hash::{hash_bytes, FileHash};
@@ -984,6 +985,7 @@ impl TransactionalTree {
     /// the V1 mutation root plan. Every fallible allocation precedes moving the
     /// parsed operation owner into the mutation cursor, so allocation failure
     /// leaves that same operation owner retryable.
+    #[cfg(any(feature = "wasm", test))]
     pub(crate) fn prepare_candidate_mutation_root(&self) -> Result<RootNode, ChunkError> {
         let root = self
             .candidate_root
@@ -1018,6 +1020,7 @@ impl TransactionalTree {
         })
     }
 
+    #[cfg(any(feature = "wasm", test))]
     pub(crate) fn step_candidate_mutation(
         &self,
         cursor: &mut CandidateMutationV1,
@@ -1026,6 +1029,7 @@ impl TransactionalTree {
         cursor.step(&self.store, max_units)
     }
 
+    #[cfg(any(feature = "wasm", test))]
     pub(crate) fn finish_candidate_mutation(
         &mut self,
         cursor: &mut CandidateMutationV1,
