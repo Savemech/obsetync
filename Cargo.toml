@@ -16,7 +16,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "1.12.12"
+version = "1.13.0"
 edition = "2021"
 
 [workspace.dependencies]
