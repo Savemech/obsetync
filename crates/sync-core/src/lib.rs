@@ -8,10 +8,6 @@ pub mod diff_page;
 pub mod fastcdc_chunker;
 pub mod hash;
 pub mod merge;
-pub(crate) mod replacement_rebuild;
-pub(crate) mod replacement_rebuild_v1;
-pub(crate) mod replacement_rebuild_v2;
-pub(crate) mod root_export_v1;
 pub mod store;
 pub mod sync_rules;
 pub mod transactional_tree;
@@ -27,3 +23,15 @@ pub mod wasm;
 
 #[cfg(any(feature = "wasm", test))]
 pub(crate) mod wasm_memory;
+
+#[cfg(any(feature = "wasm", test))]
+pub(crate) mod replacement_rebuild;
+
+#[cfg(any(feature = "wasm", test))]
+pub(crate) mod replacement_rebuild_v1;
+
+#[cfg(any(feature = "wasm", test))]
+pub(crate) mod replacement_rebuild_v2;
+
+#[cfg(any(feature = "wasm", test))]
+pub(crate) mod root_export_v1;

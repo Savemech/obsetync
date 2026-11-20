@@ -300,13 +300,14 @@ impl RootExportV1 {
         match self.phase {
             Phase::PlanVault => {
                 Self::check_string(&root.vault_id)?;
-                self.charge(root.vault_id.len())?;
                 self.child_count = root.children.len();
-                // Check vector length/bytes before copying or allocating rows.
-                self.child_count
+                // Every child needs a fixed allowance even with an empty prefix.
+                let fixed = self
+                    .child_count
                     .checked_mul(128)
-                    .filter(|value| *value <= MAX_ARENA_BYTES)
-                    .ok_or_else(|| invalid("root export child count exceeds the codec limit"))?;
+                    .and_then(|bytes| bytes.checked_add(root.vault_id.len()))
+                    .ok_or_else(|| invalid("root export size overflow"))?;
+                self.charge(fixed)?;
                 self.phase = Phase::PlanDevice;
             }
             Phase::PlanDevice => {
@@ -321,7 +322,7 @@ impl RootExportV1 {
             Phase::PlanPrefix => {
                 let (prefix, _) = &root.children[self.next_child];
                 Self::check_string(prefix)?;
-                self.charge(prefix.len() + 128)?;
+                self.charge(prefix.len())?;
                 self.hasher.as_mut().unwrap().update_str(prefix);
                 self.phase = Phase::PlanHash;
             }
@@ -738,19 +739,21 @@ mod tests {
         assert!(cursor.charge(1).is_err());
         assert_eq!(cursor.arena.capacity(), 0);
 
+        let small = root(2);
+        let mut plan = RootExportV1::new();
+        drain(&mut plan, &small, 256);
+        let required = plan.workset().unwrap().max_length;
+        let mut exact = RootExportV1::with_arena_limit(required).unwrap();
+        drain(&mut exact, &small, 256);
+        assert_eq!(exact.workset().unwrap().max_length, required);
+        let mut short = RootExportV1::with_arena_limit(required - 1).unwrap();
+        assert!(short.step(&small, 256, ROOT_EXPORT_MAX_STEP_BYTES).is_err());
+
         let value = root(25_000);
         let mut capped = RootExportV1::with_arena_limit(32 * 1024).unwrap();
-        let mut calls = 0;
-        loop {
-            calls += 1;
-            if capped.step(&value, 4096, 256 * 1024).is_err() {
-                break;
-            }
-        }
-        assert!(
-            calls <= 2,
-            "impossible arena was not rejected during early Plan"
-        );
+        // Even empty child prefixes exceed this arena. Reject before hashing any rows.
+        assert!(capped.step(&value, 1, 1).is_err());
+        assert_eq!(capped.next_child, 0);
         assert_eq!(capped.arena.capacity(), 0);
         assert_eq!(capped.offsets.capacity(), 0);
         assert!(capped.builder.is_none());
