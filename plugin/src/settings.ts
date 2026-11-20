@@ -279,13 +279,14 @@ export class ObsetyncSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName("Auto-Sync")
-            .setDesc("Automatically sync when files change.")
+            .setDesc("Upload local edits as you make them. Startup sync, scheduled downloads, and manual sync run independently.")
             .addToggle((toggle) =>
                 toggle
                     .setValue(this.plugin.settings.autoSync)
                     .onChange(async (value) => {
                         this.plugin.authorizeSettingsMutation();
                         this.plugin.settings.autoSync = value;
+                        this.plugin.syncEngineOrNull()?.setAutoSync(value);
                         await this.plugin.saveSettings();
                     })
             );

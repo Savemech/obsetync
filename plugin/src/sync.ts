@@ -567,6 +567,12 @@ export class ObsetyncSyncEngine {
         try { return this.syncBase.lastSyncTimestamp; } catch { return 0; }
     }
 
+    setAutoSync(enabled: boolean): void {
+        if (this.autoSync === enabled) return;
+        this.autoSync = enabled;
+        if (enabled && this.pendingChanges.size > 0) this.autoPushCoalescer?.trigger();
+    }
+
     setUploadPriority(priority: SyncPriority): void {
         this.syncPriority = priority;
     }

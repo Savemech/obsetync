@@ -88,6 +88,26 @@ function guardRefcountsAndOverflowAreBounded(): void {
     check(guards.size === 0 && !guards.has("same"), "completed overlap/overflow leaked a guard");
 }
 
+async function toggleControlsAlreadyQueuedLocalEvents(): Promise<void> {
+    const f = fixture();
+    let pushes = 0;
+    f.engine.pushPending = async () => { pushes++; };
+    f.engine.setAutoSync(true);
+    await f.callbacks.get("modify")!(fileAt("pending.md"));
+    f.engine.setAutoSync(false);
+    const drain = async () => {
+        while (f.engine.autoPushCoalescer.snapshot().pending || f.engine.autoPushCoalescer.snapshot().running) {
+            await new Promise(resolve => setTimeout(resolve, 10));
+        }
+    };
+    await drain();
+    check(pushes === 0 && f.engine.pendingChanges.has("pending.md"), "disabling auto-sync lost or sent a pending edit");
+    f.engine.setAutoSync(true);
+    await drain();
+    check(pushes === 1, "enabling auto-sync left an existing edit waiting for another event");
+    f.engine.autoPushCoalescer.close();
+}
+
 async function overlapKeepsGuardUntilBothCallbacksSettle(): Promise<void> {
     const f = fixture();
     const firstAppend = deferred<number>();
@@ -395,6 +415,7 @@ async function pullBatchesDurableEchoesWithoutLosingEdits(): Promise<void> {
 guardRefcountsAndOverflowAreBounded();
 const watchdog = setTimeout(() => { throw new Error("local event callback test did not settle"); }, 10_000);
 void overlapKeepsGuardUntilBothCallbacksSettle()
+    .then(toggleControlsAlreadyQueuedLocalEvents)
     .then(mutablePathsNeverMoveAnEarlierEventOrAck)
     .then(oldHashCompletionPreservesNewerHint)
     .then(ackUsesOnlyItsOwnCapturedWatermark)

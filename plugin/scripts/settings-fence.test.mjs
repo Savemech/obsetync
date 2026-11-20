@@ -79,6 +79,7 @@ function fixture(enrolled = true) {
     const effects = { authorized: 0, saves: 0, stops: 0, enrolls: 0, syncs: 0,
         scans: 0, reconciles: 0, histories: 0, rollbacks: 0, forces: 0 };
     const engine = {
+        setAutoSync(value) { effects.autoSync = value; },
         setUploadPriority(value) { effects.priority = value; },
         stop() { effects.stops++; },
         async reconcileContent() { effects.reconciles++; return { smallUploaded: 0, largeUploaded: 0, treeChunksUploaded: 0 }; },
@@ -147,6 +148,17 @@ test("claimed credentials with a failed save expose recovery in the settings tab
     assert.equal(globalThis.__settingsFence.notices.at(-1), "Select Sync Now to retry");
     await invoke("Sync Now:button");
     assert.equal(f.effects.syncs, 1);
+});
+
+test("auto-sync toggle updates the running engine and persists the preference", async () => {
+    const f = fixture();
+    f.setBlocked(false);
+    for (const enabled of [false, true]) {
+        await invoke("Auto-Sync:toggle", enabled);
+        assert.equal(f.effects.autoSync, enabled);
+        assert.equal(f.plugin.settings.autoSync, enabled);
+    }
+    assert.equal(f.effects.saves, 2);
 });
 
 test("upload priority reaches the running engine from the dropdown", async () => {

@@ -1920,7 +1920,7 @@ export default class ObsetyncPlugin extends Plugin {
             syncSettings.sharePresence,
             syncSettings.ignorePatterns,
             this.operationCheckpoint,
-            syncSettings.autoSync,
+            this.settings.autoSync,
             hashWorkers,
             this.visibilityGate,
             {

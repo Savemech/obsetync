@@ -153,7 +153,7 @@ pending	plugin/scripts/native-root-qualification.test.mjs	tests	Not reviewed
 reviewed	plugin/scripts/run-resource-governor-bench.mjs	tooling	Traced worker bundling, child exit, result recording and cleanup; live x86 record run passes and leaves historical reports intact
 read	plugin/scripts/run-tests.mjs	tooling	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
 read	plugin/scripts/run-tests.test.mjs	tests	Updated build/installer contracts and verified 26 targeted cases; full runner fixture semantics still under review
-reviewed	plugin/scripts/settings-fence.test.mjs	tests	Read bundled settings controls and fixture; seven cases pass, including all 13 settings mutation controls and recovery UI after a failed credential save
+reviewed	plugin/scripts/settings-fence.test.mjs	tests	Read bundled settings controls and fixture; eight cases pass, including all 13 settings mutation controls and recovery UI after a failed credential save
 read	plugin/scripts/test-main-lifecycle.mjs	tooling	Read bundle fixture/owner/IO ports and enrollment regressions; actual main has 40 passing scenarios / 411 assertions; entire runner and all scenario bodies still require review
 read	plugin/scripts/test-native-root-crash-recovery.mjs	tooling	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
 pending	plugin/scripts/test-native-root-mutation-complexity.mjs	tooling	Not reviewed
@@ -357,7 +357,7 @@ pending	plugin/src/segmented-store.test.ts	tests	Not reviewed
 pending	plugin/src/segmented-store.ts	production	Not reviewed
 reviewed	plugin/src/settings-persistence.test.ts	tests	Read full six-group suite; 10,000 coalesced submissions, four failure combinations, detach/copy failure, reentrant enqueue/close and actual native drain pass
 reviewed	plugin/src/settings-persistence.ts	production	Read full serial writer and main/native fixture callers; active/latest-pending snapshot bound and actual settlement ownership verified by six unit groups plus real-main settings IO gates; no writer change required
-read	plugin/src/settings.ts	production	Connection fields support explicit HTTPS and optional admin URL; internal URL migration marker persists with snapshots; type/full plugin tests pass; remaining settings/persistence handlers pending
+read	plugin/src/settings.ts	production	Connection fields support explicit HTTPS and optional admin URL; live auto-upload toggle resumes queued events and persists; internal URL migration marker persists with snapshots; type/full plugin tests pass; remaining settings/persistence handlers pending
 reviewed	plugin/src/startup-activation.test.ts	tests	Checked stale and current WASM publication, shared loader, delayed and rejected stale retirement. Regression failed before the fix; replay and bundled main lifecycle suites passed.
 reviewed	plugin/src/startup-activation.ts	production	Traced prepare/select/start and WASM publication through main. Stale activation joins engine quiescence and forwards retirement failure; removed unused terminal stop from the activation interface.
 read	plugin/src/startup-replay.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
