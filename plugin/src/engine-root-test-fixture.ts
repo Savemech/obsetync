@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import { blake3 } from "@noble/hashes/blake3";
 import { TFile } from "obsidian";
+import type { BulkUploadRecord } from "./bulk-codec";
 import { ObsetyncSyncEngine } from "./sync";
 import { ObsetyncSyncBase, SYNC_BASE_STORE_PATH } from "./sync-base";
 import { ObsetyncJournal, JOURNAL_STORE_PATH } from "./journal";
@@ -388,6 +389,7 @@ async function fixture(count = 1) {
                     last_sequence: server.floor, current_root_hash: server.root };
                 events.push(`${name}:outcome-query`); server.queries++; await control.beforeQueryAnswer?.();
                 assert(server.receipt); assert.equal(identity.sequence, server.receipt.sequence);
+                assert.equal(identity.mutation_id, server.receipt.mutation_id);
                 assert.equal(identity.request_hash, server.receipt.request_hash);
                 events.push(`${name}:outcome-answer`); return structuredClone(server.receipt);
             },
@@ -412,9 +414,10 @@ async function fixture(count = 1) {
                 server.checks++; await control.beforeContentCheck?.([...hashes]);
                 return control.contentMissing ? [...hashes] : [];
             },
-            async putObjects(records: Array<{ kind: number }>, _perf?: unknown, _memory?: unknown,
+            async putObjects(records: readonly BulkUploadRecord[], _perf?: unknown, _memory?: unknown,
                 _signal?: AbortSignal, options?: { priority?: string }) {
                 await control.beforePut?.(_signal);
+                for (const record of records) assert.equal(hash(record.data), record.hash, "uploaded bytes differ from the declared object hash");
                 server.uploadPriorities.push(options?.priority);
                 server.uploadedKinds.push(...records.map(record => record.kind));
             },

@@ -967,6 +967,8 @@ async function lostAcceptedReplyRequiresRecoveryBeforeANewReviewedCut() {
         await a.engine.pushPending(); f.control.beforeRootAnswer = undefined;
         assert.equal(f.server.requests.length, 1); assert.equal(a.engine.rootRepairRequired, true);
         assert.equal(f.base.getHash(pathAt(0)), hashFor(1)); assert.equal(f.journal.unsyncedCount(), 600);
+        const acceptedRoot = f.server.root;
+        assert.notEqual(acceptedRoot, f.base.treeBaseRoot);
         assert(a.engine.rootRuntime.pending());
         f.control.beforeQueryAnswer = held.wait;
         const before = work.materializations.length, pending = observe(a.engine.pushPending());
@@ -976,6 +978,7 @@ async function lostAcceptedReplyRequiresRecoveryBeforeANewReviewedCut() {
         const newest = await f.event(a.engine, pathAt(599), 3);
         held.resolve(); await pending.done; assert.equal(pending.state.error, undefined);
         assert.equal(f.server.queries, 1); assert.deepEqual(f.server.requests.map(request => request.sequence), [1, 2, 3, 4]);
+        assert.equal(f.server.requests[1].parent_root, acceptedRoot, "resumed publication used the pre-interruption parent");
         assert.equal(work.materializations[before], 344, "outcome recovery reused the old reviewed cut");
         assert.equal(f.base.getHash(pathAt(599)), hashFor(3));
         assert.equal(f.server.cuts[1]?.length, 1, "recovered recent generation was not isolated as urgent work");

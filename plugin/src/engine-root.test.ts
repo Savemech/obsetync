@@ -2547,4 +2547,12 @@ async function run() {
         }
     }
 }
-void run().catch(error => { setTimeout(() => { throw error; }, 0); });
+function unfinishedSuite() {
+    console.error("engine-root suite ended before its integration checks completed");
+    process.exitCode = 1;
+}
+process.once("beforeExit", unfinishedSuite);
+void run().finally(() => process.off("beforeExit", unfinishedSuite)).catch(error => {
+    console.error(error);
+    process.exitCode = 1;
+});
