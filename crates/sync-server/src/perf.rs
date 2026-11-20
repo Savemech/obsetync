@@ -60,8 +60,6 @@ pub struct ServerPerfCounters {
     stat_count: AtomicU64,
     writer_queue_depth: AtomicU64,
     writer_queue_peak: AtomicU64,
-    compaction_live_bytes: AtomicU64,
-    compaction_dead_bytes: AtomicU64,
 
     diff_runs: AtomicU64,
     diff_nodes_visited: AtomicU64,
@@ -220,6 +218,7 @@ pub struct StoragePerfSnapshot {
     pub hash_verify_ns: u64,
     pub open_count: u64,
     pub rename_count: u64,
+    /// Logical index lookups, including in-memory hits.
     pub stat_count: u64,
     pub writer_queue_depth: u64,
     pub writer_queue_peak: u64,
@@ -298,19 +297,6 @@ impl ServerPerfCounters {
 
     pub fn record_request_objects(&self, objects: u64) {
         self.request_objects.fetch_add(objects, RELAXED);
-    }
-
-    #[cfg(test)]
-    pub fn record_request_bytes(
-        &self,
-        wire_in: u64,
-        plaintext_in: u64,
-        wire_out: u64,
-        plaintext_out: u64,
-    ) {
-        self.record_wire_request_bytes(wire_in);
-        self.record_plaintext_request_bytes(plaintext_in);
-        self.record_response_bytes(wire_out, plaintext_out);
     }
 
     pub fn record_wire_request_bytes(&self, bytes: u64) {
@@ -404,16 +390,7 @@ impl ServerPerfCounters {
 
     pub fn record_writer_queue_add(&self, objects: u64) {
         let depth = self.writer_queue_depth.fetch_add(objects, RELAXED) + objects;
-        let mut peak = self.writer_queue_peak.load(RELAXED);
-        while depth > peak {
-            match self
-                .writer_queue_peak
-                .compare_exchange_weak(peak, depth, RELAXED, RELAXED)
-            {
-                Ok(_) => break,
-                Err(actual) => peak = actual,
-            }
-        }
+        update_peak(&self.writer_queue_peak, depth);
     }
 
     pub fn record_writer_queue_remove(&self, objects: u64) {
@@ -510,8 +487,9 @@ impl ServerPerfCounters {
                 stat_count: load(&self.stat_count),
                 writer_queue_depth: load(&self.writer_queue_depth),
                 writer_queue_peak: load(&self.writer_queue_peak),
-                compaction_live_bytes: load(&self.compaction_live_bytes),
-                compaction_dead_bytes: load(&self.compaction_dead_bytes),
+                // Schema v1 reserves both fields for a future pack compactor.
+                compaction_live_bytes: 0,
+                compaction_dead_bytes: 0,
             },
             diff: DiffPerfSnapshot {
                 runs: load(&self.diff_runs),
@@ -560,7 +538,9 @@ mod tests {
     fn snapshot_aggregates_request_storage_and_diff_metrics() {
         let counters = ServerPerfCounters::default();
         counters.request_started();
-        counters.record_request_bytes(120, 80, 200, 160);
+        counters.record_wire_request_bytes(120);
+        counters.record_plaintext_request_bytes(80);
+        counters.record_response_bytes(200, 160);
         counters.record_request_phase(RequestPhase::EnvelopeOpen, Duration::from_micros(11));
         counters.record_request_phase(RequestPhase::TokenReplay, Duration::from_micros(7));
         counters.record_request_phase(RequestPhase::Handler, Duration::from_micros(13));
@@ -587,6 +567,8 @@ mod tests {
         assert_eq!(snapshot.requests.errors, 1);
         assert_eq!(snapshot.requests.wire_bytes_in, 120);
         assert_eq!(snapshot.requests.plaintext_bytes_in, 80);
+        assert_eq!(snapshot.requests.wire_bytes_out, 200);
+        assert_eq!(snapshot.requests.plaintext_bytes_out, 160);
         assert_eq!(snapshot.requests.envelope_open_ns, 11_000);
         assert_eq!(snapshot.storage.loose_reads, 1);
         assert_eq!(snapshot.storage.loose_writes, 1);

@@ -8,7 +8,7 @@ pub const MAX_ROOT_BYTES: usize = 512 * 1024;
 pub const MAX_COMMIT_REQUEST_BYTES: usize = 704 * 1024;
 pub const MAX_QUERY_BYTES: usize = 4 * 1024;
 pub const MAX_CANCEL_REQUEST_BYTES: usize = 4 * 1024;
-pub const MAX_SEQUENCE: u64 = 9_007_199_254_740_991;
+pub use crate::root_head::MAX_ROOT_SEQUENCE as MAX_SEQUENCE;
 pub const PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Debug)]
@@ -102,9 +102,14 @@ pub fn decode_commit(
             "root bytes exceed limit".into(),
         ));
     }
-    let root = base64::engine::general_purpose::STANDARD
-        .decode(&request.root)
+    // Decode directly after the fixed parent field consumed by the root handler.
+    let mut legacy_body = Vec::with_capacity(64 + base64::decoded_len_estimate(request.root.len()));
+    legacy_body.extend_from_slice(request.parent_root.as_bytes());
+    legacy_body.resize(64, b' ');
+    base64::engine::general_purpose::STANDARD
+        .decode_vec(&request.root, &mut legacy_body)
         .map_err(|_| invalid())?;
+    let root = &legacy_body[64..];
     if root.len() > MAX_ROOT_BYTES {
         return Err(ServerError::PayloadTooLarge(
             "root bytes exceed limit".into(),
@@ -124,7 +129,7 @@ pub fn decode_commit(
         request.server_incarnation.as_bytes(),
         request.mutation_id.as_bytes(),
         request.parent_root.as_bytes(),
-        root.as_slice(),
+        root,
     ] {
         hash.update(&(field.len() as u64).to_le_bytes());
         hash.update(field);
@@ -135,9 +140,6 @@ pub fn decode_commit(
         mutation_id: request.mutation_id,
         request_hash: hash.finalize().to_hex().to_string(),
     };
-    let mut legacy_body = Vec::with_capacity(64 + root.len());
-    legacy_body.extend_from_slice(format!("{:<64}", request.parent_root).as_bytes());
-    legacy_body.extend_from_slice(&root);
     Ok((commit, legacy_body))
 }
 
@@ -267,6 +269,29 @@ mod tests {
             value["sequence"] = serde_json::json!(sequence);
             assert_eq!(decode(&value, "vault", "device").request_hash, expected);
         }
+    }
+
+    #[test]
+    fn commit_decoder_keeps_parent_prefix_outside_the_root_byte_limit() {
+        let payload = vec![0xa5; MAX_ROOT_BYTES];
+        let mut value = request();
+        value["root"] = base64::engine::general_purpose::STANDARD
+            .encode(&payload)
+            .into();
+        for parent in [String::new(), "d".repeat(64)] {
+            value["parent_root"] = parent.clone().into();
+            let (_, body) =
+                decode_commit(&serde_json::to_vec(&value).unwrap(), "vault", "device").unwrap();
+            assert_eq!(&body[..64], format!("{parent:<64}").as_bytes());
+            assert_eq!(&body[64..], payload);
+        }
+        value["root"] = base64::engine::general_purpose::STANDARD
+            .encode(vec![0; MAX_ROOT_BYTES + 1])
+            .into();
+        assert!(matches!(
+            decode_commit(&serde_json::to_vec(&value).unwrap(), "vault", "device"),
+            Err(ServerError::PayloadTooLarge(_))
+        ));
     }
 
     #[test]
