@@ -1779,8 +1779,8 @@ fn negotiate_limits(requested: LaneLimits) -> Option<LaneLimits> {
 }
 
 fn encode_error(code: ErrorCode, retry_after_ms: u32, message: &str) -> Vec<u8> {
-    let bytes = message.as_bytes();
-    let bytes = &bytes[..bytes.len().min(MAX_ERROR_MESSAGE_BYTES)];
+    let end = message.floor_char_boundary(MAX_ERROR_MESSAGE_BYTES);
+    let bytes = &message.as_bytes()[..end];
     let message_len = bytes.len() as u16;
     let mut output = Vec::with_capacity(ERROR_HEADER_BYTES + bytes.len());
     output.extend_from_slice(ERROR_MAGIC);
@@ -2183,7 +2183,6 @@ mod tests {
         );
 
         let mut bulk_fragments = 3usize;
-        let mut check_fragments = 0usize;
         let mut control_burst = 0usize;
         let mut order = Vec::new();
         assert_eq!(
@@ -2193,7 +2192,7 @@ mod tests {
         bulk_fragments -= 1;
         order.push("bulk");
 
-        check_fragments = 6; // completed CHECK arrives after the first bulk frame
+        let mut check_fragments = 6; // completed CHECK arrives after the first bulk frame
         while bulk_fragments + check_fragments > 0 {
             let lane = next_outbound_lane(
                 (check_fragments > 0).then_some(OutboundPriority::Control),
@@ -2273,6 +2272,14 @@ mod tests {
         assert_eq!(
             u16::from_le_bytes(encoded[12..14].try_into().unwrap()) as usize,
             MAX_ERROR_MESSAGE_BYTES
+        );
+
+        let prefix = "x".repeat(MAX_ERROR_MESSAGE_BYTES - 1);
+        let encoded = encode_error(ErrorCode::Internal, 0, &format!("{prefix}я"));
+        assert_eq!(&encoded[ERROR_HEADER_BYTES..], prefix.as_bytes());
+        assert_eq!(
+            u16::from_le_bytes(encoded[12..14].try_into().unwrap()) as usize,
+            prefix.len()
         );
     }
 

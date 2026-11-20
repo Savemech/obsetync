@@ -140,7 +140,7 @@ async fn root_cancel_first_is_durable_terminal_and_late_commit_has_no_effect() {
     let next = outcome_commit_body(&env, &root, 2, "");
     let accepted = outcome_success(&env, "root-commit", vault, &next).await;
     outcome_assert_accepted(&accepted, &next, &hash_to_hex(&root.hash()));
-    assert!(notifications.try_recv().is_ok());
+    outcome_assert_root_frame(&notifications.try_recv().unwrap(), vault, &accepted);
     assert_eq!(
         outcome_post(&env, "root-commit", vault, &request).await.0,
         StatusCode::CONFLICT.as_u16()
@@ -239,7 +239,7 @@ async fn root_cancel_concurrent_commit_and_cancel_observe_one_terminal_winner() 
                     Some(root.hash())
                 );
                 assert!(env.state.vaults.get_root(vault, &root.hash()).is_some());
-                assert!(notifications.try_recv().is_ok());
+                outcome_assert_root_frame(&notifications.try_recv().unwrap(), vault, &a);
             }
             "cancelled" => {
                 assert_eq!(env.state.vaults.try_get_current_root(vault).unwrap(), None);
@@ -578,6 +578,17 @@ fn outcome_assert_hex(value: &serde_json::Value, bytes: usize) {
         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
 }
 
+fn outcome_assert_root_frame(frame: &str, vault: &str, receipt: &serde_json::Value) {
+    let frame: serde_json::Value = serde_json::from_str(frame).unwrap();
+    assert_eq!(frame["v"], 1);
+    assert_eq!(frame["t"], "root");
+    assert_eq!(frame["vault"], vault);
+    assert_eq!(
+        frame["root"].as_str().unwrap(),
+        receipt["result"]["root_hash"].as_str().unwrap()
+    );
+}
+
 fn outcome_assert_accepted(
     receipt: &serde_json::Value,
     request: &serde_json::Value,
@@ -656,7 +667,7 @@ async fn root_outcome_exact_replay_is_stable_and_same_semantic_root_changed_byte
     let mut notifications = env.state.subscribe_roots(vault);
     let accepted = outcome_success(&env, "root-commit", vault, &request).await;
     outcome_assert_accepted(&accepted, &request, &hash_to_hex(&root.hash()));
-    assert!(notifications.try_recv().is_ok());
+    outcome_assert_root_frame(&notifications.try_recv().unwrap(), vault, &accepted);
 
     assert_eq!(
         outcome_success(&env, "root-commit", vault, &request).await,
@@ -1197,7 +1208,7 @@ async fn root_outcome_concurrent_same_sequence_publishes_once_for_equal_or_confl
             assert_eq!(env.state.vaults.get_current_root(vault), Some(root.hash()));
             serde_json::from_slice(&winner.1).unwrap()
         };
-        assert!(notifications.try_recv().is_ok());
+        outcome_assert_root_frame(&notifications.try_recv().unwrap(), vault, &accepted);
         assert!(
             matches!(
                 notifications.try_recv(),
