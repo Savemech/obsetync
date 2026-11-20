@@ -202,6 +202,7 @@ and the output keeps each selected line’s original terminator, including a
 missing final newline. Overlap, invalid UTF-8,
 missing blobs, binary files, and chunked large files stay unresolved; side A
 remains at the original tree path and the response carries all three hashes.
+A reported storage read error aborts the merge before the server publishes a new root.
 
 The pushing client then preserves its losing side B under a normal visible
 name such as `doc (conflict Laptop 2026-08-29 1430).md`. It prefers the exact

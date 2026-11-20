@@ -8,7 +8,7 @@
 //! than returned.
 
 use crate::perf::ServerPerfCounters;
-use crate::storage::{read_blob_measured, StorageLayout};
+use crate::storage::{read_blob_bounded, StorageLayout};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -105,6 +105,7 @@ pub enum PackReadError {
 pub(crate) struct ScrubStats {
     pub checked: u64,
     pub corrupted: u64,
+    pub io_errors: u64,
 }
 
 impl std::fmt::Display for PackReadError {
@@ -231,7 +232,10 @@ impl PackStore {
         if hit {
             return true;
         }
-        read_loose_verified(&self.inner.layout, kind, hash, self.perf()).is_some()
+        matches!(
+            read_loose_verified(&self.inner.layout, kind, hash, self.perf()),
+            Ok(Some(_))
+        )
     }
 
     pub fn read(
@@ -253,8 +257,10 @@ impl PackStore {
             match self.read_location(key, location) {
                 Ok(bytes) => return Ok(Some(bytes)),
                 Err(error) => {
-                    self.hide_location(key, location);
-                    if let Some(bytes) =
+                    if matches!(error, PackReadError::Corrupt(_)) {
+                        self.hide_location(key, location);
+                    }
+                    if let Ok(Some(bytes)) =
                         read_loose_verified(&self.inner.layout, kind, hash, self.perf())
                     {
                         return Ok(Some(bytes));
@@ -263,12 +269,7 @@ impl PackStore {
                 }
             }
         }
-        Ok(read_loose_verified(
-            &self.inner.layout,
-            kind,
-            hash,
-            self.perf(),
-        ))
+        read_loose_verified(&self.inner.layout, kind, hash, self.perf())
     }
 
     pub(crate) fn read_pack_only(
@@ -290,7 +291,9 @@ impl PackStore {
         match self.read_location(key, location) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(error) => {
-                self.hide_location(key, location);
+                if matches!(error, PackReadError::Corrupt(_)) {
+                    self.hide_location(key, location);
+                }
                 Err(error)
             }
         }
@@ -322,9 +325,13 @@ impl PackStore {
         let mut stats = ScrubStats::default();
         for (position, (key, location)) in entries.into_iter().enumerate() {
             stats.checked += 1;
-            if self.read_location(key, location).is_err() {
-                stats.corrupted += 1;
-                self.hide_location(key, location);
+            match self.read_location(key, location) {
+                Err(PackReadError::Corrupt(_)) => {
+                    stats.corrupted += 1;
+                    self.hide_location(key, location);
+                }
+                Err(PackReadError::Io(_)) => stats.io_errors += 1,
+                Ok(_) => {}
             }
             if position % 256 == 255 {
                 std::thread::yield_now();
@@ -512,8 +519,7 @@ impl PackStore {
         file.seek(SeekFrom::Start(location.record_offset))
             .map_err(|error| PackReadError::Io(error.to_string()))?;
         let mut header = [0u8; RECORD_HEADER_BYTES];
-        file.read_exact(&mut header)
-            .map_err(|error| PackReadError::Corrupt(error.to_string()))?;
+        file.read_exact(&mut header).map_err(record_read_error)?;
         let decoded = decode_record_header(&header)
             .map_err(|error| PackReadError::Corrupt(error.to_string()))?;
         if decoded.key != key
@@ -532,11 +538,9 @@ impl PackStore {
             ));
         }
         let mut bytes = vec![0u8; stored_len];
-        file.read_exact(&mut bytes)
-            .map_err(|error| PackReadError::Corrupt(error.to_string()))?;
+        file.read_exact(&mut bytes).map_err(record_read_error)?;
         let mut trailer = [0u8; RECORD_TRAILER_BYTES];
-        file.read_exact(&mut trailer)
-            .map_err(|error| PackReadError::Corrupt(error.to_string()))?;
+        file.read_exact(&mut trailer).map_err(record_read_error)?;
         let stored_crc = u32::from_le_bytes(trailer);
         let read_elapsed = read_started.elapsed();
         let verify_started = Instant::now();
@@ -1087,18 +1091,31 @@ fn replace_file(temp: &Path, final_path: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+fn record_read_error(error: std::io::Error) -> PackReadError {
+    if error.kind() == std::io::ErrorKind::UnexpectedEof {
+        PackReadError::Corrupt(error.to_string())
+    } else {
+        PackReadError::Io(error.to_string())
+    }
+}
+
 fn read_loose_verified(
     layout: &StorageLayout,
     kind: PackedObjectKind,
     hash: &FileHash,
     perf: &ServerPerfCounters,
-) -> Option<Vec<u8>> {
+) -> Result<Option<Vec<u8>>, PackReadError> {
     let path = loose_path(layout, kind, hash);
-    let bytes = read_blob_measured(&path, perf)?;
+    let bytes = match read_blob_bounded(&path, MAX_PACK_OBJECT_BYTES, Some(perf)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(PackReadError::Io(error.to_string())),
+    };
     let started = Instant::now();
-    let valid = validate_bytes(kind, hash, &bytes).is_ok();
-    perf.record_hash_check(bytes.len() as u64, started.elapsed(), valid);
-    valid.then_some(bytes)
+    let valid = validate_bytes(kind, hash, &bytes);
+    perf.record_hash_check(bytes.len() as u64, started.elapsed(), valid.is_ok());
+    valid.map_err(PackReadError::Corrupt)?;
+    Ok(Some(bytes))
 }
 
 pub(crate) fn loose_path(
@@ -1394,6 +1411,40 @@ mod tests {
         assert_eq!(
             recovered.store.read(object.kind, &object.hash).unwrap(),
             Some(object.bytes)
+        );
+    }
+
+    #[test]
+    fn temporarily_unavailable_segment_remains_readable_after_recovery() {
+        let (dir, _, mut opened) = open_temp();
+        let object = content(31, 4096);
+        opened
+            .store
+            .append_group(&mut opened.active, &[&object], CommitFault::None)
+            .unwrap();
+        let segment = StorageLayout::new(dir.path()).object_segment_path(1);
+        let offline = dir.path().join("unavailable-segment");
+        std::fs::rename(&segment, &offline).unwrap();
+
+        assert!(matches!(
+            opened.store.read(object.kind, &object.hash),
+            Err(PackReadError::Io(_))
+        ));
+        assert!(matches!(
+            opened.store.read_pack_only(object.kind, &object.hash),
+            Err(PackReadError::Io(_))
+        ));
+        let stats = opened.store.scrub_once();
+        assert_eq!((stats.checked, stats.corrupted, stats.io_errors), (1, 0, 1));
+
+        std::fs::rename(offline, segment).unwrap();
+        assert_eq!(
+            opened
+                .store
+                .read(object.kind, &object.hash)
+                .unwrap()
+                .unwrap(),
+            object.bytes
         );
     }
 

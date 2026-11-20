@@ -116,6 +116,14 @@ async fn history_lists_roots_newest_first_and_rollback_converges() {
         .await
         .unwrap();
     assert_eq!(r.status.as_u16(), 404, "unknown root must 404");
+    let after = fetch_history(&observer, &vault).await;
+    let current: Vec<_> = after
+        .roots
+        .iter()
+        .filter(|e| e.current)
+        .map(|e| &e.root)
+        .collect();
+    assert_eq!(current, [&p1]);
 }
 
 #[tokio::test]
@@ -160,7 +168,7 @@ async fn admin_export_serves_tar_of_any_root() {
         let path = entry.path().unwrap().to_string_lossy().to_string();
         let mut data = Vec::new();
         entry.read_to_end(&mut data).unwrap();
-        files.insert(path, data);
+        assert!(files.insert(path, data).is_none(), "duplicate tar entry");
     }
     assert_eq!(files.len(), 2, "tar must hold exactly the v1 file set");
     assert_eq!(

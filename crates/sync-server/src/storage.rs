@@ -557,7 +557,7 @@ impl VaultStore {
     /// Load a root node's bytes from history.
     pub fn get_root(&self, vault_id: &str, hash: &FileHash) -> Option<Vec<u8>> {
         let path = self.layout.vault_root_path(vault_id, hash);
-        read_blob_bounded_with_optional_perf(&path, MAX_ROOT_HEAD_BYTES, self.perf.as_deref())
+        read_blob_bounded(&path, MAX_ROOT_HEAD_BYTES, self.perf.as_deref()).ok()
     }
 
     #[cfg(test)]
@@ -744,35 +744,42 @@ pub fn read_blob(path: &Path) -> Option<Vec<u8>> {
     read_blob_with_optional_perf(path, None)
 }
 
+#[cfg(test)]
 pub fn read_blob_measured(path: &Path, perf: &ServerPerfCounters) -> Option<Vec<u8>> {
     read_blob_with_optional_perf(path, Some(perf))
 }
 
-fn read_blob_bounded_with_optional_perf(
+pub(crate) fn read_blob_bounded(
     path: &Path,
     max_bytes: usize,
     perf: Option<&ServerPerfCounters>,
-) -> Option<Vec<u8>> {
+) -> io::Result<Vec<u8>> {
     let started = Instant::now();
-    let mut file = std::fs::File::open(path).ok()?;
-    let metadata = file.metadata().ok()?;
+    let mut file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.len() > max_bytes as u64 {
-        return None;
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid blob type or size",
+        ));
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     (&mut file)
         .take(max_bytes.saturating_add(1) as u64)
-        .read_to_end(&mut bytes)
-        .ok()?;
+        .read_to_end(&mut bytes)?;
     if bytes.len() > max_bytes {
-        return None;
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid blob type or size",
+        ));
     }
     if let Some(perf) = perf {
         perf.record_loose_read(bytes.len() as u64, started.elapsed());
     }
-    Some(bytes)
+    Ok(bytes)
 }
 
+#[cfg(test)]
 fn read_blob_with_optional_perf(path: &Path, perf: Option<&ServerPerfCounters>) -> Option<Vec<u8>> {
     let started = Instant::now();
     let bytes = std::fs::read(path).ok()?;

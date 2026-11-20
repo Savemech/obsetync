@@ -408,11 +408,12 @@ impl StorageWriter {
                     break;
                 };
                 let stats = handle.store.scrub_once();
-                if stats.corrupted > 0 {
+                if stats.corrupted > 0 || stats.io_errors > 0 {
                     tracing::error!(
                         checked = stats.checked,
                         corrupted = stats.corrupted,
-                        "pack scrub hid corrupted object records"
+                        io_errors = stats.io_errors,
+                        "pack scrub encountered unreadable records"
                     );
                 } else {
                     tracing::info!(checked = stats.checked, "pack scrub finished");

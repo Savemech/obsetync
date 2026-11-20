@@ -265,12 +265,17 @@ async fn try_text_merge<C: ContentStore>(
     }
 
     // A missing blob is not an error — just fall back to the conflict path.
+    let optional = |result| match result {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(ChunkError::NotFound(_)) => Ok(None),
+        Err(error) => Err(error),
+    };
     let (base_bytes, a_bytes, b_bytes) = match (
-        content.get(&todo.base_hash).await,
-        content.get(&todo.a.hash).await,
-        content.get(&todo.b.hash).await,
+        optional(content.get(&todo.base_hash).await)?,
+        optional(content.get(&todo.a.hash).await)?,
+        optional(content.get(&todo.b.hash).await)?,
     ) {
-        (Ok(base), Ok(a), Ok(b)) => (base, a, b),
+        (Some(base), Some(a), Some(b)) => (base, a, b),
         _ => return Ok(false),
     };
 

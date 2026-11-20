@@ -336,7 +336,12 @@ mod tests {
     use tempfile::tempdir;
 
     fn make_entry(path: &str, content: &str) -> FileEntry {
-        FileEntry::new(path.into(), hash_bytes(content.as_bytes()), 1, 1)
+        FileEntry::new(
+            path.into(),
+            hash_bytes(content.as_bytes()),
+            1,
+            content.len() as u64,
+        )
     }
 
     /// Build a tree on a temp index dir. Uses spawn_blocking + a fresh
@@ -431,6 +436,33 @@ mod tests {
 
         let entries = run_validate_root(store, root).await.unwrap();
         assert_eq!(entries.len(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unreadable_loose_merge_input_aborts_until_repaired() {
+        let dir = tempdir().unwrap();
+        let store = test_writer(dir.path());
+        let layout = StorageLayout::new(dir.path());
+        let make_root =
+            |bytes: &str| build_tree_on_store(store.clone(), vec![make_entry("a.md", bytes)]);
+        let base = VersionedRoot::V1(make_root("one\ntwo\n").await);
+        let a = VersionedRoot::V1(make_root("ONE\ntwo\n").await);
+        let b = VersionedRoot::V1(make_root("one\nTWO\n").await);
+        let merge = || run_versioned_merge(store.clone(), base.clone(), a.clone(), b.clone());
+
+        // Even with the base absent, a read error on another side must propagate.
+        let path = layout.content_blob_path(&hash_bytes(b"ONE\ntwo\n"));
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(merge().await.is_err());
+        std::fs::remove_dir(&path).unwrap();
+        assert_eq!(merge().await.unwrap().file_conflicts.len(), 1);
+
+        for bytes in [b"one\ntwo\n", b"ONE\ntwo\n", b"one\nTWO\n"] {
+            let path = layout.content_blob_path(&hash_bytes(bytes));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        assert_eq!(merge().await.unwrap().text_merged_count, 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
