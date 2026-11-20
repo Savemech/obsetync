@@ -765,6 +765,9 @@ test("mobile interruption holds automatic startup across reloads until explicit 
     f.state.interruption = null;
     plugin = await f.loaded();
     equal(f.layoutCallbacks.length, 0, "Reload forgot the unacknowledged crash hold");
+    await plugin.reconcileLegacyDowngradeState();
+    equal(f.engines.length, 0, "Compatibility recovery bypassed the mobile crash hold");
+    equal(plugin.startupInterruptionId, "interrupted-pull", "Recovery acknowledged an interruption without Sync now");
     await plugin.syncNow();
     equal(f.saves.at(-1).resumedInterruptionId, "interrupted-pull", "Manual retry did not durably acknowledge the hold");
     equal(f.engines.length, 1, "Explicit Sync now did not resume");
@@ -831,7 +834,8 @@ test("persistence replacement drains old maintenance owners before opening new s
     equal(f.count("journal:new"), 2, "Replacement did not open one fresh journal");
     const replacementOpen = f.events.lastIndexOf("base:new");
     for (const owner of ["base", "journal", "confirmations"]) {
-        check(f.events.indexOf(`${owner}:maintenance-drained:done`) < replacementOpen,
+        const drained = f.events.indexOf(`${owner}:maintenance-drained:done`);
+        check(drained >= 0 && drained < replacementOpen,
             `Replacement opened storage before ${owner} maintenance drained`);
     }
     await f.unload(plugin);
@@ -1181,7 +1185,7 @@ test("unload stops admission immediately and a separately evaluated bundle waits
     const uninstall = f.events.indexOf("debug:uninstall"), installs = f.events.reduce((out, value, i) => {
         if (value === "debug:install") out.push(i); return out;
     }, []);
-    check(installs[1] > uninstall, "Cross-bundle logger installation follows prior cleanup");
+    check(uninstall >= 0 && installs[1] > uninstall, "Cross-bundle logger installation follows prior cleanup");
     first.onunload();
     equal(f.count("tree1:free"), 1, "Repeated unload is idempotent");
     await f.unload(second);

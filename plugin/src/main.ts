@@ -942,7 +942,7 @@ export default class ObsetyncPlugin extends Plugin {
         }).catch(error => this.reconcileLegacyDowngradeFailure(error));
         this.currentHostWork = new CurrentHostWorkOwner();
         this.installCurrentRuntimeUi(false);
-        this.updateStatusBar("sync …");
+        if (this.startupInterruptionId === null) this.updateStatusBar("sync …");
         if (this.settings.enrolled && this.settings.serverUrl) await this.initSync();
         new Notice(`Compatibility work from ObsetyNC ${LEGACY_DOWNGRADE_TARGET} was imported; current sync may resume.`);
     }
@@ -1599,7 +1599,7 @@ export default class ObsetyncPlugin extends Plugin {
         const hostToken = this.legacyDowngradeHost?.authorize("sync");
         if ((!this.syncEngine || this.syncEngine.isStopped()) &&
             this.settings.enrolled && this.settings.serverUrl) {
-            await this.initSync();
+            await this.initSync(true);
             return;
         }
         if (!this.syncEngine) {
@@ -1651,8 +1651,8 @@ export default class ObsetyncPlugin extends Plugin {
         modal.open();
     }
 
-    private async initSync(): Promise<void> {
-        if (this.unloaded) return;
+    private async initSync(resumeInterruption = false): Promise<void> {
+        if (this.unloaded || (this.startupInterruptionId !== null && !resumeInterruption)) return;
         const hostToken = this.legacyDowngradeHost?.authorize("init");
         this.cancelStartupSync();
         const generation = ++this.syncInitGeneration;
