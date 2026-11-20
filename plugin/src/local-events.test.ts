@@ -71,6 +71,10 @@ function fixture() {
 
 function guardRefcountsAndOverflowAreBounded(): void {
     const guards = new LocalEventGuards(1);
+    const older = guards.acquire("note");
+    guards.acquire("note").release();
+    check(!older.isCurrent() && guards.has("note"), "newer completion restored an older callback's echo claim");
+    older.release();
     const first = guards.acquire("same");
     const second = guards.acquire("same");
     check(!first.isCurrent() && second.isCurrent(), "overlap did not supersede earlier echo/hash token");
@@ -242,7 +246,7 @@ async function pullApplyFenceWaitsForEchoClassification(): Promise<void> {
     f.engine.pullEchoHash = async () => { entered++; return release.promise; };
     const callbacks = Array.from({ length: 4 }, (_, index) =>
         f.callbacks.get("create")!(fileAt(`remote-${index}.md`)));
-    while (entered < callbacks.length) await Promise.resolve();
+    while (entered < callbacks.length) await new Promise<void>(resolve => setImmediate(resolve));
     let drained = false;
     const drain = f.engine.drainPullEchoWork(new AbortController().signal)
         .then(() => { drained = true; });

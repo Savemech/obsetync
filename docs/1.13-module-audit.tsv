@@ -262,8 +262,8 @@ pending	plugin/src/legacy-downgrade.test.ts	tests	Not reviewed
 pending	plugin/src/legacy-downgrade.ts	production	Not reviewed
 pending	plugin/src/legacy-source.test.ts	tests	Not reviewed
 pending	plugin/src/legacy-source.ts	production	Not reviewed
-pending	plugin/src/local-event-guards.ts	production	Not reviewed
-read	plugin/src/local-events.test.ts	tests	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
+reviewed	plugin/src/local-event-guards.ts	production	Traced reference counts, generation ordering, idempotent release and bounded overflow through create/modify/delete/rename listeners and pull protection
+reviewed	plugin/src/local-events.test.ts	tests	Reviewed callback and mobile journal fixtures; exercise newer-first release and let the watchdog run during echo classification waits
 read	plugin/src/main.ts	production	Legacy endpoint migration and enrollment owner traced; duplicate requests rejected before dispatch; credential/address changes fence response and saved continuation; 38 bundled-main scenarios pass, including two failed credential writes followed by successful retry without a second claim; full host audit remains
 reviewed	plugin/src/max-latency-coalescer.test.ts	tests	Read quiet/max-latency, failure and closure coverage; npm test passes
 reviewed	plugin/src/max-latency-coalescer.ts	production	Read timer, rerun, flush and close paths with production sync.ts callers and dedicated tests; npm test passes
