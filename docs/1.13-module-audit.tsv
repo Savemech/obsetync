@@ -199,8 +199,8 @@ reviewed	plugin/src/current-host-work.ts	production	Read entire bounded owner; m
 reviewed	plugin/src/debug-log.test.ts	tests	Tested layered console hooks, hostile error getter, missing/unreadable/existing logs, rotation and 2000 duplicate events during stalled IO through install/uninstall
 reviewed	plugin/src/debug-log.ts	production	Traced console and window hooks to plugin load/unload; failed reads preserve existing logs, stalled writes coalesce, stale hooks only forward, stack splitting bounded to six lines
 reviewed	plugin/src/debug-modal.ts	production	Read plain text rendering, clipboard success/failure and close handling. Traced settings report, typing and browser probe entry points; settings fixture verifies pending report UI lifetime and duplicate clicks.
-pending	plugin/src/deferred-changes.test.ts	tests	Not reviewed
-pending	plugin/src/deferred-changes.ts	production	Not reviewed
+read	plugin/src/deferred-changes.test.ts	tests	Checked clean-settlement path read guard and retained retry/rename tests; full suite passes, remaining fixture bodies pending.
+reviewed	plugin/src/deferred-changes.ts	production	Traced retry gates, partition/settlement closure, generation-fenced rename retirement and summary. Clean settlement skips path and generation indexes; detached ACK ownership preserved.
 reviewed	plugin/src/delta-validation.test.ts	tests	60 assertions including dot and empty segments, Unicode, controls and length boundaries
 reviewed	plugin/src/delta-validation.ts	production	Reviewed legacy JSON actions, path/rename uniqueness and bounds; shared path predicate no longer expands code points or splits segments; differential parity over 131966 inputs
 pending	plugin/src/desktop-hash-workers.test.ts	tests	Not reviewed

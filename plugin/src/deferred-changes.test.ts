@@ -40,7 +40,9 @@ function settlementRestoresOnlyDeferredAndPreservesNewerEdits(): void {
     const planned = tracker.partition(next, next, "mobile:320", 1_001);
     assert.equal(planned.ready.length, 2);
     assert.deepEqual(planned.deferred, []);
-    const accepted = tracker.settle(next, next, [], "mobile:320", 1_002);
+    const accepted = tracker.settle(next, next.map(change => ({
+        ...change, get path(): string { throw new Error("clean settlement revisited materialized paths"); },
+    })), [], "mobile:320", 1_002);
     assert.deepEqual(accepted.retained, []);
     assert.deepEqual(accepted.acknowledged.map((item) => item.throughId).sort(), [12, 13]);
     assert.equal(tracker.summary().count, 0);

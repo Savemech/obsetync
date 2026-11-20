@@ -48,7 +48,6 @@ export class DeferredDependencyCaptureError extends Error {
 
 interface DeferredRecord {
     hint: DirtyFileChange;
-    current: DirtyFileChange;
     detail: DeferredPushChange;
     retryKey: string;
     retryAt: number;
@@ -123,7 +122,7 @@ function sameDetail(left: DeferredPushChange, right: DeferredPushChange): boolea
 }
 
 function sameRecord(left: DeferredRecord, right: DeferredRecord): boolean {
-    return sameHint(left.hint, right.hint) && sameHint(left.current, right.current) &&
+    return sameHint(left.hint, right.hint) &&
         sameDetail(left.detail, right.detail) && left.retryKey === right.retryKey && left.retryAt === right.retryAt;
 }
 
@@ -266,7 +265,7 @@ function* partitionSteps(
             if (
                 (previous?.detail.reason === "source-too-large" || previous?.detail.reason === "range-unavailable") && hint &&
                 change.action !== "deleted" && sameHint(hint, previous.hint) &&
-                sameHint(compact(change, hint.journalId), previous.current) &&
+                sameHint(compact(change, hint.journalId), previous.hint) &&
                 previous.retryKey === retryKey &&
                 (previous.detail.reason === "range-unavailable" || now < previous.retryAt)
             ) held.set(change.path, { ...previous.detail });
@@ -499,24 +498,26 @@ export class DeferredChangeTracker {
         retryKey: string,
         now: number,
     ): DeferredSettlement {
-        const hints = new Map(queued.map((hint) => [hint.path, hint]));
-        const current = new Map(materialized.map((change) => [change.path, change]));
         const held = new Map<string, DeferredPushChange>();
-        for (const detail of deferred) {
-            if (!hints.has(detail.path) ||
-                (detail.reason !== "source-too-large" && detail.reason !== "range-unavailable" &&
-                    detail.reason !== "dependent-delete") ||
-                !Number.isSafeInteger(detail.requiredBytes) || detail.requiredBytes < 0 ||
-                !Number.isSafeInteger(detail.capacityBytes) || detail.capacityBytes < 0) {
-                throw new Error("invalid deferred push outcome");
+        if (deferred.length > 0) {
+            const hints = new Map(queued.map((hint) => [hint.path, hint]));
+            for (const detail of deferred) {
+                if (!hints.has(detail.path) ||
+                    (detail.reason !== "source-too-large" && detail.reason !== "range-unavailable" &&
+                        detail.reason !== "dependent-delete") ||
+                    !Number.isSafeInteger(detail.requiredBytes) || detail.requiredBytes < 0 ||
+                    !Number.isSafeInteger(detail.capacityBytes) || detail.capacityBytes < 0) {
+                    throw new Error("invalid deferred push outcome");
+                }
+                held.set(detail.path, { ...detail });
             }
-            held.set(detail.path, { ...detail });
+            // Settlement may run after an accepted root and exact journal ACK. It
+            // must preserve the pre-existing synchronous closure semantics rather
+            // than introduce a new post-commit admission failure. Full-review
+            // partition rejects the same oversized graph before any claim.
+            exhaust(includeLinkedGenerationSteps(queued, hints, held, this.legacyLinks, queued.length, false));
         }
-        // Settlement may run after an accepted root and exact journal ACK. It
-        // must preserve the pre-existing synchronous closure semantics rather
-        // than introduce a new post-commit admission failure. Full-review
-        // partition rejects the same oversized graph before any claim.
-        exhaust(includeLinkedGenerationSteps(queued, hints, held, this.legacyLinks, queued.length, false));
+        const current = held.size ? new Map(materialized.map((change) => [change.path, change])) : null;
         const retained: DirtyFileChange[] = [];
         const acknowledged: Array<{ path: string; throughId: number }> = [];
         let changed = false;
@@ -535,7 +536,7 @@ export class DeferredChangeTracker {
                 if (hint.journalId !== undefined) acknowledged.push({ path: hint.path, throughId: hint.journalId });
                 continue;
             }
-            const refreshed = compact(current.get(hint.path) ?? hint, hint.journalId);
+            const refreshed = compact(current?.get(hint.path) ?? hint, hint.journalId);
             const previous = this.records.get(hint.path);
             // Unrelated successful note uploads must not postpone an existing
             // attachment retry forever by repeatedly refreshing its cooldown.
@@ -545,7 +546,6 @@ export class DeferredChangeTracker {
             const stored = compact(refreshed, hint.journalId);
             const record: DeferredRecord = {
                 hint: stored,
-                current: stored,
                 detail,
                 retryKey,
                 retryAt: detail.reason === "range-unavailable"
