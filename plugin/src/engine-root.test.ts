@@ -710,6 +710,24 @@ async function metadataErrorAndAbortReleaseOnlyAfterActualRead() {
     }
 }
 
+async function failedLegacyPushWaitsForAnExternalTrigger() {
+    const f = await fixture(), a = await f.create("legacy-retry", { autoSync: true });
+    try {
+        const file = pathAt(0);
+        const [id] = await f.queue(a.engine, [file], 2);
+        f.control.caps = null;
+        f.control.statErrors.set(file, new Error("source stat failed"));
+        await a.engine.pushPending();
+        assert.match(a.engine.lastError.message, /source stat failed/);
+        assert.equal(a.engine.pendingChanges.size, 1);
+        assert.equal(f.journal.unsynced()[0]?.id, id);
+        assert.equal(a.engine.autoPushCoalescer.snapshot().pending, false,
+            "failed legacy push immediately scheduled its restored input");
+        await f.event(a.engine, file, 3);
+        assert.equal(a.engine.autoPushCoalescer.snapshot().pending, true);
+    } finally { await f.close(); }
+}
+
 async function automaticPushOwnsEarlyScopeRejection() {
     // The normal runner launches this actual bundle in a strict child. Do not
     // install unhandledRejection/uncaughtException listeners to hide a leak.
@@ -2496,6 +2514,7 @@ async function run() {
         await localOmissionCutsAreBoundedAndWaitForFullBulkReview();
         await metadataMutexProtectsNativeAuditAndStillDrainsLiveEdits();
         await metadataErrorAndAbortReleaseOnlyAfterActualRead();
+        await failedLegacyPushWaitsForAnExternalTrigger();
         await automaticPushOwnsEarlyScopeRejection();
         await continuationReadinessDoesNotDetachTheBacklog();
         await outputAdmissionRefusalRetriesOnlyWhenFactsChange();
@@ -2517,7 +2536,7 @@ async function run() {
         await deferredFreshPullWithoutAHeadKeepsItsDurableFence();
         await disabledConfigScanPreservesPreviouslyTrackedSettings();
         await ignoredFreshPullCannotAdoptOrPublishMissingLeaves();
-        console.log("engine-root.test: 39 actual engine/root/journal/base integration suites passed (synthetic tree/transport)");
+        console.log("engine-root.test: 40 actual engine/root/journal/base integration suites passed (synthetic tree/transport)");
     } finally {
         if (globals.__obsetyncTestNotice === notice) {
             if (oldNotice === undefined) delete globals.__obsetyncTestNotice; else globals.__obsetyncTestNotice = oldNotice;

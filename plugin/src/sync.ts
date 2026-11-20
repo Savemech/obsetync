@@ -3849,8 +3849,9 @@ export class ObsetyncSyncEngine {
                     this.pendingIdleStatus(),
                 );
             }
-            // Drain user edits that arrived while we were pushing.
+            // Restored failures retry on a fresh event, manual sync or poll.
             if (
+                !pushFailed &&
                 !this.reenrollmentRequired &&
                 !this.stopped &&
                 !this.bulkChangeReviewRequired &&
