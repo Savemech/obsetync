@@ -1,5 +1,5 @@
+import { utf8Bytes } from "./utf8-bytes";
 import { isSafeVaultPath } from "./delta-validation";
-import { checksumJournalUtf8 } from "./journal-format";
 import { SegmentedStore, STORE_LIMITS, StoreRecoveryError, createMigrationProof,
     type SegmentedStoreIO } from "./segmented-store";
 import { detachRootBasePublication, type RootBasePublication,
@@ -174,7 +174,7 @@ function* snapshotRows(state: State): IterableIterator<Row> {
 function encodedSize(intent: StoredRootIntent): number {
     let bytes = 0;
     for (const row of intentRows(intent)) {
-        bytes += checksumJournalUtf8(JSON.stringify(row)).bytes;
+        bytes += utf8Bytes(JSON.stringify(row));
         if (bytes > ROOT_INTENT_LIMITS.encodedBytes) fail("LIMIT", "root-intent exceeds serialized ceiling");
     }
     return bytes;
@@ -273,7 +273,7 @@ export class RootIntentStore {
             if (!current) fail("IDENTITY", "no root intent owns this terminal outcome");
             const terminal = validateRootTerminalOutcome(raw, wireIdentity(current.intent));
             const id = identityCopy(current.intent.publication.identity);
-            const bytes = checksumJournalUtf8(JSON.stringify(terminal)).bytes * 2;
+            const bytes = utf8Bytes(JSON.stringify(terminal)) * 2;
             return this.enqueue(bytes, async () => {
                 this.assertReady();
                 const pending = this.requirePending(id);
@@ -299,7 +299,7 @@ export class RootIntentStore {
             const identity = identityCopy(rawIdentity), receipt = copyConflictReceipt(rawReceipt);
             validateConflictBinding(this.requirePending(identity), receipt);
             const row: Row = { schema: 1, op: "conflict-copy", identity, receipt };
-            const bytes = checksumJournalUtf8(JSON.stringify(row)).bytes * 2;
+            const bytes = utf8Bytes(JSON.stringify(row)) * 2;
             return this.enqueue(bytes, async () => {
                 this.assertReady();
                 const pending = this.requirePending(identity);
@@ -422,10 +422,10 @@ export class RootIntentStore {
                     !uint(h.cutCount) || h.cutCount > ROOT_INTENT_LIMITS.journalCuts) fail("LIMIT", "root-intent header exceeds ceiling");
                 // The complete validators run at the seal before promotion.
                 header = h as Header; root = ""; rootIndex = 0; entries = []; cuts = [];
-                assemblingBytes = checksumJournalUtf8(JSON.stringify(row)).bytes;
+                assemblingBytes = utf8Bytes(JSON.stringify(row));
             } else if (row.op === "root" || row.op === "entry" || row.op === "cut") {
                 if (!header) fail("CORRUPT", "root-intent body has no header");
-                assemblingBytes += checksumJournalUtf8(JSON.stringify(row)).bytes;
+                assemblingBytes += utf8Bytes(JSON.stringify(row));
                 if (assemblingBytes > ROOT_INTENT_LIMITS.encodedBytes) fail("LIMIT", "root-intent body exceeds ceiling");
                 if (row.op === "root") {
                     exact(row, ["schema", "op", "index", "data"]);

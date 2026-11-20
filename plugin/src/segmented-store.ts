@@ -1,3 +1,4 @@
+import { utf8Bytes } from "./utf8-bytes";
 import { checksumJournalUtf8 } from "./journal-format";
 import { isMissingPathError } from "./file-safety";
 import { yieldWork } from "./work-scheduler";
@@ -78,7 +79,7 @@ function metadataJSON(metadata: unknown): string {
     let raw: string | undefined;
     try { raw = JSON.stringify(metadata); } catch { fail("migration metadata cannot be encoded"); }
     if (raw === undefined) fail("migration metadata cannot be encoded");
-    if (checksumJournalUtf8(raw).bytes > STORE_LIMITS.headBytes) {
+    if (utf8Bytes(raw) > STORE_LIMITS.headBytes) {
         throw new StoreRecoveryError("LIMIT", "migration metadata exceeds bounded proof size");
     }
     return raw;
@@ -151,7 +152,7 @@ function seal(value: unknown, limit: number): string {
     const payload = JSON.stringify(value);
     const checksum = checksumJournalUtf8(payload);
     const encoded = JSON.stringify({ schema: 1, payload, ...checksum });
-    if (checksumJournalUtf8(encoded).bytes > limit) throw new StoreRecoveryError("LIMIT", "storage frame exceeds bounded encoding");
+    if (utf8Bytes(encoded) > limit) throw new StoreRecoveryError("LIMIT", "storage frame exceeds bounded encoding");
     return encoded;
 }
 
@@ -500,7 +501,7 @@ export class SegmentedStore {
         for (const row of rows) {
             const encoded = JSON.stringify(row);
             if (encoded === undefined) fail("storage row cannot be encoded");
-            const size = checksumJournalUtf8(encoded).bytes + 1;
+            const size = utf8Bytes(encoded) + 1;
             if (size + 512 > STORE_LIMITS.payloadBytes) throw new StoreRecoveryError("LIMIT", "storage row exceeds page capacity");
             if (batch.length && (bytes + size > STORE_LIMITS.payloadBytes || batch.length >= STORE_LIMITS.rowsPerPage)) {
                 yield batch; batch = []; bytes = 512;
@@ -531,7 +532,7 @@ export class SegmentedStore {
         if (page.kind !== kind || page.epoch !== head.epoch || page.id !== id ||
             !integer(page.from) || !integer(page.through) || !Array.isArray(page.rows) ||
             page.rows.length === 0 || page.rows.length > STORE_LIMITS.rowsPerPage ||
-            checksumJournalUtf8(JSON.stringify(page)).bytes > STORE_LIMITS.payloadBytes) fail("invalid storage page bounds or identity");
+            utf8Bytes(JSON.stringify(page)) > STORE_LIMITS.payloadBytes) fail("invalid storage page bounds or identity");
         return page;
     }
 
@@ -836,7 +837,7 @@ export class SegmentedStore {
                 if (stat.size > limit) throw new StoreRecoveryError("LIMIT", "storage file exceeds bounded read");
             }
             const raw = await this.io.read(path);
-            if (checksumJournalUtf8(raw).bytes > limit) throw new StoreRecoveryError("LIMIT", "storage read exceeded admitted frame size");
+            if (utf8Bytes(raw) > limit) throw new StoreRecoveryError("LIMIT", "storage read exceeded admitted frame size");
             return raw;
         } catch (error) {
             if (error instanceof StoreRecoveryError) throw error;

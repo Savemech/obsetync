@@ -1,3 +1,4 @@
+import { utf8Bytes } from "./utf8-bytes";
 import { strict as assert } from "node:assert";
 import { ObsetyncJournal, JOURNAL_PATHS, JOURNAL_STORE_PATH, JournalRecoveryError,
     type JournalEntry, type NewJournalEntry } from "./journal";
@@ -76,6 +77,9 @@ function deferred(): { promise: Promise<void>; resolve(): void } {
 }
 
 async function legacyTailCoalescesWithoutTouchingSource(): Promise<void> {
+    for (const text of ["", "a", "é", "ࠀ", "😀", "\ud800", "\udc00", "\ud800😀\udc00"]) {
+        same(utf8Bytes(text), new TextEncoder().encode(text).length, "UTF-8 byte limit differs from wire encoding");
+    }
     check(checksumJournalUtf8("123456789").crc32 === "cbf43926", "CRC32 differs from its standard known vector");
     check(checksumJournalUtf8("éééééé😀").bytes === 16, "checksum counted UTF-16 rather than UTF-8 bytes");
     const raw = [

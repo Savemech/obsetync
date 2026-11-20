@@ -1,5 +1,6 @@
+import { utf8Bytes } from "./utf8-bytes";
 import { isMissingPathError } from "./file-safety";
-import { checksumJournalUtf8, JournalRecoveryError, parseJournalCooperatively, type ParsedJournal } from "./journal-format";
+import { JournalRecoveryError, parseJournalCooperatively, type ParsedJournal } from "./journal-format";
 import { fingerprintLegacyCopies } from "./legacy-source";
 import type { SegmentedStoreIO } from "./segmented-store";
 
@@ -70,7 +71,7 @@ async function readLegacy(io: SegmentedStoreIO, path: string): Promise<string | 
             if (stat.size > LEGACY_READ_LIMIT) throw new JournalRecoveryError("LIMIT", "legacy journal requires bounded external migration");
         }
         const raw = await io.read(path);
-        if (checksumJournalUtf8(raw).bytes > LEGACY_READ_LIMIT) throw new JournalRecoveryError("LIMIT", "legacy journal exceeds portable read limit");
+        if (utf8Bytes(raw) > LEGACY_READ_LIMIT) throw new JournalRecoveryError("LIMIT", "legacy journal exceeds portable read limit");
         return raw;
     } catch (error) {
         if (error instanceof JournalRecoveryError) throw error;

@@ -1,3 +1,4 @@
+import { utf8Bytes } from "./utf8-bytes";
 import { isSafeVaultPath } from "./delta-validation";
 import type { CapturedBaseTreeEntries, CapturedBaseTreeEntry, ObsetyncSyncBase } from "./sync-base";
 import type { WasmTree } from "./push";
@@ -392,22 +393,6 @@ function serializeEntry(row: CapturedBaseTreeEntry, previousPath: string | null)
     // Only explicit scalar fields cross the native boundary; no caller data
     // or extra fields/toJSON hooks are retained.
     return JSON.stringify({ path: row.path, hash: row.hash, mtime_ms: row.mtime_ms, size: row.size });
-}
-
-/** Count without constructing an additional encoded byte array. JSON.stringify
- * has already escaped isolated UTF-16 surrogates, so only valid pairs remain. */
-function utf8Bytes(text: string): number {
-    let bytes = 0;
-    for (let index = 0; index < text.length; index++) {
-        const code = text.charCodeAt(index);
-        if (code < 0x80) bytes++;
-        else if (code < 0x800) bytes += 2;
-        else if (code >= 0xd800 && code <= 0xdbff && index + 1 < text.length &&
-            text.charCodeAt(index + 1) >= 0xdc00 && text.charCodeAt(index + 1) <= 0xdfff) {
-            bytes += 4; index++;
-        } else bytes += 3;
-    }
-    return bytes;
 }
 
 /** Rebuild the COMPLETE immutable graph from current validated base entries,

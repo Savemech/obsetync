@@ -1,10 +1,10 @@
+import { utf8Bytes } from "./utf8-bytes";
 import type { App } from "obsidian";
 import { PersistentPathIndex } from "./persistent-path-index";
 import { SegmentedStore, STORE_LIMITS, StoreRecoveryError, createMigrationProof } from "./segmented-store";
 import { fingerprintLegacyCopies } from "./legacy-source";
 import { isSafeVaultPath } from "./delta-validation";
 import { isMissingPathError } from "./file-safety";
-import { checksumJournalUtf8 } from "./journal-format";
 import { yieldWork } from "./work-scheduler";
 import { assertLegacyDowngradeReadable } from "./legacy-downgrade";
 
@@ -289,7 +289,7 @@ export class ObsetyncSyncBase {
             this.queuedPublications++; ownsSlot = true;
             captured = detachRootBasePublication(publication);
             encoded = JSON.stringify(captured);
-            bytes = checksumJournalUtf8(encoded).bytes;
+            bytes = utf8Bytes(encoded);
             if (bytes > ROOT_BASE_PUBLICATION_LIMITS.queuedEncodedBytes - this.queuedPublicationBytes) {
                 throw new StoreRecoveryError("LIMIT", "root publication queued metadata exceeds bound");
             }
@@ -685,7 +685,7 @@ export class ObsetyncSyncBase {
                 if (stat.size > LEGACY_READ_LIMIT) throw new StoreRecoveryError("LIMIT", "legacy import needs a bounded external migration");
             }
             const raw = await adapter.read(path);
-            if (checksumJournalUtf8(raw).bytes > LEGACY_READ_LIMIT) throw new StoreRecoveryError("LIMIT", "legacy import exceeds portable read limit");
+            if (utf8Bytes(raw) > LEGACY_READ_LIMIT) throw new StoreRecoveryError("LIMIT", "legacy import exceeds portable read limit");
             return raw;
         } catch (error) {
             if (error instanceof StoreRecoveryError) throw error;
@@ -923,12 +923,12 @@ export function detachRootBasePublication(value: unknown): RootBasePublication {
                 ...(row.treeMtime === undefined ? {} : { treeMtime: row.treeMtime }) });
             detached = { action: "upsert", path: row.path, ...entry };
         } else invalid("unsupported root publication entry action");
-        rowBytes += checksumJournalUtf8(JSON.stringify(detached)).bytes;
+        rowBytes += utf8Bytes(JSON.stringify(detached));
         if (rowBytes > ROOT_BASE_PUBLICATION_LIMITS.encodedBytes) throw new StoreRecoveryError("LIMIT", "root publication metadata exceeds bound");
         entries.push(detached);
     }
     const captured = { identity, candidateRoot: value.candidateRoot, entries, committedAt: value.committedAt };
-    if (checksumJournalUtf8(JSON.stringify(captured)).bytes > ROOT_BASE_PUBLICATION_LIMITS.encodedBytes) {
+    if (utf8Bytes(JSON.stringify(captured)) > ROOT_BASE_PUBLICATION_LIMITS.encodedBytes) {
         throw new StoreRecoveryError("LIMIT", "root publication metadata exceeds bound");
     }
     return captured;

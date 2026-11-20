@@ -1,8 +1,8 @@
+import { utf8Bytes } from "./utf8-bytes";
 import type { ObsetyncJournal, JournalEntry } from "./journal";
 import type { ObsetyncSyncBase, DiffPageCheckpoint } from "./sync-base";
 import type { RootIntentStore } from "./root-intent";
 import { isSafeVaultPath } from "./delta-validation";
-import { checksumJournalUtf8 } from "./journal-format";
 import { StoreRecoveryError, segmentedMigrationPaths, type SegmentedStoreIO } from "./segmented-store";
 
 const ROOT = ".obsidian/plugins/obsetync";
@@ -89,7 +89,7 @@ function sameCore(left: Marker, right: Marker): boolean {
     return JSON.stringify(markerCore(left)) === JSON.stringify(markerCore(right));
 }
 function validateMarker(raw: string, expectedPhase: Marker["phase"]): Marker {
-    if (checksumJournalUtf8(raw).bytes > MAX_MARKER_BYTES) fail("LIMIT", "legacy downgrade marker exceeds ceiling");
+    if (utf8Bytes(raw) > MAX_MARKER_BYTES) fail("LIMIT", "legacy downgrade marker exceeds ceiling");
     let value: unknown;
     try { value = JSON.parse(raw); } catch { fail("CORRUPT", "legacy downgrade marker is not JSON"); }
     exact(value, ["schema", "kind", "sourceVersion", "targetVersion", "treeVersion", "bundleId",
@@ -134,7 +134,7 @@ async function readOptional(io: SegmentedStoreIO, path: string, limit: number): 
         }
     }
     const raw = await io.read(path);
-    if (checksumJournalUtf8(raw).bytes > limit) fail("LIMIT", "legacy downgrade file exceeds ceiling");
+    if (utf8Bytes(raw) > limit) fail("LIMIT", "legacy downgrade file exceeds ceiling");
     return raw;
 }
 async function readMarker(io: SegmentedStoreIO, path: string, phase: Marker["phase"]): Promise<Marker | null> {
@@ -286,7 +286,7 @@ function detachedJournal(entryCount: number, entries: Iterable<JournalEntry>): s
         previousId = entry.id;
         const row = JSON.stringify({ id: entry.id, action: entry.action, path: entry.path,
             ...(entry.oldPath === undefined ? {} : { oldPath: entry.oldPath }), ts: entry.ts, synced: false });
-        bytes += checksumJournalUtf8(row).bytes + 1;
+        bytes += utf8Bytes(row) + 1;
         if (bytes > MAX_FILE_BYTES) fail("LIMIT", "legacy journal projection exceeds ceiling");
         rows.push(row);
     }
@@ -307,7 +307,7 @@ function detachedBase(syncBase: ObsetyncSyncBase): string {
         previous = path;
         const entry = syncBase.getEntry(path);
         if (!entry) fail("CORRUPT", "legacy sync-base capture changed");
-        retainedBytes += checksumJournalUtf8(`${JSON.stringify(path)}:${JSON.stringify(entry)},`).bytes;
+        retainedBytes += utf8Bytes(`${JSON.stringify(path)}:${JSON.stringify(entry)},`);
         if (retainedBytes > MAX_FILE_BYTES) fail("LIMIT", "legacy sync-base projection exceeds ceiling");
         entries[path] = entry;
         count++;
@@ -317,7 +317,7 @@ function detachedBase(syncBase: ObsetyncSyncBase): string {
     const raw = JSON.stringify({ lastSyncTimestamp: syncBase.lastSyncTimestamp, entries,
         ...(syncBase.treeBaseRoot === null ? {} : { treeBaseRoot: syncBase.treeBaseRoot }),
         ...(checkpoint === null ? {} : { diffPageCheckpoint: checkpoint }) });
-    if (checksumJournalUtf8(raw).bytes > MAX_FILE_BYTES) fail("LIMIT", "legacy sync-base projection exceeds ceiling");
+    if (utf8Bytes(raw) > MAX_FILE_BYTES) fail("LIMIT", "legacy sync-base projection exceeds ceiling");
     return raw;
 }
 
