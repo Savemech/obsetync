@@ -3988,10 +3988,15 @@ export class ObsetyncSyncEngine {
         // Merge each unique old path once. Live callbacks may have completed
         // during the yields; preserve those newer hints and carry only the
         // older WAL watermark into their eventual successful publication.
-        const hints = recovered.take();
-        for (let offset = 0; offset < hints.length; offset += DIRTY_RETIREMENT_LIMIT) {
+        let remaining = recovered.size;
+        const batch: DirtyFileChange[] = [];
+        for (const hint of recovered.iterate()) {
+            batch.push(hint);
+            remaining--;
+            if (batch.length < DIRTY_RETIREMENT_LIMIT && remaining > 0) continue;
             throwIfWorkAborted(this.hashWorkerAbort.signal);
-            this.pendingChanges.restoreJournal(hints.slice(offset, offset + DIRTY_RETIREMENT_LIMIT));
+            this.pendingChanges.restoreJournal(batch);
+            batch.length = 0;
             await yieldToUI({ signal: this.hashWorkerAbort.signal, lane: "maintenance" });
         }
     }
