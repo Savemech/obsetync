@@ -566,10 +566,10 @@ export class RootTreeResidentAdmission {
      * invalidates graph provenance. Proof/epoch validation precedes any change. */
     settleAfterV2Sweep(token: RootTreeResidentSettlement,
         proof: V2TreeOutputSettlementProof): boolean {
-        const proofState = takeV2TreeOutputSettlementProof(proof);
         const state = this.settlements.get(token);
         const record = state && this.trees.get(state.tree);
         if (!state?.active || !record || record.settlement !== state) return false;
+        const proofState = takeV2TreeOutputSettlementProof(proof);
         state.active = false;
         record.settlement = undefined;
         this.settlements.delete(token);

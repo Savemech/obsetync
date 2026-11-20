@@ -740,6 +740,8 @@ function stableV2SettlementIsExactOneUseAndFailClosed(): void {
         witness.committedRevision, witness.candidateRevision)!;
     const result = settleTreeCandidateOutput(tree, "commit", witness);
     assert(result.proof);
+    const foreign = new RootTreeResidentAdmission({ capacityBytes: 200 });
+    assert.equal(foreign.settleAfterV2Sweep(ticket, result.proof), false);
     assert.equal(admitted.settleAfterV2Sweep(ticket, result.proof), true);
     charges(admitted, { privateBytes: 0, residentBytes: 90, retiringBytes: 0,
         privateAttempts: 0, residentTrees: 1, retiringOwners: 0, activeLeases: 1 });
