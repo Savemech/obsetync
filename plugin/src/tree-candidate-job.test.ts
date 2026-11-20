@@ -3,7 +3,7 @@ import { abortTreeCandidateAfterReachabilityRetirement, beginTreeCandidate,
     collectTreeCandidateChunkPages, collectTreeCandidateChunks, TREE_CANDIDATE_JOB_STEP_UNITS,
     TREE_CANDIDATE_CHUNK_SORT_STEP_UNITS,
     TREE_REACHABILITY_RETIREMENT_STEP_UNITS, drainTreeReachabilityRetirement,
-    hasPendingTreeReachabilityRetirement, parseCandidateOpenMemoryPlan,
+    hasPendingTreeReachabilityRetirement, parseCandidateOpenMemoryPlan, TreeReachabilityRetirementError,
     type CandidateJobTree, type CandidateOpenMemoryOwner, type CandidateOpenMemoryPlan,
     type TreeJobProgress } from "./tree-candidate-job";
 
@@ -593,6 +593,33 @@ async function candidateOpenMemoryPostPublicationUsesExactAbort(): Promise<void>
     assert.equal(hasPendingTreeReachabilityRetirement(tree), false);
 }
 
+async function failedOutputReleaseCanBeRetried(): Promise<void> {
+    const tree = new MemoryDeferredTreeFixture();
+    const failure = new Error("release failed");
+    let attempts = 0, allowRelease = false;
+    const originalConsoleError = console.error; console.error = () => {};
+    try {
+        await assert.rejects(beginTreeCandidate(tree, {
+            cooperate: async () => {}, cooperateRetirement: async () => {},
+            onOpenMemoryPlan: () => ({ ...memoryOwner(tree.events), retired: () => {
+                attempts++;
+                if (!allowRelease) throw failure;
+            } }),
+            onCandidateOpened: () => assert.fail("unexpected handoff"),
+        }), error => error instanceof TreeReachabilityRetirementError && error.cleanupCause === failure);
+    } finally { console.error = originalConsoleError; }
+    const previous = attempts;
+    await assert.rejects(drainTreeReachabilityRetirement(tree), error =>
+        error instanceof TreeReachabilityRetirementError && error.cleanupCause === failure);
+    assert.equal(attempts, previous + 1);
+    allowRelease = true;
+    await drainTreeReachabilityRetirement(tree);
+    assert.equal(attempts, previous + 2);
+    assert.equal(hasPendingTreeReachabilityRetirement(tree), false);
+    assert.equal(tree.candidate, false);
+    assert.equal(tree.events.filter(event => event === "retirement-finish").length, 1);
+}
+
 async function candidateOpenMemoryFailedExactAbortRetainsRetryDebt(): Promise<void> {
     const tree = new MemoryDeferredTreeFixture(); let exactAborts = 0;
     const originalConsoleError = console.error; console.error = () => {};
@@ -1143,6 +1170,7 @@ async function run(): Promise<void> {
     await candidateOpenMemorySuccessTransfersOwnershipInOrder();
     await candidateOpenMemoryFailuresRetireTheExactOwner();
     await candidateOpenMemoryPostPublicationUsesExactAbort();
+    await failedOutputReleaseCanBeRetried();
     await candidateOpenMemoryFailedExactAbortRetainsRetryDebt();
     completed = true;
     console.log("tree-candidate-job.test: bounded steps, cancellation and ownership handoff passed");

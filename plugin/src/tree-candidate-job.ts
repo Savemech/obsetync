@@ -470,10 +470,6 @@ export function drainTreeReachabilityRetirement(tree: CandidateJobTree): Promise
         throw new TreeReachabilityRetirementError(error);
     }).finally(() => {
         owner.flight = undefined;
-        if (owner.finalized && owner.output) {
-            owner.output.retired();
-            owner.output = undefined;
-        }
         if (owner.finalized && !owner.output && owner.abortCandidateRevision === undefined) {
             pendingReachabilityRetirements.delete(tree);
         }
