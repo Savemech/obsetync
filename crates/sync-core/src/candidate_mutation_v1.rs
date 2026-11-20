@@ -1149,21 +1149,15 @@ impl PrefixMutation {
             match phase {
                 PrefixPhase::AppendProbe(probe) => match probe {
                     AppendProbe::Read(hash) => {
-                        let bytes = overlay
-                            .get(&hash)
-                            .cloned()
-                            .or_else(|| store.get_chunk(&hash))
-                            .ok_or_else(|| ChunkError::NotFound(hash_to_hex(&hash)))?;
-                        if hash_bytes(&bytes) != hash {
-                            return Err(invalid("index object failed content-address validation"));
-                        }
-                        if let Ok(leaf) = LeafChunk::deserialize(&bytes) {
+                        let chunk = verified_chunk(overlay, store, &hash)?;
+                        let bytes = chunk.as_ref();
+                        if let Ok(leaf) = LeafChunk::deserialize(bytes) {
                             self.phase = PrefixPhase::AppendProbe(AppendProbe::ValidateTail {
                                 hashes: vec![hash],
                                 entries: leaf.entries,
                                 position: 0,
                             });
-                        } else if let Ok(node) = InternalNode::deserialize(&bytes) {
+                        } else if let Ok(node) = InternalNode::deserialize(bytes) {
                             self.phase = PrefixPhase::AppendProbe(AppendProbe::Canonicalize {
                                 rows: node.children,
                                 position: 0,
@@ -1230,15 +1224,9 @@ impl PrefixMutation {
                     }
                     AppendProbe::ReadTail(hashes) => {
                         let hash = *hashes.last().expect("empty children fall back before tail");
-                        let bytes = overlay
-                            .get(&hash)
-                            .cloned()
-                            .or_else(|| store.get_chunk(&hash))
-                            .ok_or_else(|| ChunkError::NotFound(hash_to_hex(&hash)))?;
-                        if hash_bytes(&bytes) != hash {
-                            return Err(invalid("index object failed content-address validation"));
-                        }
-                        let Ok(leaf) = LeafChunk::deserialize(&bytes) else {
+                        let chunk = verified_chunk(overlay, store, &hash)?;
+                        let bytes = chunk.as_ref();
+                        let Ok(leaf) = LeafChunk::deserialize(bytes) else {
                             self.append_fallback();
                             return Ok(true);
                         };
@@ -1353,18 +1341,12 @@ impl PrefixMutation {
                             return Ok(true);
                         }
                         let hash = hashes[index];
-                        let bytes = overlay
-                            .get(&hash)
-                            .cloned()
-                            .or_else(|| store.get_chunk(&hash))
-                            .ok_or_else(|| ChunkError::NotFound(hash_to_hex(&hash)))?;
-                        if hash_bytes(&bytes) != hash {
-                            return Err(invalid("index object failed content-address validation"));
-                        }
+                        let chunk = verified_chunk(overlay, store, &hash)?;
+                        let bytes = chunk.as_ref();
                         let exact_entries =
                             (index + 1 < hashes.len()).then_some(TARGET_CHUNK_ENTRIES);
                         let Ok(Some((first, last))) = LeafChunk::validated_path_bounds(
-                            &bytes,
+                            bytes,
                             &self.prefix,
                             exact_entries,
                             TARGET_CHUNK_ENTRIES,
@@ -1408,18 +1390,12 @@ impl PrefixMutation {
                         }
                         let middle = lower + (upper - lower) / 2;
                         let hash = hashes[middle];
-                        let bytes = overlay
-                            .get(&hash)
-                            .cloned()
-                            .or_else(|| store.get_chunk(&hash))
-                            .ok_or_else(|| ChunkError::NotFound(hash_to_hex(&hash)))?;
-                        if hash_bytes(&bytes) != hash {
-                            return Err(invalid("index object failed content-address validation"));
-                        }
+                        let chunk = verified_chunk(overlay, store, &hash)?;
+                        let bytes = chunk.as_ref();
                         let exact_entries =
                             (middle + 1 < hashes.len()).then_some(TARGET_CHUNK_ENTRIES);
                         let Ok(Some((first, last))) = LeafChunk::validated_path_bounds(
-                            &bytes,
+                            bytes,
                             &self.prefix,
                             exact_entries,
                             TARGET_CHUNK_ENTRIES,
@@ -1475,18 +1451,12 @@ impl PrefixMutation {
                             return Ok(true);
                         }
                         let hash = hashes[index];
-                        let bytes = overlay
-                            .get(&hash)
-                            .cloned()
-                            .or_else(|| store.get_chunk(&hash))
-                            .ok_or_else(|| ChunkError::NotFound(hash_to_hex(&hash)))?;
-                        if hash_bytes(&bytes) != hash {
-                            return Err(invalid("index object failed content-address validation"));
-                        }
+                        let chunk = verified_chunk(overlay, store, &hash)?;
+                        let bytes = chunk.as_ref();
                         let exact_entries =
                             (index + 1 < hashes.len()).then_some(TARGET_CHUNK_ENTRIES);
                         let Ok(Some((first, last))) = LeafChunk::validated_path_bounds(
-                            &bytes,
+                            bytes,
                             &self.prefix,
                             exact_entries,
                             TARGET_CHUNK_ENTRIES,
@@ -1508,7 +1478,7 @@ impl PrefixMutation {
                             self.update_fallback(pending, None, adds);
                             return Ok(true);
                         }
-                        let leaf = LeafChunk::deserialize(&bytes).map_err(|_| {
+                        let leaf = LeafChunk::deserialize(bytes).map_err(|_| {
                             invalid("candidate update leaf failed canonical deserialization")
                         })?;
                         self.phase = PrefixPhase::AppendProbe(AppendProbe::ValidateUpdateLeaf {
@@ -1654,21 +1624,11 @@ impl PrefixMutation {
                             });
                             return Ok(true);
                         }
-                        let hash = if hashes.len() == 1 {
-                            hashes[0]
+                        self.phase = if hashes.len() == 1 {
+                            PrefixPhase::Done(Some(hashes[0]))
                         } else {
-                            let children = hashes
-                                .into_iter()
-                                .enumerate()
-                                .map(|(index, hash)| (format!("{}{}", self.prefix, index), hash))
-                                .collect();
-                            stage(
-                                overlay,
-                                staged_bytes,
-                                InternalNode::new(children).serialize(),
-                            )?
+                            PrefixPhase::InternalChildren(hashes.into_iter(), Vec::new())
                         };
-                        self.phase = PrefixPhase::Done(Some(hash));
                         return Ok(true);
                     }
                     AppendProbe::FallbackRetire { mut entries, adds } => {
@@ -1718,22 +1678,16 @@ impl PrefixMutation {
                         if load.visited > MAX_VISITED_NODES {
                             return Err(invalid("tree has too many nodes"));
                         }
-                        let bytes = overlay
-                            .get(&hash)
-                            .cloned()
-                            .or_else(|| store.get_chunk(&hash))
-                            .ok_or_else(|| ChunkError::NotFound(hash_to_hex(&hash)))?;
-                        if hash_bytes(&bytes) != hash {
-                            return Err(invalid("index object failed content-address validation"));
-                        }
-                        if let Ok(leaf) = LeafChunk::deserialize(&bytes) {
+                        let chunk = verified_chunk(overlay, store, &hash)?;
+                        let bytes = chunk.as_ref();
+                        if let Ok(leaf) = LeafChunk::deserialize(bytes) {
                             if load.entries.len().saturating_add(leaf.entries.len())
                                 > MAX_LOADED_ENTRIES
                             {
                                 return Err(invalid("tree has too many entries"));
                             }
                             load.moving = Some(leaf.entries.into_iter());
-                        } else if let Ok(node) = InternalNode::deserialize(&bytes) {
+                        } else if let Ok(node) = InternalNode::deserialize(bytes) {
                             load.children = Some(LoadChildren::Canonicalize {
                                 rows: node.children,
                                 position: 0,
@@ -2106,6 +2060,39 @@ impl PrefixMutation {
         }
         false
     }
+}
+
+enum MutationChunk<'a> {
+    Staged(&'a [u8]),
+    Resident(std::cell::Ref<'a, [u8]>),
+}
+
+impl AsRef<[u8]> for MutationChunk<'_> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Staged(bytes) => bytes,
+            Self::Resident(bytes) => bytes,
+        }
+    }
+}
+
+fn verified_chunk<'a>(
+    overlay: &'a HashMap<FileHash, Vec<u8>>,
+    store: &'a MemoryChunkStore,
+    hash: &FileHash,
+) -> Result<MutationChunk<'a>, ChunkError> {
+    let chunk = match overlay.get(hash) {
+        Some(bytes) => MutationChunk::Staged(bytes),
+        None => MutationChunk::Resident(
+            store
+                .borrow_chunk(hash)
+                .ok_or_else(|| ChunkError::NotFound(hash_to_hex(hash)))?,
+        ),
+    };
+    if hash_bytes(chunk.as_ref()) != *hash {
+        return Err(invalid("index object failed content-address validation"));
+    }
+    Ok(chunk)
 }
 
 fn stage(
@@ -2835,6 +2822,29 @@ mod tests {
             completed <= 350_000,
             "ordered existing updates revisited the full prefix: {completed} units"
         );
+    }
+
+    #[test]
+    fn updated_wide_prefix_emits_one_child_label_per_tick() {
+        let hashes = vec![[1; 32], [2; 32], [3; 32]];
+        let mut prefix = PrefixMutation::new("wide/".into(), Vec::new(), Vec::new(), None);
+        prefix.phase = PrefixPhase::AppendProbe(AppendProbe::EmitUpdates {
+            hashes: hashes.clone(),
+            pending: Vec::new().into_iter(),
+            retiring: None,
+        });
+        let store = MemoryChunkStore::new();
+        let mut overlay = HashMap::new();
+        let mut staged = 0;
+        for count in 0..=hashes.len() {
+            assert!(prefix.tick(&store, &mut overlay, &mut staged).unwrap());
+            let PrefixPhase::InternalChildren(remaining, labels) = &prefix.phase else {
+                panic!("updated prefix skipped stepped child assembly");
+            };
+            assert_eq!(remaining.as_slice(), &hashes[count..]);
+            assert_eq!(labels.len(), count);
+            assert!(overlay.is_empty());
+        }
     }
 
     #[test]

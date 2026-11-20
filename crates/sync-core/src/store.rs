@@ -495,6 +495,13 @@ impl MemoryChunkStore {
             .map(|chunk| chunk.bytes.clone())
     }
 
+    pub(crate) fn borrow_chunk(&self, hash: &FileHash) -> Option<std::cell::Ref<'_, [u8]>> {
+        std::cell::Ref::filter_map(self.data.borrow(), |state| {
+            state.map.get(hash).map(|chunk| chunk.bytes.as_slice())
+        })
+        .ok()
+    }
+
     /// Inspect the resident buffer without cloning or serializing its bytes.
     pub fn chunk_byte_length(&self, hash: &FileHash) -> Option<usize> {
         self.data
