@@ -957,7 +957,7 @@ async fn post_capabilities(
                     return Ok::<_, ServerError>(1);
                 };
                 let bytes = store
-                    .get_root(&vault_id, &hash)
+                    .try_get_root(&vault_id, &hash)?
                     .ok_or_else(|| ServerError::Internal("current root data missing".into()))?;
                 let root = decode_stored_root(&bytes, "current")?;
                 validate_root_identity(&root, &vault_id, &hash, "current")?;
@@ -1283,8 +1283,8 @@ async fn get_root(
 
     let data = state
         .vaults
-        .get_root(&vault_id, &hash)
-        .ok_or_else(|| ServerError::NotFound("root data missing".into()))?;
+        .try_get_root(&vault_id, &hash)?
+        .ok_or_else(|| ServerError::Internal("current root data missing".into()))?;
 
     let root = decode_stored_root(&data, "current")?;
     validate_root_identity(&root, &vault_id, &hash, "current")?;
@@ -1306,7 +1306,7 @@ async fn get_root_at(
         .map_err(|_| ServerError::BadRequest("invalid historical root hash".into()))?;
     let data = state
         .vaults
-        .get_root(&vault_id, &hash)
+        .try_get_root(&vault_id, &hash)?
         .ok_or_else(|| ServerError::NotFound("root not found in history".into()))?;
     let root = decode_stored_root(&data, "historical")?;
     validate_root_identity(&root, &vault_id, &hash, "historical")?;
@@ -1351,7 +1351,7 @@ fn read_history(
     if let Some(current_hash) = current {
         let current_data = state
             .vaults
-            .get_root(&vault_id, &current_hash)
+            .try_get_root(&vault_id, &current_hash)?
             .ok_or_else(|| ServerError::Internal("current root data missing".into()))?;
         let current_root = decode_stored_root(&current_data, "current")?;
         validate_root_identity(&current_root, &vault_id, &current_hash, "current")?;
@@ -1622,7 +1622,7 @@ async fn post_rollback(
 
     let target_data = state
         .vaults
-        .get_root(&vault_id, &hash)
+        .try_get_root(&vault_id, &hash)?
         .ok_or_else(|| ServerError::NotFound("root not found in history".into()))?;
     let target_root = decode_stored_root(&target_data, "rollback target")?;
     validate_root_identity(&target_root, &vault_id, &hash, "rollback target")?;
@@ -1651,7 +1651,7 @@ async fn post_rollback(
     if let Some(current_hash) = state.vaults.try_get_current_root(&vault_id)? {
         let current_data = state
             .vaults
-            .get_root(&vault_id, &current_hash)
+            .try_get_root(&vault_id, &current_hash)?
             .ok_or_else(|| ServerError::Internal("current root data missing".into()))?;
         let current_root = decode_stored_root(&current_data, "current")?;
         validate_root_identity(&current_root, &vault_id, &current_hash, "current")?;
@@ -1864,6 +1864,13 @@ async fn publish_root(
     body: &[u8],
     commit: Option<&RootCommit>,
 ) -> Result<serde_json::Value, ServerError> {
+    // Serialize the read-modify-write on `current` per vault. Without this,
+    // two concurrent pushes both observe the same current, both pass the
+    // fast-forward check (or merge against a stale current), and the second
+    // set_current_root silently drops the first push. Held across the guard
+    // scan and merge awaits by design — pushes to ONE vault are serialized
+    // (ms for fast-forwards, worst-case seconds for a huge merge), different
+    // vaults never contend.
     let vault_lock = state.vault_lock(vault_id);
     let _vault_guard = vault_lock.lock().await;
     if let Some(commit) = commit {
@@ -1936,18 +1943,9 @@ async fn publish_root(
 
     let incoming_hash = incoming_root.hash();
 
-    // Serialize the read-modify-write on `current` per vault. Without this,
-    // two concurrent pushes both observe the same current, both pass the
-    // fast-forward check (or merge against a stale current), and the second
-    // set_current_root silently drops the first push. Held across the guard
-    // scan and merge awaits by design — pushes to ONE vault are serialized
-    // (ms for fast-forwards, worst-case seconds for a huge merge), different
-    // vaults never contend.
     // History metadata is server-authored. It is not part of the semantic
     // root hash, so trusting client values would let a replay rewrite the
     // displayed author, timestamp, or parent of an existing state.
-    incoming_root.set_history_metadata(unix_time_ms(), None, device.0.clone());
-
     match current_root_hash {
         None => {
             // Staged migration: a new vault always starts on the universally
@@ -1986,7 +1984,7 @@ async fn publish_root(
                 .map_err(|_| ServerError::BadRequest("invalid X-Parent-Root header".into()))?;
             let current_data = state
                 .vaults
-                .get_root(vault_id, &current_hash)
+                .try_get_root(vault_id, &current_hash)?
                 .ok_or_else(|| ServerError::Internal("current root data missing".into()))?;
             let current_root = decode_stored_root(&current_data, "current")?;
             validate_root_identity(&current_root, vault_id, &current_hash, "current")?;
@@ -2033,7 +2031,7 @@ async fn publish_root(
                     vault_id,
                     &device.0,
                     current_root,
-                    incoming_root.clone(),
+                    incoming_root,
                     "ff",
                 )
                 .await?;
@@ -2058,7 +2056,7 @@ async fn publish_root(
                 // TODO: walk parent chain to find true common ancestor.
                 let base_data = state
                     .vaults
-                    .get_root(vault_id, &parent_hash)
+                    .try_get_root(vault_id, &parent_hash)?
                     .ok_or_else(|| {
                         ServerError::BadRequest(
                             "parent root not found in history — full rescan needed".into(),
@@ -2112,7 +2110,7 @@ async fn publish_root(
                     vault_id,
                     &device.0,
                     current_for_guard,
-                    merge_result.new_root.clone(),
+                    merge_result.new_root,
                     "merge",
                 )
                 .await?;
@@ -2227,7 +2225,7 @@ fn load_snapshot_root(
     hash: &FileHash,
     description: &str,
 ) -> Result<sync_core::versioned_root::VersionedRoot, ServerError> {
-    let data = state.vaults.get_root(vault_id, hash).ok_or_else(|| {
+    let data = state.vaults.try_get_root(vault_id, hash)?.ok_or_else(|| {
         ServerError::BadRequest(format!(
             "{description} root not found in history — full rescan needed"
         ))
@@ -2393,9 +2391,9 @@ async fn post_diff(
     // JSON number array (`[172,42,...]`). The plugin expects hex strings
     // in its DTO. Convert at the wire boundary so the plugin can just
     // interpolate `delta.hash` into URLs like `/api/v1/content/{hash}`.
-    let wire_deltas: Vec<WireDelta> = deltas.iter().map(WireDelta::from).collect();
+    let wire_deltas: Vec<WireDelta> = deltas.into_iter().map(WireDelta::from).collect();
     let json = serde_json::to_string(&wire_deltas)?;
-    state.perf.record_request_objects(deltas.len() as u64);
+    state.perf.record_request_objects(wire_deltas.len() as u64);
     state.perf.record_diff(DiffSample {
         nodes_visited: diff_result.stats.nodes_visited,
         nodes_skipped: diff_result.stats.nodes_skipped,
@@ -2437,8 +2435,8 @@ enum WireDelta {
     },
 }
 
-impl From<&sync_core::diff::FileDelta> for WireDelta {
-    fn from(d: &sync_core::diff::FileDelta) -> Self {
+impl From<sync_core::diff::FileDelta> for WireDelta {
+    fn from(d: sync_core::diff::FileDelta) -> Self {
         use sync_core::diff::FileDelta as F;
         match d {
             F::Added {
@@ -2447,10 +2445,10 @@ impl From<&sync_core::diff::FileDelta> for WireDelta {
                 size,
                 mtime_ms,
             } => WireDelta::Added {
-                path: path.clone(),
-                hash: hash_to_hex(hash),
-                size: *size,
-                mtime_ms: *mtime_ms,
+                path,
+                hash: hash_to_hex(&hash),
+                size,
+                mtime_ms,
             },
             F::Modified {
                 path,
@@ -2458,12 +2456,12 @@ impl From<&sync_core::diff::FileDelta> for WireDelta {
                 size,
                 mtime_ms,
             } => WireDelta::Modified {
-                path: path.clone(),
-                hash: hash_to_hex(hash),
-                size: *size,
-                mtime_ms: *mtime_ms,
+                path,
+                hash: hash_to_hex(&hash),
+                size,
+                mtime_ms,
             },
-            F::Deleted { path, .. } => WireDelta::Deleted { path: path.clone() },
+            F::Deleted { path, .. } => WireDelta::Deleted { path },
             F::Renamed {
                 path,
                 old_path,
@@ -2471,11 +2469,11 @@ impl From<&sync_core::diff::FileDelta> for WireDelta {
                 size,
                 mtime_ms,
             } => WireDelta::Renamed {
-                path: path.clone(),
-                old_path: old_path.clone(),
-                hash: hash_to_hex(hash),
-                size: *size,
-                mtime_ms: *mtime_ms,
+                path,
+                old_path,
+                hash: hash_to_hex(&hash),
+                size,
+                mtime_ms,
             },
         }
     }
@@ -4199,6 +4197,25 @@ mod integration_tests {
         assert_eq!(roots.len(), HISTORY_LIMIT);
         for (entry, (_, expected_hash)) in roots.iter().zip(expected) {
             assert_eq!(entry["root"], expected_hash);
+        }
+    }
+
+    #[tokio::test]
+    async fn root_read_reports_storage_errors_separately_from_absence() {
+        let env = setup();
+        let vault = "root-read";
+        let hash = hash_bytes(b"root");
+        let current = format!("/api/v1/root/{vault}");
+        let historical = format!("/api/v1/root/{vault}/{}", hash_to_hex(&hash));
+        for path in [&current, &historical] {
+            assert_eq!(send_semantic(&env, "GET", path, &[]).await.0, 404);
+        }
+        env.state.vaults.set_current_root(vault, &hash).unwrap();
+        assert_eq!(send_semantic(&env, "GET", &current, &[]).await.0, 500);
+        let file = env.state.layout.vault_root_path(vault, &hash);
+        std::fs::create_dir_all(file).unwrap();
+        for path in [&current, &historical] {
+            assert_eq!(send_semantic(&env, "GET", path, &[]).await.0, 500);
         }
     }
 

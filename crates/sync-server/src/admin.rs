@@ -1285,7 +1285,8 @@ fn admin_history_root(
 ) -> Result<sync_core::versioned_root::VersionedRoot, ServerErrorHtml> {
     let bytes = state
         .vaults
-        .get_root(vault_id, hash)
+        .try_get_root(vault_id, hash)
+        .map_err(|error| ServerErrorHtml(format!("history root read failed: {error}")))?
         .ok_or_else(|| ServerErrorHtml("root not found in history".into()))?;
     let root = sync_core::versioned_root::VersionedRoot::deserialize(&bytes)
         .map_err(|error| ServerErrorHtml(format!("corrupt history root: {error}")))?;

@@ -555,8 +555,16 @@ impl VaultStore {
 
     /// Load a root node's bytes from history.
     pub fn get_root(&self, vault_id: &str, hash: &FileHash) -> Option<Vec<u8>> {
+        self.try_get_root(vault_id, hash).ok().flatten()
+    }
+
+    pub fn try_get_root(&self, vault_id: &str, hash: &FileHash) -> io::Result<Option<Vec<u8>>> {
         let path = self.layout.vault_root_path(vault_id, hash);
-        read_blob_bounded(&path, MAX_ROOT_HEAD_BYTES, self.perf.as_deref()).ok()
+        match read_blob_bounded(&path, MAX_ROOT_HEAD_BYTES, self.perf.as_deref()) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     #[cfg(test)]
