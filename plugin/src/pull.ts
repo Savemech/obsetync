@@ -1443,28 +1443,10 @@ async function applyDeltas(
         report(failed.length);
     };
 
-    const applyLargeBatch = async (batch: FileDelta[]) => {
-        const results = await Promise.allSettled(
-            batch.map((delta) => applyContentDelta(
-                api,
-                io,
-                syncBase,
-                wasm,
-                delta,
-                stats,
-                () => shouldSkip(delta),
-                perf,
-                beforeHeavyBatch,
-                largeTransferScope,
-                () => registerUpsert(delta),
-            ))
-        );
-        results.forEach((r, j) => {
-            if (r.status === "rejected") failed.push(batch[j]);
-            else if (!r.value) deferLocal(batch[j]);
-        });
-        await checkpointAndReport(batch.length);
-    };
+    const applyOne = (delta: FileDelta) => applyContentDelta(
+        api, io, syncBase, wasm, delta, stats, () => shouldSkip(delta),
+        perf, beforeHeavyBatch, largeTransferScope, () => registerUpsert(delta),
+    );
 
     const applySmallBatch = async (batch: FileDelta[]): Promise<void> => {
         const activeTuning = getHashTuning();
@@ -1599,7 +1581,11 @@ async function applyDeltas(
     }
     for (const delta of largeDownloads) {
         await beforeHeavyBatch?.();
-        await applyLargeBatch([delta]);
+        let applied: boolean | undefined;
+        try { applied = await applyOne(delta); }
+        catch { failed.push(delta); }
+        if (applied === false) deferLocal(delta);
+        await checkpointAndReport(1);
     }
 
     // One retry pass — most failures are transient. A file that STILL fails is
@@ -1612,19 +1598,7 @@ async function applyDeltas(
         for (const delta of failed) {
             try {
                 await beforeHeavyBatch?.();
-                const applied = await applyContentDelta(
-                    api,
-                    io,
-                    syncBase,
-                    wasm,
-                    delta,
-                    stats,
-                    () => shouldSkip(delta),
-                    perf,
-                    beforeHeavyBatch,
-                    largeTransferScope,
-                    () => registerUpsert(delta),
-                );
+                const applied = await applyOne(delta);
                 if (!applied) {
                     deferLocal(delta);
                     continue;
