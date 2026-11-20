@@ -177,12 +177,13 @@ export class ObsetyncWsChannel {
         const session = this.session;
         const generation = this.connectionGeneration;
         if (!ws || !session || this.state !== "connected") return;
+        const current = () => generation === this.connectionGeneration && this.ws === ws && ws.readyState === WebSocket.OPEN;
         const json = JSON.stringify(frame);
         this.txChain = this.txChain
             .then(async () => {
+                if (!current()) return;
                 const sealed = await session.seal(json);
-                if (generation === this.connectionGeneration && this.ws === ws &&
-                    ws.readyState === WebSocket.OPEN) {
+                if (current()) {
                     ws.send(sealed.buffer as ArrayBuffer);
                 }
             })

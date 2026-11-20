@@ -35,9 +35,10 @@ class FakeSocket {
     onclose: (() => void) | null = null;
     onerror: (() => void) | null = null;
     closes = 0;
+    sends = 0;
 
     constructor(url: string) { this.url = url; FakeSocket.sockets.push(this); }
-    send(): void {}
+    send(): void { this.sends++; }
     close(): void {
         this.closes++;
         this.readyState = 3;
@@ -94,6 +95,15 @@ test("foreground resume invalidates an apparently-connected stale session exactl
         const stale = FakeSocket.sockets[0];
         stale.readyState = FakeSocket.OPEN;
         (channel as any).state = "connected";
+        let finishSeal!: (bytes: Uint8Array) => void;
+        const heldSeal = new Promise<Uint8Array>(resolve => { finishSeal = resolve; });
+        let seals = 0;
+        (channel as any).session.seal = () => { seals++; return heldSeal; };
+        channel.sendPresence("first.md", "active");
+        channel.sendPresence("second.md", "active");
+        const sendsDone = (channel as any).txChain as Promise<void>;
+        await eventually(() => seals === 1, "first presence did not start encryption");
+
 
         documentEvents.visibilityState = "hidden";
         documentEvents.dispatch("visibilitychange");
@@ -101,6 +111,10 @@ test("foreground resume invalidates an apparently-connected stale session exactl
         documentEvents.dispatch("visibilitychange");
         assert.deepEqual(observedConnected, [false], "resume callback ran before stale state was invalidated");
         await eventually(() => FakeSocket.sockets.length === 2, "resume did not mint a fresh WS session");
+        finishSeal(new Uint8Array([1]));
+        await sendsDone;
+        assert.equal(stale.sends, 0, "in-flight presence reached the retired socket");
+        assert.equal(seals, 1, "queued presence was encrypted after its session retired");
         assert.equal(stale.closes, 1);
         assert.equal(channel.getState(), "connecting");
         assert.equal(channel.lastFrameAgeMs(), -1);
