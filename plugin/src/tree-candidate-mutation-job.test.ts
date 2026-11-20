@@ -195,6 +195,11 @@ async function partialCapabilitiesNeverFallBack(): Promise<void> {
         await assert.rejects(applyTreeCandidateMutation(tree, "update", payload, tree.options()), /incomplete candidate mutation/);
         assert.equal(tree.begun.length, 0); assert.equal(tree.legacyCalls, 0); assert.equal(tree.candidate, true);
     }
+    const policy = { requireIncremental: true, legacy: () => assert.fail("unexpected synchronous mutation"),
+        cooperate: async () => { policy.requireIncremental = false; } };
+    await assert.rejects(applyTreeCandidateMutation({ has_candidate: () => true }, "update", payload, policy),
+        /incremental candidate mutation API is required/);
+
     const noCandidate = new MutationFixture(); noCandidate.candidate = false;
     await assert.rejects(applyTreeCandidateMutation(noCandidate, "delete", payload, noCandidate.options()), /candidate disappeared/);
     assert.deepEqual(noCandidate.events, []);

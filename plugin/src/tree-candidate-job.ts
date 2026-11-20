@@ -807,7 +807,7 @@ export async function beginTreeCandidate(
         (options.requireIncremental !== undefined && typeof options.requireIncremental !== "boolean")) {
         throw new TypeError("candidate begin requires host cooperation and an ownership handoff");
     }
-    const cooperate = options.cooperate;
+    const { cooperate, requireIncremental } = options;
     const cooperateRetirementOption = options.cooperateRetirement;
     const signal = options.signal;
     const assertOwner = options.assertCurrent;
@@ -848,7 +848,7 @@ export async function beginTreeCandidate(
         throw new TypeError("deferred reachability requires the candidate job API");
     }
     if (!traversal) {
-        if (options.requireIncremental) {
+        if (requireIncremental) {
             throw new TypeError("incremental candidate begin API is required");
         }
         let opened = false, handedOff = false;
@@ -1055,7 +1055,7 @@ export async function collectTreeCandidateChunks(
     if (options.requireIncremental !== undefined && typeof options.requireIncremental !== "boolean") {
         throw new TypeError("candidate chunk collection requires a valid incremental policy");
     }
-    const cooperate = options.cooperate;
+    const { cooperate, requireIncremental } = options;
     const cooperateRetirementOption = options.cooperateRetirement;
     const signal = options.signal;
     const assertOwner = options.assertCurrent;
@@ -1086,7 +1086,7 @@ export async function collectTreeCandidateChunks(
         throw new TypeError("deferred reachability requires the candidate chunk job API");
     }
     if (!traversal) {
-        if (options.requireIncremental) {
+        if (requireIncremental) {
             throw new TypeError("incremental candidate chunk API is required");
         }
         const plan = chunkPlan(legacy());
@@ -1196,13 +1196,14 @@ export async function collectTreeCandidateChunkPages(
         typeof options.onSortMemoryPlan !== "function" || typeof options.onPage !== "function") {
         throw new TypeError("candidate chunk pages require cooperation, admission, a sink and a fallback");
     }
+    const { requireIncremental } = options;
     if (hasPendingTreeReachabilityRetirement(tree)) await drainTreeReachabilityRetirement(tree);
     const paged = candidateChunkPagedApi(tree);
     if (!paged) {
-        if (options.requireIncremental) {
+        if (requireIncremental) {
             throw new TypeError("incremental candidate chunk page API is required");
         }
-        const plan = await collectTreeCandidateChunks(tree, options);
+        const plan = await collectTreeCandidateChunks(tree, { ...options, requireIncremental });
         let freshOffset = 0;
         for (let offset = 0; offset < plan.all.length;) {
             const nextOffset = Math.min(plan.all.length, offset + TREE_CANDIDATE_CHUNK_PAGE_HASHES);

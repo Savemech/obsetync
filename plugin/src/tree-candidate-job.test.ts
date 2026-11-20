@@ -161,9 +161,9 @@ async function legacyAndPartialCapabilitiesFailSafely(): Promise<void> {
     assert.equal(candidate, false);
 
     const beforeRequired = begins;
-    await assert.rejects(beginTreeCandidate(legacy, {
-        cooperate: async () => {}, onCandidateOpened: () => {}, requireIncremental: true,
-    }), /incremental candidate begin API is required/);
+    const policy = { requireIncremental: true, onCandidateOpened: () => {},
+        cooperate: async () => { policy.requireIncremental = false; } };
+    await assert.rejects(beginTreeCandidate(legacy, policy), /incremental candidate begin API is required/);
     assert.equal(begins, beforeRequired);
     assert.equal(candidate, false);
 

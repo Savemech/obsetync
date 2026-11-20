@@ -625,7 +625,7 @@ export async function applyTreeCandidateMutation(
     }
     const { cooperate, signal, assertCurrent: assertOwner, legacy,
         onCandidateMutated = () => {}, cooperateRetirement = () => yieldWork(), onOutputMemoryPlan,
-        now: rawNow } = options;
+        now: rawNow, requireIncremental } = options;
     const now = monotonicClock(rawNow ?? defaultMonotonicClock());
     if (pendingMutationRetirements.has(tree)) await drainTreeCandidateMutationRetirement(tree);
     // Cleanup can use its pinned old wrapper after stop, but a NEW operation
@@ -652,7 +652,7 @@ export async function applyTreeCandidateMutation(
     assertCurrent();
 
     if (!jobs) {
-        if (options.requireIncremental) {
+        if (requireIncremental) {
             throw new TypeError("incremental candidate mutation API is required");
         }
         legacy();
