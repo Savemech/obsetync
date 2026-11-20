@@ -554,7 +554,7 @@ async function materializationFailureCannotBecomeLocalOmissionAck() {
     }
 }
 
-async function sourceReadDirectoryRaceRemainsRetryable() {
+async function sourceReadRaceRemainsRetryable(kind: "directory" | "missing") {
     const f = await fixture(), a = await f.create("source-type-race");
     const path = pathAt(0);
     try {
@@ -564,19 +564,19 @@ async function sourceReadDirectoryRaceRemainsRetryable() {
         f.control.beforeRead = async candidate => {
             assert.equal(candidate, path);
             f.source.delete(path);
-            throw directory;
+            if (kind === "directory") throw directory;
         };
 
         const originalRoot = f.base.treeBaseRoot;
         await a.engine.pushPending();
-        assert.equal(a.engine.lastError?.message, directory.message);
-        assert.equal(f.server.requests.length, 0, "directory race published a root");
-        assert.equal(f.journal.unsyncedCount(), 1, "directory race acknowledged its journal generation");
-        assert.equal(a.engine.pendingChanges.size, 1, "directory race discarded its retry hint");
+        assert.equal(a.engine.lastError?.message, kind === "directory" ? directory.message : `missing file: ${path}`);
+        assert.equal(f.server.requests.length, 0, "source race published a root");
+        assert.equal(f.journal.unsyncedCount(), 1, "source race acknowledged its journal generation");
+        assert.equal(a.engine.pendingChanges.size, 1, "source race discarded its retry hint");
         assert.equal(f.base.treeBaseRoot, originalRoot);
-        assert.equal(f.base.getHash(path), hashFor(1), "directory race changed the durable base");
+        assert.equal(f.base.getHash(path), hashFor(1), "source race changed the durable base");
         const failedDisk = await f.cold();
-        assert.equal(failedDisk.journal.unsyncedCount(), 1, "directory race was not restart-durable");
+        assert.equal(failedDisk.journal.unsyncedCount(), 1, "source race was not restart-durable");
         assert.equal(failedDisk.base.getHash(path), hashFor(1));
 
         f.control.beforeRead = undefined;
@@ -2513,7 +2513,8 @@ async function run() {
         await ambiguousLocalAckReloadsItsActualCut();
         await omittedRenamePeerHoldsItsGroupWhileIndependentWorkPublishes();
         await materializationFailureCannotBecomeLocalOmissionAck();
-        await sourceReadDirectoryRaceRemainsRetryable();
+        await sourceReadRaceRemainsRetryable("directory");
+        await sourceReadRaceRemainsRetryable("missing");
         await localOmissionCutsAreBoundedAndWaitForFullBulkReview();
         await metadataMutexProtectsNativeAuditAndStillDrainsLiveEdits();
         await metadataErrorAndAbortReleaseOnlyAfterActualRead();
@@ -2539,7 +2540,7 @@ async function run() {
         await deferredFreshPullWithoutAHeadKeepsItsDurableFence();
         await disabledConfigScanPreservesPreviouslyTrackedSettings();
         await ignoredFreshPullCannotAdoptOrPublishMissingLeaves();
-        console.log("engine-root.test: 40 actual engine/root/journal/base integration suites passed (synthetic tree/transport)");
+        console.log("engine-root.test: 41 actual engine/root/journal/base integration suites passed (synthetic tree/transport)");
     } finally {
         if (globals.__obsetyncTestNotice === notice) {
             if (oldNotice === undefined) delete globals.__obsetyncTestNotice; else globals.__obsetyncTestNotice = oldNotice;

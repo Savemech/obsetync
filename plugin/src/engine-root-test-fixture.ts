@@ -429,7 +429,13 @@ async function fixture(count = 1) {
                 const error = control.statErrors.get(path); if (error) throw error;
                 const version = source.get(path); return version === undefined ? null : { mtime: version, size: 1 };
             },
-            async readFile(path: string) { events.push(`${name}:source-read`); await control.beforeRead?.(path); return dataFor(source.get(path)!); },
+            async readFile(path: string) {
+                events.push(`${name}:source-read`);
+                await control.beforeRead?.(path);
+                const version = source.get(path);
+                if (version === undefined) throw Object.assign(new Error(`missing file: ${path}`), { code: "ENOENT" });
+                return dataFor(version);
+            },
             async listObsidianConfig() { events.push(`${name}:config-list`); return control.listConfig ? control.listConfig() : new Map(); },
             statBulk() {
                 events.push(`${name}:stat-bulk`); control.statBulk?.();
