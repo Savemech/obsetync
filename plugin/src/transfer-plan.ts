@@ -489,8 +489,11 @@ export class PreparedTransferPlan {
                 if (pending) failure("CORRUPT", "prepared manifest header interrupts another record");
                 exact(raw.header, ["scopeHash", "path", "mutationId", "journalThroughId", "baseRoot", "source", "fileHash", "totalSize", "chunkCount"], "invalid prepared header");
                 const h = raw.header;
-                if (!integer(h.chunkCount) || h.chunkCount > this.limits.chunks || estimate(h.path ?? "", h.chunkCount) > this.limits.queuedBytes) failure("LIMIT", "prepared record exceeds metadata retention ceiling");
                 const fields = baseFields(h, this.storeKind);
+                if (!integer(h.chunkCount) || h.chunkCount > this.limits.chunks ||
+                    estimate(fields.path, h.chunkCount) > Math.min(this.limits.queuedBytes, this.limits.retainedBytes)) {
+                    failure("LIMIT", "prepared record exceeds metadata retention ceiling");
+                }
                 if (!hash(h.fileHash) || h.totalSize !== fields.source.size) failure("CORRUPT", "prepared header differs from source");
                 const key = keyOf(fields.scopeHash, fields.path);
                 if (snapshot) {

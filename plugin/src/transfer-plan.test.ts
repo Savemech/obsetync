@@ -280,6 +280,22 @@ async function unknownCorruptAndAmbiguousStoresStayClosed(): Promise<void> {
     await rejects(new PreparedTransferPlan(unavailable).load(), "READ_FAILED");
 }
 
+async function oversizedRecoveryStopsAtTheManifestHeader(): Promise<void> {
+    const { io, plan } = await fixture();
+    await plan.retain(input());
+    const head = readStoreTestFrame(io, HEAD);
+    const path = `${PREPARED_TRANSFER_PATH}/wal-${head.epoch}-${head.walStart}.json`;
+    const page = readStoreTestFrame(io, path);
+    // A bad following row distinguishes early budget refusal from late rejection at seal.
+    page.rows[1].mutationId++;
+    io.files.set(path, sealStoreTestFrame(page));
+    const restored = new PreparedTransferPlan(io, { retainedBytes: 1024 });
+    const before = io.snapshot();
+    await rejects(restored.load(), "LIMIT");
+    same(io.snapshot(), before, "oversized recovery changed durable evidence");
+    check(!restored.snapshot().ready, "oversized record became visible");
+}
+
 async function monotonicReplayAndExhaustedWatermark(): Promise<void> {
     const seed = await fixture();
     await seed.plan.retain(input({ generation: 5 }));
@@ -464,6 +480,7 @@ void scopeCasOwnershipAndRestart()
     .then(faultedPublicationRetainsOnlyWholeCuts)
     .then(malformedClosureCannotPromoteAStage)
     .then(unknownCorruptAndAmbiguousStoresStayClosed)
+    .then(oversizedRecoveryStopsAtTheManifestHeader)
     .then(monotonicReplayAndExhaustedWatermark)
     .then(boundedAtomicCleanupKeepsNewerHints)
     .then(emptyInitializationUsesProofNotOrphanGuessing)
