@@ -123,8 +123,8 @@ export async function runBrowserCapabilityProbe(options: {
                         phase = "result";
                         try {
                             const fixture = probeFixture().buffer;
-                            const scalar = options.scalar.slice().buffer;
-                            const simd = options.simd.slice().buffer;
+                            const scalar = new Uint8Array(options.scalar).buffer;
+                            const simd = new Uint8Array(options.simd).buffer;
                             report.jobDispatched = true;
                             worker!.postMessage({ type: "run", fixture, scalar, simd }, [fixture, scalar, simd]);
                             report.transferToWorker = fixture.byteLength === 0 && scalar.byteLength === 0 && simd.byteLength === 0;

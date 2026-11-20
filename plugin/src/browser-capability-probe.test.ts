@@ -43,8 +43,8 @@ function fixture(behavior: Behavior = "success", onRun?: () => void) {
             return worker;
         },
     };
-    const scalar = new Uint8Array([1, 2]);
-    const simd = new Uint8Array([3, 4]);
+    const scalar = Buffer.alloc(8, 1).subarray(3, 5);
+    const simd = Buffer.alloc(2, 3);
     const run = (signal?: AbortSignal, timeoutMs = 1000) => runBrowserCapabilityProbe({
         host, source: "test synthetic worker source", scalar, simd,
         expectedHash: PROBE_FIXTURE_HASH, signal, timeoutMs,
@@ -64,7 +64,7 @@ async function tests(): Promise<void> {
         assert.equal(result.transferFromWorker, true);
         assert.equal(result.scalarHashMatches, true);
         assert.equal(result.simdHashMatches, behavior === "scalar-only" ? null : true);
-        assert.equal(f.scalar.byteLength, 2, "probe transferred embedded scalar bytes instead of its own copy");
+        assert.deepEqual([...f.scalar], [1, 1], "probe transferred embedded scalar bytes instead of its own copy");
         assert.equal(f.simd.byteLength, 2, "probe transferred embedded SIMD bytes instead of its own copy");
         assert.deepEqual(f.cleanup(), { starts: 1, terminations: 1, revocations: 1 });
     }
@@ -85,12 +85,12 @@ async function tests(): Promise<void> {
     assert.equal((await denied.run()).code, "STARTUP_FAILED");
     assert.equal(denied.cleanup().revocations, 1);
     const copyFailed = fixture();
-    copyFailed.scalar.slice = () => { throw new Error("private allocation failure"); };
-    const failedCopy = await copyFailed.run();
+    const copyFailure = copyFailed.run();
+    structuredClone(copyFailed.scalar.buffer, { transfer: [copyFailed.scalar.buffer] });
+    const failedCopy = await copyFailure;
     assert.equal(failedCopy.code, "POST_FAILED");
     assert.equal(failedCopy.jobDispatched, false);
     assert.deepEqual(copyFailed.cleanup(), { starts: 1, terminations: 1, revocations: 1 });
-    assert.ok(!JSON.stringify(failedCopy).includes("private allocation failure"));
     const shutdownFailed = fixture();
     const createWorker = shutdownFailed.host.createWorker;
     shutdownFailed.host.createWorker = url => {

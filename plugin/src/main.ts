@@ -1698,8 +1698,8 @@ export default class ObsetyncPlugin extends Plugin {
         if (this.browserHashStartup) return this.browserHashStartup;
         this.browserHashStartup = (async () => {
             const pool = createBrowserHashWorkerPool(browserHashWorkerSource, {
-                scalarWasm: embeddedScalarWasmBytes.slice().buffer as ArrayBuffer,
-                simdWasm: embeddedSimdWasmBytes.slice().buffer as ArrayBuffer,
+                scalarWasm: new Uint8Array(embeddedScalarWasmBytes).buffer,
+                simdWasm: new Uint8Array(embeddedSimdWasmBytes).buffer,
                 onDiagnostic: event => {
                     if (this.unloaded) return;
                     this.browserHashWorkerDiagnostic = event;

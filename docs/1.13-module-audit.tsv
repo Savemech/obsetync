@@ -176,7 +176,7 @@ reviewed	plugin/src/browser-hash-worker-entry.ts	production	Read init, cancellat
 reviewed	plugin/src/browser-hash-worker-protocol.ts	production	Traced fixture/hash and byte/feed bounds across worker, pool and push; real module transfer/hash parity and host lifecycle tests pass
 pending	plugin/src/browser-hash-workers.test.ts	tests	Not reviewed
 reviewed	plugin/src/browser-hash-workers.ts	production	Read worker qualification, transfers, cancellation, fallback and disposal; removed write-only detached-buffer field; npm test worker ownership cases pass; real browser gate remains
-read	plugin/src/browser-probe-entry.ts	production	Read single-run validation, scalar/SIMD initialization, synthetic digest and transfer-back; generated glue receives embedded bytes; browser fixture passes, physical iPad unverified
+reviewed	plugin/src/browser-probe-entry.ts	production	Traced opt-in dispatch, single-job validation, both embedded modules, result and release acknowledgement. Worker bundles pass with real WASM in Node. Fixed host copies for Buffer subviews and tested retained input ownership; physical iPad unverified.
 reviewed	plugin/src/browser-probe-protocol.ts	production	Traced synthetic fixture, buffer limits and message types through worker and host; packaged worker round-trip passed
 reviewed	plugin/src/build-identity-contract.ts	production	Read embedded identity and comparison; version mismatch, dirty and local-unknown diagnostics tested. Build-time and runtime checks share a strict prerelease and metadata identifier validator.
 reviewed	plugin/src/build-identity.test.ts	tests	Read identity, protocol and diagnostic assertions; prerelease identifiers, numeric leading zeros and empty components covered.
