@@ -86,7 +86,8 @@ function markerCore(marker: Marker): MarkerCore {
     return core;
 }
 function sameCore(left: Marker, right: Marker): boolean {
-    return JSON.stringify(markerCore(left)) === JSON.stringify(markerCore(right));
+    // readMarker verifies this digest against every variable core field.
+    return left.bundleId === right.bundleId;
 }
 function validateMarker(raw: string, expectedPhase: Marker["phase"]): Marker {
     if (utf8Bytes(raw) > MAX_MARKER_BYTES) fail("LIMIT", "legacy downgrade marker exceeds ceiling");

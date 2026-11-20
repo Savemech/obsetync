@@ -167,6 +167,19 @@ async function run(): Promise<void> {
             "segmented authority was not retained in an archive");
         check(!io.events.slice(downgradeEventCut).some(event => event.method === "remove" &&
             event.path.includes("legacy-downgrade-archives")), "downgrade deleted an archive");
+        const archivedPath = LEGACY_DOWNGRADE_PATHS.archived;
+        const archived = JSON.parse(io.files.get(archivedPath)!);
+        io.files.set(archivedPath, JSON.stringify(Object.fromEntries(Object.entries(archived).reverse())));
+        same(await inspectLegacyDowngradeState(io), "legacy-active", "JSON key order changed marker identity");
+        const corrupt = new DirectoryIO(io.snapshot());
+        corrupt.files.set(archivedPath, JSON.stringify({ ...archived, rootLastSequence: 2 }));
+        await rejects(inspectLegacyDowngradeState(corrupt), "CORRUPT");
+        const other = new DirectoryIO();
+        const otherStores = await populated(other);
+        await activateLegacyDowngrade({ io: other, journal: otherStores.journal, syncBase: otherStores.base,
+            rootIntents: rootIntents(2), treeVersion: 1, lease });
+        corrupt.files.set(archivedPath, other.files.get(archivedPath)!);
+        await rejects(inspectLegacyDowngradeState(corrupt), "CORRUPT");
         const reopenedRoot = new RootIntentStore(io, SCOPE, hashBytes); await reopenedRoot.load();
         check(reopenedRoot.lastSequence === 1, "active downgrade did not validate the retained root sequence");
 
@@ -314,8 +327,12 @@ async function run(): Promise<void> {
         io.files.delete(`${BASE}.next`);
         await resumeLegacyDowngrade(io, lease);
         check((await io.exists(LEGACY_DOWNGRADE_PATHS.active)), "restart did not resume archived promotion");
-        released1113Journal(io.files.get(JOURNAL)!);
-        released1113Base(io.files.get(BASE)!);
+        const bundleId = JSON.parse(io.files.get(LEGACY_DOWNGRADE_PATHS.active)!).bundleId;
+        const projection = `${ROOT}/legacy-downgrade-archives/${bundleId}/projection`;
+        same(await io.read(JOURNAL), await io.read(`${projection}/change-journal.ndjson`),
+            "resumed promotion did not preserve the journal bytes");
+        same(await io.read(BASE), await io.read(`${projection}/sync-base.json`),
+            "resumed promotion did not preserve the sync-base bytes");
     }
 
     {

@@ -258,8 +258,8 @@ reviewed	plugin/src/legacy-downgrade-host.test.ts	tests	Verified activation, int
 reviewed	plugin/src/legacy-downgrade-host.ts	production	Reviewed generation fences, activation, import and retirement ownership. Publish the shared unload promise before synchronous abort listeners run.
 reviewed	plugin/src/legacy-downgrade-modal.test.ts	tests	Exercised typed target, explicit consent, cancellation and text for all nine host states; focused suite passed
 reviewed	plugin/src/legacy-downgrade-modal.ts	production	Traced confirmation and status bar in main; removed unused tone and duplicate action type; bundled lifecycle and type checks passed
-pending	plugin/src/legacy-downgrade.test.ts	tests	Not reviewed
-pending	plugin/src/legacy-downgrade.ts	production	Not reviewed
+reviewed	plugin/src/legacy-downgrade.test.ts	tests	Checked released parser fixtures, recovery phases, corruption and lease revocation. Added reordered and mixed marker cases and exact resumed projection comparisons.
+reviewed	plugin/src/legacy-downgrade.ts	production	Traced projection, archive and import recovery checks. Compare validated content digests across phase markers so JSON member order cannot block recovery.
 reviewed	plugin/src/legacy-source.test.ts	tests	Compared digests to independent Node crypto implementation across Unicode boundaries; exercised absent roles, host yields and rename ACK parsing.
 reviewed	plugin/src/legacy-source.ts	production	Traced bounded SHA-256 fingerprinting from journal, sync base and transfer scope; captures immutable role/value pairs before yielding.
 reviewed	plugin/src/local-event-guards.ts	production	Traced reference counts, generation ordering, idempotent release and bounded overflow through create/modify/delete/rename listeners and pull protection
