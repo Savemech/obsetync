@@ -73,11 +73,13 @@ export function selectReconcileMissingRanges(
     chunks: readonly ReconcileManifestRange[],
     missingHashes: Iterable<string>,
 ): ReconcileManifestRange[] {
-    const missing = new Set(missingHashes);
+    const missing = new Set<string>();
+    for (const hash of missingHashes) missing.add(hash.toLowerCase());
     const ranges: ReconcileManifestRange[] = [];
     for (const chunk of chunks) {
-        if (missing.delete(chunk.hash)) {
-            ranges.push(chunk);
+        const hash = chunk.hash.toLowerCase();
+        if (missing.delete(hash)) {
+            ranges.push(chunk.hash === hash ? chunk : { ...chunk, hash });
         }
     }
     return ranges;

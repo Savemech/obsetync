@@ -26,11 +26,11 @@ function run(): void {
     );
     assert.deepEqual(
         selectReconcileMissingRanges([
-            { hash: "a", offset: 0, size: 4 },
+            { hash: "A", offset: 0, size: 4 },
             { hash: "b", offset: 4, size: 4 },
             { hash: "a", offset: 8, size: 4 },
             { hash: "c", offset: 12, size: 4 },
-        ], ["c", "a", "unknown"]),
+        ], ["C", "a", "unknown"]),
         [
             { hash: "a", offset: 0, size: 4 },
             { hash: "c", offset: 12, size: 4 },

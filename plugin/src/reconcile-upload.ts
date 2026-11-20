@@ -223,7 +223,9 @@ export async function repairSmallContent(api: RepairApi, io: PlatformIO, wasm: W
 
 async function checkChunkHashes(api: RepairApi, hashes: readonly string[], options: ReconcileUploadOptions,
     memory: TransientWorkScope): Promise<string[]> {
-    const unique = [...new Set(hashes)];
+    const seen = new Set<string>();
+    for (const hash of hashes) seen.add(hash.toLowerCase());
+    const unique = [...seen];
     const missing: string[] = [];
     for (let cursor = 0; cursor < unique.length; cursor += 1000) {
         throwIfWorkAborted(options.signal);
