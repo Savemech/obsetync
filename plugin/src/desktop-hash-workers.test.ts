@@ -261,7 +261,7 @@ async function crashedWorkerRestartsAndBinaryResponseIsRejected(): Promise<void>
 }
 
 async function hostileWorkerMetadataIsRejected(): Promise<void> {
-    for (const invalid of [{ inode: -1 }, { mtime: 10.25 }]) {
+    for (const invalid of [null, { inode: -1 }, { mtime: 10.25 }]) {
         const worker = new FakeWorker();
         const pool = new DesktopHashWorkerPool(() => worker as any, 1, 1);
         worker.emit({ type: "ready", wasm_mode: "simd" });
@@ -273,15 +273,15 @@ async function hostileWorkerMetadataIsRejected(): Promise<void> {
             feedBytes: 64 * 1024,
         });
         const job = jobFrom(worker);
-        worker.emit({
+        worker.emit(invalid === null ? null as unknown as HashWorkerResponse : {
             ...hashResult(job),
             fingerprint: { ...fingerprintFor(job), ...invalid },
         });
         await pending.then(
-            () => check(false, "invalid fingerprint resolved"),
+            () => check(false, "malformed worker reply resolved"),
             (error) => check(
                 error instanceof HashWorkerPoolError && error.code === "PROTOCOL",
-                "invalid fingerprint was accepted",
+                "malformed worker reply was accepted",
             ),
         );
         await pool.close();

@@ -583,7 +583,11 @@ export class DesktopHashWorkerPool {
     }
 
     private onMessage(slot: WorkerSlot, message: HashWorkerResponse): void {
-        if (slot.dead || this.closed || !message || typeof message !== "object") return;
+        if (slot.dead || this.closed) return;
+        if (!message || typeof message !== "object") {
+            this.onWorkerFailure(slot, new HashWorkerPoolError("invalid hash worker response", "PROTOCOL"));
+            return;
+        }
         if (message.type === "ready") {
             if (message.wasm_mode !== "simd") {
                 this.onWorkerFailure(
