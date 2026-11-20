@@ -232,6 +232,7 @@ async function fixtureWorker() {
         assert(phase.maxWriteUtf8Bytes <= STORE_LIMITS.frameBytes);
         assert.equal(phase.headStageWrites, phase.headPromotions);
     }
+    await journal.drainMaintenance();
     const measuredAdapterIO = { ...totalAdapterIO };
     let diskLogicalBytes = 0;
     let diskAllocatedBytes = 0;
@@ -263,6 +264,7 @@ async function fixtureWorker() {
         await journal.acknowledge([{ path: renameOld, throughId: renameId },
             { path: probe, throughId: totalAppends + 4 }]);
         await journal.compact();
+        await journal.closeAndDrain();
         const reloaded = createJournal();
         await reloaded.load();
         verifyPending(reloaded, false);
@@ -270,6 +272,7 @@ async function fixtureWorker() {
         assert.equal(await reloaded.append({ action: "created", path: probe,
             ts: postCompactTs + 2, synced: false }), totalAppends + 5);
         await reloaded.acknowledge([{ path: probe, throughId: totalAppends + 5 }]);
+        await reloaded.closeAndDrain();
         restartHighwaterVerified = true;
     }
     process.stdout.write(JSON.stringify({ phases, adapterIOBeforeVerificationProbes: measuredAdapterIO,
@@ -422,7 +425,7 @@ async function main() {
                 batches: "adjacent actual wrapper submissions; count WAL heads and snapshot heads separately",
                 checkpoint: "append batches publish their head; compact is the explicit journal snapshot/checkpoint",
                 instrumentation: "native IO counters and bounded head classification included in timings",
-                diskBytes: "fixture data before untimed verification probes; generated benchmark bundle excluded",
+                diskBytes: "fixture data after maintenance and before untimed verification probes; generated benchmark bundle excluded",
                 verification: "fresh-process identity/highwater check; then untimed rename retirement, compact and same-process new-instance reload",
                 verificationIncludedInTimings: false, performanceGate: null,
                 scope: "native temporary fixture; not Obsidian/WebView/iPhone or production-vault proof" },

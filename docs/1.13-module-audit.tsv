@@ -121,7 +121,7 @@ reviewed	plugin/esbuild.config.mjs	production	Read all build paths and checked n
 reviewed	plugin/manifest.json	configuration/schema	Verified root copy byte parity; mobile-availability discrepancy regression added
 reviewed	plugin/package-lock.json	generated/lock	Fresh offline npm ci and npm ls succeeded on Linux; release checker verifies both version declarations
 read	plugin/package.json	configuration/schema	Entry-point/build inventory; behavior/callers still under review
-pending	plugin/scripts/bench-journal.mjs	tooling	Not reviewed
+reviewed	plugin/scripts/bench-journal.mjs	tooling	Traced documented native fixture, actual journal calls, returned IDs and restart checks. Fixed enumeration racing WAL cleanup and retired the writer before new-instance reload. Three cold-load pairs passed on 25k paths and 10k edits.
 read	plugin/scripts/bench-native-root.mjs	tooling	Removed obsolete debounce mocks or unused imports; affected fixture/callers reviewed and npm test passes; complete module review pending
 pending	plugin/scripts/bench-prepared-manifest.mjs	tooling	Not reviewed
 reviewed	plugin/scripts/bench-sync-base.mjs	tooling	Ran three 25k-entry seed/cold-process pairs. Fixed producer exceeding the bounded queue and disk enumeration racing maintenance. Schema 2 identifies incremental checkpoints.
