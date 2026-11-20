@@ -303,7 +303,7 @@ pending	plugin/src/push-transaction.test.ts	tests	Not reviewed
 pending	plugin/src/push.ts	production	Not reviewed
 reviewed	plugin/src/reconcile-content.test.ts	tests	Single-pass iterator covers ignored first copy, mixed-case hashes, physical totals, threshold and duplicate missing ranges
 reviewed	plugin/src/reconcile-content.ts	production	Read index, byte totals and range selection; traced sync and both upload paths; one-pass snapshot input and ordered unique ranges
-pending	plugin/src/reconcile-status.test.ts	tests	Not reviewed
+reviewed	plugin/src/reconcile-status.test.ts	tests	Traced force sync, reconcile summary, pending status, cancellation and recovery; reproduced returned-result alias changing idle warning; 27 status assertions and engine/root plus startup replay suites passed
 reviewed	plugin/src/reconcile-upload.test.ts	tests	Reviewed source drift, sibling drain, range close and fallback coverage; 211 repair assertions passed alongside range selection and desktop repair suites
 reviewed	plugin/src/reconcile-upload.ts	production	Reviewed drift detection, admission, worker fallback and range repair; normalize manifest chunk hashes before presence checks and selection
 pending	plugin/src/resident-memory.test.ts	tests	Not reviewed

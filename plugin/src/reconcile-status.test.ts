@@ -51,6 +51,15 @@ async function incompleteRepairNeverClaimsCompletion(): Promise<void> {
     check(engine.pendingIdleStatus() === "sync ✓", "successful follow-up left false repair warning");
 }
 
+async function returnedRepairResultCannotChangeIdleStatus(): Promise<void> {
+    const { engine } = fixture();
+    engine._reconcileInner = async () => ({ ...complete, deferred: 2 });
+    const result = await engine.reconcileContent();
+    result.deferred = 0;
+    check(engine.pendingIdleStatus() === "sync ⚠ repair 2",
+        "mutating the returned result changed the stored repair count");
+}
+
 async function failedCheckAndCancellationRemainDistinct(): Promise<void> {
     const { engine, pushes } = fixture();
     engine._reconcileInner = async () => { throw new Error("injected repair check failure"); };
@@ -134,6 +143,7 @@ function rootRecoveryCannotLookComplete(): void {
 }
 
 void incompleteRepairNeverClaimsCompletion()
+    .then(returnedRepairResultCannotChangeIdleStatus)
     .then(failedCheckAndCancellationRemainDistinct)
     .then(checkpointBeginFailureReleasesEngine)
     .then(repairMutexPreventsIdleCapabilityProbe)

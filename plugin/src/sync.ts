@@ -1328,10 +1328,8 @@ export class ObsetyncSyncEngine {
      * server, upload whatever is missing. This exists because `sync-base` is
      * just a local cache of "what we believe the server has" — and the cache
      * can lie (server wiped, user restored from backup, migrated from TLS
-     * server, etc.). Running it costs one `checkContent` for small files +
-     * one `checkContentChunks` per large file the server already knows about,
-     * plus real uploads for anything truly missing. O(1) network when the
-     * server is fully populated; O(missing) otherwise.
+     * server, etc.). Check index chunks, small content and large-file manifests
+     * in batches. Only missing manifests need local chunking and chunk checks.
      */
     reconcileContent(onProgress?: (msg: string) => void): Promise<ReconcileResult> {
         return this.trackOperation(() => this.reconcileContentInner(onProgress), {
@@ -1367,7 +1365,7 @@ export class ObsetyncSyncEngine {
                 progress(message);
                 if (operationId) this.operationCheckpoint?.progress(operationId, message);
             }, perf);
-            this.lastRepairSummary = { ts: Date.now(), incomplete: result.deferred > 0, result };
+            this.lastRepairSummary = { ts: Date.now(), incomplete: result.deferred > 0, result: { ...result } };
             if (result.deferred > 0) {
                 perfOutcome = "error";
                 this.lastError = { ts: Date.now(), origin: "reconcile",
