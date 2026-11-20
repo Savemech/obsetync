@@ -117,6 +117,26 @@ async function boundedFifoNeedsRealTasks(): Promise<void> {
     scheduler.dispose();
 }
 
+async function timingFailureDoesNotStrandQueuedWork(): Promise<void> {
+    const host = new FakeHost(true), scheduler = new WorkScheduler({ runtime: host });
+    const failure = new Error("timing failed");
+    const perf = { phase: () => () => { throw failure; } } as unknown as PerfOperation;
+    const first = assert.rejects(scheduler.yield({ perf }), error => error === failure);
+    const second = scheduler.yield();
+    host.tick();
+    assert.equal(host.tasks.size, 1, "timing failure stranded the next task");
+    host.tick();
+    await Promise.all([first, second]);
+
+    const controller = new AbortController();
+    const reason = new Error("cancelled");
+    const cancelled = assert.rejects(scheduler.yield({ perf, signal: controller.signal }), error => error === reason);
+    controller.abort(reason);
+    await cancelled;
+    assert.equal(scheduler.snapshot().pendingJobs, 0);
+    scheduler.dispose();
+}
+
 async function abortsAreBoundedAndDoNotBlockLaterJobs(): Promise<void> {
     const host = new FakeHost();
     const scheduler = new WorkScheduler({ runtime: host, maxPendingJobs: 2 });
@@ -372,6 +392,7 @@ async function run(): Promise<void> {
     assert.throws(() => new WorkScheduler({ maxPendingJobs: 0 }), RangeError);
     assert.throws(() => new WorkScheduler({ maxPendingJobs: 1025 }), RangeError);
     await boundedFifoNeedsRealTasks();
+    await timingFailureDoesNotStrandQueuedWork();
     await abortsAreBoundedAndDoNotBlockLaterJobs();
     await disposingCancelsPendingAndReleasesResources();
     await brokenCapabilitiesFallBackWithoutLeaking();

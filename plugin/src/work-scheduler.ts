@@ -123,12 +123,6 @@ function defaultRuntime(): WorkSchedulerRuntime {
             : undefined,
         scheduleTimer: (callback) => globalThis.setTimeout(callback, 0),
         cancelTimer: (handle) => globalThis.clearTimeout(handle as ReturnType<typeof setTimeout>),
-        now: () => {
-            const value = globalThis.performance?.now?.();
-            return typeof value === "number" && Number.isFinite(value) && value >= 0
-                ? value
-                : Date.now();
-        },
     };
 }
 
@@ -351,7 +345,11 @@ export class WorkScheduler {
 
     private finish(entry: PendingYield, error?: unknown): void {
         if (entry.onAbort) entry.signal?.removeEventListener("abort", entry.onAbort);
-        entry.endWait?.();
+        try { entry.endWait?.(); }
+        catch (timingError) {
+            entry.reject(error === undefined ? timingError : error);
+            return;
+        }
         if (error !== undefined) entry.reject(error);
         else entry.resolve();
     }
