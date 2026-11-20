@@ -640,19 +640,24 @@ function chunkHashes(value: unknown, maximum = 1_000_000): string[] {
     return output;
 }
 
+function freshChunkHashes(value: unknown, all: string[], invalidSubset: string): string[] {
+    const fresh = chunkHashes(value, all.length);
+    let cursor = 0;
+    for (const hash of fresh) {
+        while (cursor < all.length && all[cursor] < hash) cursor++;
+        if (all[cursor] !== hash) throw new TypeError(invalidSubset);
+        cursor++;
+    }
+    return fresh;
+}
+
 function chunkPlan(value: unknown): TreeCandidateChunkPlan {
     if (!value || typeof value !== "object") {
         throw new TypeError("WASM tree chunk job returned an invalid plan");
     }
     const row = value as Partial<TreeCandidateChunkPlan>;
-    const all = chunkHashes(row.all), fresh = chunkHashes(row.fresh);
-    let cursor = 0;
-    for (const hash of fresh) {
-        while (cursor < all.length && all[cursor] < hash) cursor++;
-        if (all[cursor] !== hash) throw new TypeError("WASM tree chunk job returned an invalid plan");
-        cursor++;
-    }
-    return { all, fresh };
+    const all = chunkHashes(row.all);
+    return { all, fresh: freshChunkHashes(row.fresh, all, "WASM tree chunk job returned an invalid plan") };
 }
 
 interface CandidateChunkPagedApi {
@@ -786,13 +791,7 @@ function candidateChunkPage(value: unknown, expectedOffset: number, allCount: nu
     }
     const all = chunkHashes(row.all, pageLength);
     if (all.length !== pageLength) throw new TypeError("WASM tree returned inconsistent candidate chunk plan page");
-    const fresh = chunkHashes(row.fresh, pageLength);
-    let cursor = 0;
-    for (const hash of fresh) {
-        while (cursor < all.length && all[cursor] < hash) cursor++;
-        if (all[cursor] !== hash) throw new TypeError("WASM tree chunk page fresh hashes are not a subset");
-        cursor++;
-    }
+    const fresh = freshChunkHashes(row.fresh, all, "WASM tree chunk page fresh hashes are not a subset");
     Object.freeze(all);
     Object.freeze(fresh);
     return Object.freeze({ offset, nextOffset, done: row.done, all, fresh });
@@ -843,6 +842,7 @@ export async function beginTreeCandidate(
     const assertCurrent = () => {
         throwIfWorkAborted(signal);
         assertOwner?.();
+        throwIfWorkAborted(signal);
     };
     assertCurrent();
     await cooperate();
@@ -1082,6 +1082,7 @@ export async function collectTreeCandidateChunks(
         throwIfWorkAborted(signal);
         assertOwner?.();
         if (!candidatePresent()) throw new Error("candidate disappeared during chunk collection");
+        throwIfWorkAborted(signal);
     };
     assertCurrent();
     await cooperate();
@@ -1200,20 +1201,24 @@ export async function collectTreeCandidateChunkPages(
         typeof options.onSortMemoryPlan !== "function" || typeof options.onPage !== "function") {
         throw new TypeError("candidate chunk pages require cooperation, admission, a sink and a fallback");
     }
-    const { requireIncremental } = options;
+    const { requireIncremental, signal, assertCurrent: assertOwner } = options;
     if (hasPendingTreeReachabilityRetirement(tree)) await drainTreeReachabilityRetirement(tree);
     const paged = candidateChunkPagedApi(tree);
     if (!paged) {
         if (requireIncremental) {
             throw new TypeError("incremental candidate chunk page API is required");
         }
-        const plan = await collectTreeCandidateChunks(tree, { ...options, requireIncremental });
+        const plan = await collectTreeCandidateChunks(tree, { ...options, requireIncremental, signal, assertCurrent: assertOwner });
+        const check = () => {
+            throwIfWorkAborted(signal);
+            assertOwner?.();
+            throwIfWorkAborted(signal);
+        };
         let freshOffset = 0;
         for (let offset = 0; offset < plan.all.length;) {
             const nextOffset = Math.min(plan.all.length, offset + TREE_CANDIDATE_CHUNK_PAGE_HASHES);
             const all = plan.all.slice(offset, nextOffset);
             const fresh: string[] = [];
-            while (freshOffset < plan.fresh.length && plan.fresh[freshOffset] < all[0]) freshOffset++;
             while (freshOffset < plan.fresh.length && plan.fresh[freshOffset] <= all[all.length - 1]) {
                 fresh.push(plan.fresh[freshOffset++]);
             }
@@ -1221,16 +1226,13 @@ export async function collectTreeCandidateChunkPages(
             const page = Object.freeze({
                 offset, nextOffset, done: nextOffset === plan.all.length, all, fresh,
             });
-            throwIfWorkAborted(options.signal);
-            options.assertCurrent?.();
+            check();
             await options.onPage(page, plan.all.length);
-            throwIfWorkAborted(options.signal);
-            options.assertCurrent?.();
+            check();
             offset = nextOffset;
             if (!page.done) {
                 await options.cooperate();
-                throwIfWorkAborted(options.signal);
-                options.assertCurrent?.();
+                check();
             }
         }
         return { allCount: plan.all.length, freshCount: plan.fresh.length };
@@ -1241,7 +1243,6 @@ export async function collectTreeCandidateChunkPages(
     if (!traversal || !deferred) {
         throw new TypeError("candidate chunk page API requires deferred candidate traversal");
     }
-    const signal = options.signal;
     const candidatePresent = () => {
         const value = deferred.hasCandidate.call(tree);
         if (typeof value !== "boolean") throw new TypeError("WASM tree returned invalid candidate presence");
@@ -1249,7 +1250,7 @@ export async function collectTreeCandidateChunkPages(
     };
     const assertCurrent = () => {
         throwIfWorkAborted(signal);
-        options.assertCurrent?.();
+        assertOwner?.();
         if (!candidatePresent()) throw new Error("candidate disappeared during chunk collection");
         throwIfWorkAborted(signal);
     };
@@ -1338,17 +1339,15 @@ export async function collectTreeCandidateChunkPages(
 
         const allCount = candidateChunkPlanInfo(paged.info.call(tree, token), reachable);
         let offset = 0, freshCount = 0;
-        let previousAll: string | undefined, previousFresh: string | undefined;
+        let previousAll: string | undefined;
         while (offset < allCount) {
             assertCurrent();
             const page = candidateChunkPage(paged.read.call(tree, token, offset,
                 TREE_CANDIDATE_CHUNK_PAGE_HASHES), offset, allCount);
-            if ((previousAll && previousAll >= page.all[0]) ||
-                (previousFresh && page.fresh.length > 0 && previousFresh >= page.fresh[0])) {
+            if (previousAll !== undefined && previousAll >= page.all[0]) {
                 throw new TypeError("WASM tree candidate chunk pages are not globally canonical");
             }
             previousAll = page.all[page.all.length - 1];
-            if (page.fresh.length > 0) previousFresh = page.fresh[page.fresh.length - 1];
             freshCount += page.fresh.length;
             assertCurrent();
             await options.onPage(page, allCount);

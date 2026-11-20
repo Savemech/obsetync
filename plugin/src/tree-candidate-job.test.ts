@@ -1062,6 +1062,19 @@ async function pagedCandidateChunksCapabilitiesAndLegacyFailClosed(): Promise<vo
         assert.equal(tree.retirement, false);
         assert.equal(tree.pageFinishes, 0);
     }
+    for (const boundaryHash of [h(255), h(256)]) {
+        const tree = new PagedChunkTreeFixture();
+        tree.all[256] = boundaryHash;
+        let delivered = 0, released = 0;
+        await assert.rejects(collectTreeCandidateChunkPages(tree, {
+            cooperate: async () => {}, cooperateRetirement: async () => {}, legacy: () => ({}),
+            onSortMemoryPlan: () => ({ release: () => { released++; } }),
+            onPage: async () => { delivered++; },
+        }), /not globally canonical/);
+        assert.equal(delivered, 1);
+        assert.equal(released, 1);
+        assert.equal(tree.retirement, false);
+    }
     const partial = new PagedChunkTreeFixture() as CandidateJobTree;
     partial.read_candidate_chunks_page_v1_job = undefined;
     await assert.rejects(collectTreeCandidateChunkPages(partial, {
@@ -1080,6 +1093,15 @@ async function pagedCandidateChunksCapabilitiesAndLegacyFailClosed(): Promise<vo
         onSortMemoryPlan: () => ({ release: () => {} }), onPage: async () => {},
     }), /incremental candidate chunk page API is required/);
     assert.equal(refusedCalls, 0);
+    const controller = new AbortController(), stopped = new Error("owner stopped during presence check");
+    let checked = false, legacyReads = 0;
+    await assert.rejects(collectTreeCandidateChunks(legacy, {
+        signal: controller.signal,
+        cooperate: async () => { checked = true; },
+        assertCurrent: () => { if (checked) controller.abort(stopped); },
+        legacy: () => { legacyReads++; return { all: [], fresh: [] }; },
+    }), error => error === stopped);
+    assert.equal(legacyReads, 0);
     const all = Array.from({ length: 600 }, (_, index) => h(index + 1));
     const fresh = all.filter((_, index) => index % 7 === 0);
     const pages: string[][] = []; let admissions = 0;
